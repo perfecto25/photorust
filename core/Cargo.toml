@@ -1,0 +1,24 @@
+[package]
+name = "photorust_core"
+version = "0.1.0"
+edition = "2021"
+description = "Image engine for PhotoRust — pixel buffers, layers, compositing, filters, history, PSD I/O"
+
+# CMake links this into the C++ shell. See the top-level CMakeLists.txt.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+cxx = "1.0"
+cxx-qt = "0.9"
+# `qt_gui` pulls in QImage/QColor/QPainter. Do NOT bump this to `qt_full`: it
+# drags in Qt Qml, which then has to be listed in QT_MODULES in CMake even
+# though this is a QWidgets-only application.
+cxx-qt-lib = { version = "0.9", features = ["qt_gui"] }
+rayon = "1.10"
+
+[build-dependencies]
+cxx-qt-build = "0.9"
+
+[dev-dependencies]
+approx = "0.5"

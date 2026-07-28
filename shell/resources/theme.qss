@@ -1,0 +1,567 @@
+/*
+ * Photoshop CS6 "Kona" dark theme.
+ *
+ * Palette sampled from the CS6 UI. The four greys that do most of the work:
+ *
+ *   #535353  panel/dialog background   (the default CS6 brightness level)
+ *   #454545  toolbars, options bar, panel headers
+ *   #3c3c3c  sunken wells, list backgrounds
+ *   #1e1e1e  the canvas surround
+ *
+ * Text is #d4d4d4; disabled text drops to #7d7d7d. The accent used for
+ * selection and focus is #4b6eaf, CS6's muted blue.
+ *
+ * Metrics matter as much as colour here (CLAUDE.md §8): CS6 panel headers are
+ * 22px, the tool strip is a 30px column of 26px buttons, and the options bar is
+ * 26px. Those numbers are encoded below rather than left to Qt's defaults.
+ */
+
+/* ---------------------------------------------------------------- base --- */
+
+QWidget {
+    background-color: #535353;
+    color: #d4d4d4;
+    font-size: 11px;
+    /* CS6 shipped Tahoma on Windows; these are the closest metric matches on
+       our two target platforms. */
+    font-family: "Lucida Grande", "DejaVu Sans", "Segoe UI", sans-serif;
+}
+
+QWidget:disabled {
+    color: #7d7d7d;
+}
+
+QMainWindow, QDialog {
+    background-color: #535353;
+}
+
+QMainWindow::separator {
+    background-color: #333333;
+    width: 4px;
+    height: 4px;
+}
+
+QMainWindow::separator:hover {
+    background-color: #4b6eaf;
+}
+
+QToolTip {
+    background-color: #ffffe1;
+    color: #000000;
+    border: 1px solid #767676;
+    padding: 2px 4px;
+}
+
+/* ---------------------------------------------------------------- menu --- */
+
+QMenuBar {
+    background-color: #454545;
+    color: #d4d4d4;
+    border-bottom: 1px solid #333333;
+    padding: 1px 0;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 9px;
+}
+
+QMenuBar::item:selected {
+    background-color: #4b6eaf;
+    color: #ffffff;
+}
+
+QMenuBar::item:pressed {
+    background-color: #3d5a92;
+}
+
+QMenu {
+    background-color: #454545;
+    border: 1px solid #2a2a2a;
+    padding: 2px 0;
+}
+
+QMenu::item {
+    /* Left padding leaves room for the check/icon column. */
+    padding: 4px 28px 4px 24px;
+    background: transparent;
+}
+
+QMenu::item:selected {
+    background-color: #4b6eaf;
+    color: #ffffff;
+}
+
+QMenu::item:disabled {
+    color: #7d7d7d;
+}
+
+QMenu::item:disabled:selected {
+    background: transparent;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: #5e5e5e;
+    margin: 3px 8px 3px 24px;
+}
+
+QMenu::indicator {
+    width: 13px;
+    height: 13px;
+    left: 6px;
+}
+
+/* ------------------------------------------------------------- toolbar --- */
+
+/* The options bar across the top. CS6 keeps this at 26px tall. */
+QToolBar {
+    background-color: #454545;
+    border: none;
+    border-bottom: 1px solid #333333;
+    spacing: 3px;
+    padding: 2px 4px;
+    min-height: 26px;
+}
+
+QToolBar::separator {
+    background-color: #5e5e5e;
+    width: 1px;
+    margin: 3px 5px;
+}
+
+QToolBar QToolButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 2px;
+}
+
+QToolBar QToolButton:hover {
+    background-color: #5e5e5e;
+    border-color: #6e6e6e;
+}
+
+QToolBar QToolButton:pressed,
+QToolBar QToolButton:checked {
+    background-color: #3c3c3c;
+    border-color: #2a2a2a;
+}
+
+/* The vertical tool strip down the left edge. */
+QToolBar#toolStrip {
+    background-color: #454545;
+    border-right: 1px solid #333333;
+    border-bottom: none;
+    spacing: 0px;
+    padding: 2px 1px;
+}
+
+QToolBar#toolStrip QToolButton {
+    /* CS6's tool buttons are 26px square in the single-column layout. */
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
+    margin: 0px;
+    border-radius: 0px;
+}
+
+QToolBar#toolStrip QToolButton:checked {
+    background-color: #6e6e6e;
+    border-color: #808080;
+}
+
+/* -------------------------------------------------------------- panels --- */
+
+QDockWidget {
+    color: #d4d4d4;
+    titlebar-close-icon: none;
+    titlebar-normal-icon: none;
+}
+
+QDockWidget::title {
+    background-color: #454545;
+    padding: 5px 6px;
+    border-bottom: 1px solid #333333;
+    text-align: left;
+}
+
+QDockWidget::close-button, QDockWidget::float-button {
+    background: transparent;
+    border: none;
+    padding: 0px;
+    icon-size: 10px;
+}
+
+QDockWidget::close-button:hover, QDockWidget::float-button:hover {
+    background-color: #5e5e5e;
+}
+
+/* Panel tabs, when docks are stacked — the CS6 panel group look. */
+QTabBar::tab {
+    background-color: #3c3c3c;
+    color: #a8a8a8;
+    padding: 5px 11px;
+    border: none;
+    border-right: 1px solid #2a2a2a;
+    min-height: 12px;
+}
+
+QTabBar::tab:selected {
+    background-color: #535353;
+    color: #d4d4d4;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #464646;
+}
+
+QTabWidget::pane {
+    background-color: #535353;
+    border: none;
+    border-top: 1px solid #333333;
+}
+
+/* -------------------------------------------------------------- inputs --- */
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTextEdit {
+    background-color: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    padding: 2px 4px;
+    selection-background-color: #4b6eaf;
+    selection-color: #ffffff;
+    min-height: 16px;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus {
+    border-color: #4b6eaf;
+}
+
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QComboBox:disabled {
+    background-color: #464646;
+    color: #7d7d7d;
+}
+
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 15px;
+    border: none;
+    background: transparent;
+}
+
+QComboBox::down-arrow {
+    /* Drawn as a small triangle; QSS has no polygon primitive, so this is a
+       CSS border trick — a 3px wedge in the text colour. */
+    width: 0px;
+    height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 4px solid #d4d4d4;
+    margin-right: 5px;
+}
+
+QComboBox::down-arrow:disabled {
+    border-top-color: #7d7d7d;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #454545;
+    color: #d4d4d4;
+    border: 1px solid #2a2a2a;
+    selection-background-color: #4b6eaf;
+    selection-color: #ffffff;
+    outline: none;
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background-color: #4a4a4a;
+    border: 1px solid #2a2a2a;
+    width: 12px;
+}
+
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #5e5e5e;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    width: 0px; height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-bottom: 3px solid #d4d4d4;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    width: 0px; height: 0px;
+    border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
+    border-top: 3px solid #d4d4d4;
+}
+
+/* ------------------------------------------------------------- buttons --- */
+
+QPushButton {
+    background-color: #4a4a4a;
+    color: #d4d4d4;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    padding: 4px 12px;
+    min-height: 16px;
+    min-width: 60px;
+}
+
+QPushButton:hover {
+    background-color: #5e5e5e;
+}
+
+QPushButton:pressed {
+    background-color: #3c3c3c;
+}
+
+QPushButton:default {
+    border-color: #4b6eaf;
+}
+
+QPushButton:disabled {
+    background-color: #464646;
+    color: #7d7d7d;
+}
+
+QCheckBox, QRadioButton {
+    background: transparent;
+    spacing: 5px;
+}
+
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 12px;
+    height: 12px;
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+}
+
+QRadioButton::indicator {
+    border-radius: 7px;
+}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: #4b6eaf;
+    border-color: #5a7fbf;
+}
+
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    background-color: #464646;
+}
+
+/* -------------------------------------------------------------- lists ---- */
+
+QListView, QTreeView, QTableView, QListWidget, QTreeWidget {
+    background-color: #3c3c3c;
+    alternate-background-color: #404040;
+    color: #d4d4d4;
+    border: 1px solid #2a2a2a;
+    outline: none;
+    selection-background-color: #4b6eaf;
+    selection-color: #ffffff;
+}
+
+QListView::item, QTreeView::item, QListWidget::item {
+    padding: 2px;
+    border: none;
+}
+
+QListView::item:hover, QTreeView::item:hover, QListWidget::item:hover {
+    background-color: #464646;
+}
+
+QListView::item:selected, QTreeView::item:selected, QListWidget::item:selected {
+    background-color: #4b6eaf;
+    color: #ffffff;
+}
+
+QHeaderView::section {
+    background-color: #454545;
+    color: #d4d4d4;
+    border: none;
+    border-right: 1px solid #2a2a2a;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 3px 5px;
+}
+
+/* ------------------------------------------------------------ sliders ---- */
+
+QSlider::groove:horizontal {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+    height: 3px;
+    border-radius: 1px;
+}
+
+QSlider::handle:horizontal {
+    background-color: #c8c8c8;
+    border: 1px solid #2a2a2a;
+    width: 9px;
+    height: 11px;
+    margin: -5px 0;
+    border-radius: 1px;
+}
+
+QSlider::handle:horizontal:hover {
+    background-color: #e0e0e0;
+}
+
+QSlider::handle:horizontal:disabled {
+    background-color: #6e6e6e;
+}
+
+QSlider::sub-page:horizontal {
+    background-color: #6e6e6e;
+}
+
+/* ---------------------------------------------------------- scrollbars --- */
+
+QScrollBar:vertical {
+    background-color: #3c3c3c;
+    width: 13px;
+    margin: 0px;
+    border: none;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #666666;
+    min-height: 24px;
+    border-radius: 3px;
+    margin: 1px 2px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #7a7a7a;
+}
+
+QScrollBar:horizontal {
+    background-color: #3c3c3c;
+    height: 13px;
+    margin: 0px;
+    border: none;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #666666;
+    min-width: 24px;
+    border-radius: 3px;
+    margin: 2px 1px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #7a7a7a;
+}
+
+/* CS6 has no scrollbar step buttons — hide Qt's. */
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0px;
+    width: 0px;
+    background: none;
+    border: none;
+}
+
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+
+/* ------------------------------------------------------------- status ---- */
+
+QStatusBar {
+    background-color: #454545;
+    color: #d4d4d4;
+    border-top: 1px solid #333333;
+    min-height: 22px;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+QStatusBar QLabel {
+    background: transparent;
+    padding: 0 4px;
+}
+
+QProgressBar {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    text-align: center;
+    height: 14px;
+}
+
+QProgressBar::chunk {
+    background-color: #4b6eaf;
+}
+
+/* -------------------------------------------------------- app-specific --- */
+
+/* The area around the canvas — CS6's near-black surround. */
+QScrollArea#canvasScroll, QWidget#canvasSurround {
+    background-color: #1e1e1e;
+    border: none;
+}
+
+/* Small header strip inside a panel, e.g. the Layers blend-mode row. */
+QWidget#panelHeader {
+    background-color: #4a4a4a;
+    border-bottom: 1px solid #333333;
+}
+
+/* Button row at the bottom of a panel (new layer, delete, …). */
+QWidget#panelFooter {
+    background-color: #4a4a4a;
+    border-top: 1px solid #333333;
+    min-height: 22px;
+}
+
+QWidget#panelFooter QToolButton {
+    background: transparent;
+    border: 1px solid transparent;
+    padding: 1px;
+    min-width: 20px;
+    min-height: 20px;
+}
+
+QWidget#panelFooter QToolButton:hover {
+    background-color: #5e5e5e;
+    border-color: #6e6e6e;
+}
+
+QWidget#panelFooter QToolButton:disabled {
+    color: #7d7d7d;
+}
+
+/* The foreground/background colour swatch widget in the tool strip. */
+QWidget#colorSwatches {
+    background: transparent;
+}
+
+/* Rows in the Layers panel are taller than a normal list row to fit the
+   thumbnail — CS6 uses 40px at the default thumbnail size. */
+QListWidget#layerList::item {
+    padding: 0px;
+    min-height: 40px;
+    border-bottom: 1px solid #4a4a4a;
+}
+
+/* History rows are compact by comparison. */
+QListWidget#historyList::item {
+    min-height: 18px;
+    padding-left: 2px;
+}
+
+/* States after the cursor are dimmed, as CS6 dims undone history. */
+QListWidget#historyList::item:disabled {
+    color: #7d7d7d;
+}

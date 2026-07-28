@@ -1,0 +1,4 @@
+build/
+core/target/
+*.user
+.DS_Store
