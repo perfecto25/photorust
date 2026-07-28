@@ -12,6 +12,9 @@ set(SHELL_SOURCES
     src/canvas/CanvasView.cpp
     src/canvas/CanvasView.h
 
+    src/dialogs/ColorPickerDialog.cpp
+    src/dialogs/ColorPickerDialog.h
+
     src/panels/ColorPanel.cpp
     src/panels/ColorPanel.h
     src/panels/HistoryPanel.cpp

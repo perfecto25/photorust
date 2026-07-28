@@ -32,6 +32,10 @@ paint, manage layers, select, filter and undo.
   add/subtract/intersect, invert, and feather.
 - Adjustments (destructive and as non-destructive adjustment layers) and
   filters (Gaussian blur, sharpen, unsharp mask, noise).
+- A Photoshop-style **Color Picker**: square field + vertical ramp driven by
+  the H/S/B/R/G/B radio buttons (each re-maps both axes as CS6 does),
+  new/current comparison, HSB/RGB/Lab/CMYK readouts, hex entry, and web-safe
+  snapping.
 - Undo/redo with a linear History panel, bounded by state count and memory.
 - Photoshop CS6 default keymap, loaded from data and user-remappable.
 
@@ -47,6 +51,11 @@ paint, manage layers, select, filter and undo.
 - Text, shapes, paths, gradients, transforms, layer effects, adjustment-layer
   parameter dialogs, Channels/Paths/Navigator panels.
 - Tool icons are placeholder glyphs, not CS6 artwork.
+- In the Color Picker: Lab values are editable but have no radio buttons, so
+  L/a/b cannot drive the field and ramp. CMYK is a direct conversion with no
+  press profile, so it will not match a colour-managed Photoshop (which uses
+  an ICC profile such as US Web Coated). "Add to Swatches" and "Color
+  Libraries" are present for layout but disabled.
 
 ---
 

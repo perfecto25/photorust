@@ -1,8 +1,9 @@
 #include "ColorPanel.h"
 
+#include "../dialogs/ColorPickerDialog.h"
+
 #include "photorust_core/src/bridge.cxxqt.h"
 
-#include <QColorDialog>
 #include <QGridLayout>
 #include <QMouseEvent>
 #include <QPainter>
@@ -145,16 +146,16 @@ void ColorSwatchWidget::mousePressEvent(QMouseEvent *event)
 
     // Test foreground first — it is drawn on top where the two overlap.
     if (foregroundRect().contains(pos)) {
-        const QColor picked =
-            QColorDialog::getColor(m_foreground, this, tr("Color Picker (Foreground Color)"));
+        const QColor picked = ColorPickerDialog::getColor(m_foreground, this,
+                                                          tr("Foreground Color"));
         if (picked.isValid()) {
             setForeground(picked);
         }
         return;
     }
     if (backgroundRect().contains(pos)) {
-        const QColor picked =
-            QColorDialog::getColor(m_background, this, tr("Color Picker (Background Color)"));
+        const QColor picked = ColorPickerDialog::getColor(m_background, this,
+                                                          tr("Background Color"));
         if (picked.isValid()) {
             setBackground(picked);
         }
