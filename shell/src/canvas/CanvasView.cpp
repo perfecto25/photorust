@@ -183,6 +183,60 @@ void CanvasView::setActiveTool(ToolId tool)
     update();
 }
 
+void CanvasView::setMarqueeType(MarqueeType type)
+{
+    if (m_marqueeType == type) {
+        return;
+    }
+    m_marqueeType = type;
+    m_marqueeActive = false;
+    m_marquee = QRectF();
+    update();
+}
+
+bool CanvasView::marqueeIsLineSelect() const
+{
+    return m_marqueeType == MarqueeType::SingleRow
+        || m_marqueeType == MarqueeType::SingleColumn;
+}
+
+void CanvasView::commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_engine) {
+        return;
+    }
+
+    // Shift adds, Alt subtracts — the modifier convention CS6 uses in place of
+    // the options-bar combine buttons.
+    int op = 0;
+    if (modifiers & Qt::ShiftModifier) {
+        op = 1;
+    } else if (modifiers & Qt::AltModifier) {
+        op = 2;
+    }
+
+    const int x = int(std::floor(documentRect.x()));
+    const int y = int(std::floor(documentRect.y()));
+    const int w = int(std::round(documentRect.width()));
+    const int h = int(std::round(documentRect.height()));
+
+    switch (m_marqueeType) {
+    case MarqueeType::Rectangular:
+        m_engine->selectRect(x, y, w, h, op);
+        break;
+    case MarqueeType::Elliptical:
+        m_engine->selectEllipse(x, y, w, h, op);
+        break;
+    case MarqueeType::SingleRow:
+        // One full-width scanline through the click point.
+        m_engine->selectRect(0, y, m_engine->getCanvasWidth(), 1, op);
+        break;
+    case MarqueeType::SingleColumn:
+        m_engine->selectRect(x, 0, 1, m_engine->getCanvasHeight(), op);
+        break;
+    }
+}
+
 void CanvasView::updateCursor()
 {
     const ToolId effective = m_spacePanOverride ? ToolId::Hand : m_tool;
@@ -265,19 +319,32 @@ void CanvasView::paintEvent(QPaintEvent *event)
 
     paintSelection(painter);
 
-    // Live marquee while the user is dragging one out.
+    // Live marquee while the user is dragging one out. Drawn as the shape the
+    // active variant will actually produce, so an elliptical drag previews an
+    // ellipse rather than its bounding box.
     if (m_marqueeActive && !m_marquee.isNull()) {
         const QPointF topLeft = documentToWidget(m_marquee.topLeft());
         const QPointF bottomRight = documentToWidget(m_marquee.bottomRight());
         const QRectF r(topLeft, bottomRight);
+        const bool ellipse =
+            m_tool == ToolId::Marquee && m_marqueeType == MarqueeType::Elliptical;
 
         painter.setBrush(Qt::NoBrush);
         painter.setPen(QPen(Qt::white, 1, Qt::SolidLine));
-        painter.drawRect(r);
+        if (ellipse) {
+            painter.drawEllipse(r);
+        } else {
+            painter.drawRect(r);
+        }
+
         QPen dashed(Qt::black, 1, Qt::DashLine);
         dashed.setDashPattern({4, 4});
         painter.setPen(dashed);
-        painter.drawRect(r);
+        if (ellipse) {
+            painter.drawEllipse(r);
+        } else {
+            painter.drawRect(r);
+        }
     }
 }
 
@@ -352,6 +419,16 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     }
 
     case ToolId::Marquee:
+        // Single row and column are a click, not a drag: select immediately,
+        // then keep following the cursor while the button is held.
+        if (marqueeIsLineSelect()) {
+            m_marqueeActive = true;
+            m_dragStartDoc = doc;
+            commitMarquee(QRectF(doc, doc), event->modifiers());
+            update();
+            return;
+        }
+        [[fallthrough]];
     case ToolId::Lasso:
     case ToolId::QuickSelect:
         m_marqueeActive = true;
@@ -394,7 +471,13 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
     }
 
     if (m_marqueeActive) {
-        m_marquee = QRectF(m_dragStartDoc, doc).normalized();
+        if (m_tool == ToolId::Marquee && marqueeIsLineSelect()) {
+            // Dragging slides the selected line under the cursor. Replace each
+            // time so it does not accumulate a band of rows.
+            commitMarquee(QRectF(doc, doc), Qt::NoModifier);
+        } else {
+            m_marquee = QRectF(m_dragStartDoc, doc).normalized();
+        }
         update();
         m_lastMousePos = pos;
         return;
@@ -434,23 +517,21 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
 
     if (m_marqueeActive) {
         m_marqueeActive = false;
-        const QRectF r = QRectF(m_dragStartDoc, doc).normalized();
 
+        // The line variants already committed on press and drag.
+        if (m_tool == ToolId::Marquee && marqueeIsLineSelect()) {
+            m_marquee = QRectF();
+            update();
+            return;
+        }
+
+        const QRectF r = QRectF(m_dragStartDoc, doc).normalized();
         if (m_engine) {
             // A click without a drag clears the selection, as in Photoshop.
             if (r.width() < 1.0 || r.height() < 1.0) {
                 m_engine->deselect();
             } else {
-                // Shift adds, Alt subtracts — the modifier convention CS6 uses
-                // in place of the options-bar buttons.
-                int op = 0;
-                if (event->modifiers() & Qt::ShiftModifier) {
-                    op = 1;
-                } else if (event->modifiers() & Qt::AltModifier) {
-                    op = 2;
-                }
-                m_engine->selectRect(int(r.x()), int(r.y()), int(r.width()),
-                                     int(r.height()), op);
+                commitMarquee(r, event->modifiers());
             }
         }
         m_marquee = QRectF();

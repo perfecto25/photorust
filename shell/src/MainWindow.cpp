@@ -73,6 +73,9 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     createDocks();
     createStatusBar();
     connectEngine();
+    // Must run after createMenus(), so the tool commands the strip registered
+    // and the menu commands are all present in the registry.
+    installShortcuts();
 
     connect(m_toolStrip, &ToolStrip::toolChanged, this, &MainWindow::onToolChanged);
     connect(m_canvas, &CanvasView::cursorMoved, this, &MainWindow::onCursorMoved);
@@ -89,7 +92,7 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         m_toolStrip->swatches()->setForeground(c);
     });
 
-    onToolChanged(ToolId::Brush);
+    onToolChanged(ToolId::Brush, 0);
     updateWindowTitle();
     // Wait for the first layout pass so the canvas knows its real size.
     QMetaObject::invokeMethod(this, &MainWindow::fitOnScreen, Qt::QueuedConnection);
@@ -293,6 +296,34 @@ void MainWindow::createMenus()
 
 // ------------------------------------------------------------ options bar ---
 
+void MainWindow::installShortcuts()
+{
+    if (!m_registry) {
+        return;
+    }
+    // Adopt every registered command, not just the ones that reached a menu.
+    // Tool commands are registered by the ToolStrip and would otherwise never
+    // belong to a widget, leaving their shortcuts dead.
+    for (const QString &id : m_registry->commandIds()) {
+        QAction *action = m_registry->action(id);
+        if (action && !actions().contains(action)) {
+            addAction(action);
+        }
+    }
+
+    // Shift+M cycles Rectangular ↔ Elliptical, as CS6 does with its
+    // "Use Shift Key for Tool Switch" preference on by default. Registered
+    // here rather than in the strip so it lands on the window with the rest.
+    QAction *cycle = m_registry->registerCommand(QStringLiteral("tool.marquee.cycle"),
+                                                 tr("Cycle Marquee Tool"),
+                                                 QKeySequence(QStringLiteral("Shift+M")));
+    connect(cycle, &QAction::triggered, this,
+            [this] { m_toolStrip->cycleVariant(ToolId::Marquee); });
+    if (!actions().contains(cycle)) {
+        addAction(cycle);
+    }
+}
+
 void MainWindow::createOptionsBar()
 {
     m_optionsBar = new QToolBar(tr("Options"), this);
@@ -302,7 +333,7 @@ void MainWindow::createOptionsBar()
     addToolBar(Qt::TopToolBarArea, m_optionsBar);
 }
 
-void MainWindow::populateOptionsBar(ToolId tool)
+void MainWindow::populateOptionsBar(ToolId tool, int variant)
 {
     m_optionsBar->clear();
     // These point into the widgets we just deleted.
@@ -311,7 +342,9 @@ void MainWindow::populateOptionsBar(ToolId tool)
     m_brushOpacity = nullptr;
     m_brushFlow = nullptr;
 
-    auto *label = new QLabel(QStringLiteral("  %1  ").arg(toolName(tool)), m_optionsBar);
+    // Name the active variant, so switching to Elliptical says so.
+    auto *label = new QLabel(QStringLiteral("  %1  ").arg(toolVariantName(tool, variant)),
+                             m_optionsBar);
     QFont bold = label->font();
     bold.setBold(true);
     label->setFont(bold);
@@ -364,8 +397,13 @@ void MainWindow::populateOptionsBar(ToolId tool)
 
         pushBrushSettings();
     } else if (toolSelects(tool)) {
+        const bool lineSelect = tool == ToolId::Marquee
+            && (static_cast<MarqueeType>(variant) == MarqueeType::SingleRow
+                || static_cast<MarqueeType>(variant) == MarqueeType::SingleColumn);
         m_optionsBar->addWidget(new QLabel(
-            tr("Shift = add to selection    Alt = subtract    Click = deselect"),
+            lineSelect
+                ? tr("Click to select a line    Shift = add to selection    Alt = subtract")
+                : tr("Shift = add to selection    Alt = subtract    Click = deselect"),
             m_optionsBar));
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(
@@ -735,12 +773,17 @@ void MainWindow::actualPixels()
 
 // --------------------------------------------------------------- reactions --
 
-void MainWindow::onToolChanged(ToolId tool)
+void MainWindow::onToolChanged(ToolId tool, int variant)
 {
     m_activeTool = tool;
+    m_activeVariant = variant;
+
     m_canvas->setActiveTool(tool);
-    populateOptionsBar(tool);
-    statusBar()->showMessage(toolName(tool), 2000);
+    if (tool == ToolId::Marquee) {
+        m_canvas->setMarqueeType(static_cast<MarqueeType>(variant));
+    }
+    populateOptionsBar(tool, variant);
+    statusBar()->showMessage(toolVariantName(tool, variant), 2000);
 }
 
 void MainWindow::onDocumentChanged()

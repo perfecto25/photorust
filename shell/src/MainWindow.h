@@ -61,7 +61,7 @@ private slots:
     void actualPixels();
 
     // -- reactions --
-    void onToolChanged(ToolId tool);
+    void onToolChanged(ToolId tool, int variant);
     void onDocumentChanged();
     void onCursorMoved(const QPointF &pos);
     void onZoomChanged(double zoom);
@@ -84,8 +84,16 @@ private:
     /// Returns false if the user cancelled.
     bool confirmDiscardChanges();
 
+    /// Make every registered command's shortcut live.
+    ///
+    /// A QAction only fires its shortcut once it belongs to a widget. Menu
+    /// commands get that from being added to a QMenu, but tool commands live
+    /// only in the registry and a QActionGroup, so without this the whole
+    /// single-letter keymap (V, M, L, B, …) is inert.
+    void installShortcuts();
+
     /// Rebuild the options bar for the active tool.
-    void populateOptionsBar(ToolId tool);
+    void populateOptionsBar(ToolId tool, int variant);
     /// Push the current brush settings into the engine.
     void pushBrushSettings();
 
@@ -112,4 +120,5 @@ private:
     QLabel *m_statusDocSize = nullptr;
 
     ToolId m_activeTool = ToolId::Brush;
+    int m_activeVariant = 0;
 };

@@ -25,6 +25,8 @@ set(SHELL_SOURCES
     src/shortcuts/CommandRegistry.cpp
     src/shortcuts/CommandRegistry.h
 
+    src/tools/ToolIcons.cpp
+    src/tools/ToolIcons.h
     src/tools/ToolId.h
     src/tools/ToolStrip.cpp
     src/tools/ToolStrip.h
@@ -40,6 +42,7 @@ target_link_libraries(photorust PRIVATE
     photorust_core
     Qt::Core
     Qt::Gui
+    Qt::Svg
     Qt::Widgets
 )
 

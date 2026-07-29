@@ -20,6 +20,9 @@ paint, manage layers, select, filter and undo.
 
 - CS6-style dark UI: menu bar, options bar, left tool strip, dockable panels
   (Color/Swatches tabbed, History, Layers), status bar.
+- Tool strip with SVG line-art icons, the corner triangle marking tools that
+  have hidden tools, press-and-hold (or right-click) flyout menus listing each
+  CS6 tool group, and the footer swatch / Quick Mask / screen-mode controls.
 - Canvas viewport with zoom (CS6's zoom stops), cursor-anchored wheel zoom,
   pan (space-drag or middle-drag), and a transparency checkerboard.
 - Layers: add, delete, duplicate, reorder, merge down, flatten, rename,
@@ -28,8 +31,10 @@ paint, manage layers, select, filter and undo.
   Saturation, Color, Luminosity, Darker/Lighter Color).
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
   opacity; a whole stroke is one undo step.
-- Selections: rectangular and elliptical with antialiased edges, plus
-  add/subtract/intersect, invert, and feather.
+- Selections: all four marquee variants (rectangular, elliptical, single row,
+  single column) with antialiased edges, plus add/subtract/intersect, invert,
+  and feather. `M` selects the marquee and `Shift+M` cycles rectangular ↔
+  elliptical, as CS6 does.
 - Adjustments (destructive and as non-destructive adjustment layers) and
   filters (Gaussian blur, sharpen, unsharp mask, noise).
 - A Photoshop-style **Color Picker**: square field + vertical ramp driven by
@@ -50,7 +55,13 @@ paint, manage layers, select, filter and undo.
   renderer described in CLAUDE.md §7 has not been built.
 - Text, shapes, paths, gradients, transforms, layer effects, adjustment-layer
   parameter dialogs, Channels/Paths/Navigator panels.
-- Tool icons are placeholder glyphs, not CS6 artwork.
+- The Marquee is the only fully implemented strip group. For every other tool
+  the flyout lists the full CS6 group, but only the first entry works; the
+  rest are shown disabled rather than silently falling back to the parent
+  tool. Quick Mask toggles its button but does not yet change editing
+  behaviour, and screen modes are not implemented.
+- Tool icons are line-art reconstructions in CS6's visual language, not
+  Adobe's artwork.
 - In the Color Picker: Lab values are editable but have no radio buttons, so
   L/a/b cannot drive the field and ramp. CMYK is a direct conversion with no
   press profile, so it will not match a colour-managed Photoshop (which uses

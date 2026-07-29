@@ -172,6 +172,35 @@ QToolBar#toolStrip QToolButton:checked {
     border-color: #808080;
 }
 
+/* The hidden-tools flyout. CS6 pops this to the right of the button with the
+   tool icons repeated down the left edge, so it needs more left padding than
+   an ordinary menu. */
+QMenu#toolFlyout {
+    background-color: #454545;
+    border: 1px solid #2a2a2a;
+    padding: 1px 0;
+}
+
+QMenu#toolFlyout::item {
+    /* Right padding leaves a column for the shortcut letter CS6 shows there. */
+    padding: 4px 30px 4px 6px;
+    /* Room for the 20px icon plus breathing space. */
+    icon-size: 20px;
+}
+
+QMenu#toolFlyout::item:selected {
+    background-color: #4b6eaf;
+    color: #ffffff;
+}
+
+QMenu#toolFlyout::item:disabled {
+    color: #808080;
+}
+
+QMenu#toolFlyout::item:disabled:selected {
+    background: transparent;
+}
+
 /* -------------------------------------------------------------- panels --- */
 
 QDockWidget {

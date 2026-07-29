@@ -49,6 +49,10 @@ public:
     void setActiveTool(ToolId tool);
     ToolId activeTool() const { return m_tool; }
 
+    /// Which marquee variant the Marquee tool draws.
+    void setMarqueeType(MarqueeType type);
+    MarqueeType marqueeType() const { return m_marqueeType; }
+
     /// Re-fetch the composited image from the engine and repaint.
     void refresh();
 
@@ -88,6 +92,11 @@ private:
     void updateCursor();
     /// Marching-ants outline of the current selection.
     void paintSelection(QPainter &painter);
+    /// Send the in-progress marquee to the engine.
+    /// `modifiers` picks the combine operation (Shift adds, Alt subtracts).
+    void commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers);
+    /// True when the active marquee variant is a click rather than a drag.
+    bool marqueeIsLineSelect() const;
 
     Engine *m_engine = nullptr;
 
@@ -99,6 +108,7 @@ private:
     QPointF m_pan{0.0, 0.0};
 
     ToolId m_tool = ToolId::Brush;
+    MarqueeType m_marqueeType = MarqueeType::Rectangular;
 
     // -- interaction state --
     bool m_dragging = false;

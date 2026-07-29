@@ -18,6 +18,7 @@
   "tools": [
     { "id": "tool.move",            "key": "V", "name": "Move Tool" },
     { "id": "tool.marquee",         "key": "M", "name": "Rectangular Marquee Tool" },
+    { "id": "tool.marquee.cycle",   "key": "Shift+M", "name": "Cycle Marquee Tool" },
     { "id": "tool.lasso",           "key": "L", "name": "Lasso Tool" },
     { "id": "tool.quickselect",     "key": "W", "name": "Quick Selection Tool" },
     { "id": "tool.crop",            "key": "C", "name": "Crop Tool" },
