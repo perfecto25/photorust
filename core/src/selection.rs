@@ -5,6 +5,16 @@
 //! matching Photoshop, where "selected" is a continuous quantity.
 
 use crate::buffer::{Pixmap, Rect};
+use std::cell::Cell;
+use std::collections::BTreeMap;
+
+/// Coverage at which a pixel counts as inside the marching-ants boundary.
+///
+/// Photoshop draws the ants at the 50% contour, which is why a heavily
+/// feathered selection's outline sits well inside the visible falloff — the
+/// outline is not the edge of the affected area, it is where the selection is
+/// half-strength.
+const OUTLINE_THRESHOLD: u8 = 128;
 
 /// How a new selection combines with the existing one. Mirrors the four
 /// buttons at the left of the marquee tool's options bar.
@@ -38,6 +48,13 @@ pub struct Selection {
     /// Cached bounding box of all non-zero coverage. `None` means "not yet
     /// computed"; recalculated lazily by [`Selection::bounds`].
     cached_bounds: Option<Rect>,
+    /// Memoised answer for [`Selection::is_empty`].
+    ///
+    /// A `Cell` because `is_empty` takes `&self` and is called from hot paths
+    /// that only have a shared borrow — the compositor asks it once per stroke
+    /// and the shell once per repaint. Without the memo each call walks the
+    /// whole mask.
+    cached_empty: Cell<Option<bool>>,
 }
 
 impl Selection {
@@ -48,6 +65,7 @@ impl Selection {
             height,
             coverage: vec![0u8; (width as usize) * (height as usize)],
             cached_bounds: Some(Rect::default()),
+            cached_empty: Cell::new(Some(true)),
         }
     }
 
@@ -58,6 +76,7 @@ impl Selection {
             height,
             coverage: vec![255u8; (width as usize) * (height as usize)],
             cached_bounds: Some(Rect::from_size(width, height)),
+            cached_empty: Cell::new(Some(false)),
         }
     }
 
@@ -72,7 +91,12 @@ impl Selection {
     /// True when nothing is selected. Callers treat this as "operate on the
     /// whole layer", which is how Photoshop behaves with no active marquee.
     pub fn is_empty(&self) -> bool {
-        self.coverage.iter().all(|&c| c == 0)
+        if let Some(known) = self.cached_empty.get() {
+            return known;
+        }
+        let empty = self.coverage.iter().all(|&c| c == 0);
+        self.cached_empty.set(Some(empty));
+        empty
     }
 
     /// Coverage at a point, `0.0..=1.0`. Outside the canvas reads as 0.
@@ -90,6 +114,11 @@ impl Selection {
             return;
         }
         self.coverage[y as usize * self.width as usize + x as usize] = v;
+        // A single store, but skipping it would leave the caches describing the
+        // mask as it was. Callers build whole regions a pixel at a time, so
+        // correctness here is worth more than the branch.
+        self.cached_bounds = None;
+        self.cached_empty.set(None);
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -149,18 +178,21 @@ impl Selection {
             };
         }
         self.cached_bounds = None;
+        self.cached_empty.set(None);
     }
 
     /// Select everything.
     pub fn select_all(&mut self) {
         self.coverage.fill(255);
         self.cached_bounds = Some(Rect::from_size(self.width, self.height));
+        self.cached_empty.set(Some(false));
     }
 
     /// Deselect everything.
     pub fn clear(&mut self) {
         self.coverage.fill(0);
         self.cached_bounds = Some(Rect::default());
+        self.cached_empty.set(Some(true));
     }
 
     /// Select ▸ Inverse.
@@ -169,6 +201,7 @@ impl Selection {
             *c = 255 - *c;
         }
         self.cached_bounds = None;
+        self.cached_empty.set(None);
     }
 
     /// Feather the edges with a box blur of the given radius.
@@ -217,6 +250,7 @@ impl Selection {
             }
         }
         self.cached_bounds = None;
+        self.cached_empty.set(None);
     }
 
     /// Bounding box of all selected pixels. Empty when nothing is selected.
@@ -251,7 +285,101 @@ impl Selection {
             )
         };
         self.cached_bounds = Some(b);
+        // The scan just answered both questions.
+        self.cached_empty.set(Some(b.is_empty()));
         b
+    }
+
+    /// Trace the selection boundary as closed loops of pixel-corner points, in
+    /// document coordinates.
+    ///
+    /// This is what the marching ants follow. The result is the real contour of
+    /// the mask, not its bounding box: an elliptical selection comes back as an
+    /// ellipse, a subtracted region leaves a hole as its own loop, and a
+    /// multi-part selection returns one loop per part.
+    ///
+    /// Points sit on pixel *corners*, so a single selected pixel at (3, 4)
+    /// yields the loop (3,4) (4,4) (4,5) (3,5) — the ants trace the outside of
+    /// the pixel, as Photoshop draws them. Runs along a straight edge are
+    /// collapsed to their endpoints, which keeps a full-canvas selection at
+    /// four points instead of one per pixel.
+    pub fn outline(&self) -> Vec<Vec<(i32, i32)>> {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        if w == 0 || h == 0 {
+            return Vec::new();
+        }
+
+        let inside = |x: i32, y: i32| -> bool {
+            x >= 0
+                && y >= 0
+                && x < w
+                && y < h
+                && self.coverage[y as usize * self.width as usize + x as usize] >= OUTLINE_THRESHOLD
+        };
+
+        // Every boundary between an inside pixel and an outside one becomes a
+        // directed unit edge, wound so the selected side is always on the
+        // right. That consistent winding is what makes the walk below trivial:
+        // in-degree equals out-degree at every corner, so following edges from
+        // any starting corner is guaranteed to come back to it.
+        //
+        // BTreeMap rather than HashMap so loop order and starting corners are
+        // deterministic — an outline that reshuffles between identical
+        // selections would make the ants crawl for no reason.
+        let mut edges: BTreeMap<(i32, i32), Vec<(i32, i32)>> = BTreeMap::new();
+        for y in 0..h {
+            for x in 0..w {
+                if !inside(x, y) {
+                    continue;
+                }
+                if !inside(x, y - 1) {
+                    edges.entry((x, y)).or_default().push((x + 1, y));
+                }
+                if !inside(x + 1, y) {
+                    edges.entry((x + 1, y)).or_default().push((x + 1, y + 1));
+                }
+                if !inside(x, y + 1) {
+                    edges.entry((x + 1, y + 1)).or_default().push((x, y + 1));
+                }
+                if !inside(x - 1, y) {
+                    edges.entry((x, y + 1)).or_default().push((x, y));
+                }
+            }
+        }
+
+        let mut loops: Vec<Vec<(i32, i32)>> = Vec::new();
+        while let Some((&start, _)) = edges.iter().next() {
+            let mut path: Vec<(i32, i32)> = Vec::new();
+            let mut at = start;
+            loop {
+                let next = match edges.get_mut(&at) {
+                    Some(outgoing) => {
+                        let next = outgoing.pop();
+                        if outgoing.is_empty() {
+                            edges.remove(&at);
+                        }
+                        next
+                    }
+                    None => None,
+                };
+                let Some(next) = next else {
+                    // Only reachable at a corner where diagonally touching
+                    // regions meet and the walk has already used both of its
+                    // outgoing edges; the leftovers become their own loop.
+                    break;
+                };
+                path.push(at);
+                at = next;
+                if at == start {
+                    break;
+                }
+            }
+            if path.len() >= 4 {
+                loops.push(collapse_runs(&path));
+            }
+        }
+        loops
     }
 
     /// Render the mask as a greyscale [`Pixmap`], for Quick Mask display and
@@ -282,7 +410,32 @@ impl Selection {
         self.width = width;
         self.height = height;
         self.cached_bounds = None;
+        self.cached_empty.set(None);
     }
+}
+
+/// Drop the interior points of straight runs in a closed polygon.
+///
+/// Every step in a traced outline is one pixel along an axis, so a horizontal
+/// edge a thousand pixels long arrives as a thousand points. Keeping only the
+/// corners costs one pass and saves the painter the rest.
+fn collapse_runs(path: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let n = path.len();
+    if n < 3 {
+        return path.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = path[(i + n - 1) % n];
+        let cur = path[i];
+        let next = path[(i + 1) % n];
+        let incoming = (cur.0 - prev.0, cur.1 - prev.1);
+        let outgoing = (next.0 - cur.0, next.1 - cur.1);
+        if incoming != outgoing {
+            out.push(cur);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -469,6 +622,140 @@ mod tests {
         s.resize(4, 4);
         assert_eq!(s.coverage_at(3, 3), 1.0);
         assert_eq!(s.as_bytes().len(), 16);
+    }
+
+    /// Loops are closed and rotation-independent, so compare them as sets of
+    /// points rather than as sequences.
+    fn point_set(loops: &[Vec<(i32, i32)>], index: usize) -> Vec<(i32, i32)> {
+        let mut pts = loops[index].clone();
+        pts.sort_unstable();
+        pts
+    }
+
+    #[test]
+    fn is_empty_tracks_edits_through_the_cache() {
+        let mut s = Selection::new(16, 16);
+        assert!(s.is_empty());
+        s.apply_rect(Rect::new(2, 2, 4, 4), SelectionOp::Replace);
+        assert!(!s.is_empty(), "cache went stale after a selection was made");
+        s.apply_rect(Rect::new(2, 2, 4, 4), SelectionOp::Subtract);
+        assert!(s.is_empty(), "cache went stale after the selection was removed");
+        s.select_all();
+        assert!(!s.is_empty());
+        s.clear();
+        assert!(s.is_empty());
+        s.apply_rect(Rect::new(0, 0, 16, 16), SelectionOp::Replace);
+        s.invert();
+        assert!(s.is_empty(), "inverting a full selection empties it");
+    }
+
+    #[test]
+    fn bounds_answers_emptiness_too() {
+        // bounds() walks the mask, so it should leave is_empty() free.
+        let mut s = Selection::new(8, 8);
+        s.apply_rect(Rect::new(1, 1, 2, 2), SelectionOp::Replace);
+        assert_eq!(s.bounds(), Rect::new(1, 1, 2, 2));
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn outline_of_a_rect_is_its_four_corners() {
+        let mut s = Selection::new(16, 16);
+        s.apply_rect(Rect::new(2, 3, 4, 5), SelectionOp::Replace);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 1);
+        // Corner coordinates, not pixel centres: the ants run outside the
+        // selected pixels.
+        assert_eq!(point_set(&loops, 0), vec![(2, 3), (2, 8), (6, 3), (6, 8)]);
+    }
+
+    #[test]
+    fn outline_of_nothing_is_empty() {
+        let s = Selection::new(8, 8);
+        assert!(s.outline().is_empty());
+    }
+
+    #[test]
+    fn outline_of_one_pixel_wraps_it() {
+        let mut s = Selection::new(8, 8);
+        s.apply_rect(Rect::new(3, 4, 1, 1), SelectionOp::Replace);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(point_set(&loops, 0), vec![(3, 4), (3, 5), (4, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn outline_of_an_ellipse_is_not_its_bounding_box() {
+        // The bug this exists to catch: an elliptical selection whose ants are
+        // drawn as a rectangle.
+        let mut s = Selection::new(64, 64);
+        s.apply_ellipse(Rect::new(0, 0, 64, 64), SelectionOp::Replace);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 1);
+        assert!(
+            loops[0].len() > 8,
+            "an ellipse should trace many corners, got {}",
+            loops[0].len()
+        );
+        // No corner of the bounding box is on the contour.
+        for corner in [(0, 0), (64, 0), (0, 64), (64, 64)] {
+            assert!(!loops[0].contains(&corner), "{:?} is on the outline", corner);
+        }
+    }
+
+    #[test]
+    fn outline_returns_one_loop_per_disjoint_region() {
+        let mut s = Selection::new(32, 32);
+        s.apply_rect(Rect::new(0, 0, 4, 4), SelectionOp::Replace);
+        s.apply_rect(Rect::new(20, 20, 4, 4), SelectionOp::Add);
+        assert_eq!(s.outline().len(), 2);
+    }
+
+    #[test]
+    fn outline_traces_a_hole_as_its_own_loop() {
+        let mut s = Selection::new(32, 32);
+        s.apply_rect(Rect::new(4, 4, 20, 20), SelectionOp::Replace);
+        s.apply_rect(Rect::new(10, 10, 6, 6), SelectionOp::Subtract);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 2, "expected an outer loop and the hole");
+        let sizes: Vec<usize> = loops.iter().map(|l| l.len()).collect();
+        assert_eq!(sizes, vec![4, 4], "both loops are rectangles");
+    }
+
+    #[test]
+    fn outline_follows_the_fifty_percent_contour() {
+        // Coverage below half is outside the ants, even though those pixels are
+        // still partly selected.
+        let mut s = Selection::new(8, 8);
+        s.apply_rect(Rect::new(2, 2, 4, 4), SelectionOp::Replace);
+        s.set_raw(2, 2, 100);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 1);
+        assert!(
+            !loops[0].contains(&(2, 2)),
+            "a 39% pixel should sit outside the contour"
+        );
+    }
+
+    #[test]
+    fn outline_handles_a_selection_touching_the_canvas_edge() {
+        let mut s = Selection::all(8, 8);
+        let loops = s.outline();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(point_set(&loops, 0), vec![(0, 0), (0, 8), (8, 0), (8, 8)]);
+        assert!(s.bounds() == Rect::new(0, 0, 8, 8));
+    }
+
+    #[test]
+    fn outline_handles_diagonally_touching_regions() {
+        // Two pixels meeting at a corner give that corner two outgoing edges;
+        // the walk must not lose either region.
+        let mut s = Selection::new(8, 8);
+        s.apply_rect(Rect::new(2, 2, 1, 1), SelectionOp::Replace);
+        s.apply_rect(Rect::new(3, 3, 1, 1), SelectionOp::Add);
+        let loops = s.outline();
+        let total: usize = loops.iter().map(|l| l.len()).sum();
+        assert_eq!(total, 8, "both pixels must be traced");
     }
 
     #[test]

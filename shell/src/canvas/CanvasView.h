@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QPainterPath>
 #include <QPoint>
 #include <QPointF>
 #include <QWidget>
@@ -55,6 +56,14 @@ public:
 
     /// Re-fetch the composited image from the engine and repaint.
     void refresh();
+
+    /// Re-trace the selection outline from the engine and repaint.
+    ///
+    /// Deliberately *not* called by `refresh()`. Tracing the contour walks the
+    /// whole mask, and `refresh()` runs on every brush dab; only a real change
+    /// to the selection should pay for it. The engine's `selectionChanged`
+    /// signal is the trigger.
+    void refreshSelection();
 
     /// Convert a widget point to document space.
     QPointF widgetToDocument(const QPointF &pos) const;
@@ -124,4 +133,7 @@ private:
 
     /// Animation phase for the marching ants.
     int m_antsOffset = 0;
+    /// The selection contour in document coordinates, one subpath per loop.
+    /// Cached; rebuilt only by `refreshSelection()`.
+    QPainterPath m_selectionPath;
 };

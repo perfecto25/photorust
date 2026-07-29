@@ -366,6 +366,16 @@ pub mod ffi {
         #[cxx_name = "selectionBounds"]
         fn selection_bounds(self: Pin<&mut Engine>) -> Vec<i32>;
 
+        /// The selection's contour, for the marching ants.
+        ///
+        /// Flattened as a run of loops, each `[n, x0, y0, … x(n-1), y(n-1)]`
+        /// in document coordinates, closing back to its first point. A flat
+        /// `Vec<i32>` rather than a list of polygons keeps the bridge to types
+        /// `cxx` already carries (CLAUDE.md §3).
+        #[qinvokable]
+        #[cxx_name = "selectionOutline"]
+        fn selection_outline(self: &Engine) -> Vec<i32>;
+
         /// The selection mask as a greyscale image, for marching ants.
         #[qinvokable]
         #[cxx_name = "selectionMask"]
@@ -622,6 +632,12 @@ impl ffi::Engine {
         self.as_mut().canvas_changed();
         self.as_mut().layers_changed();
         self.as_mut().history_changed();
+        // Every caller of `sync` has replaced or resized the document, which
+        // takes the selection with it. `canvasChanged` deliberately does not
+        // imply this — it fires on every brush dab, and re-tracing the
+        // selection contour that often is what made painting inside a marquee
+        // crawl.
+        self.as_mut().selection_changed();
     }
 
     // -- document -----------------------------------------------------------
@@ -1104,6 +1120,19 @@ impl ffi::Engine {
     fn selection_bounds(mut self: core::pin::Pin<&mut Self>) -> Vec<i32> {
         let b = self.as_mut().rust_mut().doc.selection_mut().bounds();
         vec![b.x, b.y, b.width as i32, b.height as i32]
+    }
+
+    fn selection_outline(&self) -> Vec<i32> {
+        let loops = self.doc.selection().outline();
+        let mut flat = Vec::with_capacity(loops.iter().map(|l| l.len() * 2 + 1).sum());
+        for points in loops {
+            flat.push(points.len() as i32);
+            for (x, y) in points {
+                flat.push(x);
+                flat.push(y);
+            }
+        }
+        flat
     }
 
     fn selection_mask(&self) -> QImage {

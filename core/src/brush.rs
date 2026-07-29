@@ -214,6 +214,13 @@ impl StrokeMask {
             return Rect::default();
         }
         let opacity = opacity.clamp(0.0, 1.0);
+
+        // An empty selection means "no marquee", i.e. paint freely — but that
+        // test walks the mask, so it is answered once here rather than per
+        // pixel. Asking inside the loop made one dab cost O(dab × canvas) and
+        // froze the app as soon as a marquee was active.
+        let selection = selection.filter(|sel| !sel.is_empty());
+
         let region = Rect::new(
             self.dirty.x - offset.0,
             self.dirty.y - offset.1,
@@ -232,12 +239,9 @@ impl StrokeMask {
                     continue;
                 }
                 if let Some(sel) = selection {
-                    // An empty selection means "no marquee", i.e. paint freely.
-                    if !sel.is_empty() {
-                        alpha *= sel.coverage_at(doc_x, doc_y);
-                        if alpha <= 0.0 {
-                            continue;
-                        }
+                    alpha *= sel.coverage_at(doc_x, doc_y);
+                    if alpha <= 0.0 {
+                        continue;
                     }
                 }
 

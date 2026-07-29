@@ -517,8 +517,7 @@ void MainWindow::connectEngine()
     connect(m_engine, &Engine::canvasChanged, m_canvas, &CanvasView::refresh);
     connect(m_engine, &Engine::layersChanged, m_layersPanel, &LayersPanel::refresh);
     connect(m_engine, &Engine::historyChanged, m_historyPanel, &HistoryPanel::refresh);
-    connect(m_engine, &Engine::selectionChanged, m_canvas,
-            qOverload<>(&QWidget::update));
+    connect(m_engine, &Engine::selectionChanged, m_canvas, &CanvasView::refreshSelection);
     connect(m_engine, &Engine::documentTitleChanged, this, &MainWindow::updateWindowTitle);
 }
 

@@ -3,8 +3,12 @@
 A from-scratch clone of Adobe Photoshop CS6 (the 2012–2013 "Kona" dark UI).
 
 A **C++/Qt QWidgets shell** over a **Rust image engine**, joined by
-[CXX-Qt](https://github.com/KDAB/cxx-qt). See [CLAUDE.md](CLAUDE.md) for the
-architecture and the rules that keep the two halves separate.
+[CXX-Qt](https://github.com/KDAB/cxx-qt).
+
+- [docs/REFERENCE.md](docs/REFERENCE.md) — the interface in full: window layout,
+  every tool and flyout, the panels, and the complete keymap for Linux and macOS.
+- [CLAUDE.md](CLAUDE.md) — architecture, and the rules that keep the two halves
+  separate.
 
 Targets **Linux and macOS**. Windows is out of scope, and the top-level
 `CMakeLists.txt` fails the configure step there rather than half-working.
@@ -34,7 +38,8 @@ paint, manage layers, select, filter and undo.
 - Selections: all four marquee variants (rectangular, elliptical, single row,
   single column) with antialiased edges, plus add/subtract/intersect, invert,
   and feather. `M` selects the marquee and `Shift+M` cycles rectangular ↔
-  elliptical, as CS6 does.
+  elliptical, as CS6 does. Marching ants trace the mask's real 50% contour, so
+  an ellipse reads as an ellipse and a subtracted region shows its hole.
 - Adjustments (destructive and as non-destructive adjustment layers) and
   filters (Gaussian blur, sharpen, unsharp mask, noise).
 - A Photoshop-style **Color Picker**: square field + vertical ramp driven by
@@ -112,7 +117,7 @@ staged next to the executable, so a fresh build runs without installing.
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 206 tests
+cd core && cargo test        # 217 tests
 ```
 
 or through CTest, which runs them as part of the project:
@@ -164,6 +169,10 @@ These are the ones that cause real bugs if missed:
 - **Blur and convolution run on premultiplied colour.** Filtering straight
   alpha lets the colour of fully transparent pixels bleed into visible ones,
   which shows up as dark halos on soft edges.
+- **Selection queries walk the whole mask.** `is_empty`, `bounds` and `outline`
+  are all O(canvas). They memoise, but the answers still have to be hoisted out
+  of per-pixel loops and off the per-dab repaint path. `canvasChanged` fires on
+  every brush dab; only `selectionChanged` should trigger a re-trace.
 - **`QImage`s crossing the bridge must own their pixels.** Wrapping a Rust
   allocation with `QImage::from_raw_bytes` and returning it does not work: the
   wrapper is a temporary whose destructor frees the Rust buffer, leaving the

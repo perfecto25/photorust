@@ -78,6 +78,17 @@ bool CommandRegistry::loadKeymapFile(const QString &path, bool isDefaults)
             }
 
             if (isDefaults) {
+                // Two commands sharing a key is worse than it looks: Qt calls
+                // that an ambiguous shortcut and fires neither, so a clash
+                // silently disables both. Refuse the later binding and say so.
+                const QString clash = commandForShortcut(sequence);
+                if (!clash.isEmpty() && clash != id) {
+                    qCWarning(lcShortcuts)
+                        << "ignoring" << keyText << "for" << id << "— already bound to" << clash;
+                    registerCommand(id, name, QKeySequence());
+                    m_defaults.insert(id, QKeySequence());
+                    continue;
+                }
                 registerCommand(id, name, sequence);
                 m_defaults.insert(id, sequence);
             } else if (QAction *existing = action(id)) {

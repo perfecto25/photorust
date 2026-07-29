@@ -8,6 +8,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QResizeEvent>
+#include <QTransform>
 #include <QWheelEvent>
 #include <QtMath>
 
@@ -47,6 +48,30 @@ void CanvasView::refresh()
         // The engine hands back a QImage that borrows a Rust-owned buffer; it
         // is cheap to take because QImage is implicitly shared.
         m_image = m_engine->compositeImage();
+    }
+    update();
+}
+
+void CanvasView::refreshSelection()
+{
+    m_selectionPath = QPainterPath();
+
+    if (m_engine && m_engine->hasSelection()) {
+        // The engine hands back the contour flattened as a run of loops, each
+        // prefixed by its point count (see bridge.rs::selection_outline).
+        const rust::Vec<::std::int32_t> flat = m_engine->selectionOutline();
+        for (std::size_t i = 0; i + 1 <= flat.size();) {
+            const int count = flat[i++];
+            if (count <= 0 || i + std::size_t(count) * 2 > flat.size()) {
+                break;
+            }
+            m_selectionPath.moveTo(flat[i], flat[i + 1]);
+            for (int p = 1; p < count; ++p) {
+                m_selectionPath.lineTo(flat[i + p * 2], flat[i + p * 2 + 1]);
+            }
+            m_selectionPath.closeSubpath();
+            i += std::size_t(count) * 2;
+        }
     }
     update();
 }
@@ -350,32 +375,35 @@ void CanvasView::paintEvent(QPaintEvent *event)
 
 void CanvasView::paintSelection(QPainter &painter)
 {
-    if (!m_engine || !m_engine->hasSelection()) {
+    if (m_selectionPath.isEmpty()) {
         return;
     }
 
-    // Draw the selection's bounding box as marching ants. A precise outline
-    // means tracing the coverage mask's contour, which is a later refinement —
-    // the bounding box already tells the user a selection is live.
-    const rust::Vec<::std::int32_t> bounds = m_engine->selectionBounds();
-    if (bounds.size() < 4 || bounds[2] == 0 || bounds[3] == 0) {
-        return;
-    }
+    // The cached path is in document coordinates; map it once rather than
+    // transforming every point by hand.
+    const QPointF origin = documentOrigin();
+    QTransform toWidget;
+    toWidget.translate(origin.x(), origin.y());
+    toWidget.scale(m_zoom, m_zoom);
+    const QPainterPath path = toWidget.map(m_selectionPath);
 
-    const QPointF topLeft = documentToWidget(QPointF(bounds[0], bounds[1]));
-    const QPointF bottomRight =
-        documentToWidget(QPointF(bounds[0] + bounds[2], bounds[1] + bounds[3]));
-    const QRectF r(topLeft, bottomRight);
-
+    painter.save();
+    // The contour follows pixel edges, so it is all axis-aligned lines.
+    // Antialiasing them only blurs the ants across two rows of pixels.
+    painter.setRenderHint(QPainter::Antialiasing, false);
     painter.setBrush(Qt::NoBrush);
+
+    // Photoshop's ants are black dashes over white, so the outline stays
+    // visible on light and dark image content alike.
     painter.setPen(QPen(Qt::white, 1, Qt::SolidLine));
-    painter.drawRect(r);
+    painter.drawPath(path);
 
     QPen ants(Qt::black, 1, Qt::CustomDashLine);
     ants.setDashPattern({4, 4});
     ants.setDashOffset(m_antsOffset);
     painter.setPen(ants);
-    painter.drawRect(r);
+    painter.drawPath(path);
+    painter.restore();
 }
 
 // ------------------------------------------------------------------- input --

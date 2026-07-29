@@ -10,7 +10,11 @@
     "table serves both target platforms.",
     "",
     "Users may override any binding by copying this file to the per-user config",
-    "directory; see CommandRegistry::userKeymapPath()."
+    "directory; see CommandRegistry::userKeymapPath().",
+    "",
+    "No two commands may share a key. Qt treats a duplicate as an ambiguous",
+    "shortcut and fires NEITHER action, so a clash silently kills both. The",
+    "registry warns about one at load; docs/REFERENCE.md lists every binding."
   ],
 
   "version": 1,
@@ -115,7 +119,7 @@
     { "id": "select.feather",       "key": "Shift+F6",           "name": "Feather..." },
 
     { "id": "filter.last",          "key": "Ctrl+F",             "name": "Last Filter" },
-    { "id": "filter.fade",          "key": "Shift+Ctrl+F",       "name": "Fade Filter..." },
+    { "id": "filter.fade",          "key": "",                   "name": "Fade Filter..." },
     { "id": "filter.liquify",       "key": "Shift+Ctrl+X",       "name": "Liquify..." },
     { "id": "filter.vanishingPoint","key": "Alt+Ctrl+V",         "name": "Vanishing Point..." },
     { "id": "filter.gaussianBlur",  "key": "",                   "name": "Gaussian Blur..." },
