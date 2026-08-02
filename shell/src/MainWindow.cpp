@@ -402,8 +402,10 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
                 || static_cast<MarqueeType>(variant) == MarqueeType::SingleColumn);
         m_optionsBar->addWidget(new QLabel(
             lineSelect
-                ? tr("Click to select a line    Shift = add to selection    Alt = subtract")
-                : tr("Shift = add to selection    Alt = subtract    Click = deselect"),
+                ? tr("Click to select a line    Ctrl+Shift = add to selection    "
+                     "Ctrl+Alt = subtract")
+                : tr("Ctrl+Shift = add to selection    Ctrl+Alt = subtract    "
+                     "Click = deselect"),
             m_optionsBar));
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(

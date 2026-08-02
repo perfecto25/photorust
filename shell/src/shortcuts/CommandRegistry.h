@@ -3,6 +3,7 @@
 #include <QAction>
 #include <QHash>
 #include <QKeySequence>
+#include <QList>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -38,6 +39,16 @@ public:
                              const QString &text,
                              const QKeySequence &shortcut = {});
 
+    /// Register a command that answers to more than one key sequence.
+    ///
+    /// The first entry is the canonical binding — the one menus display; the
+    /// rest are aliases. Aliases exist because a single logical Photoshop
+    /// shortcut can arrive as several different key events depending on the
+    /// keyboard layout (Ctrl+"+" is physically Ctrl+Shift+= on a US layout).
+    QAction *registerCommand(const QString &id,
+                             const QString &text,
+                             const QList<QKeySequence> &shortcuts);
+
     /// The action for `id`, or nullptr if it was never registered.
     QAction *action(const QString &id) const;
 
@@ -47,8 +58,11 @@ public:
     /// All registered ids, sorted. Used by the shortcut editor.
     QStringList commandIds() const;
 
-    /// Current binding for `id`, or an empty sequence.
+    /// Canonical binding for `id`, or an empty sequence.
     QKeySequence shortcut(const QString &id) const;
+
+    /// Every sequence bound to `id`, canonical first, aliases after.
+    QList<QKeySequence> shortcuts(const QString &id) const;
 
     /// Rebind a command at runtime, as Edit ▸ Keyboard Shortcuts does.
     ///
@@ -80,5 +94,6 @@ private:
 
     QHash<QString, QAction *> m_actions;
     /// Defaults as shipped, so resetToDefaults() does not need the file again.
-    QHash<QString, QKeySequence> m_defaults;
+    /// Canonical binding first, layout aliases after.
+    QHash<QString, QList<QKeySequence>> m_defaults;
 };

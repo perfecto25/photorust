@@ -231,13 +231,23 @@ void CanvasView::commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers
         return;
     }
 
-    // Shift adds, Alt subtracts — the modifier convention CS6 uses in place of
-    // the options-bar combine buttons.
+    // Combine mode from the modifiers held at the end of the drag.
+    //
+    // CS6 uses plain Shift to add and plain Alt to subtract, but bare Alt+drag
+    // never reaches us on Linux: Cinnamon (and Mutter, KWin, …) grab it for
+    // move-window. So Ctrl+Shift and Ctrl+Alt are the primary bindings here —
+    // window managers leave those alone. Plain Shift still adds, for the
+    // muscle memory of anyone coming from Photoshop.
     int op = 0;
-    if (modifiers & Qt::ShiftModifier) {
-        op = 1;
-    } else if (modifiers & Qt::AltModifier) {
+    if (modifiers.testFlag(Qt::ControlModifier) && modifiers.testFlag(Qt::AltModifier)) {
         op = 2;
+    } else if (modifiers.testFlag(Qt::ControlModifier)
+               && modifiers.testFlag(Qt::ShiftModifier)) {
+        op = 1;
+    } else if (modifiers.testFlag(Qt::AltModifier)) {
+        op = 2;
+    } else if (modifiers.testFlag(Qt::ShiftModifier)) {
+        op = 1;
     }
 
     const int x = int(std::floor(documentRect.x()));

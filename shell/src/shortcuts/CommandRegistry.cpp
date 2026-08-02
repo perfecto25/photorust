@@ -68,33 +68,50 @@ bool CommandRegistry::loadKeymapFile(const QString &path, bool isDefaults)
 
             const QString name = entry.value(QStringLiteral("name")).toString();
             // An empty "key" is legitimate: the command exists and appears in
-            // menus, it simply has no default binding.
+            // menus, it simply has no default binding. "altKeys" adds aliases
+            // that fire the same command without being shown in menus.
+            QStringList keyTexts;
             const QString keyText = entry.value(QStringLiteral("key")).toString();
-            const QKeySequence sequence =
-                keyText.isEmpty() ? QKeySequence() : QKeySequence(keyText);
+            if (!keyText.isEmpty()) {
+                keyTexts.append(keyText);
+            }
+            const QJsonArray altKeys = entry.value(QStringLiteral("altKeys")).toArray();
+            for (const QJsonValue &alt : altKeys) {
+                const QString altText = alt.toString();
+                if (!altText.isEmpty()) {
+                    keyTexts.append(altText);
+                }
+            }
 
-            if (!keyText.isEmpty() && sequence.isEmpty()) {
-                qCWarning(lcShortcuts) << "unparseable key" << keyText << "for" << id;
+            QList<QKeySequence> sequences;
+            for (const QString &text : keyTexts) {
+                const QKeySequence sequence(text);
+                if (sequence.isEmpty()) {
+                    qCWarning(lcShortcuts) << "unparseable key" << text << "for" << id;
+                    continue;
+                }
+                // Two commands sharing a key is worse than it looks: Qt calls
+                // that an ambiguous shortcut and fires neither, so a clash
+                // silently disables both. Drop the later binding and say so.
+                const QString clash = commandForShortcut(sequence);
+                if (sequences.contains(sequence)) {
+                    continue;
+                }
+                if (!clash.isEmpty() && clash != id) {
+                    qCWarning(lcShortcuts)
+                        << "ignoring" << text << "for" << id << "— already bound to" << clash;
+                    continue;
+                }
+                sequences.append(sequence);
             }
 
             if (isDefaults) {
-                // Two commands sharing a key is worse than it looks: Qt calls
-                // that an ambiguous shortcut and fires neither, so a clash
-                // silently disables both. Refuse the later binding and say so.
-                const QString clash = commandForShortcut(sequence);
-                if (!clash.isEmpty() && clash != id) {
-                    qCWarning(lcShortcuts)
-                        << "ignoring" << keyText << "for" << id << "— already bound to" << clash;
-                    registerCommand(id, name, QKeySequence());
-                    m_defaults.insert(id, QKeySequence());
-                    continue;
-                }
-                registerCommand(id, name, sequence);
-                m_defaults.insert(id, sequence);
+                registerCommand(id, name, sequences);
+                m_defaults.insert(id, sequences);
             } else if (QAction *existing = action(id)) {
                 // A user override rebinds a command the defaults declared.
-                existing->setShortcut(sequence);
-                emit shortcutChanged(id, sequence);
+                existing->setShortcuts(sequences);
+                emit shortcutChanged(id, existing->shortcut());
             } else {
                 qCWarning(lcShortcuts) << "user keymap binds unknown command" << id;
             }
@@ -107,6 +124,15 @@ QAction *CommandRegistry::registerCommand(const QString &id,
                                           const QString &text,
                                           const QKeySequence &shortcut)
 {
+    return registerCommand(id, text,
+                           shortcut.isEmpty() ? QList<QKeySequence>()
+                                              : QList<QKeySequence>{shortcut});
+}
+
+QAction *CommandRegistry::registerCommand(const QString &id,
+                                          const QString &text,
+                                          const QList<QKeySequence> &shortcuts)
+{
     if (QAction *existing = m_actions.value(id)) {
         // Re-registering is how widgets attach a nicer label to a command the
         // keymap declared first. Keep the action identity stable.
@@ -118,8 +144,8 @@ QAction *CommandRegistry::registerCommand(const QString &id,
 
     auto *act = new QAction(text.isEmpty() ? id : text, this);
     act->setObjectName(id);
-    if (!shortcut.isEmpty()) {
-        act->setShortcut(shortcut);
+    if (!shortcuts.isEmpty()) {
+        act->setShortcuts(shortcuts);
     }
     // Shortcuts must fire regardless of which dock panel holds focus.
     act->setShortcutContext(Qt::WindowShortcut);
@@ -152,6 +178,14 @@ QKeySequence CommandRegistry::shortcut(const QString &id) const
     return {};
 }
 
+QList<QKeySequence> CommandRegistry::shortcuts(const QString &id) const
+{
+    if (QAction *act = action(id)) {
+        return act->shortcuts();
+    }
+    return {};
+}
+
 bool CommandRegistry::setShortcut(const QString &id, const QKeySequence &sequence)
 {
     QAction *act = action(id);
@@ -169,6 +203,8 @@ bool CommandRegistry::setShortcut(const QString &id, const QKeySequence &sequenc
         }
     }
 
+    // An explicit rebind replaces the whole set: any layout aliases the
+    // defaults carried belonged to the key the user just replaced.
     act->setShortcut(sequence);
     emit shortcutChanged(id, sequence);
     return true;
@@ -180,7 +216,9 @@ QString CommandRegistry::commandForShortcut(const QKeySequence &sequence) const
         return {};
     }
     for (auto it = m_actions.constBegin(); it != m_actions.constEnd(); ++it) {
-        if (it.value()->shortcut() == sequence) {
+        // Aliases count as taken too: whichever command answers to the key
+        // first is the one Qt would make ambiguous.
+        if (it.value()->shortcuts().contains(sequence)) {
             return it.key();
         }
     }
@@ -199,14 +237,24 @@ bool CommandRegistry::saveUserKeymap() const
     // stays small and future default changes still reach the user.
     QJsonArray overrides;
     for (auto it = m_actions.constBegin(); it != m_actions.constEnd(); ++it) {
-        const QKeySequence current = it.value()->shortcut();
-        const QKeySequence original = m_defaults.value(it.key());
+        const QList<QKeySequence> current = it.value()->shortcuts();
+        const QList<QKeySequence> original = m_defaults.value(it.key());
         if (current == original) {
             continue;
         }
         QJsonObject entry;
         entry.insert(QStringLiteral("id"), it.key());
-        entry.insert(QStringLiteral("key"), current.toString(QKeySequence::PortableText));
+        entry.insert(QStringLiteral("key"),
+                     current.isEmpty()
+                         ? QString()
+                         : current.first().toString(QKeySequence::PortableText));
+        if (current.size() > 1) {
+            QJsonArray altKeys;
+            for (int i = 1; i < current.size(); ++i) {
+                altKeys.append(current.at(i).toString(QKeySequence::PortableText));
+            }
+            entry.insert(QStringLiteral("altKeys"), altKeys);
+        }
         entry.insert(QStringLiteral("name"), it.value()->text());
         overrides.append(entry);
     }
@@ -228,9 +276,9 @@ void CommandRegistry::resetToDefaults()
 {
     for (auto it = m_defaults.constBegin(); it != m_defaults.constEnd(); ++it) {
         if (QAction *act = m_actions.value(it.key())) {
-            if (act->shortcut() != it.value()) {
-                act->setShortcut(it.value());
-                emit shortcutChanged(it.key(), it.value());
+            if (act->shortcuts() != it.value()) {
+                act->setShortcuts(it.value());
+                emit shortcutChanged(it.key(), act->shortcut());
             }
         }
     }

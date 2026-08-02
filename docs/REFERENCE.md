@@ -170,8 +170,8 @@ the active variant's name in bold — switching to Elliptical says
 | Active tool | Options shown |
 |---|---|
 | Brush, Eraser, Spot Healing, Clone Stamp, History Brush | **Size** (1–5000 px), **Hardness** (0–100%), **Opacity** (0–100%), **Flow** (1–100%) — all live, pushed to the engine on change |
-| Marquee, Lasso, Quick Selection | Modifier hint: `Shift` = add · `Alt` = subtract · click = deselect |
-| Marquee (Single Row / Single Column) | Hint changes to: click to select a line · `Shift` = add · `Alt` = subtract |
+| Marquee, Lasso, Quick Selection | Modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
+| Marquee (Single Row / Single Column) | Hint changes to: click to select a line · `Ctrl+Shift` = add · `Ctrl+Alt` = subtract |
 | Zoom | Hint: click to zoom in · `Alt`+click to zoom out |
 | Move | Hint: drag to move the active layer · arrow keys nudge |
 | Anything else | Name only |
@@ -430,8 +430,8 @@ shortcut in Qt, which kills both.
 
 | Linux | macOS | Command | Status |
 |---|---|---|---|
-| `Ctrl++` | `Cmd++` | Zoom In | ✅ |
-| `Ctrl+-` | `Cmd+-` | Zoom Out | ✅ |
+| `Ctrl++` | `Cmd++` | Zoom In — also `Ctrl+=` / `Ctrl+Shift+=` | ✅ |
+| `Ctrl+-` | `Cmd+-` | Zoom Out — also `Ctrl+_` | ✅ |
 | `Ctrl+0` | `Cmd+0` | Fit on Screen | ✅ |
 | `Ctrl+1` | `Cmd+1` | Actual Pixels | ✅ |
 | `Ctrl+Y` | `Cmd+Y` | Proof Colors | ⚪ |
@@ -476,8 +476,9 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | `Alt`+click with Zoom | Zoom out |
 | `Esc` | Abandon the stroke or marquee in progress |
 | Arrow keys with Move | Nudge the active layer 1 px; `Shift` makes it 10 px |
-| `Shift`-drag a selection tool | Add to the selection |
-| `Alt`-drag a selection tool | Subtract from the selection |
+| `Ctrl+Shift`-drag a selection tool | Add to the selection |
+| `Ctrl+Alt`-drag a selection tool | Subtract from the selection |
+| `Shift`-drag a selection tool | Add to the selection (CS6's own binding) |
 | Click without dragging | Deselect (for Rectangular / Elliptical) |
 
 Zoom steps through CS6's own sequence (0.67%, 1%, 1.67%, … 1600%, 3200%) rather
