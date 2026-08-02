@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QIcon>
 #include <QLoggingCategory>
 #include <QStandardPaths>
 
@@ -54,6 +55,25 @@ void applyTheme(QApplication &app)
     app.setStyleSheet(QString::fromUtf8(file.readAll()));
 }
 
+/// Set the application icon: the window's, the task switcher's and whatever
+/// the desktop shows for a running instance.
+///
+/// The file installed for the desktop entry is this same SVG (see
+/// `shell/CMakeLists.txt`), so the launcher and the running window never drift
+/// apart.
+void applyIcon(QApplication &app)
+{
+    const QString path = findResource(QStringLiteral("icons/photorust.svg"));
+    if (path.isEmpty()) {
+        qCWarning(lcApp) << "application icon not found";
+        return;
+    }
+    app.setWindowIcon(QIcon(path));
+    // Wayland matches a window to its desktop entry by this name rather than
+    // by the icon Qt sets, so the launcher shows the right artwork there too.
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.photorust.PhotoRust"));
+}
+
 } // namespace
 
 int main(int argc, char *argv[])
@@ -67,6 +87,7 @@ int main(int argc, char *argv[])
     // and macOS each override too much of it to match CS6 reliably.
     QApplication::setStyle(QStringLiteral("Fusion"));
     applyTheme(app);
+    applyIcon(app);
 
     // The engine: one instance, owning the open document. Everything the UI
     // does goes through this object.

@@ -21,6 +21,8 @@ set(SHELL_SOURCES
     src/panels/HistoryPanel.h
     src/panels/LayersPanel.cpp
     src/panels/LayersPanel.h
+    src/panels/PanelHeader.cpp
+    src/panels/PanelHeader.h
 
     src/shortcuts/CommandRegistry.cpp
     src/shortcuts/CommandRegistry.h
@@ -78,6 +80,11 @@ if(APPLE)
     # Inside a bundle, resources belong in Contents/Resources.
     set_source_files_properties(resources/theme.qss resources/shortcuts.json
         PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    set_source_files_properties(resources/icons/photorust.svg
+        PROPERTIES MACOSX_PACKAGE_LOCATION Resources/icons)
+    # That covers the window icon, which Qt loads from the SVG. The Finder
+    # icon is a separate thing: it needs an .icns, which has to be generated
+    # from the SVG with iconutil and pointed at by MACOSX_BUNDLE_ICON_FILE.
 endif()
 
 install(TARGETS photorust
@@ -87,4 +94,13 @@ install(TARGETS photorust
 
 if(NOT APPLE)
     install(DIRECTORY resources/ DESTINATION bin/resources)
+
+    # Desktop integration. The icon goes into the hicolor theme under the name
+    # the .desktop file's `Icon=` key refers to, which is how launchers, the
+    # task switcher and the window list all find it.
+    include(GNUInstallDirs)
+    install(FILES resources/icons/photorust.svg
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps)
+    install(FILES resources/org.photorust.PhotoRust.desktop
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
 endif()

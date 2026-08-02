@@ -245,6 +245,73 @@ QString ToolIcons::quickMaskSvg(bool active)
         R"SVG(<circle cx="10" cy="10" r="3.4" fill="COLOR" stroke="none"/>)SVG");
 }
 
+QString ToolIcons::closeSvg()
+{
+    return QStringLiteral(
+        R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.6" stroke-linecap="round">
+           <path d="M5 5 15 15"/><path d="M15 5 5 15"/></g>)SVG");
+}
+
+QString ToolIcons::columnToggleSvg(bool pointsLeft)
+{
+    // Two chevrons, thinner than the tool glyphs — this is chrome, not a tool.
+    if (pointsLeft) {
+        return QStringLiteral(
+            R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.6" stroke-linecap="round"
+               stroke-linejoin="round"><path d="M10 5 5 10 10 15"/>
+               <path d="M16 5 11 10 16 15"/></g>)SVG");
+    }
+    return QStringLiteral(
+        R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.6" stroke-linecap="round"
+           stroke-linejoin="round"><path d="M10 5 15 10 10 15"/>
+           <path d="M4 5 9 10 4 15"/></g>)SVG");
+}
+
+QString ToolIcons::selectionModeSvg(SelectionMode mode)
+{
+    // Two squares on the 20×20 grid, overlapping in their corners:
+    //   A = 3.5…12.5, B = 7.5…16.5, so the overlap is 7.5…12.5 on both axes.
+    // Each icon outlines both squares and shades the region that mode keeps.
+    // The regions are axis-aligned, so they are written out as explicit
+    // polygons rather than leaning on SVG clipping, which Qt's renderer only
+    // partly supports.
+    const QString outlines = QStringLiteral(
+        R"SVG(<rect x="3.5" y="3.5" width="9" height="9"/>)SVG"
+        R"SVG(<rect x="7.5" y="7.5" width="9" height="9"/>)SVG");
+
+    QString shaded;
+    switch (mode) {
+    case SelectionMode::New:
+        // A single square, centred — nothing to combine with.
+        return QStringLiteral(
+            R"SVG(<rect x="5" y="5" width="10" height="10" fill="COLOR" fill-opacity="0.55"
+               stroke="COLOR" stroke-width="1.2"/>)SVG");
+
+    case SelectionMode::Add:
+        // The union, as one L-shaped hexagon.
+        shaded = QStringLiteral(
+            R"SVG(<path d="M3.5 3.5H12.5V7.5H16.5V16.5H7.5V12.5H3.5Z"/>)SVG");
+        break;
+
+    case SelectionMode::Subtract:
+        // A with the overlap bitten out.
+        shaded = QStringLiteral(
+            R"SVG(<path d="M3.5 3.5H12.5V7.5H7.5V12.5H3.5Z"/>)SVG");
+        break;
+
+    case SelectionMode::Intersect:
+        // The overlap alone.
+        shaded = QStringLiteral(
+            R"SVG(<rect x="7.5" y="7.5" width="5" height="5"/>)SVG");
+        break;
+    }
+
+    return QStringLiteral(R"SVG(<g fill="COLOR" fill-opacity="0.55" stroke="none">%1</g>)SVG")
+               .arg(shaded)
+        + QStringLiteral(R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.2">%1</g>)SVG")
+              .arg(outlines);
+}
+
 QString ToolIcons::screenModeSvg()
 {
     return QStringLiteral(

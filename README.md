@@ -109,15 +109,26 @@ cmake --build build -j$(nproc)
 ```
 
 CMake drives both halves: Corrosion invokes Cargo for `core/`, and the
-resulting static library is linked into the shell. The theme and keymap are
-staged next to the executable, so a fresh build runs without installing.
+resulting static library is linked into the shell. The theme, keymap and icon
+are staged next to the executable, so a fresh build runs without installing.
+
+To get a launcher entry and a desktop icon, install it:
+
+```bash
+cmake --install build --prefix ~/.local
+```
+
+That puts the binary in `~/.local/bin`, the icon into the hicolor theme and
+`org.photorust.PhotoRust.desktop` into `~/.local/share/applications`. The
+running window already shows the icon without installing; the desktop entry is
+what gives it a launcher, a name and a file association for `.psd`.
 
 ### Tests
 
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 217 tests
+cd core && cargo test        # 221 tests
 ```
 
 or through CTest, which runs them as part of the project:

@@ -148,28 +148,65 @@ QToolBar QToolButton:checked {
     border-color: #2a2a2a;
 }
 
-/* The vertical tool strip down the left edge. */
-QToolBar#toolStrip {
+/* The Tools panel contents. Lives in a QDockWidget with a PanelHeader
+   title bar, so this rule only styles the button field itself. */
+QWidget#toolStrip {
     background-color: #454545;
-    border-right: 1px solid #333333;
-    border-bottom: none;
-    spacing: 0px;
-    padding: 2px 1px;
+    border: none;
 }
 
-QToolBar#toolStrip QToolButton {
-    /* CS6's tool buttons are 26px square in the single-column layout. */
+QWidget#toolStrip QToolButton {
+    /* CS6's tool buttons are 26px square in the single-column layout.
+       These are content-box metrics, so the padding and border have to go —
+       ToolStrip fixes the widgets at 26px and the two must agree, or the
+       glyph ends up drawn off-centre inside a squeezed button. */
     min-width: 26px;
     max-width: 26px;
     min-height: 26px;
     max-height: 26px;
     margin: 0px;
+    padding: 0px;
+    border: none;
     border-radius: 0px;
 }
 
-QToolBar#toolStrip QToolButton:checked {
+QWidget#toolStrip QToolButton:checked {
     background-color: #6e6e6e;
     border-color: #808080;
+}
+
+/* Group breaks between tool families, and above the footer. CS6 rules these
+   right across the panel, so they are laid out full width. */
+QWidget#toolStrip QFrame#toolStripDivider {
+    border: none;
+    border-top: 1px solid #3a3a3a;
+    margin: 2px 3px;
+}
+
+/* The Tools dock. Its title bar is a PanelHeader, so the frame is all that is
+   left to style here; floating, it needs an edge on every side. */
+QDockWidget#toolsDock {
+    background-color: #454545;
+    border: 1px solid #2a2a2a;
+}
+
+/* CS6 panel title bar: the dotted drag grip plus the chevron and close cross.
+   PanelHeader paints the dots itself. Distinct from #panelHeader, which is the
+   header strip *inside* a panel (the Layers blend-mode row). */
+QWidget#panelTitleBar {
+    background-color: #3f3f3f;
+    border: none;
+}
+
+QWidget#panelTitleBar QToolButton#panelTitleBarButton {
+    background: transparent;
+    border: none;
+    padding: 0px;
+    margin: 0px;
+}
+
+QWidget#panelTitleBar QToolButton#panelTitleBarButton:hover {
+    background-color: #5e5e5e;
 }
 
 /* The hidden-tools flyout. CS6 pops this to the right of the button with the

@@ -3,6 +3,7 @@
 #include "cxx-qt-lib/qcolor.h"
 #include "photorust_core/src/bridge.cxxqt.h"
 
+#include <QContextMenuEvent>
 #include <QEnterEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -225,49 +226,62 @@ bool CanvasView::marqueeIsLineSelect() const
         || m_marqueeType == MarqueeType::SingleColumn;
 }
 
-void CanvasView::commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers)
+SelectionMode CanvasView::effectiveSelectionMode(Qt::KeyboardModifiers modifiers) const
 {
-    if (!m_engine) {
-        return;
-    }
-
-    // Combine mode from the modifiers held at the end of the drag.
+    // A held modifier overrides the options-bar mode for this gesture only,
+    // exactly as CS6 does — the bar's buttons do not change while you hold it.
     //
     // CS6 uses plain Shift to add and plain Alt to subtract, but bare Alt+drag
     // never reaches us on Linux: Cinnamon (and Mutter, KWin, …) grab it for
     // move-window. So Ctrl+Shift and Ctrl+Alt are the primary bindings here —
     // window managers leave those alone. Plain Shift still adds, for the
     // muscle memory of anyone coming from Photoshop.
-    int op = 0;
-    if (modifiers.testFlag(Qt::ControlModifier) && modifiers.testFlag(Qt::AltModifier)) {
-        op = 2;
-    } else if (modifiers.testFlag(Qt::ControlModifier)
-               && modifiers.testFlag(Qt::ShiftModifier)) {
-        op = 1;
-    } else if (modifiers.testFlag(Qt::AltModifier)) {
-        op = 2;
-    } else if (modifiers.testFlag(Qt::ShiftModifier)) {
-        op = 1;
+    const bool shift = modifiers.testFlag(Qt::ShiftModifier);
+    const bool alt = modifiers.testFlag(Qt::AltModifier);
+
+    // Both together is intersect, the same combination CS6 uses.
+    if (shift && alt) {
+        return SelectionMode::Intersect;
     }
+    if (alt) {
+        return SelectionMode::Subtract;
+    }
+    if (shift) {
+        return SelectionMode::Add;
+    }
+    return m_selectionMode;
+}
+
+void CanvasView::commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_engine) {
+        return;
+    }
+
+    const int op = static_cast<int>(effectiveSelectionMode(modifiers));
 
     const int x = int(std::floor(documentRect.x()));
     const int y = int(std::floor(documentRect.y()));
     const int w = int(std::round(documentRect.width()));
     const int h = int(std::round(documentRect.height()));
 
+    // The engine softens the incoming region before combining it, so the
+    // feather never reaches what the selection already held.
+    const int feather = m_featherRadius;
+
     switch (m_marqueeType) {
     case MarqueeType::Rectangular:
-        m_engine->selectRect(x, y, w, h, op);
+        m_engine->selectRect(x, y, w, h, op, feather);
         break;
     case MarqueeType::Elliptical:
-        m_engine->selectEllipse(x, y, w, h, op);
+        m_engine->selectEllipse(x, y, w, h, op, feather);
         break;
     case MarqueeType::SingleRow:
         // One full-width scanline through the click point.
-        m_engine->selectRect(0, y, m_engine->getCanvasWidth(), 1, op);
+        m_engine->selectRect(0, y, m_engine->getCanvasWidth(), 1, op, feather);
         break;
     case MarqueeType::SingleColumn:
-        m_engine->selectRect(x, 0, 1, m_engine->getCanvasHeight(), op);
+        m_engine->selectRect(x, 0, 1, m_engine->getCanvasHeight(), op, feather);
         break;
     }
 }
@@ -461,8 +475,9 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         // then keep following the cursor while the button is held.
         if (marqueeIsLineSelect()) {
             m_marqueeActive = true;
+            m_gestureModifiers = event->modifiers();
             m_dragStartDoc = doc;
-            commitMarquee(QRectF(doc, doc), event->modifiers());
+            commitMarquee(QRectF(doc, doc), m_gestureModifiers);
             update();
             return;
         }
@@ -470,6 +485,7 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     case ToolId::Lasso:
     case ToolId::QuickSelect:
         m_marqueeActive = true;
+        m_gestureModifiers = event->modifiers();
         m_dragStartDoc = doc;
         m_marquee = QRectF(doc, doc);
         update();
@@ -510,9 +526,10 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
 
     if (m_marqueeActive) {
         if (m_tool == ToolId::Marquee && marqueeIsLineSelect()) {
-            // Dragging slides the selected line under the cursor. Replace each
-            // time so it does not accumulate a band of rows.
-            commitMarquee(QRectF(doc, doc), Qt::NoModifier);
+            // Dragging slides the selected line under the cursor: in New mode
+            // each commit replaces the last, so no band accumulates. In the
+            // combining modes it does accumulate, which is what CS6 does too.
+            commitMarquee(QRectF(doc, doc), m_gestureModifiers);
         } else {
             m_marquee = QRectF(m_dragStartDoc, doc).normalized();
         }
@@ -565,11 +582,13 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
 
         const QRectF r = QRectF(m_dragStartDoc, doc).normalized();
         if (m_engine) {
-            // A click without a drag clears the selection, as in Photoshop.
-            if (r.width() < 1.0 || r.height() < 1.0) {
+            if (r.width() >= 1.0 && r.height() >= 1.0) {
+                commitMarquee(r, m_gestureModifiers);
+            } else if (effectiveSelectionMode(m_gestureModifiers) == SelectionMode::New) {
+                // A click without a drag clears the selection, as in Photoshop
+                // — but only in New mode; a stray click while adding or
+                // subtracting leaves the selection alone.
                 m_engine->deselect();
-            } else {
-                commitMarquee(r, event->modifiers());
             }
         }
         m_marquee = QRectF();
@@ -660,6 +679,26 @@ void CanvasView::keyReleaseEvent(QKeyEvent *event)
         return;
     }
     QWidget::keyReleaseEvent(event);
+}
+
+void CanvasView::contextMenuEvent(QContextMenuEvent *event)
+{
+    // CS6 gives every tool its own right-click menu; the selection tools are
+    // the ones that have one here so far.
+    if (!toolSelects(m_tool)) {
+        QWidget::contextMenuEvent(event);
+        return;
+    }
+
+    // Mid-gesture a right-click is not a request for a menu — it would open
+    // on top of the marquee being dragged.
+    if (m_marqueeActive || m_dragging || m_panning) {
+        event->ignore();
+        return;
+    }
+
+    emit contextMenuRequested(event->globalPos());
+    event->accept();
 }
 
 void CanvasView::resizeEvent(QResizeEvent *event)

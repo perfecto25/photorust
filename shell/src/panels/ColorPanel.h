@@ -27,6 +27,10 @@ public:
     /// Reset to black on white — the D shortcut.
     void reset();
 
+    /// Public, as it is on `QWidget`: the tool strip sizes itself to this,
+    /// since the swatch is the widest thing the panel holds.
+    QSize sizeHint() const override;
+
 signals:
     void foregroundChanged(const QColor &color);
     void backgroundChanged(const QColor &color);
@@ -34,7 +38,6 @@ signals:
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
-    QSize sizeHint() const override;
 
 private:
     /// Hit rectangles, computed from the widget size so they stay in sync with

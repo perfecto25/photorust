@@ -127,6 +127,16 @@ impl Selection {
 
     /// Combine a rectangular region into the selection.
     pub fn apply_rect(&mut self, rect: Rect, op: SelectionOp) {
+        self.apply_rect_feathered(rect, op, 0);
+    }
+
+    /// As `apply_rect`, softening the incoming region first.
+    ///
+    /// The feather lands on the *new* region, before it is combined — which is
+    /// what the options bar's Feather field means. Feathering the whole mask
+    /// afterwards (what Select ▸ Feather does) would also re-soften whatever
+    /// the selection already held.
+    pub fn apply_rect_feathered(&mut self, rect: Rect, op: SelectionOp, feather: u32) {
         let mut incoming = Selection::new(self.width, self.height);
         let r = rect.intersect(&Rect::from_size(self.width, self.height));
         for y in r.y..r.bottom() {
@@ -134,11 +144,19 @@ impl Selection {
                 incoming.set_raw(x, y, 255);
             }
         }
+        // The mask is empty outside the rect, so the blur can only reach
+        // `feather` pixels beyond it.
+        incoming.feather_region(feather, rect.inflate(feather));
         self.combine(&incoming, op);
     }
 
     /// Combine an elliptical region inscribed in `rect`, with antialiased edges.
     pub fn apply_ellipse(&mut self, rect: Rect, op: SelectionOp) {
+        self.apply_ellipse_feathered(rect, op, 0);
+    }
+
+    /// As `apply_ellipse`, softening the incoming region first.
+    pub fn apply_ellipse_feathered(&mut self, rect: Rect, op: SelectionOp, feather: u32) {
         let mut incoming = Selection::new(self.width, self.height);
         if !rect.is_empty() {
             let cx = rect.x as f32 + rect.width as f32 / 2.0;
@@ -162,6 +180,8 @@ impl Selection {
                 }
             }
         }
+        // The antialiased edge already spills one pixel past the rect.
+        incoming.feather_region(feather, rect.inflate(feather + 1));
         self.combine(&incoming, op);
     }
 
@@ -209,46 +229,103 @@ impl Selection {
     /// Photoshop uses a Gaussian here; a box blur is a close enough
     /// approximation at the radii users actually pick and is much cheaper.
     pub fn feather(&mut self, radius: u32) {
+        let canvas = Rect::from_size(self.width, self.height);
+        self.feather_region(radius, canvas);
+    }
+
+    /// Feather, writing only inside `region`.
+    ///
+    /// A caller that knows the mask is empty outside a box — which is the case
+    /// for the shape a marquee just drew — passes it here, so the work tracks
+    /// the size of the shape instead of the size of the canvas. Samples
+    /// outside `region` read as 0, so the result matches a whole-canvas
+    /// feather exactly whenever that assumption holds.
+    ///
+    /// Both passes carry a running sum across the row or column rather than
+    /// re-adding the kernel at every pixel, so the cost no longer scales with
+    /// the radius: feathering by 50 px costs what feathering by 1 px costs.
+    /// This is a hot path — it runs on every mouse-up with a selection tool.
+    pub fn feather_region(&mut self, radius: u32, region: Rect) {
         if radius == 0 || self.width == 0 || self.height == 0 {
             return;
         }
+        let region = region.intersect(&Rect::from_size(self.width, self.height));
+        if region.is_empty() {
+            return;
+        }
+
         let r = radius as i32;
         let w = self.width as i32;
         let h = self.height as i32;
+        let (rx, ry) = (region.x, region.y);
+        let (rw, rh) = (region.width as i32, region.height as i32);
 
-        // Horizontal pass.
-        let mut tmp = vec![0u8; self.coverage.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum = 0u32;
-                let mut n = 0u32;
-                for d in -r..=r {
-                    let sx = x + d;
-                    if sx < 0 || sx >= w {
-                        continue;
-                    }
-                    sum += self.coverage[y as usize * w as usize + sx as usize] as u32;
-                    n += 1;
+        // Horizontal pass, into a scratch buffer the size of the region.
+        //
+        // Each output is the mean of the kernel samples that land on the
+        // canvas, so the divisor shrinks towards the edges — the same
+        // normalisation the per-pixel version used.
+        let mut tmp = vec![0u8; (rw * rh) as usize];
+        for y in ry..ry + rh {
+            let row = y as usize * w as usize;
+            let mut lo = (rx - r).max(0);
+            let mut hi = (rx + r).min(w - 1);
+            let mut sum: u32 = self.coverage[row + lo as usize..=row + hi as usize]
+                .iter()
+                .map(|&c| c as u32)
+                .sum();
+
+            for x in rx..rx + rw {
+                // Both bounds only ever move right, so each sample enters and
+                // leaves the window at most once per row.
+                let want_lo = (x - r).max(0);
+                let want_hi = (x + r).min(w - 1);
+                while lo < want_lo {
+                    sum -= self.coverage[row + lo as usize] as u32;
+                    lo += 1;
                 }
-                tmp[y as usize * w as usize + x as usize] = (sum / n.max(1)) as u8;
+                while hi < want_hi {
+                    hi += 1;
+                    sum += self.coverage[row + hi as usize] as u32;
+                }
+                let n = (want_hi - want_lo + 1) as u32;
+                tmp[((y - ry) * rw + (x - rx)) as usize] = (sum / n) as u8;
             }
         }
-        // Vertical pass.
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum = 0u32;
-                let mut n = 0u32;
-                for d in -r..=r {
-                    let sy = y + d;
-                    if sy < 0 || sy >= h {
-                        continue;
-                    }
-                    sum += tmp[sy as usize * w as usize + x as usize] as u32;
-                    n += 1;
+
+        // Vertical pass, reading the scratch buffer a column at a time. Rows
+        // outside the region contribute 0 but still count towards the divisor,
+        // which is what keeps this identical to the whole-canvas result.
+        for x in rx..rx + rw {
+            let col = (x - rx) as usize;
+            let sample = |buf: &[u8], y: i32| -> u32 {
+                if y < ry || y >= ry + rh {
+                    0
+                } else {
+                    buf[((y - ry) * rw) as usize + col] as u32
                 }
-                self.coverage[y as usize * w as usize + x as usize] = (sum / n.max(1)) as u8;
+            };
+
+            let mut lo = (ry - r).max(0);
+            let mut hi = (ry + r).min(h - 1);
+            let mut sum: u32 = (lo..=hi).map(|y| sample(&tmp, y)).sum();
+
+            for y in ry..ry + rh {
+                let want_lo = (y - r).max(0);
+                let want_hi = (y + r).min(h - 1);
+                while lo < want_lo {
+                    sum -= sample(&tmp, lo);
+                    lo += 1;
+                }
+                while hi < want_hi {
+                    hi += 1;
+                    sum += sample(&tmp, hi);
+                }
+                let n = (want_hi - want_lo + 1) as u32;
+                self.coverage[y as usize * w as usize + x as usize] = (sum / n) as u8;
             }
         }
+
         self.cached_bounds = None;
         self.cached_empty.set(None);
     }
@@ -585,6 +662,98 @@ mod tests {
         assert!(c > 0.0 && c < 1.0, "expected soft edge, got {}", c);
         // Well inside is still fully selected.
         assert!(s.coverage_at(16, 16) > 0.95);
+    }
+
+    /// The straightforward per-pixel box blur the running-sum version replaced.
+    /// Kept here as the oracle for it.
+    fn naive_feather(s: &Selection, radius: i32) -> Vec<u8> {
+        let (w, h) = (s.width as i32, s.height as i32);
+        let mut tmp = vec![0u8; s.coverage.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut sum, mut n) = (0u32, 0u32);
+                for d in -radius..=radius {
+                    let sx = x + d;
+                    if sx >= 0 && sx < w {
+                        sum += s.coverage[(y * w + sx) as usize] as u32;
+                        n += 1;
+                    }
+                }
+                tmp[(y * w + x) as usize] = (sum / n.max(1)) as u8;
+            }
+        }
+        let mut out = vec![0u8; s.coverage.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut sum, mut n) = (0u32, 0u32);
+                for d in -radius..=radius {
+                    let sy = y + d;
+                    if sy >= 0 && sy < h {
+                        sum += tmp[(sy * w + x) as usize] as u32;
+                        n += 1;
+                    }
+                }
+                out[(y * w + x) as usize] = (sum / n.max(1)) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn running_sum_feather_matches_the_per_pixel_blur() {
+        for &radius in &[1, 3, 7, 20] {
+            let mut s = Selection::new(37, 29);
+            // An off-centre rect plus a blob touching the canvas edge, so the
+            // clamped-divisor behaviour at the borders is exercised too.
+            s.apply_rect(Rect::new(5, 4, 11, 9), SelectionOp::Replace);
+            s.apply_rect(Rect::new(30, 0, 7, 6), SelectionOp::Add);
+
+            let expected = naive_feather(&s, radius);
+            s.feather(radius as u32);
+            assert_eq!(s.as_bytes(), &expected[..], "radius {}", radius);
+        }
+    }
+
+    #[test]
+    fn region_limited_feather_matches_a_whole_canvas_one() {
+        // The marquee path feathers only the box the shape can reach. That has
+        // to give the same mask as feathering everything.
+        let rect = Rect::new(8, 6, 20, 14);
+        for &radius in &[1, 5, 12] {
+            let mut whole = Selection::new(48, 40);
+            whole.apply_rect(rect, SelectionOp::Replace);
+            whole.feather(radius);
+
+            let mut region = Selection::new(48, 40);
+            region.apply_rect(rect, SelectionOp::Replace);
+            region.feather_region(radius, rect.inflate(radius));
+
+            assert_eq!(region.as_bytes(), whole.as_bytes(), "radius {}", radius);
+        }
+    }
+
+    #[test]
+    fn feathered_apply_softens_only_the_new_region() {
+        let mut s = Selection::new(64, 64);
+        // A hard-edged first selection, then a feathered one added beside it.
+        s.apply_rect(Rect::new(4, 4, 16, 56), SelectionOp::Replace);
+        s.apply_rect_feathered(Rect::new(32, 4, 16, 56), SelectionOp::Add, 3);
+
+        // The original region keeps its hard edge…
+        assert_eq!(s.coverage_at(3, 32), 0.0, "old region bled outward");
+        assert_eq!(s.coverage_at(4, 32), 1.0, "old region was softened");
+        // …while the region just added has a falloff.
+        let soft = s.coverage_at(31, 32);
+        assert!(soft > 0.0 && soft < 1.0, "expected soft edge, got {}", soft);
+    }
+
+    #[test]
+    fn feathered_apply_with_zero_matches_the_hard_edged_call() {
+        let mut soft = Selection::new(16, 16);
+        soft.apply_rect_feathered(Rect::new(2, 2, 8, 8), SelectionOp::Replace, 0);
+        let mut hard = Selection::new(16, 16);
+        hard.apply_rect(Rect::new(2, 2, 8, 8), SelectionOp::Replace);
+        assert_eq!(soft.as_bytes(), hard.as_bytes());
     }
 
     #[test]

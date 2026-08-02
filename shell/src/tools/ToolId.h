@@ -84,6 +84,29 @@ enum class MarqueeType {
     SingleColumn = 3,
 };
 
+/// How a new selection combines with the existing one.
+///
+/// The values are the `op` codes `Engine::selectRect`/`selectEllipse` take, so
+/// this enum crosses the bridge as-is (see core/src/selection.rs SelectionOp).
+enum class SelectionMode {
+    New = 0,
+    Add = 1,
+    Subtract = 2,
+    Intersect = 3,
+};
+
+/// Label for the options-bar button and its tooltip.
+inline QString selectionModeName(SelectionMode mode)
+{
+    switch (mode) {
+    case SelectionMode::New:       return QStringLiteral("New selection");
+    case SelectionMode::Add:       return QStringLiteral("Add to selection");
+    case SelectionMode::Subtract:  return QStringLiteral("Subtract from selection");
+    case SelectionMode::Intersect: return QStringLiteral("Intersect with selection");
+    }
+    return {};
+}
+
 /// One entry in a tool's flyout.
 struct SubTool {
     /// Display name, e.g. "Elliptical Marquee Tool".

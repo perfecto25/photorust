@@ -13,6 +13,7 @@ class HistoryPanel;
 class LayersPanel;
 class ToolStrip;
 class QComboBox;
+class QDockWidget;
 class QDoubleSpinBox;
 class QSpinBox;
 class QToolBar;
@@ -70,6 +71,10 @@ private slots:
 
 private:
     void createMenus();
+    /// Build the Tools panel: the strip inside its dock with a CS6 header.
+    void createToolPanel();
+    /// CS6's marquee right-click menu, opened by the canvas.
+    void showSelectionContextMenu(const QPoint &globalPos);
     void createOptionsBar();
     void createDocks();
     void createStatusBar();
@@ -94,6 +99,9 @@ private:
 
     /// Rebuild the options bar for the active tool.
     void populateOptionsBar(ToolId tool, int variant);
+    /// Add the new/add/subtract/intersect buttons the selection tools open
+    /// their options bar with.
+    void addSelectionModeButtons();
     /// Push the current brush settings into the engine.
     void pushBrushSettings();
 
@@ -102,6 +110,7 @@ private:
 
     CanvasView *m_canvas = nullptr;
     ToolStrip *m_toolStrip = nullptr;
+    QDockWidget *m_toolsDock = nullptr;
     QToolBar *m_optionsBar = nullptr;
 
     LayersPanel *m_layersPanel = nullptr;
@@ -121,4 +130,8 @@ private:
 
     ToolId m_activeTool = ToolId::Brush;
     int m_activeVariant = 0;
+    /// Options-bar combine mode and feather radius, kept here because the bar
+    /// is rebuilt on every tool change and CS6 remembers both.
+    SelectionMode m_selectionMode = SelectionMode::New;
+    int m_featherRadius = 0;
 };

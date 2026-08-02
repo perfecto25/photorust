@@ -319,6 +319,8 @@ pub mod ffi {
     // -- selection ---------------------------------------------------------
     unsafe extern "RustQt" {
         /// `op`: 0 = replace, 1 = add, 2 = subtract, 3 = intersect.
+        /// `feather`: radius in pixels applied to the new region before it
+        /// combines — the options bar's Feather field. 0 for a hard edge.
         #[qinvokable]
         #[cxx_name = "selectRect"]
         fn select_rect(
@@ -328,6 +330,7 @@ pub mod ffi {
             width: i32,
             height: i32,
             op: i32,
+            feather: i32,
         );
 
         #[qinvokable]
@@ -339,6 +342,7 @@ pub mod ffi {
             width: i32,
             height: i32,
             op: i32,
+            feather: i32,
         );
 
         #[qinvokable]
@@ -1065,10 +1069,12 @@ impl ffi::Engine {
         width: i32,
         height: i32,
         op: i32,
+        feather: i32,
     ) {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
         let op = SelectionOp::from_i32(op);
-        self.as_mut().rust_mut().doc.select_rect(rect, op);
+        let feather = feather.clamp(0, 1000) as u32;
+        self.as_mut().rust_mut().doc.select_rect(rect, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -1080,10 +1086,12 @@ impl ffi::Engine {
         width: i32,
         height: i32,
         op: i32,
+        feather: i32,
     ) {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
         let op = SelectionOp::from_i32(op);
-        self.as_mut().rust_mut().doc.select_ellipse(rect, op);
+        let feather = feather.clamp(0, 1000) as u32;
+        self.as_mut().rust_mut().doc.select_ellipse(rect, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }

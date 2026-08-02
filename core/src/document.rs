@@ -364,12 +364,14 @@ impl Document {
         &mut self.selection
     }
 
-    pub fn select_rect(&mut self, rect: Rect, op: SelectionOp) {
-        self.selection.apply_rect(rect, op);
+    /// `feather` softens the incoming region before it combines, which is the
+    /// options bar's Feather field. Pass 0 for a hard edge.
+    pub fn select_rect(&mut self, rect: Rect, op: SelectionOp, feather: u32) {
+        self.selection.apply_rect_feathered(rect, op, feather);
     }
 
-    pub fn select_ellipse(&mut self, rect: Rect, op: SelectionOp) {
-        self.selection.apply_ellipse(rect, op);
+    pub fn select_ellipse(&mut self, rect: Rect, op: SelectionOp, feather: u32) {
+        self.selection.apply_ellipse_feathered(rect, op, feather);
     }
 
     pub fn select_all(&mut self) {
@@ -954,7 +956,7 @@ mod tests {
     #[test]
     fn fill_respects_the_selection() {
         let mut d = Document::new_transparent(16, 16);
-        d.select_rect(Rect::new(0, 0, 8, 16), SelectionOp::Replace);
+        d.select_rect(Rect::new(0, 0, 8, 16), SelectionOp::Replace, 0);
         d.fill(Rgba8::new(255, 0, 0, 255));
 
         let out = d.composite();
@@ -972,7 +974,7 @@ mod tests {
     #[test]
     fn clear_erases_within_the_selection() {
         let mut d = doc();
-        d.select_rect(Rect::new(0, 0, 8, 16), SelectionOp::Replace);
+        d.select_rect(Rect::new(0, 0, 8, 16), SelectionOp::Replace, 0);
         d.clear_selection_pixels();
 
         let out = d.composite();

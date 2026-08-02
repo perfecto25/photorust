@@ -170,15 +170,25 @@ the active variant's name in bold — switching to Elliptical says
 | Active tool | Options shown |
 |---|---|
 | Brush, Eraser, Spot Healing, Clone Stamp, History Brush | **Size** (1–5000 px), **Hardness** (0–100%), **Opacity** (0–100%), **Flow** (1–100%) — all live, pushed to the engine on change |
-| Marquee, Lasso, Quick Selection | Modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
-| Marquee (Single Row / Single Column) | Hint changes to: click to select a line · `Ctrl+Shift` = add · `Ctrl+Alt` = subtract |
+| Marquee, Lasso, Quick Selection | **Combine mode** buttons (new / add / subtract / intersect), **Feather** (0–1000 px), then a modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
+| Marquee (Single Row / Single Column) | Same controls; the hint changes to: click to select a line · `Ctrl+Shift` = add · `Ctrl+Alt` = subtract |
 | Zoom | Hint: click to zoom in · `Alt`+click to zoom out |
 | Move | Hint: drag to move the active layer · arrow keys nudge |
 | Anything else | Name only |
 
-CS6's selection **mode buttons** (new / add / subtract / intersect) are not
-drawn yet — the operations are reachable through the modifier keys only. Brush
-presets, blend mode and airbrush are likewise absent from the bar.
+The **combine mode** is a radio set and persists across tool switches, as CS6
+does. Holding a modifier overrides it for that one drag without moving the
+checked button, and the modifiers are sampled when the drag *starts* — letting
+go of Shift mid-drag does not change the mode. In New mode a click without a
+drag deselects; in the other three it leaves the selection alone.
+
+**Feather** applies to selections made from then on, and softens only the
+incoming region — the part of the selection that was already there keeps its
+edge. Select ▸ Feather is the command that softens an existing selection.
+
+Still absent from the selection bar: Anti-alias, Style (Normal / Fixed Ratio /
+Fixed Size) with its Width and Height fields, and Refine Edge. Brush presets,
+blend mode and airbrush are likewise absent from the brush bar.
 
 ---
 
@@ -480,11 +490,21 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | `Ctrl+Alt`-drag a selection tool | Subtract from the selection |
 | `Shift`-drag a selection tool | Add to the selection (CS6's own binding) |
 | Click without dragging | Deselect (for Rectangular / Elliptical) |
+| Right-click with a selection tool | CS6's marquee context menu |
 
 Zoom steps through CS6's own sequence (0.67%, 1%, 1.67%, … 1600%, 3200%) rather
 than a smooth ramp. Below 200% the canvas is drawn smoothed; at 200% and above
 it switches to nearest-neighbour so individual pixels stay crisp, exactly as
 Photoshop does.
+
+The **selection context menu** carries CS6's entries in CS6's grouping:
+Deselect · Select Inverse · Feather… · Refine Edge… │ Save Selection… · Make
+Work Path… │ Layer Via Copy · Layer Via Cut · New Layer… │ Free Transform ·
+Transform Selection │ Fill… · Stroke… │ Last Filter · Fade…. The five that the
+engine can do reuse the menu bar's own actions, so they show the same
+shortcuts; the rest are listed but disabled, keeping the menu's shape without
+pretending to work. It is drawn in the app's dark theme rather than CS6's
+native light one, so it matches the rest of the UI.
 
 **Marching ants** trace the selection mask's real 50% coverage contour, so an
 elliptical selection reads as an ellipse and a subtracted region shows its

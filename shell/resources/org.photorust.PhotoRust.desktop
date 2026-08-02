@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=PhotoRust
+GenericName=Image Editor
+Comment=Layer-based image editor with a Photoshop CS6 interface
+# Resolved against the desktop icon theme: the installed
+# share/icons/hicolor/scalable/apps/photorust.svg. Deliberately not an absolute
+# path, so the icon scales to whatever size the shell asks for.
+Icon=photorust
+Exec=photorust %f
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;Photography;
+MimeType=image/vnd.adobe.photoshop;image/png;image/jpeg;image/tiff;image/bmp;image/webp;
+Keywords=photo;image;editor;paint;layers;psd;
+StartupNotify=true
+# Must match QGuiApplication::setDesktopFileName() in main.cpp, which is how
+# Wayland ties a running window back to this entry.
+StartupWMClass=photorust

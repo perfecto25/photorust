@@ -2,13 +2,14 @@
 
 #include <QActionGroup>
 #include <QHash>
-#include <QToolBar>
 #include <QToolButton>
+#include <QWidget>
 
 #include "ToolId.h"
 
 class CommandRegistry;
 class ColorSwatchWidget;
+class QGridLayout;
 class QTimer;
 
 /// A tool strip button.
@@ -44,14 +45,24 @@ private:
     bool m_flyoutShown = false;
 };
 
-/// The single-column tool strip down the left edge.
+/// The tool strip: the contents of CS6's Tools panel.
 ///
 /// Buttons are mutually exclusive and bound to the `tool.*` commands in the
 /// registry, so their shortcuts come from `shortcuts.json` rather than being
 /// hard-coded here (CLAUDE.md §9). Below the tools sit the CS6 footer: the
 /// foreground/background swatch, the Quick Mask toggle and the screen-mode
 /// button.
-class ToolStrip : public QToolBar
+///
+/// This is a plain widget; `MainWindow` puts it in a `QDockWidget` with a
+/// `PanelHeader` for its title bar, which is what makes it draggable, dockable
+/// on either side, floatable and closable — CS6's Tools panel exactly. It was
+/// a `QToolBar` before: that gave docking for free but Qt does not paint a
+/// toolbar's drag grip while it floats, so a floated panel had nothing left to
+/// grab and could not be moved again.
+///
+/// The buttons live in a grid so the panel can reflow between one and two
+/// columns.
+class ToolStrip : public QWidget
 {
     Q_OBJECT
 
@@ -59,6 +70,11 @@ public:
     explicit ToolStrip(CommandRegistry *registry, QWidget *parent = nullptr);
 
     ToolId activeTool() const { return m_activeTool; }
+
+    /// How many columns of tools the strip shows: 1 or 2.
+    int columnCount() const { return m_columns; }
+    /// Reflow the strip. Values other than 1 or 2 are clamped.
+    void setColumnCount(int columns);
 
     /// The active variant of a tool, indexing its `subTools()` list.
     /// Each tool remembers its own last-used variant, as CS6 does.
@@ -86,6 +102,8 @@ signals:
     /// `subTools()` list.
     void toolChanged(ToolId tool, int variant);
     void quickMaskToggled(bool enabled);
+    /// The strip was reflowed between one and two columns.
+    void columnCountChanged(int columns);
 
 private slots:
     /// Open the hidden-tools flyout for a button.
@@ -93,14 +111,35 @@ private slots:
     void onQuickMaskToggled(bool on);
 
 private:
+    /// One cell of the strip: a button, or a group divider that spans the
+    /// whole width and forces the next button onto a new row.
+    struct Entry {
+        QWidget *widget = nullptr;
+        bool divider = false;
+    };
+
     ToolButton *createButton(const ToolInfo &info);
     void createFooter();
+    /// Lay `entries` into `grid` at the current column count.
+    void flow(QGridLayout *grid, const QList<Entry> &entries);
+    /// Reflow both grids and resize the strip to match.
+    void applyColumnCount();
+    /// Size the panel to its current column count.
+    void refitWidth();
     /// Tooltip text in CS6's form: "Brush Tool  (B)".
     QString tooltipFor(const ToolInfo &info, const QKeySequence &shortcut) const;
+    /// Divider widget for a group break.
+    QWidget *createDivider();
 
     CommandRegistry *m_registry = nullptr;
     QActionGroup *m_group = nullptr;
     QHash<ToolId, ToolButton *> m_buttons;
+
+    QGridLayout *m_toolGrid = nullptr;
+    QGridLayout *m_footerGrid = nullptr;
+    QList<Entry> m_toolEntries;
+    QList<Entry> m_footerEntries;
+    int m_columns = 1;
 
     ColorSwatchWidget *m_swatches = nullptr;
     QToolButton *m_quickMask = nullptr;

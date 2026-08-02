@@ -40,4 +40,18 @@ QString quickMaskSvg(bool active);
 /// SVG body for the screen-mode cycle button.
 QString screenModeSvg();
 
+/// SVG body for the close cross on a panel header.
+QString closeSvg();
+
+/// SVG body for the double-chevron at the top of the tool strip, which
+/// switches it between one and two columns. Points right to expand, left to
+/// collapse — the same way CS6's does.
+QString columnToggleSvg(bool pointsLeft);
+
+/// SVG body for one of the options-bar selection combine buttons.
+///
+/// CS6 draws these as two overlapping squares with the resulting region
+/// shaded, so the four read as a set at a glance.
+QString selectionModeSvg(SelectionMode mode);
+
 } // namespace ToolIcons

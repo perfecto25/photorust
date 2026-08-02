@@ -5,6 +5,9 @@
 #include "ToolIcons.h"
 
 #include <QAction>
+#include <QFrame>
+#include <QGridLayout>
+#include <QHBoxLayout>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
@@ -16,6 +19,8 @@ namespace {
 
 /// CS6's tool buttons are 26px square in the single-column layout.
 constexpr int kButtonSize = 26;
+/// Breathing room between the buttons and the panel edge, as CS6 has.
+constexpr int kPanelMargin = 4;
 /// How long a press must be held before the flyout opens.
 constexpr int kHoldMs = 400;
 
@@ -109,32 +114,46 @@ void ToolButton::mouseReleaseEvent(QMouseEvent *event)
 // ================================================================ ToolStrip
 
 ToolStrip::ToolStrip(CommandRegistry *registry, QWidget *parent)
-    : QToolBar(parent)
+    : QWidget(parent)
     , m_registry(registry)
 {
     setObjectName(QStringLiteral("toolStrip"));
-    setWindowTitle(tr("Tools"));
-    setOrientation(Qt::Vertical);
-    setMovable(false);
-    setFloatable(false);
-    setIconSize(QSize(20, 20));
+    // A plain QWidget only paints its stylesheet background once asked to.
+    setAttribute(Qt::WA_StyledBackground, true);
+    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
 
     // Exclusive selection, like a radio group.
     m_group = new QActionGroup(this);
     m_group->setExclusive(true);
 
+    auto *outer = new QVBoxLayout(this);
+    outer->setContentsMargins(kPanelMargin, kPanelMargin, kPanelMargin, kPanelMargin);
+    outer->setSpacing(0);
+
+    m_toolGrid = new QGridLayout;
+    m_toolGrid->setContentsMargins(0, 0, 0, 0);
+    m_toolGrid->setSpacing(0);
+    outer->addLayout(m_toolGrid);
+
+    m_footerGrid = new QGridLayout;
+    m_footerGrid->setContentsMargins(0, 0, 0, 0);
+    m_footerGrid->setSpacing(0);
+    outer->addLayout(m_footerGrid);
+    outer->addStretch(1);
+
     const ToolInfo *table = toolTable();
     for (int i = 0; i < static_cast<int>(ToolId::Count); ++i) {
         const ToolInfo &info = table[i];
         if (info.groupBreak) {
-            addSeparator();
+            m_toolEntries.append({createDivider(), true});
         }
         ToolButton *button = createButton(info);
-        addWidget(button);
+        m_toolEntries.append({button, false});
         m_buttons.insert(info.id, button);
     }
 
     createFooter();
+    applyColumnCount();
     setActiveTool(ToolId::Brush);
 }
 
@@ -147,7 +166,6 @@ QString ToolStrip::tooltipFor(const ToolInfo &info, const QKeySequence &shortcut
     }
     return tip;
 }
-
 ToolButton *ToolStrip::createButton(const ToolInfo &info)
 {
     auto *button = new ToolButton(info.id, this);
@@ -186,18 +204,93 @@ ToolButton *ToolStrip::createButton(const ToolInfo &info)
     return button;
 }
 
+QWidget *ToolStrip::createDivider()
+{
+    auto *divider = new QFrame(this);
+    divider->setObjectName(QStringLiteral("toolStripDivider"));
+    divider->setFrameShape(QFrame::NoFrame);
+    divider->setFixedHeight(5);
+    return divider;
+}
+
+void ToolStrip::flow(QGridLayout *grid, const QList<Entry> &entries)
+{
+    // Take everything out first. The items are layout wrappers, not the
+    // widgets, so the buttons themselves survive the reflow.
+    while (QLayoutItem *item = grid->takeAt(0)) {
+        delete item;
+    }
+
+    // The panel is wider than its button column — the colour swatch sets the
+    // width. An elastic column either side keeps the buttons centred in it
+    // while full-width rows (dividers, the swatch) still reach both edges.
+    const int span = m_columns + 2;
+    for (int c = 0; c < span + 2; ++c) {
+        grid->setColumnStretch(c, (c == 0 || c == span - 1) ? 1 : 0);
+    }
+
+    int row = 0;
+    int column = 0;
+    for (const Entry &entry : entries) {
+        if (entry.divider) {
+            if (column != 0) {
+                ++row;
+                column = 0;
+            }
+            grid->addWidget(entry.widget, row++, 0, 1, span);
+            continue;
+        }
+        grid->addWidget(entry.widget, row, column + 1, Qt::AlignCenter);
+        if (++column >= m_columns) {
+            column = 0;
+            ++row;
+        }
+    }
+}
+
+void ToolStrip::setColumnCount(int columns)
+{
+    const int clamped = qBound(1, columns, 2);
+    if (clamped == m_columns) {
+        return;
+    }
+    m_columns = clamped;
+    applyColumnCount();
+    emit columnCountChanged(m_columns);
+}
+
+void ToolStrip::applyColumnCount()
+{
+    flow(m_toolGrid, m_toolEntries);
+    flow(m_footerGrid, m_footerEntries);
+    refitWidth();
+}
+
+void ToolStrip::refitWidth()
+{
+    // The button column is the floor, not the answer: the colour swatch is
+    // wider than one button and would be clipped to a sliver if the panel were
+    // sized to the buttons alone. CS6's panel is likewise wider than its 26px
+    // buttons.
+    const int swatchWidth = m_swatches ? m_swatches->sizeHint().width() : 0;
+    const int content = qMax(kButtonSize * m_columns, swatchWidth);
+    setFixedWidth(content + 2 * kPanelMargin);
+    updateGeometry();
+}
+
 void ToolStrip::createFooter()
 {
-    addSeparator();
+    m_footerEntries.append({createDivider(), true});
 
-    // Foreground/background swatch, centred as in CS6.
+    // Foreground/background swatch, centred as in CS6. It spans the strip in
+    // either layout, so it goes in as a divider-style full-width row.
     auto *swatchHost = new QWidget(this);
     auto *swatchLayout = new QVBoxLayout(swatchHost);
     swatchLayout->setContentsMargins(0, 4, 0, 4);
     swatchLayout->setSpacing(0);
     m_swatches = new ColorSwatchWidget(swatchHost);
     swatchLayout->addWidget(m_swatches, 0, Qt::AlignHCenter);
-    addWidget(swatchHost);
+    m_footerEntries.append({swatchHost, true});
 
     m_quickMask = new QToolButton(this);
     m_quickMask->setCheckable(true);
@@ -215,7 +308,7 @@ void ToolStrip::createFooter()
         m_quickMask->setToolTip(tr("Edit in Quick Mask Mode"));
     }
     connect(m_quickMask, &QToolButton::toggled, this, &ToolStrip::onQuickMaskToggled);
-    addWidget(m_quickMask);
+    m_footerEntries.append({m_quickMask, false});
 
     m_screenMode = new QToolButton(this);
     m_screenMode->setAutoRaise(true);
@@ -226,7 +319,7 @@ void ToolStrip::createFooter()
     // Screen modes are not implemented; the button holds its place in the
     // strip rather than pretending to switch anything.
     m_screenMode->setEnabled(false);
-    addWidget(m_screenMode);
+    m_footerEntries.append({m_screenMode, false});
 }
 
 bool ToolStrip::quickMaskEnabled() const
@@ -282,8 +375,12 @@ void ToolStrip::showFlyout(ToolId id)
         connect(action, &QAction::triggered, this, [this, id, i] { setActiveTool(id, i); });
     }
 
-    // Photoshop pops the flyout out to the right of the button, top-aligned.
-    menu.exec(button->mapToGlobal(QPoint(button->width(), 0)));
+    // Photoshop pops the flyout clear of the panel's right edge, top-aligned
+    // with the button — so in two-column mode the left column's flyout does
+    // not land on top of the right column.
+    const QPoint stripRight = mapToGlobal(QPoint(width(), 0));
+    const QPoint buttonTop = button->mapToGlobal(QPoint(0, 0));
+    menu.exec(QPoint(stripRight.x(), buttonTop.y()));
 }
 
 int ToolStrip::toolVariant(ToolId tool) const

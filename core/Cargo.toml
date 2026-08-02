@@ -22,3 +22,13 @@ cxx-qt-build = "0.9"
 
 [dev-dependencies]
 approx = "0.5"
+
+# A debug build of the shell still gets an optimised engine.
+#
+# Unoptimised, the per-pixel loops here run roughly 10× slower — enough to turn
+# a feathered marquee or a large filter into a visible stall while debugging
+# the UI, which is exactly when you are least interested in the engine being
+# the slow part. Debug assertions and symbols are kept, so `cargo test` and
+# breakpoints in the core still behave.
+[profile.dev]
+opt-level = 2

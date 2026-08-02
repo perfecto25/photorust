@@ -4,12 +4,15 @@
 #include "panels/ColorPanel.h"
 #include "panels/HistoryPanel.h"
 #include "panels/LayersPanel.h"
+#include "panels/PanelHeader.h"
 #include "shortcuts/CommandRegistry.h"
+#include "tools/ToolIcons.h"
 #include "tools/ToolStrip.h"
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QApplication>
+#include <QButtonGroup>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
@@ -27,6 +30,7 @@
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
@@ -48,6 +52,9 @@ const char *const kSaveFilter =
     "TIFF (*.tif *.tiff);;"
     "All Files (*)";
 
+/// Line-art tint for options-bar icons, matching the tool strip.
+const QColor kOptionsIconColor(0xd4, 0xd4, 0xd4);
+
 } // namespace
 
 MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *parent)
@@ -65,8 +72,7 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     m_canvas = new CanvasView(m_engine, this);
     setCentralWidget(m_canvas);
 
-    m_toolStrip = new ToolStrip(m_registry, this);
-    addToolBar(Qt::LeftToolBarArea, m_toolStrip);
+    createToolPanel();
 
     createOptionsBar();
     createMenus();
@@ -80,6 +86,8 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_toolStrip, &ToolStrip::toolChanged, this, &MainWindow::onToolChanged);
     connect(m_canvas, &CanvasView::cursorMoved, this, &MainWindow::onCursorMoved);
     connect(m_canvas, &CanvasView::zoomChanged, this, &MainWindow::onZoomChanged);
+    connect(m_canvas, &CanvasView::contextMenuRequested, this,
+            &MainWindow::showSelectionContextMenu);
     connect(m_canvas, &CanvasView::colorPicked, this, [this](const QColor &c) {
         m_colorPanel->setForegroundColor(c);
         m_toolStrip->swatches()->setForeground(c);
@@ -324,6 +332,103 @@ void MainWindow::installShortcuts()
     }
 }
 
+void MainWindow::showSelectionContextMenu(const QPoint &globalPos)
+{
+    // CS6's marquee right-click menu, in its order and grouping. Entries the
+    // engine cannot do yet are listed and disabled rather than omitted, the
+    // same way the tool flyouts list their unimplemented variants — the menu
+    // keeps CS6's shape and nothing silently does nothing.
+    struct Entry {
+        const char *commandId; ///< Registry id, or nullptr for a separator.
+        const char *text;      ///< Label, for entries with no command yet.
+        bool implemented;
+    };
+    const Entry entries[] = {
+        {"select.deselect", "Deselect", true},
+        {"select.inverse", "Select Inverse", true},
+        {"select.feather", "Feather...", true},
+        {"select.refineEdge", "Refine Edge...", false},
+        {nullptr, nullptr, false},
+        {nullptr, "Save Selection...", false},
+        {nullptr, "Make Work Path...", false},
+        {nullptr, nullptr, false},
+        {"layer.newViaCopy", "Layer Via Copy", true},
+        {"layer.newViaCut", "Layer Via Cut", false},
+        {"layer.new", "New Layer...", true},
+        {nullptr, nullptr, false},
+        {"edit.freeTransform", "Free Transform", false},
+        {nullptr, "Transform Selection", false},
+        {nullptr, nullptr, false},
+        {"edit.fill", "Fill...", false},
+        {nullptr, "Stroke...", false},
+        {nullptr, nullptr, false},
+        {"filter.last", "Last Filter", false},
+        {"edit.fade", "Fade...", false},
+    };
+
+    QMenu menu(this);
+    menu.setObjectName(QStringLiteral("canvasContextMenu"));
+    // So the disabled entries can say why they are disabled.
+    menu.setToolTipsVisible(true);
+
+    for (const Entry &entry : entries) {
+        if (!entry.commandId && !entry.text) {
+            menu.addSeparator();
+            continue;
+        }
+
+        // An implemented entry reuses the registry's action, so the menu shows
+        // the same shortcut and runs the same handler as the menu bar.
+        if (entry.implemented && entry.commandId) {
+            if (QAction *action = m_registry->action(QLatin1String(entry.commandId))) {
+                menu.addAction(action);
+                continue;
+            }
+        }
+
+        // Not tr(): the label comes from the table above, not a literal, so
+        // there is nothing for lupdate to collect here.
+        QAction *placeholder = menu.addAction(QString::fromUtf8(entry.text));
+        placeholder->setEnabled(false);
+        placeholder->setToolTip(tr("Not implemented yet"));
+    }
+
+    menu.exec(globalPos);
+}
+
+void MainWindow::createToolPanel()
+{
+    m_toolStrip = new ToolStrip(m_registry, this);
+
+    // CS6's Tools panel: dragged by its header, dockable on either side,
+    // floatable and closable. A QDockWidget with a PanelHeader for its title
+    // bar gives all four; a QToolBar could not, because Qt stops painting a
+    // toolbar's drag grip once it floats, stranding the panel.
+    m_toolsDock = new QDockWidget(tr("Tools"), this);
+    m_toolsDock->setObjectName(QStringLiteral("toolsDock"));
+    m_toolsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    m_toolsDock->setFeatures(QDockWidget::DockWidgetMovable
+                             | QDockWidget::DockWidgetFloatable
+                             | QDockWidget::DockWidgetClosable);
+
+    auto *header = new PanelHeader(m_toolsDock);
+    m_toolsDock->setTitleBarWidget(header);
+    m_toolsDock->setWidget(m_toolStrip);
+    addDockWidget(Qt::LeftDockWidgetArea, m_toolsDock);
+
+    connect(header, &PanelHeader::closeClicked, m_toolsDock, &QWidget::close);
+    connect(header, &PanelHeader::collapseClicked, this, [this] {
+        m_toolStrip->setColumnCount(m_toolStrip->columnCount() == 1 ? 2 : 1);
+    });
+    connect(m_toolStrip, &ToolStrip::columnCountChanged, this,
+            [this, header](int columns) {
+                header->setCollapsePointsLeft(columns == 2);
+                // The dock area caches its extent, so ask for the new one.
+                resizeDocks({m_toolsDock}, {m_toolStrip->sizeHint().width()},
+                            Qt::Horizontal);
+            });
+}
+
 void MainWindow::createOptionsBar()
 {
     m_optionsBar = new QToolBar(tr("Options"), this);
@@ -397,15 +502,33 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
 
         pushBrushSettings();
     } else if (toolSelects(tool)) {
+        addSelectionModeButtons();
+
+        // Feather, as CS6 places it: straight after the combine buttons. The
+        // value applies to selections made from now on, not to the current
+        // one — Select ▸ Feather is what softens an existing selection.
+        m_optionsBar->addWidget(new QLabel(tr("Feather:"), m_optionsBar));
+        auto *feather = new QSpinBox(m_optionsBar);
+        feather->setRange(0, 1000);
+        feather->setValue(m_featherRadius);
+        feather->setSuffix(tr(" px"));
+        feather->setFixedWidth(72);
+        feather->setToolTip(tr("Soften the edge of new selections"));
+        m_optionsBar->addWidget(feather);
+        connect(feather, &QSpinBox::valueChanged, this, [this](int value) {
+            m_featherRadius = value;
+            m_canvas->setFeatherRadius(value);
+        });
+        m_canvas->setFeatherRadius(m_featherRadius);
+        m_optionsBar->addSeparator();
+
         const bool lineSelect = tool == ToolId::Marquee
             && (static_cast<MarqueeType>(variant) == MarqueeType::SingleRow
                 || static_cast<MarqueeType>(variant) == MarqueeType::SingleColumn);
         m_optionsBar->addWidget(new QLabel(
             lineSelect
-                ? tr("Click to select a line    Ctrl+Shift = add to selection    "
-                     "Ctrl+Alt = subtract")
-                : tr("Ctrl+Shift = add to selection    Ctrl+Alt = subtract    "
-                     "Click = deselect"),
+                ? tr("Click to select a line    Ctrl+Shift = add    Ctrl+Alt = subtract")
+                : tr("Ctrl+Shift = add    Ctrl+Alt = subtract    Click = deselect"),
             m_optionsBar));
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(
@@ -420,6 +543,56 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     auto *spacer = new QWidget(m_optionsBar);
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_optionsBar->addWidget(spacer);
+}
+
+void MainWindow::addSelectionModeButtons()
+{
+    // CS6 opens the selection tools' options bar with these four buttons,
+    // before Feather and the rest. They are a radio set: the chosen mode
+    // persists across tool switches, and holding a modifier overrides it for
+    // one drag without moving the checked button (see
+    // CanvasView::effectiveSelectionMode).
+    struct Entry {
+        SelectionMode mode;
+        QString hint;
+    };
+    const Entry entries[] = {
+        {SelectionMode::New, QString()},
+        {SelectionMode::Add, tr("Ctrl+Shift-drag")},
+        {SelectionMode::Subtract, tr("Ctrl+Alt-drag")},
+        {SelectionMode::Intersect, tr("Ctrl+Shift+Alt-drag")},
+    };
+
+    auto *group = new QButtonGroup(m_optionsBar);
+    group->setExclusive(true);
+
+    for (const Entry &entry : entries) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setIcon(ToolIcons::fromSvgBody(ToolIcons::selectionModeSvg(entry.mode),
+                                               kOptionsIconColor));
+        button->setIconSize(QSize(20, 20));
+        button->setChecked(entry.mode == m_selectionMode);
+
+        const QString name = selectionModeName(entry.mode);
+        button->setToolTip(entry.hint.isEmpty()
+                               ? name
+                               : QStringLiteral("%1 (%2)").arg(name, entry.hint));
+        button->setStatusTip(button->toolTip());
+
+        group->addButton(button, static_cast<int>(entry.mode));
+        m_optionsBar->addWidget(button);
+    }
+
+    connect(group, &QButtonGroup::idClicked, this, [this](int id) {
+        m_selectionMode = static_cast<SelectionMode>(id);
+        m_canvas->setSelectionMode(m_selectionMode);
+    });
+
+    // Keep the canvas in step even if the bar was rebuilt for another tool.
+    m_canvas->setSelectionMode(m_selectionMode);
+    m_optionsBar->addSeparator();
 }
 
 void MainWindow::pushBrushSettings()
@@ -437,6 +610,13 @@ void MainWindow::pushBrushSettings()
 void MainWindow::createDocks()
 {
     QMenu *windowMenu = menuBar()->findChild<QMenu *>(QStringLiteral("windowMenu"));
+
+    // The tool panel closes from the × on its own header, so it needs an entry
+    // here to come back — same as CS6's Window ▸ Tools.
+    if (windowMenu && m_toolsDock) {
+        windowMenu->addAction(m_toolsDock->toggleViewAction());
+        windowMenu->addSeparator();
+    }
 
     auto addPanel = [&](const QString &title, QWidget *content, Qt::DockWidgetArea area,
                         const QString &commandId = {}) {

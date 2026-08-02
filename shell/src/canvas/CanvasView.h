@@ -54,6 +54,18 @@ public:
     void setMarqueeType(MarqueeType type);
     MarqueeType marqueeType() const { return m_marqueeType; }
 
+    /// How the next selection combines with the current one — the options
+    /// bar's new/add/subtract/intersect buttons. Modifiers held during a drag
+    /// override this for that drag only, as they do in CS6.
+    void setSelectionMode(SelectionMode mode) { m_selectionMode = mode; }
+    SelectionMode selectionMode() const { return m_selectionMode; }
+
+    /// Feather radius in pixels for new selections — the options bar's
+    /// Feather field. Softens the incoming region only, so it does not
+    /// re-soften what the selection already holds.
+    void setFeatherRadius(int pixels) { m_featherRadius = qMax(0, pixels); }
+    int featherRadius() const { return m_featherRadius; }
+
     /// Re-fetch the composited image from the engine and repaint.
     void refresh();
 
@@ -77,6 +89,10 @@ signals:
     void zoomChanged(double zoom);
     /// The user picked a colour with the eyedropper.
     void colorPicked(const QColor &color);
+    /// Right-click with a selection tool active. `globalPos` is where the
+    /// menu should open. The canvas does not build the menu itself: the
+    /// commands on it belong to the registry, which `MainWindow` owns.
+    void contextMenuRequested(const QPoint &globalPos);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -86,6 +102,7 @@ protected:
     void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
+    void contextMenuEvent(QContextMenuEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void enterEvent(QEnterEvent *event) override;
     void leaveEvent(QEvent *event) override;
@@ -101,8 +118,10 @@ private:
     void updateCursor();
     /// Marching-ants outline of the current selection.
     void paintSelection(QPainter &painter);
+    /// The combine operation for a gesture made with `modifiers` held: the
+    /// options-bar mode unless a modifier overrides it.
+    SelectionMode effectiveSelectionMode(Qt::KeyboardModifiers modifiers) const;
     /// Send the in-progress marquee to the engine.
-    /// `modifiers` picks the combine operation (Shift adds, Alt subtracts).
     void commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers);
     /// True when the active marquee variant is a click rather than a drag.
     bool marqueeIsLineSelect() const;
@@ -118,6 +137,8 @@ private:
 
     ToolId m_tool = ToolId::Brush;
     MarqueeType m_marqueeType = MarqueeType::Rectangular;
+    SelectionMode m_selectionMode = SelectionMode::New;
+    int m_featherRadius = 0;
 
     // -- interaction state --
     bool m_dragging = false;
@@ -130,6 +151,9 @@ private:
     /// Live marquee rectangle while dragging a selection tool.
     QRectF m_marquee;
     bool m_marqueeActive = false;
+    /// Modifiers held when the selection drag began. Photoshop samples these
+    /// at press, so letting go of Shift mid-drag does not change the mode.
+    Qt::KeyboardModifiers m_gestureModifiers = Qt::NoModifier;
 
     /// Animation phase for the marching ants.
     int m_antsOffset = 0;
