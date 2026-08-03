@@ -54,4 +54,16 @@ QString columnToggleSvg(bool pointsLeft);
 /// shaded, so the four read as a set at a glance.
 QString selectionModeSvg(SelectionMode mode);
 
+/// SVG body for the Info panel's cursor-position glyph: CS6's small crosshair
+/// with an origin corner.
+QString crosshairSvg();
+
+/// SVG body for the Info panel's selection-size glyph: a dashed rectangle with
+/// a corner arrow.
+QString boundsSvg();
+
+/// SVG body for the Info panel's angle glyph: the protractor CS6 shows beside
+/// the ruler's A and L readouts.
+QString protractorSvg();
+
 } // namespace ToolIcons

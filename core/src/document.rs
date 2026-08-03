@@ -4,6 +4,7 @@
 //! brush stroke, and is the single object the bridge drives. Every mutating
 //! method that a user would recognise as "an action" records a history state.
 
+use crate::annotation::Annotations;
 use crate::blend::BlendMode;
 use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
@@ -11,7 +12,9 @@ use crate::compositor;
 use crate::filters::{Adjustment, Filter};
 use crate::history::History;
 use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
+use crate::perspective;
 use crate::selection::{Selection, SelectionOp};
+use crate::slice::{Slice, SliceSet};
 
 /// One open image.
 pub struct Document {
@@ -20,6 +23,13 @@ pub struct Document {
     stack: LayerStack,
     selection: Selection,
     history: History,
+    /// Web-export slices. Not part of a history state: Photoshop does not put
+    /// slice edits on the History panel either.
+    slices: SliceSet,
+    /// Colour samplers, notes, count markers and the ruler. Like slices, these
+    /// annotate the document without editing it, and stay off the History
+    /// panel for the same reason.
+    annotations: Annotations,
 
     /// Layer the tools act on.
     active_layer: LayerId,
@@ -43,13 +53,15 @@ impl Document {
         let id = stack.allocate_id();
         stack.push(Layer::new_filled(id, "Background", width, height, background));
 
-        let history = History::new(stack.clone());
+        let history = History::new(stack.clone(), (width, height));
         Self {
             width,
             height,
             stack,
             selection: Selection::new(width, height),
             history,
+            slices: SliceSet::new(),
+            annotations: Annotations::new(),
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
@@ -64,7 +76,7 @@ impl Document {
         if let Some(l) = doc.stack.get_mut(0) {
             l.name = "Layer 1".to_string();
         }
-        doc.history = History::new(doc.stack.clone());
+        doc.history = History::new(doc.stack.clone(), (doc.width, doc.height));
         doc
     }
 
@@ -77,13 +89,15 @@ impl Document {
         layer.pixels = pixels;
         stack.push(layer);
 
-        let history = History::new(stack.clone());
+        let history = History::new(stack.clone(), (width, height));
         Self {
             width,
             height,
             stack,
             selection: Selection::new(width, height),
             history,
+            slices: SliceSet::new(),
+            annotations: Annotations::new(),
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
@@ -374,6 +388,23 @@ impl Document {
         self.selection.apply_ellipse_feathered(rect, op, feather);
     }
 
+    /// Combine a freehand/polygonal region — the lasso family. `points` are
+    /// document-space vertices; the shape closes back to the first.
+    pub fn select_polygon(&mut self, points: &[(f32, f32)], op: SelectionOp, feather: u32) {
+        self.selection.apply_polygon_feathered(points, op, feather);
+    }
+
+    /// Combine a coverage mask produced by the magic wand or quick selector.
+    pub fn select_mask(&mut self, coverage: &[u8], op: SelectionOp, feather: u32) {
+        self.selection.apply_mask_feathered(coverage, op, feather);
+    }
+
+    /// Replace the selection outright, for the live preview a Quick Selection
+    /// drag paints as it goes.
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
+    }
+
     pub fn select_all(&mut self) {
         self.selection.select_all();
     }
@@ -617,6 +648,147 @@ impl Document {
         self.commit("Canvas Size");
     }
 
+    /// Crop the document to `rect`, in document coordinates.
+    ///
+    /// Every layer moves with the canvas rather than being resampled: only the
+    /// origin changes, so nothing is resized or blurred. `delete_cropped`
+    /// mirrors CS6's checkbox — when set, pixels now outside the canvas are
+    /// discarded; when clear they are kept, hanging off the edge, and come back
+    /// if the canvas is enlarged again.
+    ///
+    /// A rect that misses the canvas entirely, or has no area, is ignored.
+    pub fn crop(&mut self, rect: Rect, delete_cropped: bool) {
+        let rect = rect.intersect(&Rect::from_size(self.width, self.height));
+        if rect.is_empty() {
+            return;
+        }
+
+        for layer in self.stack.iter_mut() {
+            layer.offset = (layer.offset.0 - rect.x, layer.offset.1 - rect.y);
+
+            if !delete_cropped || layer.pixels.is_empty() {
+                continue;
+            }
+
+            // The part of this layer still on the canvas, in the layer's own
+            // coordinates.
+            let canvas = Rect::from_size(rect.width, rect.height);
+            let bounds = Rect::new(
+                layer.offset.0,
+                layer.offset.1,
+                layer.pixels.width(),
+                layer.pixels.height(),
+            );
+            let keep = bounds.intersect(&canvas);
+            if keep.is_empty() {
+                // Nothing of this layer survives. Keep the layer — deleting it
+                // would be a structural change the user did not ask for — but
+                // drop its pixels.
+                layer.pixels = Pixmap::new(0, 0);
+                layer.mask = None;
+                layer.offset = (0, 0);
+                continue;
+            }
+
+            let local = Rect::new(
+                keep.x - layer.offset.0,
+                keep.y - layer.offset.1,
+                keep.width,
+                keep.height,
+            );
+            layer.pixels = layer.pixels.crop(local);
+            // The mask is stored at the same size and origin as the pixels, so
+            // it has to be cropped identically or the two fall out of step.
+            if let Some(mask) = layer.mask.as_ref() {
+                layer.mask = Some(mask.crop(local));
+            }
+            layer.offset = (keep.x, keep.y);
+        }
+
+        self.width = rect.width;
+        self.height = rect.height;
+        self.selection.crop(rect);
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(rect.width, rect.height);
+        }
+        self.commit("Crop");
+    }
+
+    /// Straighten a quadrilateral into a rectangle and crop to it — the
+    /// Perspective Crop tool.
+    ///
+    /// `quad` is the four corners in document coordinates, ordered top-left,
+    /// top-right, bottom-right, bottom-left. Unlike an ordinary crop this
+    /// *resamples*: every layer is warped through the same homography, so the
+    /// stack stays in register.
+    ///
+    /// Returns false, changing nothing, for a degenerate quad.
+    pub fn perspective_crop(&mut self, quad: &[(f32, f32); 4]) -> bool {
+        let (width, height) = perspective::suggested_size(quad);
+        let Some(map) = perspective::inverse_map(quad, width, height) else {
+            return false;
+        };
+
+        for layer in self.stack.iter_mut() {
+            // Adjustment and fill layers have no pixels to warp; they are
+            // evaluated over whatever canvas they end up on.
+            if layer.pixels.is_empty() {
+                continue;
+            }
+            layer.pixels = perspective::warp(&layer.pixels, layer.offset, &map, width, height);
+            if let Some(mask) = layer.mask.as_ref() {
+                layer.mask = Some(perspective::warp(mask, layer.offset, &map, width, height));
+            }
+            // The warp resolves everything into canvas coordinates, so no
+            // layer hangs off the edge any more.
+            layer.offset = (0, 0);
+        }
+
+        let warped = perspective::warp_mask(
+            self.selection.as_bytes(),
+            self.width,
+            self.height,
+            &map,
+            width,
+            height,
+        );
+        if let Some(selection) = Selection::from_coverage(width, height, warped) {
+            self.selection = selection;
+        }
+
+        self.width = width;
+        self.height = height;
+        self.stroke = None;
+        self.commit("Perspective Crop");
+        true
+    }
+
+    // -- annotations ----------------------------------------------------------
+
+    pub fn annotations(&self) -> &Annotations {
+        &self.annotations
+    }
+
+    pub fn annotations_mut(&mut self) -> &mut Annotations {
+        &mut self.annotations
+    }
+
+    // -- slices ---------------------------------------------------------------
+
+    pub fn slices(&self) -> &SliceSet {
+        &self.slices
+    }
+
+    pub fn slices_mut(&mut self) -> &mut SliceSet {
+        &mut self.slices
+    }
+
+    /// The full slice list — user slices plus the auto slices filling the rest
+    /// of the canvas — numbered in reading order.
+    pub fn resolved_slices(&self) -> Vec<Slice> {
+        self.slices.resolve(Rect::from_size(self.width, self.height))
+    }
+
     // -- compositing --------------------------------------------------------
 
     /// Composite the whole document.
@@ -653,8 +825,10 @@ impl Document {
         self.stroke = None;
         self.stroke_undo_base = None;
 
-        if let Some(stack) = self.history.undo() {
-            self.stack = stack.clone();
+        if let Some(state) = self.history.undo() {
+            let (stack, size) = (state.stack.clone(), state.size);
+            self.stack = stack;
+            self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -667,8 +841,10 @@ impl Document {
         self.stroke = None;
         self.stroke_undo_base = None;
 
-        if let Some(stack) = self.history.redo() {
-            self.stack = stack.clone();
+        if let Some(state) = self.history.redo() {
+            let (stack, size) = (state.stack.clone(), state.size);
+            self.stack = stack;
+            self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -682,8 +858,10 @@ impl Document {
         self.stroke = None;
         self.stroke_undo_base = None;
 
-        if let Some(stack) = self.history.jump_to(index) {
-            self.stack = stack.clone();
+        if let Some(state) = self.history.jump_to(index) {
+            let (stack, size) = (state.stack.clone(), state.size);
+            self.stack = stack;
+            self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -694,8 +872,23 @@ impl Document {
 
     /// Record the current stack as a new history state.
     pub fn commit(&mut self, name: impl Into<String>) {
-        self.history.push(name, self.stack.clone());
+        self.history.push(name, self.stack.clone(), (self.width, self.height));
         self.dirty = true;
+    }
+
+    /// Adopt a canvas size restored from history.
+    ///
+    /// Crop and Canvas Size change the dimensions, so stepping across one of
+    /// those states has to bring the selection and any live stroke buffer with
+    /// it or they are left sized for a document that no longer exists.
+    fn restore_size(&mut self, size: (u32, u32)) {
+        if (self.width, self.height) == size {
+            return;
+        }
+        self.width = size.0;
+        self.height = size.1;
+        self.selection.resize(size.0, size.1);
+        self.stroke = None;
     }
 
     /// After restoring a snapshot the active layer may no longer exist.
@@ -1026,6 +1219,179 @@ mod tests {
         d.active_layer_mut().unwrap().lock_position = true;
         d.offset_layer(id, 4, 4);
         assert_eq!(d.layers().by_id(id).unwrap().offset, (0, 0));
+    }
+
+    #[test]
+    fn crop_resizes_the_canvas_and_keeps_the_right_pixels() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        // Mark one pixel so we can tell whether the right region survived.
+        d.active_layer_mut().unwrap().pixels.set(20, 20, Rgba8::BLACK);
+
+        d.crop(Rect::new(16, 16, 8, 8), true);
+
+        assert_eq!(d.size(), (8, 8));
+        assert_eq!(d.composite().width(), 8);
+        // (20, 20) in the old document is (4, 4) in the new one.
+        assert_eq!(d.composite().get(4, 4), Rgba8::BLACK);
+        assert_eq!(d.composite().get(0, 0), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn crop_moves_the_selection_with_the_canvas() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.select_rect(Rect::new(16, 16, 8, 8), SelectionOp::Replace, 0);
+        d.crop(Rect::new(16, 16, 8, 8), true);
+
+        assert_eq!(d.selection().width(), 8);
+        assert_eq!(d.selection().coverage_at(0, 0), 1.0, "selection did not move with the crop");
+        assert_eq!(d.selection().coverage_at(7, 7), 1.0);
+    }
+
+    #[test]
+    fn crop_without_deleting_keeps_pixels_off_canvas() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.active_layer_mut().unwrap().pixels.set(2, 2, Rgba8::BLACK);
+        d.crop(Rect::new(16, 16, 8, 8), false);
+
+        // The layer still holds its full 32×32 buffer, now hanging off the
+        // top-left of the smaller canvas.
+        let layer = d.active_layer().unwrap();
+        assert_eq!(layer.pixels.width(), 32);
+        assert_eq!(layer.offset, (-16, -16));
+
+        // Deleting instead trims the buffer to the canvas.
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.crop(Rect::new(16, 16, 8, 8), true);
+        assert_eq!(d.active_layer().unwrap().pixels.width(), 8);
+        assert_eq!(d.active_layer().unwrap().offset, (0, 0));
+    }
+
+    #[test]
+    fn crop_clamps_to_the_canvas() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        // A rect running off the bottom-right takes only what exists.
+        d.crop(Rect::new(24, 24, 100, 100), true);
+        assert_eq!(d.size(), (8, 8));
+    }
+
+    #[test]
+    fn a_degenerate_crop_is_ignored() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.crop(Rect::new(4, 4, 0, 0), true);
+        assert_eq!(d.size(), (32, 32), "an empty rect cropped the document");
+        d.crop(Rect::new(100, 100, 8, 8), true);
+        assert_eq!(d.size(), (32, 32), "an off-canvas rect cropped the document");
+    }
+
+    #[test]
+    fn crop_is_undoable() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.crop(Rect::new(8, 8, 16, 16), true);
+        assert_eq!(d.size(), (16, 16));
+        d.undo();
+        assert_eq!(d.size(), (32, 32), "undo did not restore the canvas");
+    }
+
+    #[test]
+    fn crop_keeps_a_layer_mask_aligned_with_its_pixels() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        let id = d.active_layer_id();
+        d.add_layer_mask(id, true);
+        d.crop(Rect::new(8, 8, 16, 16), true);
+
+        let layer = d.active_layer().unwrap();
+        let mask = layer.mask.as_ref().expect("the mask was dropped");
+        assert_eq!(mask.width(), layer.pixels.width());
+        assert_eq!(mask.height(), layer.pixels.height());
+    }
+
+    #[test]
+    fn perspective_crop_straightens_and_resizes() {
+        let mut d = Document::new(64, 64, Rgba8::WHITE);
+        // A keystoned quad: the top edge narrower than the bottom.
+        let quad = [(20.0, 10.0), (44.0, 10.0), (56.0, 50.0), (8.0, 50.0)];
+        assert!(d.perspective_crop(&quad));
+
+        // 48 wide (the longer, bottom edge) and hypot(12, 40) ≈ 41.8 tall.
+        assert_eq!(d.size(), (48, 42));
+        assert_eq!(d.composite().width(), 48);
+        assert_eq!(d.selection().width(), 48);
+    }
+
+    #[test]
+    fn perspective_crop_pulls_the_marked_region_to_the_corners() {
+        let mut d = Document::new(64, 64, Rgba8::WHITE);
+        // Mark the four corners of the quad we are about to straighten; each
+        // should end up at the matching corner of the result.
+        d.active_layer_mut().unwrap().pixels.set(20, 10, Rgba8::BLACK);
+        d.active_layer_mut().unwrap().pixels.set(43, 10, Rgba8::BLACK);
+
+        let quad = [(20.0, 10.0), (44.0, 10.0), (44.0, 50.0), (20.0, 50.0)];
+        assert!(d.perspective_crop(&quad));
+
+        // An axis-aligned quad is just a crop, so this is exact.
+        assert_eq!(d.size(), (24, 40));
+        assert_eq!(d.composite().get(0, 0), Rgba8::BLACK);
+        assert_eq!(d.composite().get(23, 0), Rgba8::BLACK);
+        assert_eq!(d.composite().get(12, 20), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_degenerate_perspective_crop_is_refused() {
+        let mut d = Document::new(64, 64, Rgba8::WHITE);
+        // All four corners on one line: no homography exists.
+        let line = [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)];
+        assert!(!d.perspective_crop(&line));
+        assert_eq!(d.size(), (64, 64), "the document changed anyway");
+    }
+
+    #[test]
+    fn perspective_crop_is_undoable() {
+        let mut d = Document::new(64, 64, Rgba8::WHITE);
+        let quad = [(20.0, 10.0), (44.0, 10.0), (56.0, 50.0), (8.0, 50.0)];
+        d.perspective_crop(&quad);
+        assert_ne!(d.size(), (64, 64));
+
+        d.undo();
+        assert_eq!(d.size(), (64, 64), "undo did not restore the canvas");
+        assert_eq!(d.selection().width(), 64);
+    }
+
+    #[test]
+    fn perspective_crop_keeps_every_layer_in_register() {
+        let mut d = Document::new(64, 64, Rgba8::WHITE);
+        d.add_layer(None);
+        let id = d.active_layer_id();
+        d.add_layer_mask(id, true);
+
+        let quad = [(20.0, 10.0), (44.0, 10.0), (56.0, 50.0), (8.0, 50.0)];
+        assert!(d.perspective_crop(&quad));
+
+        let (w, h) = d.size();
+        for layer in d.layers().iter() {
+            assert_eq!(layer.offset, (0, 0), "layer {} kept an offset", layer.name);
+            assert_eq!(layer.pixels.width(), w);
+            assert_eq!(layer.pixels.height(), h);
+            if let Some(mask) = layer.mask.as_ref() {
+                assert_eq!(mask.width(), w, "mask fell out of step with its pixels");
+                assert_eq!(mask.height(), h);
+            }
+        }
+    }
+
+    #[test]
+    fn stepping_across_a_crop_resizes_the_selection_too() {
+        // The selection is sized to the canvas, so a history step that changes
+        // the canvas has to bring it along or the two disagree.
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        d.crop(Rect::new(8, 8, 16, 16), true);
+        assert_eq!(d.selection().width(), 16);
+
+        d.undo();
+        assert_eq!(d.selection().width(), 32, "selection kept the cropped size");
+        d.redo();
+        assert_eq!(d.size(), (16, 16), "redo did not re-apply the crop");
+        assert_eq!(d.selection().width(), 16);
     }
 
     #[test]

@@ -13,13 +13,16 @@
 //! what the user sees in the Layers panel. The engine stores the stack the
 //! other way up, so every index is flipped at this boundary and nowhere else.
 
+use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
 use crate::brush::Brush;
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::document::Document;
 use crate::filters::{Adjustment, Filter};
 use crate::layer::LayerId;
-use crate::selection::SelectionOp;
+use crate::magnetic::EdgeMap;
+use crate::selection::{Selection, SelectionOp};
+use crate::wand::{self, QuickSelector};
 // `rust_mut()` on a generated QObject comes from this trait.
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QColor, QImage, QImageFormat, QString};
@@ -35,6 +38,11 @@ pub mod ffi {
 
         include!("cxx-qt-lib/qcolor.h");
         type QColor = cxx_qt_lib::QColor;
+
+        include!("cxx-qt-lib/qvector.h");
+        /// Carries lasso vertices in. Qt's own container, so the shell builds
+        /// it directly and nothing is copied into a Rust `Vec` on the way.
+        type QVector_f32 = cxx_qt_lib::QVector<f32>;
     }
 
     unsafe extern "RustQt" {
@@ -112,10 +120,177 @@ pub mod ffi {
         #[cxx_name = "previewImage"]
         fn preview_image(self: &Engine) -> QImage;
 
+        /// Memory footprint as `[flattened, withLayers]` in bytes — the two
+        /// numbers behind the Info panel's "Doc:" line.
+        #[qinvokable]
+        #[cxx_name = "documentSizeBytes"]
+        fn document_size_bytes(self: &Engine) -> Vec<f64>;
+
         /// Resize the canvas without scaling the content.
         #[qinvokable]
         #[cxx_name = "resizeCanvas"]
         fn resize_canvas(self: Pin<&mut Engine>, width: i32, height: i32);
+
+        /// Straighten a quadrilateral into a rectangle and crop to it — the
+        /// Perspective Crop tool.
+        ///
+        /// `corners` is eight floats: x,y for top-left, top-right,
+        /// bottom-right, bottom-left, in document coordinates. Returns false
+        /// for a degenerate quad, having changed nothing.
+        #[qinvokable]
+        #[cxx_name = "perspectiveCrop"]
+        fn perspective_crop(self: Pin<&mut Engine>, corners: &QVector_f32) -> bool;
+
+        /// Crop to a rectangle in document coordinates.
+        ///
+        /// `deleteCropped` mirrors CS6's checkbox: when false the pixels
+        /// outside the new canvas are kept, hanging off the edge, and reappear
+        /// if the canvas is enlarged again.
+        #[qinvokable]
+        #[cxx_name = "cropTo"]
+        fn crop_to(
+            self: Pin<&mut Engine>,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            delete_cropped: bool,
+        );
+    }
+
+    // -- annotations -----------------------------------------------------------
+    //
+    // Colour samplers, notes and count markers are all points, so they share
+    // one set of calls keyed by `kind` (0 = colour sampler, 1 = note,
+    // 2 = count) rather than three near-identical families. The ruler is a
+    // line and gets its own.
+    unsafe extern "RustQt" {
+        #[qinvokable]
+        #[cxx_name = "markerCount"]
+        fn marker_count(self: &Engine, kind: i32) -> i32;
+
+        /// One marker as `[x, y]`, or empty for an out-of-range index.
+        #[qinvokable]
+        #[cxx_name = "markerAt"]
+        fn marker_at(self: &Engine, kind: i32, index: i32) -> Vec<i32>;
+
+        /// Place a marker, returning its index or -1 if the kind is full.
+        /// Only colour samplers have a limit — four, as in Photoshop.
+        #[qinvokable]
+        #[cxx_name = "addMarker"]
+        fn add_marker(self: Pin<&mut Engine>, kind: i32, x: i32, y: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "moveMarker"]
+        fn move_marker(self: Pin<&mut Engine>, kind: i32, index: i32, x: i32, y: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "removeMarker"]
+        fn remove_marker(self: Pin<&mut Engine>, kind: i32, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "clearMarkers"]
+        fn clear_markers(self: Pin<&mut Engine>, kind: i32);
+
+        /// The marker of `kind` within `radius` document pixels, nearest
+        /// first, or -1. The shell scales `radius` by zoom so the grab area
+        /// stays a constant size on screen.
+        #[qinvokable]
+        #[cxx_name = "markerNear"]
+        fn marker_near(self: &Engine, kind: i32, x: i32, y: i32, radius: f32) -> i32;
+
+        /// A note's text. Empty for the other marker kinds.
+        #[qinvokable]
+        #[cxx_name = "markerText"]
+        fn marker_text(self: &Engine, kind: i32, index: i32) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "setMarkerText"]
+        fn set_marker_text(self: Pin<&mut Engine>, kind: i32, index: i32, text: &QString) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "hasRuler"]
+        fn has_ruler(self: &Engine) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "setRuler"]
+        fn set_ruler(self: Pin<&mut Engine>, ax: f32, ay: f32, bx: f32, by: f32);
+
+        #[qinvokable]
+        #[cxx_name = "clearRuler"]
+        fn clear_ruler(self: Pin<&mut Engine>);
+
+        /// The ruler's endpoints as `[ax, ay, bx, by]`, or empty.
+        #[qinvokable]
+        #[cxx_name = "rulerLine"]
+        fn ruler_line(self: &Engine) -> Vec<f32>;
+
+        /// Photoshop's readout: `[X, Y, W, H, A, D1]` — origin, deltas, angle
+        /// in degrees and length. Empty when there is no ruler.
+        #[qinvokable]
+        #[cxx_name = "rulerMeasurement"]
+        fn ruler_measurement(self: &Engine) -> Vec<f32>;
+
+        /// An annotation was added, moved, edited or removed.
+        #[qsignal]
+        #[cxx_name = "annotationsChanged"]
+        fn annotations_changed(self: Pin<&mut Engine>);
+    }
+
+    // -- slices --------------------------------------------------------------
+    //
+    // The list the shell sees is the *resolved* one: the user's own slices plus
+    // the auto slices filling the rest of the canvas. It is recomputed on every
+    // query because moving one user slice changes every auto slice around it.
+    unsafe extern "RustQt" {
+        /// Number of slices, user and auto together.
+        #[qinvokable]
+        #[cxx_name = "sliceCount"]
+        fn slice_count(self: &Engine) -> i32;
+
+        /// One slice as `[x, y, width, height, number, userIndex]`, where
+        /// `userIndex` is -1 for an auto slice. Empty for an out-of-range
+        /// index. Packed into one call because the shell reads every field of
+        /// every slice on each repaint.
+        #[qinvokable]
+        #[cxx_name = "sliceAt"]
+        fn slice_at(self: &Engine, index: i32) -> Vec<i32>;
+
+        /// Add a user slice. Returns its index, or -1 if the rect was empty.
+        #[qinvokable]
+        #[cxx_name = "addSlice"]
+        fn add_slice(self: Pin<&mut Engine>, x: i32, y: i32, width: i32, height: i32) -> i32;
+
+        /// Move or resize an existing user slice.
+        #[qinvokable]
+        #[cxx_name = "setUserSlice"]
+        fn set_user_slice(
+            self: Pin<&mut Engine>,
+            index: i32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        ) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "removeUserSlice"]
+        fn remove_user_slice(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "clearSlices"]
+        fn clear_slices(self: Pin<&mut Engine>);
+
+        /// The composite cropped to one slice, ready for the shell to write
+        /// out. The shell owns file writing for everything but `.psd`.
+        #[qinvokable]
+        #[cxx_name = "sliceImage"]
+        fn slice_image(self: &Engine, index: i32) -> QImage;
+
+        /// The slices changed and the canvas should repaint its overlay.
+        #[qsignal]
+        #[cxx_name = "slicesChanged"]
+        fn slices_changed(self: Pin<&mut Engine>);
     }
 
     // -- layers ------------------------------------------------------------
@@ -345,6 +520,92 @@ pub mod ffi {
             feather: i32,
         );
 
+        /// Combine a closed polygon — what the lasso family produces. `points`
+        /// is x,y interleaved in document coordinates; the shape closes back
+        /// to the first vertex. A flat vector rather than a point list keeps
+        /// the bridge to types `cxx` already carries (CLAUDE.md §3).
+        #[qinvokable]
+        #[cxx_name = "selectPolygon"]
+        fn select_polygon(
+            self: Pin<&mut Engine>,
+            points: &QVector_f32,
+            op: i32,
+            feather: i32,
+        );
+
+        /// Build the edge-cost field the Magnetic Lasso snaps to, from the
+        /// current composite. Called once when the gesture starts; the field
+        /// is cached until `endMagnetic`, because rebuilding it per mouse move
+        /// would not be interactive.
+        ///
+        /// `contrast` is CS6's 1–100 Contrast option.
+        #[qinvokable]
+        #[cxx_name = "beginMagnetic"]
+        fn begin_magnetic(self: Pin<&mut Engine>, contrast: i32);
+
+        /// The magnetic wire from one point to another, as flat x,y pairs in
+        /// document coordinates. `width` is CS6's detection width.
+        ///
+        /// Returns the straight line between the points when no edge map is
+        /// live, so a caller that forgot `beginMagnetic` still gets a usable
+        /// path rather than nothing.
+        #[qinvokable]
+        #[cxx_name = "magneticTrace"]
+        fn magnetic_trace(
+            self: &Engine,
+            x0: i32,
+            y0: i32,
+            x1: i32,
+            y1: i32,
+            width: i32,
+        ) -> Vec<i32>;
+
+        /// Release the cached edge field.
+        #[qinvokable]
+        #[cxx_name = "endMagnetic"]
+        fn end_magnetic(self: Pin<&mut Engine>);
+
+        /// Magic Wand: select the pixels matching the one clicked.
+        ///
+        /// `tolerance` is 0–255 per channel, `contiguous` limits it to the
+        /// connected region, `antialias` softens the boundary.
+        #[qinvokable]
+        #[cxx_name = "magicWand"]
+        fn magic_wand(
+            self: Pin<&mut Engine>,
+            x: i32,
+            y: i32,
+            tolerance: i32,
+            contiguous: bool,
+            antialias: bool,
+            op: i32,
+            feather: i32,
+        );
+
+        /// Start a Quick Selection drag: snapshot the selection to combine
+        /// against and build the edge field the dabs grow within.
+        #[qinvokable]
+        #[cxx_name = "beginQuickSelect"]
+        fn begin_quick_select(self: Pin<&mut Engine>, op: i32, feather: i32);
+
+        /// One brush dab of a Quick Selection drag. The selection is updated
+        /// live, so the marching ants follow the brush.
+        #[qinvokable]
+        #[cxx_name = "quickSelectDab"]
+        fn quick_select_dab(
+            self: Pin<&mut Engine>,
+            x: f32,
+            y: f32,
+            radius: f32,
+            subtract: bool,
+        );
+
+        /// Finish a Quick Selection drag, releasing the cached state. The
+        /// selection already holds the result.
+        #[qinvokable]
+        #[cxx_name = "endQuickSelect"]
+        fn end_quick_select(self: Pin<&mut Engine>);
+
         #[qinvokable]
         #[cxx_name = "selectAll"]
         fn select_all(self: Pin<&mut Engine>);
@@ -475,6 +736,18 @@ pub struct EngineRust {
     foreground: Rgba8,
     background: Rgba8,
     erasing: bool,
+    /// Edge field for the Magnetic Lasso, live only for the duration of one
+    /// gesture. `None` the rest of the time so a large document is not paying
+    /// for a float per pixel it is not using.
+    edge_map: Option<EdgeMap>,
+
+    /// Quick Selection state, live only during a drag for the same reason.
+    /// `quick_base` is the selection as it stood when the drag began; every
+    /// dab recombines against it, so a subtract mid-drag can give pixels back.
+    quick_select: Option<QuickSelector>,
+    quick_base: Option<Selection>,
+    quick_op: SelectionOp,
+    quick_feather: u32,
 }
 
 impl Default for EngineRust {
@@ -493,6 +766,11 @@ impl Default for EngineRust {
             foreground: Rgba8::BLACK,
             background: Rgba8::WHITE,
             erasing: false,
+            edge_map: None,
+            quick_select: None,
+            quick_base: None,
+            quick_op: SelectionOp::Replace,
+            quick_feather: 0,
         }
     }
 }
@@ -743,10 +1021,282 @@ impl ffi::Engine {
         }
     }
 
+    // -- annotations ------------------------------------------------------------
+
+    fn marker_count(&self, kind: i32) -> i32 {
+        MarkerKind::from_i32(kind).map_or(0, |k| self.doc.annotations().count(k) as i32)
+    }
+
+    fn marker_at(&self, kind: i32, index: i32) -> Vec<i32> {
+        let Some(kind) = MarkerKind::from_i32(kind) else {
+            return Vec::new();
+        };
+        let Some(marker) = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.doc.annotations().marker(kind, i))
+        else {
+            return Vec::new();
+        };
+        vec![marker.x, marker.y]
+    }
+
+    fn add_marker(mut self: core::pin::Pin<&mut Self>, kind: i32, x: i32, y: i32) -> i32 {
+        let Some(kind) = MarkerKind::from_i32(kind) else {
+            return -1;
+        };
+        let index = self.as_mut().rust_mut().doc.annotations_mut().add(kind, x, y);
+        match index {
+            Some(i) => {
+                self.as_mut().annotations_changed();
+                i as i32
+            }
+            None => -1,
+        }
+    }
+
+    fn move_marker(
+        mut self: core::pin::Pin<&mut Self>,
+        kind: i32,
+        index: i32,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let (Some(kind), Ok(index)) = (MarkerKind::from_i32(kind), usize::try_from(index)) else {
+            return false;
+        };
+        if !self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .annotations_mut()
+            .move_marker(kind, index, x, y)
+        {
+            return false;
+        }
+        self.as_mut().annotations_changed();
+        true
+    }
+
+    fn remove_marker(mut self: core::pin::Pin<&mut Self>, kind: i32, index: i32) -> bool {
+        let (Some(kind), Ok(index)) = (MarkerKind::from_i32(kind), usize::try_from(index)) else {
+            return false;
+        };
+        if !self.as_mut().rust_mut().doc.annotations_mut().remove(kind, index) {
+            return false;
+        }
+        self.as_mut().annotations_changed();
+        true
+    }
+
+    fn clear_markers(mut self: core::pin::Pin<&mut Self>, kind: i32) {
+        let Some(kind) = MarkerKind::from_i32(kind) else {
+            return;
+        };
+        self.as_mut().rust_mut().doc.annotations_mut().clear(kind);
+        self.as_mut().annotations_changed();
+    }
+
+    fn marker_near(&self, kind: i32, x: i32, y: i32, radius: f32) -> i32 {
+        MarkerKind::from_i32(kind)
+            .and_then(|k| self.doc.annotations().marker_at(k, x, y, radius.max(0.0)))
+            .map_or(-1, |i| i as i32)
+    }
+
+    fn marker_text(&self, kind: i32, index: i32) -> QString {
+        MarkerKind::from_i32(kind)
+            .and_then(|k| usize::try_from(index).ok().and_then(|i| self.doc.annotations().marker(k, i)))
+            .map_or_else(QString::default, |m| QString::from(m.text.as_str()))
+    }
+
+    fn set_marker_text(
+        mut self: core::pin::Pin<&mut Self>,
+        kind: i32,
+        index: i32,
+        text: &QString,
+    ) -> bool {
+        let (Some(kind), Ok(index)) = (MarkerKind::from_i32(kind), usize::try_from(index)) else {
+            return false;
+        };
+        let text = text.to_string();
+        if !self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .annotations_mut()
+            .set_text(kind, index, text)
+        {
+            return false;
+        }
+        self.as_mut().annotations_changed();
+        true
+    }
+
+    fn has_ruler(&self) -> bool {
+        self.doc.annotations().ruler().is_some()
+    }
+
+    fn set_ruler(mut self: core::pin::Pin<&mut Self>, ax: f32, ay: f32, bx: f32, by: f32) {
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .annotations_mut()
+            .set_ruler(Ruler::new(ax, ay, bx, by));
+        self.as_mut().annotations_changed();
+    }
+
+    fn clear_ruler(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.annotations_mut().clear_ruler();
+        self.as_mut().annotations_changed();
+    }
+
+    fn ruler_line(&self) -> Vec<f32> {
+        match self.doc.annotations().ruler() {
+            Some(r) => vec![r.ax, r.ay, r.bx, r.by],
+            None => Vec::new(),
+        }
+    }
+
+    fn ruler_measurement(&self) -> Vec<f32> {
+        match self.doc.annotations().ruler() {
+            Some(r) => {
+                let m = r.measure();
+                vec![m.x, m.y, m.width, m.height, m.angle, m.distance]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    // -- slices ---------------------------------------------------------------
+
+    fn slice_count(&self) -> i32 {
+        self.doc.resolved_slices().len() as i32
+    }
+
+    fn slice_at(&self, index: i32) -> Vec<i32> {
+        let slices = self.doc.resolved_slices();
+        let Some(slice) = usize::try_from(index).ok().and_then(|i| slices.get(i)) else {
+            return Vec::new();
+        };
+        vec![
+            slice.rect.x,
+            slice.rect.y,
+            slice.rect.width as i32,
+            slice.rect.height as i32,
+            slice.number as i32,
+            slice.user_index.map_or(-1, |i| i as i32),
+        ]
+    }
+
+    fn add_slice(
+        mut self: core::pin::Pin<&mut Self>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> i32 {
+        let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
+        let index = {
+            let mut rust = self.as_mut().rust_mut();
+            let slices = rust.doc.slices_mut();
+            if !slices.add(rect) {
+                return -1;
+            }
+            slices.len() as i32 - 1
+        };
+        self.as_mut().slices_changed();
+        index
+    }
+
+    fn set_user_slice(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
+        if !self.as_mut().rust_mut().doc.slices_mut().set(index, rect) {
+            return false;
+        }
+        self.as_mut().slices_changed();
+        true
+    }
+
+    fn remove_user_slice(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        if !self.as_mut().rust_mut().doc.slices_mut().remove(index) {
+            return false;
+        }
+        self.as_mut().slices_changed();
+        true
+    }
+
+    fn clear_slices(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.slices_mut().clear();
+        self.as_mut().slices_changed();
+    }
+
+    fn slice_image(&self, index: i32) -> QImage {
+        let slices = self.doc.resolved_slices();
+        let Some(slice) = usize::try_from(index).ok().and_then(|i| slices.get(i)) else {
+            return QImage::default();
+        };
+        pixmap_to_qimage(self.doc.composite().crop(slice.rect))
+    }
+
+    fn document_size_bytes(&self) -> Vec<f64> {
+        let (w, h) = self.doc.size();
+        // Flattened is one RGBA8 buffer; the layered figure is what the stack
+        // actually holds, masks included.
+        let flat = (w as f64) * (h as f64) * 4.0;
+        vec![flat, self.doc.layers().byte_size() as f64]
+    }
+
     fn resize_canvas(mut self: core::pin::Pin<&mut Self>, width: i32, height: i32) {
         let w = width.clamp(1, 30_000) as u32;
         let h = height.clamp(1, 30_000) as u32;
         self.as_mut().rust_mut().doc.resize_canvas(w, h);
+        self.sync();
+    }
+
+    fn perspective_crop(mut self: core::pin::Pin<&mut Self>, corners: &ffi::QVector_f32) -> bool {
+        if corners.len() != 8 {
+            return false;
+        }
+        let at = |i| corners.get(i).copied().unwrap_or(0.0);
+        let quad = [
+            (at(0), at(1)),
+            (at(2), at(3)),
+            (at(4), at(5)),
+            (at(6), at(7)),
+        ];
+
+        if !self.as_mut().rust_mut().doc.perspective_crop(&quad) {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
+    fn crop_to(
+        mut self: core::pin::Pin<&mut Self>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        delete_cropped: bool,
+    ) {
+        let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
+        self.as_mut().rust_mut().doc.crop(rect, delete_cropped);
+        // `sync` covers the rest: the size properties, the repaint, and the
+        // selection re-trace the crop needs because the ants moved with the
+        // canvas.
         self.sync();
     }
 
@@ -1094,6 +1644,134 @@ impl ffi::Engine {
         self.as_mut().rust_mut().doc.select_ellipse(rect, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
+    }
+
+    fn select_polygon(
+        mut self: core::pin::Pin<&mut Self>,
+        points: &ffi::QVector_f32,
+        op: i32,
+        feather: i32,
+    ) {
+        // Interleaved x,y. An odd trailing value would be a malformed call
+        // from the shell; drop it rather than reading past the end.
+        let pairs: Vec<(f32, f32)> = points
+            .iter()
+            .copied()
+            .collect::<Vec<f32>>()
+            .chunks_exact(2)
+            .map(|p| (p[0], p[1]))
+            .collect();
+
+        let op = SelectionOp::from_i32(op);
+        let feather = feather.clamp(0, 1000) as u32;
+        self.as_mut().rust_mut().doc.select_polygon(&pairs, op, feather);
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
+    }
+
+    fn begin_magnetic(mut self: core::pin::Pin<&mut Self>, contrast: i32) {
+        let composite = self.doc.composite();
+        let map = EdgeMap::from_pixmap(&composite, contrast.clamp(1, 100) as u32);
+        self.as_mut().rust_mut().edge_map = Some(map);
+    }
+
+    fn magnetic_trace(&self, x0: i32, y0: i32, x1: i32, y1: i32, width: i32) -> Vec<i32> {
+        let Some(map) = self.edge_map.as_ref() else {
+            return vec![x0, y0, x1, y1];
+        };
+        let path = map.trace((x0, y0), (x1, y1), width.clamp(1, 256) as u32);
+
+        let mut flat = Vec::with_capacity(path.len() * 2);
+        for (x, y) in path {
+            flat.push(x);
+            flat.push(y);
+        }
+        flat
+    }
+
+    fn end_magnetic(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().edge_map = None;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn magic_wand(
+        mut self: core::pin::Pin<&mut Self>,
+        x: i32,
+        y: i32,
+        tolerance: i32,
+        contiguous: bool,
+        antialias: bool,
+        op: i32,
+        feather: i32,
+    ) {
+        let composite = self.doc.composite();
+        let mask = wand::magic_wand(
+            &composite,
+            (x, y),
+            tolerance.clamp(0, 255) as u32,
+            contiguous,
+            antialias,
+        );
+
+        let op = SelectionOp::from_i32(op);
+        let feather = feather.clamp(0, 1000) as u32;
+        self.as_mut().rust_mut().doc.select_mask(&mask, op, feather);
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
+    }
+
+    fn begin_quick_select(mut self: core::pin::Pin<&mut Self>, op: i32, feather: i32) {
+        let composite = self.doc.composite();
+        let selector = QuickSelector::new(&composite);
+        let base = self.doc.selection().clone();
+
+        let mut rust = self.as_mut().rust_mut();
+        rust.quick_select = Some(selector);
+        rust.quick_base = Some(base);
+        rust.quick_op = SelectionOp::from_i32(op);
+        rust.quick_feather = feather.clamp(0, 1000) as u32;
+    }
+
+    fn quick_select_dab(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        radius: f32,
+        subtract: bool,
+    ) {
+        let (op, feather) = (self.quick_op, self.quick_feather);
+
+        let mask = {
+            let mut rust = self.as_mut().rust_mut();
+            let Some(selector) = rust.quick_select.as_mut() else {
+                return;
+            };
+            if subtract {
+                selector.subtract_dab(x, y, radius);
+            } else {
+                selector.add_dab(x, y, radius);
+            }
+            selector.mask().to_vec()
+        };
+
+        // Rebuild from the pre-drag snapshot each time rather than combining
+        // onto the running result: the drag as a whole is one operation, so
+        // subtracting a dab has to be able to give pixels back.
+        let Some(base) = self.quick_base.clone() else {
+            return;
+        };
+        let mut updated = base;
+        updated.apply_mask_feathered(&mask, op, feather);
+
+        self.as_mut().rust_mut().doc.set_selection(updated);
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
+    }
+
+    fn end_quick_select(mut self: core::pin::Pin<&mut Self>) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.quick_select = None;
+        rust.quick_base = None;
     }
 
     fn select_all(mut self: core::pin::Pin<&mut Self>) {

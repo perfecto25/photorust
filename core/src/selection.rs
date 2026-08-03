@@ -16,6 +16,41 @@ use std::collections::BTreeMap;
 /// half-strength.
 const OUTLINE_THRESHOLD: u8 = 128;
 
+/// Sub-scanlines per pixel row when scan-converting a polygon.
+///
+/// Four is what most rasterisers settle on: the vertical banding on a shallow
+/// diagonal is already invisible at 100% zoom, and the cost is linear in this
+/// number.
+const POLY_SUBSAMPLES: u32 = 4;
+
+/// Accumulate `weight` worth of coverage for the span `x0..x1` into `row`,
+/// which covers pixels `origin_x .. origin_x + len`.
+///
+/// The end pixels take a fraction proportional to how much of them the span
+/// covers, which is where the horizontal antialiasing comes from.
+fn add_span(row: &mut [f32], origin_x: i32, len: u32, x0: f32, x1: f32, weight: f32) {
+    let left = x0.max(origin_x as f32);
+    let right = x1.min((origin_x + len as i32) as f32);
+    if right <= left {
+        return;
+    }
+
+    let first = left.floor() as i32;
+    let last = (right.ceil() as i32 - 1).max(first);
+    for px in first..=last {
+        // Overlap between the span and this pixel's 1-wide footprint.
+        let lo = left.max(px as f32);
+        let hi = right.min(px as f32 + 1.0);
+        if hi <= lo {
+            continue;
+        }
+        let index = (px - origin_x) as usize;
+        if index < row.len() {
+            row[index] += (hi - lo) * weight;
+        }
+    }
+}
+
 /// How a new selection combines with the existing one. Mirrors the four
 /// buttons at the left of the marquee tool's options bar.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -78,6 +113,21 @@ impl Selection {
             cached_bounds: Some(Rect::from_size(width, height)),
             cached_empty: Cell::new(Some(false)),
         }
+    }
+
+    /// Wrap a coverage mask that was built elsewhere — by the magic wand or
+    /// the quick selector. `None` if it is not exactly `width * height` bytes.
+    pub fn from_coverage(width: u32, height: u32, coverage: Vec<u8>) -> Option<Self> {
+        if coverage.len() != (width as usize) * (height as usize) {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            coverage,
+            cached_bounds: None,
+            cached_empty: Cell::new(None),
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -182,6 +232,139 @@ impl Selection {
         }
         // The antialiased edge already spills one pixel past the rect.
         incoming.feather_region(feather, rect.inflate(feather + 1));
+        self.combine(&incoming, op);
+    }
+
+    /// Combine a closed polygon into the selection, with antialiased edges.
+    ///
+    /// `points` are document-space vertices; the polygon is implicitly closed
+    /// from the last back to the first. This is what the lasso family produces
+    /// — a freehand drag is just a polygon with a great many short edges.
+    pub fn apply_polygon(&mut self, points: &[(f32, f32)], op: SelectionOp) {
+        self.apply_polygon_feathered(points, op, 0);
+    }
+
+    /// As `apply_polygon`, softening the incoming region first.
+    pub fn apply_polygon_feathered(
+        &mut self,
+        points: &[(f32, f32)],
+        op: SelectionOp,
+        feather: u32,
+    ) {
+        let mut incoming = Selection::new(self.width, self.height);
+        // Fewer than three vertices encloses no area at all. Combining the
+        // empty mask still does the right thing for every op, so there is no
+        // early return: an intersect against nothing must clear the selection.
+        let bounds = if points.len() >= 3 {
+            incoming.rasterize_polygon(points)
+        } else {
+            Rect::default()
+        };
+        // The antialiased edge can spill one pixel past the exact bounds.
+        incoming.feather_region(feather, bounds.inflate(feather + 1));
+        self.combine(&incoming, op);
+    }
+
+    /// Scan-convert `points` into this (assumed empty) mask, returning the
+    /// pixel bounds actually touched.
+    ///
+    /// Coverage comes from `POLY_SUBSAMPLES` sub-scanlines per pixel row, each
+    /// filled with fractional coverage at the span ends. That gives vertical
+    /// and horizontal antialiasing respectively, for the cost of one pass over
+    /// the edge list per sub-scanline — far cheaper than point-sampling every
+    /// pixel against every edge.
+    fn rasterize_polygon(&mut self, points: &[(f32, f32)]) -> Rect {
+        let canvas = Rect::from_size(self.width, self.height);
+
+        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+        for &(x, y) in points {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        let region = Rect::new(
+            min_x.floor() as i32,
+            min_y.floor() as i32,
+            (max_x.ceil() - min_x.floor()).max(0.0) as u32 + 1,
+            (max_y.ceil() - min_y.floor()).max(0.0) as u32 + 1,
+        )
+        .intersect(&canvas);
+        if region.is_empty() {
+            return Rect::default();
+        }
+
+        // One row of accumulated coverage, reused down the region.
+        let mut row = vec![0.0f32; region.width as usize];
+        // x position of each edge crossing, paired with its winding direction.
+        let mut crossings: Vec<(f32, i32)> = Vec::with_capacity(points.len());
+        let weight = 1.0 / POLY_SUBSAMPLES as f32;
+
+        for y in region.y..region.bottom() {
+            row.fill(0.0);
+
+            for s in 0..POLY_SUBSAMPLES {
+                let sy = y as f32 + (s as f32 + 0.5) / POLY_SUBSAMPLES as f32;
+
+                crossings.clear();
+                for i in 0..points.len() {
+                    let (x0, y0) = points[i];
+                    let (x1, y1) = points[(i + 1) % points.len()];
+                    // Half-open in y so a vertex exactly on the sub-scanline
+                    // is counted once, not twice or zero times.
+                    if (y0 <= sy) == (y1 <= sy) {
+                        continue;
+                    }
+                    let t = (sy - y0) / (y1 - y0);
+                    let direction = if y0 <= sy { 1 } else { -1 };
+                    crossings.push((x0 + t * (x1 - x0), direction));
+                }
+                if crossings.len() < 2 {
+                    continue;
+                }
+                crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Nonzero winding, which is what a freehand loop wants: a
+                // stroke that crosses back over itself stays solid instead of
+                // punching an even-odd hole where the user's hand wobbled.
+                let mut winding = 0;
+                for pair in crossings.windows(2) {
+                    winding += pair[0].1;
+                    if winding != 0 {
+                        add_span(&mut row, region.x, region.width, pair[0].0, pair[1].0, weight);
+                    }
+                }
+            }
+
+            for (i, &cov) in row.iter().enumerate() {
+                if cov > 0.0 {
+                    let value = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    self.set_raw(region.x + i as i32, y, value);
+                }
+            }
+        }
+
+        region
+    }
+
+    /// Combine a coverage mask built elsewhere, softening it first.
+    ///
+    /// The route the magic wand and quick selector take into the selection:
+    /// they produce a whole-canvas mask rather than a shape, but the feather
+    /// and combine semantics are identical to the other `apply_*` calls.
+    /// A mask of the wrong size is ignored rather than panicking.
+    pub fn apply_mask_feathered(&mut self, coverage: &[u8], op: SelectionOp, feather: u32) {
+        if coverage.len() != self.coverage.len() {
+            debug_assert!(false, "mask size does not match the canvas");
+            return;
+        }
+        let Some(mut incoming) = Selection::from_coverage(self.width, self.height, coverage.to_vec())
+        else {
+            return;
+        };
+        incoming.feather(feather);
         self.combine(&incoming, op);
     }
 
@@ -475,6 +658,30 @@ impl Selection {
     }
 
     /// Resize the selection canvas, preserving overlapping coverage.
+    /// Crop to `rect`, keeping the coverage that falls inside it.
+    ///
+    /// Unlike `resize`, which keeps the top-left corner, this takes the
+    /// coverage from an arbitrary offset — what the Crop tool needs, since the
+    /// kept region rarely starts at the origin.
+    pub fn crop(&mut self, rect: Rect) {
+        let mut next = vec![0u8; (rect.width as usize) * (rect.height as usize)];
+        for y in 0..rect.height as i32 {
+            for x in 0..rect.width as i32 {
+                let (sx, sy) = (rect.x + x, rect.y + y);
+                if sx < 0 || sy < 0 || sx >= self.width as i32 || sy >= self.height as i32 {
+                    continue;
+                }
+                next[(y as usize) * (rect.width as usize) + x as usize] =
+                    self.coverage[(sy as usize) * (self.width as usize) + sx as usize];
+            }
+        }
+        self.coverage = next;
+        self.width = rect.width;
+        self.height = rect.height;
+        self.cached_bounds = None;
+        self.cached_empty.set(None);
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         let mut next = vec![0u8; (width as usize) * (height as usize)];
         let copy_w = width.min(self.width) as usize;
@@ -754,6 +961,113 @@ mod tests {
         let mut hard = Selection::new(16, 16);
         hard.apply_rect(Rect::new(2, 2, 8, 8), SelectionOp::Replace);
         assert_eq!(soft.as_bytes(), hard.as_bytes());
+    }
+
+    #[test]
+    fn polygon_rectangle_matches_the_rect_call() {
+        // A polygon tracing a rectangle on pixel boundaries must scan-convert
+        // to exactly what apply_rect produces — no half-covered edge pixels.
+        let mut poly = Selection::new(32, 32);
+        poly.apply_polygon(
+            &[(8.0, 4.0), (24.0, 4.0), (24.0, 20.0), (8.0, 20.0)],
+            SelectionOp::Replace,
+        );
+        let mut rect = Selection::new(32, 32);
+        rect.apply_rect(Rect::new(8, 4, 16, 16), SelectionOp::Replace);
+        assert_eq!(poly.as_bytes(), rect.as_bytes());
+    }
+
+    #[test]
+    fn polygon_fills_its_interior_and_nothing_outside() {
+        let mut s = Selection::new(64, 64);
+        // A triangle with its right angle at the top left.
+        s.apply_polygon(&[(8.0, 8.0), (56.0, 8.0), (8.0, 56.0)], SelectionOp::Replace);
+
+        assert_eq!(s.coverage_at(12, 12), 1.0, "interior not filled");
+        assert_eq!(s.coverage_at(50, 50), 0.0, "outside the hypotenuse was filled");
+        assert_eq!(s.coverage_at(2, 2), 0.0, "outside the bounding box was filled");
+
+        // The diagonal edge is antialiased rather than hard. The hypotenuse is
+        // x + y = 64, so this pixel's footprint straddles it.
+        let edge = s.coverage_at(31, 32);
+        assert!(edge > 0.0 && edge < 1.0, "expected a soft diagonal, got {}", edge);
+    }
+
+    #[test]
+    fn polygon_respects_the_combine_ops() {
+        let square = [(0.0, 0.0), (32.0, 0.0), (32.0, 32.0), (0.0, 32.0)];
+        let right = [(16.0, 0.0), (48.0, 0.0), (48.0, 32.0), (16.0, 32.0)];
+
+        let mut s = Selection::new(48, 32);
+        s.apply_polygon(&square, SelectionOp::Replace);
+        s.apply_polygon(&right, SelectionOp::Intersect);
+        assert_eq!(s.coverage_at(8, 16), 0.0, "intersect kept the left half");
+        assert_eq!(s.coverage_at(24, 16), 1.0, "intersect dropped the overlap");
+
+        let mut s = Selection::new(48, 32);
+        s.apply_polygon(&square, SelectionOp::Replace);
+        s.apply_polygon(&right, SelectionOp::Subtract);
+        assert_eq!(s.coverage_at(8, 16), 1.0, "subtract removed the wrong half");
+        assert_eq!(s.coverage_at(24, 16), 0.0, "subtract left the overlap behind");
+    }
+
+    #[test]
+    fn polygon_clips_to_the_canvas() {
+        // Vertices well outside the canvas must not panic or wrap around.
+        let mut s = Selection::new(16, 16);
+        s.apply_polygon(
+            &[(-40.0, -40.0), (60.0, -40.0), (60.0, 60.0), (-40.0, 60.0)],
+            SelectionOp::Replace,
+        );
+        assert_eq!(s.coverage_at(0, 0), 1.0);
+        assert_eq!(s.coverage_at(15, 15), 1.0);
+    }
+
+    #[test]
+    fn polygon_with_too_few_points_selects_nothing() {
+        let mut s = Selection::new(16, 16);
+        s.apply_rect(Rect::new(2, 2, 8, 8), SelectionOp::Replace);
+        // A click without a drag: replace with a degenerate shape clears.
+        s.apply_polygon(&[(4.0, 4.0), (5.0, 5.0)], SelectionOp::Replace);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn polygon_uses_nonzero_winding_not_even_odd() {
+        // A path that doubles back over itself, as a shaky freehand drag does.
+        // Under even-odd the overlapped middle would come out unselected.
+        let mut s = Selection::new(64, 32);
+        s.apply_polygon(
+            &[
+                (4.0, 4.0),
+                (60.0, 4.0),
+                (60.0, 28.0),
+                (4.0, 28.0),
+                // Back around the middle in the same direction, overlapping.
+                (4.0, 4.0),
+                (40.0, 4.0),
+                (40.0, 28.0),
+                (20.0, 28.0),
+                (20.0, 4.0),
+            ],
+            SelectionOp::Replace,
+        );
+        assert_eq!(s.coverage_at(30, 16), 1.0, "the overlapped region got a hole");
+        assert_eq!(s.coverage_at(50, 16), 1.0, "the outer region was dropped");
+    }
+
+    #[test]
+    fn feathered_polygon_softens_its_edge() {
+        let mut hard = Selection::new(64, 64);
+        let square = [(16.0, 16.0), (48.0, 16.0), (48.0, 48.0), (16.0, 48.0)];
+        hard.apply_polygon(&square, SelectionOp::Replace);
+        assert_eq!(hard.coverage_at(15, 32), 0.0);
+
+        let mut soft = Selection::new(64, 64);
+        soft.apply_polygon_feathered(&square, SelectionOp::Replace, 4);
+        let bleed = soft.coverage_at(15, 32);
+        assert!(bleed > 0.0 && bleed < 1.0, "expected falloff, got {}", bleed);
+        assert_eq!(soft.coverage_at(32, 32), 1.0, "the middle should stay solid");
     }
 
     #[test]

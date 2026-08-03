@@ -10,6 +10,7 @@ class ColorPanel;
 class CommandRegistry;
 class Engine;
 class HistoryPanel;
+class InfoPanel;
 class LayersPanel;
 class ToolStrip;
 class QComboBox;
@@ -40,6 +41,8 @@ private slots:
     void openDocument();
     bool saveDocument();
     bool saveDocumentAs();
+    /// Write every slice out as its own image file (File ▸ Save Slices).
+    void exportSlices();
 
     // -- Edit --
     void undo();
@@ -102,6 +105,28 @@ private:
     /// Add the new/add/subtract/intersect buttons the selection tools open
     /// their options bar with.
     void addSelectionModeButtons();
+    /// Add the Magnetic Lasso's Width / Contrast / Frequency controls.
+    void addMagneticOptions();
+    /// Push the magnetic lasso settings into the canvas.
+    void pushMagneticOptions();
+    /// Add the Quick Selection brush size, or the Magic Wand's tolerance and
+    /// checkboxes, depending on which of the two is active.
+    void addQuickSelectOptions(QuickSelectType type);
+    /// Push those settings into the canvas.
+    void pushQuickSelectOptions();
+    /// Add the Crop tool's ratio preset, Delete Cropped Pixels checkbox and
+    /// the commit/cancel pair.
+    void addCropOptions(CropType type);
+    /// The Info panel's footer text for an eyedropper-group tool.
+    QString infoHintFor(EyedropperType type) const;
+    /// Add the annotation tools' readouts and Clear button.
+    void addAnnotationOptions(EyedropperType type);
+    /// Refill those readouts from the engine.
+    void updateAnnotationReadouts();
+    /// Put up the note editor for a note marker.
+    void editNote(int index);
+    /// Push the crop settings into the canvas.
+    void pushCropOptions();
     /// Push the current brush settings into the engine.
     void pushBrushSettings();
 
@@ -116,6 +141,8 @@ private:
     LayersPanel *m_layersPanel = nullptr;
     ColorPanel *m_colorPanel = nullptr;
     HistoryPanel *m_historyPanel = nullptr;
+    InfoPanel *m_infoPanel = nullptr;
+    QDockWidget *m_infoDock = nullptr;
 
     // Options-bar widgets for the brush family. Recreated per tool, so these
     // are only valid while a painting tool is active.
@@ -134,4 +161,19 @@ private:
     /// is rebuilt on every tool change and CS6 remembers both.
     SelectionMode m_selectionMode = SelectionMode::New;
     int m_featherRadius = 0;
+    /// Magnetic Lasso settings, kept here for the same reason.
+    int m_magneticWidth = MagneticDefaults::kWidth;
+    int m_magneticContrast = MagneticDefaults::kContrast;
+    int m_magneticFrequency = MagneticDefaults::kFrequency;
+    /// Quick Selection and Magic Wand settings, likewise.
+    int m_quickBrushSize = WandDefaults::kBrushSize;
+    int m_wandTolerance = WandDefaults::kTolerance;
+    bool m_wandAntialias = WandDefaults::kAntialias;
+    bool m_wandContiguous = WandDefaults::kContiguous;
+    /// Crop settings. 0 leaves the box unconstrained.
+    double m_cropRatio = 0.0;
+    bool m_cropDeletePixels = true;
+    /// Options-bar readout labels for the annotation tools. Recreated with the
+    /// bar, so this list is only valid while one of those tools is active.
+    QList<QLabel *> m_annotationReadouts;
 };

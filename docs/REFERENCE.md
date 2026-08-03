@@ -73,7 +73,7 @@ serves both targets.
 | **Options bar** | The active tool's name in bold, then its settings. Rebuilt on every tool change. |
 | **Tool strip** | Single column of 20 tools in four groups, then the colour swatch, Quick Mask and screen-mode buttons. |
 | **Canvas viewport** | The document, centred, on the CS6 grey surround. Transparent pixels show a fixed-size checkerboard that does not scale with zoom, as in Photoshop. |
-| **Dock area** | Right-hand side. Color and Swatches share a tab group; History and Layers stack below. Panels are dockable left or right, and float when dragged out. |
+| **Dock area** | Right-hand side. Color, Swatches and Info share a tab group; History and Layers stack below. Panels are dockable left or right, and float when dragged out. |
 | **Status bar** | Zoom percentage, document size, and the live cursor position in document coordinates. |
 
 The colour palette is the CS6 "Kona" dark theme, in
@@ -107,6 +107,13 @@ letter right-aligned, and a check against the variant in use. Entries the
 engine does not implement are listed but **disabled**, so the menu keeps CS6's
 shape without pretending to work.
 
+Flyout entries get their own artwork where CS6 gives them distinct icons: the
+marquee group's four shapes; the lasso group's freehand loop, straight-segment
+polygon and beaded magnetic curve; the Quick Selection brush and Magic Wand;
+the eyedropper group's targeted pipette, ruler, note page and 1-2-3; and the
+crop group's brackets, perspective mesh, slice blade and slice pointer. Other
+groups' entries reuse the parent icon.
+
 Where several entries share a letter, **Shift+letter cycles between them**,
 matching CS6's "Use Shift Key for Tool Switch" default. Each tool remembers the
 variant you last used and its strip button shows that variant's icon.
@@ -120,10 +127,10 @@ Separators mark CS6's four functional groups.
 | Four-way arrow | Move | `V` | — | ✅ |
 | | | | | |
 | Dashed rectangle | **Marquee** | `M` | Rectangular ✅ · Elliptical ✅ · Single Row ✅ · Single Column ✅ | ✅ all four |
-| Rope loop with tail | Lasso | `L` | Lasso ✅ · Polygonal ⛔ · Magnetic ⛔ | first only |
-| Dashed circle + sparkle | Quick Selection | `W` | Quick Selection ✅ · Magic Wand ⛔ | first only |
-| Two overlapping corners | Crop | `C` | Crop ✅ · Perspective Crop ⛔ · Slice ⛔ · Slice Select ⛔ | first only |
-| Pipette | Eyedropper | `I` | Eyedropper ✅ · Color Sampler ⛔ · Ruler ⛔ · Note ⛔ · Count ⛔ | first only |
+| Rope loop with tail | **Lasso** | `L` | Lasso ✅ · Polygonal ✅ · Magnetic ✅ | ✅ all three |
+| Dashed circle + sparkle | **Quick Selection** | `W` | Quick Selection ✅ · Magic Wand ✅ | ✅ both |
+| Two overlapping corners | **Crop** | `C` | Crop ✅ · Perspective Crop ✅ · Slice ✅ · Slice Select ✅ | ✅ all four |
+| Pipette | **Eyedropper** | `I` | Eyedropper ✅ · Color Sampler ✅ · Ruler ✅ · Note ✅ · Count ✅ | ✅ all five |
 | | | | | |
 | Angled bandage | Spot Healing Brush | `J` | Spot Healing ✅ · Healing ⛔ · Patch ⛔ · Content-Aware Move ⛔ · Red Eye ⛔ | first only |
 | Brush with bristles | **Brush** | `B` | Brush ✅ · Pencil ⛔ · Color Replacement ⛔ · Mixer Brush ⛔ | first only |
@@ -147,7 +154,9 @@ flyout being populated. Pen, Type, Path Selection and Shape are present in the
 strip with correct icons and shortcuts, but selecting them does nothing on the
 canvas yet.
 
-The Marquee is the only group where more than the first entry is implemented.
+Marquee, Lasso, Eyedropper and Crop are fully implemented groups, and Quick
+Selection has both of its entries. `Shift+M`, `Shift+L`, `Shift+W`, `Shift+I`
+and `Shift+C` cycle within them, as CS6 does.
 
 ### Strip footer
 
@@ -171,7 +180,19 @@ the active variant's name in bold — switching to Elliptical says
 |---|---|
 | Brush, Eraser, Spot Healing, Clone Stamp, History Brush | **Size** (1–5000 px), **Hardness** (0–100%), **Opacity** (0–100%), **Flow** (1–100%) — all live, pushed to the engine on change |
 | Marquee, Lasso, Quick Selection | **Combine mode** buttons (new / add / subtract / intersect), **Feather** (0–1000 px), then a modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
+| Lasso (Polygonal / Magnetic) | Same controls; the hint becomes: click to place points · double-click or `Enter` to close · `Backspace` undoes one · `Esc` cancels |
+| Lasso (Magnetic) | Additionally **Width** (1–256 px), **Contrast** (1–100%) and **Frequency** (0–100), CS6's three edge-detection settings |
+| Quick Selection | Combine mode buttons, then **Size** (the brush diameter the region grows from). No Feather and no Tolerance — CS6 gives it neither |
+| Magic Wand | Combine mode buttons, **Tolerance** (0–255), **Anti-alias** and **Contiguous** checkboxes. No Feather, as in CS6 |
 | Marquee (Single Row / Single Column) | Same controls; the hint changes to: click to select a line · `Ctrl+Shift` = add · `Ctrl+Alt` = subtract |
+| Crop | **Ratio preset** (Unconstrained, 1:1, 4:5, 5:7, 2:3, 16:9), **Delete Cropped Pixels**, and a ✘ / ✓ pair to cancel or apply |
+| Crop (Perspective) | Just the ✘ / ✓ pair — CS6 gives it neither a ratio nor Delete Cropped Pixels, since the output size comes from the marked quad and everything outside it is resampled away regardless |
+| Color Sampler | **Clear** only — the sampler values read out in the Info panel, as they do in CS6 |
+| Ruler | **X, Y, W, H, A, D1** readouts and **Clear** — Photoshop's own fields, in its order |
+| Note | A **note count** and **Clear** |
+| Count | The **running count** and **Clear** |
+| Crop (Slice) | **Clear Slices** and **Save Slices...** |
+| Crop (Slice Select) | **Clear Slices**, **Delete Slice** and **Save Slices...** |
 | Zoom | Hint: click to zoom in · `Alt`+click to zoom out |
 | Move | Hint: drag to move the active layer · arrow keys nudge |
 | Anything else | Name only |
@@ -226,6 +247,26 @@ management yet.
 The linear undo stack, newest at the bottom. Click any state to jump to it.
 The stack is bounded by both state count and total memory. A whole brush stroke
 is one entry, not one per dab.
+
+### Info · `F8`
+
+CS6's live readout, in its layout: **RGB** and **CMYK** across the top (both
+labelled 8-bit), **X/Y** cursor position and **W/H** selection size beneath,
+then a two-column grid of **colour sampler** values numbered `#1` upward, the
+document's memory footprint on a `Doc:` line, and a hint that changes with the
+active tool.
+
+Everything is a readout; the panel never writes to the document. The colour
+blocks blank when the cursor leaves the canvas rather than holding their last
+value. Sampler values re-read on every canvas change, so editing under a
+sampler updates it without moving it.
+
+Choosing the Color Sampler or the Ruler brings this panel forward, since their
+values are the whole point of those tools.
+
+With the **Ruler** active the panel changes as CS6's does: the CMYK block is
+replaced by **A** (angle, in degrees) and **L** (length), and **W/H** report the
+ruler's deltas rather than the selection's size. Switching away puts CMYK back.
 
 ### Layers · `F7`
 
@@ -293,6 +334,10 @@ anything is [§3](#3-the-tool-strip).
 | `M` | Marquee ✅ | | `Y` | History Brush ✅ |
 | `Shift+M` | Cycle Rectangular ↔ Elliptical ✅ | | `E` | Eraser ✅ |
 | `L` | Lasso ✅ | | `G` | Gradient ✅ |
+| `Shift+L` | Cycle Lasso → Polygonal → Magnetic ✅ | | | |
+| `Shift+W` | Cycle Quick Selection ↔ Magic Wand ✅ | | | |
+| `Shift+C` | Cycle Crop → Perspective → Slice → Slice Select ✅ | | | |
+| `Shift+I` | Cycle Eyedropper → Color Sampler → Ruler → Note → Count ✅ | | | |
 | `W` | Quick Selection ✅ | | `O` | Dodge ✅ |
 | `C` | Crop ✅ | | `P` | Pen ⚪ |
 | `I` | Eyedropper ✅ | | `T` | Horizontal Type ⚪ |
@@ -323,7 +368,7 @@ brush, `/` toggle preserve transparency.
 | `Alt+Ctrl+W` | `Opt+Cmd+W` | Close All | ⚪ |
 | `Ctrl+S` | `Cmd+S` | Save | ✅ |
 | `Shift+Ctrl+S` | `Shift+Cmd+S` | Save As… | ✅ |
-| `Alt+Shift+Ctrl+S` | `Opt+Shift+Cmd+S` | Save for Web… | ⚪ |
+| `Alt+Shift+Ctrl+S` | `Opt+Shift+Cmd+S` | Save Slices… | ✅ writes each slice as a PNG. CS6 puts this on Save for Web, whose dialog does not exist yet |
 | `F12` | `F12` | Revert | ⚪ |
 | `Alt+Shift+Ctrl+I` | `Opt+Shift+Cmd+I` | File Info… | ⚪ |
 | `Ctrl+P` | `Cmd+P` | Print… | ⚪ |
@@ -489,7 +534,23 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | `Ctrl+Shift`-drag a selection tool | Add to the selection |
 | `Ctrl+Alt`-drag a selection tool | Subtract from the selection |
 | `Shift`-drag a selection tool | Add to the selection (CS6's own binding) |
-| Click without dragging | Deselect (for Rectangular / Elliptical) |
+| Drag with Lasso | Trace a freehand outline; release closes it back to the start |
+| Click with Polygonal / Magnetic Lasso | Place a fastening point; click the first one again, double-click, or press `Enter` to close |
+| Drag with Quick Selection | Grow the selection under the brush; it stops at edges. The ants follow the brush live |
+| Click with Magic Wand | Select everything matching the clicked pixel within Tolerance |
+| Drag with Crop | Set the crop box; drag its handles to adjust, drag inside to move |
+| `Enter` or double-click with Crop | Apply the crop |
+| `Esc` with Crop | Reset the box to the whole canvas |
+| Drag with Perspective Crop | Drag out a box, then drag each corner onto the subject's corners; drag inside to move the whole quad |
+| `Enter` or double-click with Perspective Crop | Straighten the quad into a rectangle and crop to it |
+| Drag with Slice | Cut a user slice; the rest of the canvas re-slices automatically around it |
+| Click with Slice Select | Select a user slice; drag it or its handles to adjust |
+| `Del` with Slice Select | Delete the selected slice |
+| Click with Color Sampler / Count | Place a marker; drag to move, `Alt`+click to remove |
+| Click with Note | Add a note and open its editor; click an existing note to edit it |
+| Drag with Ruler | Measure; drag either end to adjust |
+| `Backspace` with an open lasso | Take back the last fastening point |
+| Click without dragging | Deselect (for Rectangular / Elliptical / Lasso) |
 | Right-click with a selection tool | CS6's marquee context menu |
 
 Zoom steps through CS6's own sequence (0.67%, 1%, 1.67%, … 1600%, 3200%) rather

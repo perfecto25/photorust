@@ -84,6 +84,81 @@ enum class MarqueeType {
     SingleColumn = 3,
 };
 
+/// The lasso variants, in flyout order.
+///
+/// The three differ only in how the outline is *entered*: freehand drags it,
+/// polygonal clicks corner to corner, magnetic clicks and then follows the
+/// nearest edge. All three end up as the same closed polygon in the engine.
+enum class LassoType {
+    Freehand = 0,
+    Polygonal = 1,
+    Magnetic = 2,
+};
+
+/// CS6's defaults for the Magnetic Lasso's options bar.
+namespace MagneticDefaults {
+/// How far either side of the cursor an edge is looked for, in pixels.
+constexpr int kWidth = 10;
+/// How strong a gradient has to be to count as an edge, 1–100.
+constexpr int kContrast = 10;
+/// How often a fastening point is dropped automatically, 0–100. Higher
+/// anchors the path down faster.
+constexpr int kFrequency = 57;
+} // namespace MagneticDefaults
+
+/// The variants behind the Eyedropper button.
+///
+/// After the eyedropper itself these are all *annotation* tools: they read or
+/// mark up the image without editing a pixel. The marks are document data,
+/// held by the engine alongside slices (see core/src/annotation.rs).
+enum class EyedropperType {
+    Eyedropper = 0,
+    ColorSampler = 1,
+    Ruler = 2,
+    Note = 3,
+    Count = 4,
+};
+
+/// Marker kinds, mirroring `annotation::MarkerKind` across the bridge.
+enum class MarkerKind {
+    ColorSampler = 0,
+    Note = 1,
+    Count = 2,
+};
+
+/// The variants behind the Crop button.
+///
+/// The first two differ in what the user marks out: an axis-aligned rectangle,
+/// or a free quadrilateral that gets straightened into one. The slice tools
+/// are for web export and are not implemented.
+enum class CropType {
+    Rectangular = 0,
+    Perspective = 1,
+    Slice = 2,
+    SliceSelect = 3,
+};
+
+/// The two tools behind the Quick Selection button.
+///
+/// Both select on colour; the difference is how much the user has to say.
+/// The brush is dragged and grows a region that stops at edges; the wand is
+/// clicked once and floods on colour similarity alone.
+enum class QuickSelectType {
+    Brush = 0,
+    MagicWand = 1,
+};
+
+/// CS6's defaults for the Quick Selection and Magic Wand options bars.
+namespace WandDefaults {
+/// Quick Selection brush diameter, in pixels.
+constexpr int kBrushSize = 30;
+/// Magic Wand tolerance, 0–255 per channel.
+constexpr int kTolerance = 32;
+/// Both checkboxes are on by default in CS6.
+constexpr bool kAntialias = true;
+constexpr bool kContiguous = true;
+} // namespace WandDefaults
+
 /// How a new selection combines with the existing one.
 ///
 /// The values are the `op` codes `Engine::selectRect`/`selectEllipse` take, so
@@ -135,24 +210,25 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Elliptical Marquee Tool", "M", true},
                 {"Single Row Marquee Tool", nullptr, true},
                 {"Single Column Marquee Tool", nullptr, true}};
+    // CS6 puts L on all three, so Shift+L cycles the whole group.
     case ToolId::Lasso:
         return {{"Lasso Tool", "L", true},
-                {"Polygonal Lasso Tool", nullptr, false},
-                {"Magnetic Lasso Tool", nullptr, false}};
+                {"Polygonal Lasso Tool", "L", true},
+                {"Magnetic Lasso Tool", "L", true}};
     case ToolId::QuickSelect:
         return {{"Quick Selection Tool", "W", true},
-                {"Magic Wand Tool", nullptr, false}};
+                {"Magic Wand Tool", "W", true}};
     case ToolId::Crop:
         return {{"Crop Tool", "C", true},
-                {"Perspective Crop Tool", nullptr, false},
-                {"Slice Tool", nullptr, false},
-                {"Slice Select Tool", nullptr, false}};
+                {"Perspective Crop Tool", "C", true},
+                {"Slice Tool", "C", true},
+                {"Slice Select Tool", "C", true}};
     case ToolId::Eyedropper:
         return {{"Eyedropper Tool", "I", true},
-                {"Color Sampler Tool", nullptr, false},
-                {"Ruler Tool", nullptr, false},
-                {"Note Tool", nullptr, false},
-                {"Count Tool", nullptr, false}};
+                {"Color Sampler Tool", "I", true},
+                {"Ruler Tool", "I", true},
+                {"Note Tool", "I", true},
+                {"Count Tool", "I", true}};
     case ToolId::Healing:
         return {{"Spot Healing Brush Tool", "J", true},
                 {"Healing Brush Tool", nullptr, false},

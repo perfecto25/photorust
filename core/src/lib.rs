@@ -28,6 +28,7 @@
 //!   The Layers panel shows them top-first, and that flip happens only in
 //!   [`bridge`].
 
+pub mod annotation;
 pub mod blend;
 pub mod bridge;
 pub mod brush;
@@ -37,8 +38,12 @@ pub mod document;
 pub mod filters;
 pub mod history;
 pub mod layer;
+pub mod magnetic;
+pub mod perspective;
 pub mod psd;
 pub mod selection;
+pub mod slice;
+pub mod wand;
 
 pub use blend::BlendMode;
 pub use brush::Brush;

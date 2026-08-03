@@ -4,6 +4,7 @@
 #include <QPainterPath>
 #include <QPoint>
 #include <QPointF>
+#include <QPolygonF>
 #include <QWidget>
 
 #include "../tools/ToolId.h"
@@ -54,6 +55,54 @@ public:
     void setMarqueeType(MarqueeType type);
     MarqueeType marqueeType() const { return m_marqueeType; }
 
+    /// Which lasso variant the Lasso tool uses.
+    void setLassoType(LassoType type);
+    LassoType lassoType() const { return m_lassoType; }
+
+    /// The Magnetic Lasso's options-bar settings: detection width in pixels,
+    /// edge contrast 1–100, and how often a fastening point is dropped.
+    void setMagneticOptions(int width, int contrast, int frequency);
+
+    /// Which of the two colour-selection tools the Quick Selection button
+    /// currently holds.
+    void setQuickSelectType(QuickSelectType type);
+    QuickSelectType quickSelectType() const { return m_quickSelectType; }
+
+    /// Options-bar settings for those two: the brush diameter the Quick
+    /// Selection tool grows from, and the wand's tolerance and checkboxes.
+    void setQuickSelectOptions(int brushSize, int tolerance, bool antialias, bool contiguous);
+
+    /// Which eyedropper-group variant is active.
+    void setEyedropperType(EyedropperType type);
+    EyedropperType eyedropperType() const { return m_eyedropperType; }
+
+    /// Re-fetch annotations (samplers, notes, counts, ruler) and repaint.
+    /// Driven by the engine's `annotationsChanged` signal.
+    void refreshAnnotations();
+
+    /// Which crop variant the Crop button currently holds.
+    void setCropType(CropType type);
+    CropType cropType() const { return m_cropType; }
+
+    /// Crop options: the aspect ratio the box is locked to (width / height,
+    /// or 0 for unconstrained) and whether committing discards the pixels that
+    /// fall outside.
+    void setCropOptions(double aspectRatio, bool deleteCropped);
+
+    /// Apply the current crop box to the document. Does nothing unless the
+    /// Crop tool is active.
+    void commitCrop();
+    /// Reset the crop box to the whole canvas, CS6's Esc behaviour.
+    void resetCrop();
+
+    /// Re-fetch the slice list from the engine and repaint the overlay.
+    /// Driven by the engine's `slicesChanged` signal.
+    void refreshSlices();
+    /// Delete the selected user slice, if any.
+    void deleteSelectedSlice();
+    /// The selected user slice's index, or -1.
+    int selectedSlice() const { return m_selectedSlice; }
+
     /// How the next selection combines with the current one — the options
     /// bar's new/add/subtract/intersect buttons. Modifiers held during a drag
     /// override this for that drag only, as they do in CS6.
@@ -83,8 +132,11 @@ public:
     QPointF documentToWidget(const QPointF &pos) const;
 
 signals:
-    /// Emitted as the cursor moves, for the status bar readout.
+    /// Emitted as the cursor moves, for the status bar and Info panel.
     void cursorMoved(const QPointF &documentPos);
+    /// The cursor left the canvas, so readouts of what is under it should
+    /// blank rather than hold their last value.
+    void cursorLeft();
     /// Emitted whenever the zoom factor changes.
     void zoomChanged(double zoom);
     /// The user picked a colour with the eyedropper.
@@ -93,12 +145,16 @@ signals:
     /// menu should open. The canvas does not build the menu itself: the
     /// commands on it belong to the registry, which `MainWindow` owns.
     void contextMenuRequested(const QPoint &globalPos);
+    /// A note needs its text edited. The canvas does not own dialogs, so
+    /// `MainWindow` puts one up and writes the result back to the engine.
+    void noteEditRequested(int index);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
@@ -123,8 +179,112 @@ private:
     SelectionMode effectiveSelectionMode(Qt::KeyboardModifiers modifiers) const;
     /// Send the in-progress marquee to the engine.
     void commitMarquee(const QRectF &documentRect, Qt::KeyboardModifiers modifiers);
+    /// Send the traced lasso path to the engine as a closed polygon.
+    void commitLasso(Qt::KeyboardModifiers modifiers);
+    /// Abandon an in-progress lasso without touching the selection.
+    void cancelLasso();
+    /// Close a click-driven lasso and commit it.
+    void closeLasso();
+    /// Re-run the magnetic wire from the last anchor to `doc`, and drop a
+    /// fastening point if the segment has grown long enough.
+    void updateMagneticWire(const QPointF &doc);
     /// True when the active marquee variant is a click rather than a drag.
     bool marqueeIsLineSelect() const;
+    /// True when the active tool traces an outline rather than dragging a
+    /// rectangle out.
+    bool toolIsLasso() const { return m_tool == ToolId::Lasso; }
+    /// True when the lasso is entered by dragging with the button held.
+    bool lassoIsDragged() const
+    {
+        return toolIsLasso() && m_lassoType == LassoType::Freehand;
+    }
+    /// True when the lasso is entered by clicking anchors, with the button
+    /// released between them.
+    bool lassoIsClicked() const { return toolIsLasso() && !lassoIsDragged(); }
+    /// Whether `doc` is close enough to the first anchor to close the shape.
+    bool nearLassoStart(const QPointF &doc) const;
+    /// True when the Quick Selection button is holding the drag-a-brush tool
+    /// rather than the click-once wand.
+    bool toolIsQuickBrush() const
+    {
+        return m_tool == ToolId::QuickSelect && m_quickSelectType == QuickSelectType::Brush;
+    }
+    /// End a Quick Selection drag if one is running.
+    void finishQuickSelect();
+
+    /// Which part of the crop box the cursor is over, for hit-testing and for
+    /// the resize cursor. Ordered so the corners and edges can be tested as a
+    /// group.
+    enum class CropGrip {
+        None,
+        Move,
+        TopLeft,
+        Top,
+        TopRight,
+        Right,
+        BottomRight,
+        Bottom,
+        BottomLeft,
+        Left,
+    };
+
+    /// The grip under a widget-space point, or `None` outside the box.
+    CropGrip cropGripAt(const QPointF &widgetPos) const;
+    /// As `cropGripAt`, against any document-space rectangle. Shared with the
+    /// slice tools, whose handles behave the same way.
+    CropGrip gripAt(const QRectF &docRect, const QPointF &widgetPos) const;
+    /// Cursor shape for a grip.
+    Qt::CursorShape cropCursor(CropGrip grip) const;
+    /// Move or resize the crop box for a drag to `doc`.
+    void dragCrop(const QPointF &doc);
+    /// Force the box back to the locked aspect ratio, pivoting on the corner
+    /// opposite the one being dragged.
+    void applyCropRatio(CropGrip grip);
+    /// Paint the crop box: shield, thirds overlay, border and handles.
+    void paintCrop(QPainter &painter);
+
+    /// True when the Crop button is holding the perspective variant, which
+    /// marks out a free quadrilateral rather than an aligned rectangle.
+    bool cropIsPerspective() const
+    {
+        return m_tool == ToolId::Crop && m_cropType == CropType::Perspective;
+    }
+    /// Index of the quad corner under a widget-space point, or -1.
+    int cropCornerAt(const QPointF &widgetPos) const;
+    /// Warp the marked quadrilateral into a rectangle and crop to it.
+    void commitPerspectiveCrop();
+    /// Paint the perspective quad: shield, grid, edges and corner handles.
+    void paintCropQuad(QPainter &painter);
+
+    /// True when the eyedropper button is holding one of the annotation
+    /// tools rather than the eyedropper itself.
+    bool toolIsAnnotation() const
+    {
+        return m_tool == ToolId::Eyedropper
+            && m_eyedropperType != EyedropperType::Eyedropper;
+    }
+    /// The marker kind the active variant places, if it places one.
+    bool activeMarkerKind(MarkerKind *kind) const;
+    /// Press, drag and release for the annotation tools.
+    void annotationPress(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    void annotationDrag(const QPointF &doc);
+    /// Paint markers and the ruler.
+    void paintAnnotations(QPainter &painter);
+    /// Grab radius in document pixels for a fixed on-screen size.
+    float grabRadiusDoc() const;
+
+    /// True when the Crop button is holding one of the two slice tools, which
+    /// edit web-export cut lines rather than the canvas.
+    bool toolIsSlice() const
+    {
+        return m_tool == ToolId::Crop
+            && (m_cropType == CropType::Slice || m_cropType == CropType::SliceSelect);
+    }
+    /// Index into `m_slices` of the topmost slice containing `doc`, preferring
+    /// user slices over the auto slices beneath them. -1 if none.
+    int sliceAt(const QPointF &doc) const;
+    /// Paint the slice overlay: cut lines and numbered badges.
+    void paintSlices(QPainter &painter);
 
     Engine *m_engine = nullptr;
 
@@ -137,6 +297,8 @@ private:
 
     ToolId m_tool = ToolId::Brush;
     MarqueeType m_marqueeType = MarqueeType::Rectangular;
+    LassoType m_lassoType = LassoType::Freehand;
+    QuickSelectType m_quickSelectType = QuickSelectType::Brush;
     SelectionMode m_selectionMode = SelectionMode::New;
     int m_featherRadius = 0;
 
@@ -151,6 +313,94 @@ private:
     /// Live marquee rectangle while dragging a selection tool.
     QRectF m_marquee;
     bool m_marqueeActive = false;
+    /// The lasso outline committed so far, in document coordinates.
+    ///
+    /// For the freehand variant this is the traced path; points are appended
+    /// only once the cursor has moved a visible distance, so a slow drag does
+    /// not pile up thousands of coincident vertices. For the click-driven
+    /// variants it is the anchors placed so far, plus — for magnetic — every
+    /// wire point between them.
+    QPolygonF m_lassoPath;
+    /// The segment between the last committed point and the cursor: a rubber
+    /// band for the polygonal lasso, the live wire for the magnetic one.
+    /// Not yet part of the outline, and redrawn on every move.
+    QPolygonF m_lassoPreview;
+    /// Where the cursor last was, in document space, while a click-driven
+    /// lasso is open. Used to keep the preview correct across repaints.
+    QPointF m_lassoCursor;
+
+    // -- magnetic lasso options, from the options bar --
+    int m_magneticWidth = MagneticDefaults::kWidth;
+    int m_magneticContrast = MagneticDefaults::kContrast;
+    int m_magneticFrequency = MagneticDefaults::kFrequency;
+
+    // -- quick selection and magic wand options --
+    int m_quickBrushSize = WandDefaults::kBrushSize;
+    int m_wandTolerance = WandDefaults::kTolerance;
+    bool m_wandAntialias = WandDefaults::kAntialias;
+    bool m_wandContiguous = WandDefaults::kContiguous;
+    /// True between press and release of a Quick Selection drag, so the engine
+    /// gets exactly one begin/end pair around the dabs.
+    bool m_quickSelecting = false;
+
+    // -- crop --
+    /// The crop box in document coordinates. Only meaningful while the Crop
+    /// tool is active, where it starts out as the whole canvas.
+    QRectF m_cropRect;
+    /// The grip being dragged, or `None` when the box is at rest.
+    CropGrip m_cropGrip = CropGrip::None;
+    /// The box and cursor position when the drag began, so a move is computed
+    /// from the press rather than accumulated per motion event.
+    QRectF m_cropStartRect;
+    QPointF m_cropStartDoc;
+    /// Width / height the box is locked to; 0 leaves it free.
+    double m_cropRatio = 0.0;
+    bool m_cropDeletePixels = true;
+
+    CropType m_cropType = CropType::Rectangular;
+    /// The perspective quad's four corners in document coordinates, ordered
+    /// top-left, top-right, bottom-right, bottom-left. That order is the
+    /// contract with the engine, which uses it to work out which pair of edges
+    /// gives the output width and which the height.
+    QPolygonF m_cropQuad;
+    QPolygonF m_cropStartQuad;
+    /// Corner being dragged, or -1.
+    int m_cropCorner = -1;
+    /// True while the whole quad is being dragged rather than one corner.
+    bool m_cropQuadMoving = false;
+    /// True while the initial rectangle is being dragged out, before any
+    /// corner has been pulled off square.
+    bool m_cropQuadNew = false;
+
+    // -- slices --
+    /// One entry of the engine's resolved slice list, cached for painting and
+    /// hit-testing. Auto slices have `userIndex == -1`.
+    struct SliceInfo {
+        QRectF rect;
+        int number = 0;
+        int userIndex = -1;
+    };
+    QList<SliceInfo> m_slices;
+    /// The selected user slice's index, or -1. Slice Select sets this.
+    int m_selectedSlice = -1;
+    /// The rectangle being dragged out by the Slice tool.
+    QRectF m_sliceDrag;
+    bool m_sliceDragging = false;
+    /// Which grip of the selected slice is being dragged, and the state the
+    /// drag began from.
+    CropGrip m_sliceGrip = CropGrip::None;
+    QRectF m_sliceStartRect;
+    QPointF m_sliceStartDoc;
+
+    // -- annotations --
+    EyedropperType m_eyedropperType = EyedropperType::Eyedropper;
+    /// Cached marker positions, indexed by MarkerKind.
+    QList<QPointF> m_markers[3];
+    /// The ruler's two endpoints, empty when there is none.
+    QPolygonF m_ruler;
+    /// Marker being dragged, or -1, and which end of the ruler (0, 1 or -1).
+    int m_draggedMarker = -1;
+    int m_draggedRulerEnd = -1;
     /// Modifiers held when the selection drag began. Photoshop samples these
     /// at press, so letting go of Shift mid-drag does not change the mode.
     Qt::KeyboardModifiers m_gestureModifiers = Qt::NoModifier;

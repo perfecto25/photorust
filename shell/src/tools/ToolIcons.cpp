@@ -137,13 +137,161 @@ QString bodyFor(ToolId id)
     return {};
 }
 
+/// Per-variant artwork for the crop group.
+///
+/// CS6 gives all four entries their own icon: the plain crop brackets, the same
+/// shape with a perspective mesh inside, a blade cutting a framed rectangle,
+/// and that rectangle with a pointer over it.
+QString cropVariantBody(int variant)
+{
+    switch (static_cast<CropType>(variant)) {
+    // The crop brackets drawn as a slight trapezoid — narrower at the top, the
+    // way a plane recedes — with a mesh inside showing the straightening.
+    // A single cross of guides keeps the mesh legible at 20px; the four-line
+    // grid CS6 draws turns into a solid blob at this size.
+    case CropType::Perspective:
+        return R"SVG(<path stroke-width="1.15" d="M6.6 4.4 13.4 4.4 16.6 15.6 3.4 15.6z"/>
+                  <path stroke-width="0.75" d="M10 4.4V15.6M4.9 10H15.1"/>)SVG";
+
+    // A framed rectangle with a craft-knife blade cutting across its corner.
+    case CropType::Slice:
+        return R"SVG(<path stroke-width="1.1" d="M2.4 4.4H12.6V16.4H2.4z"/>
+                  <path fill="COLOR" stroke="none" d="M17.6 2.2 18.6 3.2 11.4 10.4 10.3 11.5
+                  10.6 9.3z"/>
+                  <path stroke-width="1" d="M10.3 11.5 8.6 13.2"/>)SVG";
+
+    // The same rectangle with CS6's solid arrow pointer over it. The pointer is
+    // the Path Selection arrow, scaled down and set into the lower right so it
+    // reads as a separate shape rather than merging with the frame.
+    case CropType::SliceSelect:
+        return R"SVG(<path stroke-width="1.1" d="M2.4 4.4H12.6V16.4H2.4z"/>
+                  <g transform="translate(7.3 6.6) scale(0.62)">
+                  <path fill="COLOR" stroke="COLOR" stroke-width="1.6" stroke-linejoin="round"
+                  d="M5 1.8 5 16.2 8.5 12.7 10.9 17.8 13.4 16.6 11 11.6 15.8 11.6z"/></g>)SVG";
+
+    case CropType::Rectangular:
+        break;
+    }
+    return bodyFor(ToolId::Crop);
+}
+
+/// Per-variant artwork for the lasso group.
+///
+/// All three share the loop-with-a-tail silhouette; what distinguishes them is
+/// how the loop is drawn — freehand curve, straight segments, or a curve with
+/// the fastening points the magnetic wire drops along it.
+QString lassoVariantBody(int variant)
+{
+    // The curly tail is common to all three, as it is in CS6.
+    const QString tail =
+        R"SVG(<path d="M12.9 13.4c-.5 1.7-2 2.5-2.3 3.8-.2 1.1.8 1.9 1.8 1.5"/>)SVG";
+
+    switch (static_cast<LassoType>(variant)) {
+    // Straight segments rather than a curve: the polygon the tool builds.
+    case LassoType::Polygonal:
+        return QStringLiteral(R"SVG(<path d="M12.9 13.4 15.6 8.4 11.6 4.3 5.6 5.1 3.6 9.8
+                  9.4 12.9"/>)SVG") + tail;
+
+    // The same loop, beaded: a dashed curve with solid fastening points on it,
+    // the anchors the magnetic wire drops as it clings to an edge. Solid dots
+    // on a solid curve just thicken it — at 20px the dashes are what make this
+    // read as a different tool.
+    case LassoType::Magnetic:
+        return QStringLiteral(R"SVG(<path stroke-dasharray="2.6 1.9" d="M12.9 13.4c2.6-1.2
+                  3.8-3.9 2.5-6.2C13.9 4.4 9.7 3.2 6.4 4.7 3.2 6.2 2.2 9.4 4 11.6c1.3 1.6
+                  3.6 2.2 5.5 1.4"/>
+                  <g fill="COLOR" stroke="none">
+                  <rect x="14.2" y="6.1" width="2.6" height="2.6"/>
+                  <rect x="1.9" y="9.6" width="2.6" height="2.6"/>
+                  <rect x="8.3" y="2.5" width="2.6" height="2.6"/></g>)SVG")
+            + tail;
+
+    case LassoType::Freehand:
+        break;
+    }
+    return bodyFor(ToolId::Lasso);
+}
+
+/// Per-variant artwork for the Quick Selection group.
+QString quickSelectVariantBody(int variant)
+{
+    // A wand on the diagonal with sparkles at its tip, as CS6 draws it.
+    if (static_cast<QuickSelectType>(variant) == QuickSelectType::MagicWand) {
+        return R"SVG(<path stroke-width="2" d="M2.8 17.2 10.6 9.4"/>
+                  <path stroke-width="1.1" d="M9.4 8.2 11.8 10.6"/>
+                  <g fill="COLOR" stroke="none">
+                  <path d="M15 2.2 15.8 4.5 18.1 5.3 15.8 6.1 15 8.4 14.2 6.1 11.9 5.3 14.2 4.5z"/>
+                  <path d="M17.2 9.6 17.7 11 19.1 11.5 17.7 12 17.2 13.4 16.7 12 15.3 11.5
+                  16.7 11z"/></g>)SVG";
+    }
+    return bodyFor(ToolId::QuickSelect);
+}
+
+/// Per-variant artwork for the eyedropper group.
+///
+/// CS6 gives each a plain object: the pipette with a target crosshair, an
+/// angled ruler, a lined note page, and the digits 1-2-3.
+QString eyedropperVariantBody(int variant)
+{
+    switch (static_cast<EyedropperType>(variant)) {
+    // The pipette shrunk to make room for the crosshair target CS6 sets beside
+    // it — the point whose value the sampler pins.
+    case EyedropperType::ColorSampler:
+        return R"SVG(<g transform="translate(-1.4 -1.4) scale(0.86)">
+                  <path fill="COLOR" stroke="none" d="M14.2 2.4a2.6 2.6 0 0 1 3.7 3.7l-1.9 1.9
+                  -3.7-3.7z"/>
+                  <path d="M12.3 4.3 3.5 13.1 2.4 17.6 6.9 16.5 15.7 7.7"/></g>
+                  <circle cx="14.6" cy="14.6" r="3.1" fill="none" stroke="COLOR"
+                  stroke-width="1.1"/>
+                  <path stroke-width="1" d="M14.6 10.7V18.5M10.7 14.6H18.5"/>)SVG";
+
+    // A straightedge on the diagonal with graduations along one side.
+    case EyedropperType::Ruler:
+        return R"SVG(<g transform="rotate(-32 10 10)">
+                  <rect x="1.6" y="7.4" width="16.8" height="5.2" fill="none" stroke="COLOR"
+                  stroke-width="1.2"/>
+                  <path stroke-width="0.95" d="M5 7.4V10.4M8.4 7.4V9.4M11.8 7.4V10.4
+                  M15.2 7.4V9.4"/></g>)SVG";
+
+    // A page with ruled lines and a folded corner.
+    case EyedropperType::Note:
+        return R"SVG(<path stroke-width="1.2" d="M3.4 2.6H13L16.6 6.2V17.4H3.4z"/>
+                  <path stroke-width="1.1" d="M13 2.6V6.2H16.6"/>
+                  <path stroke-width="1" d="M6.2 9.4H13.8M6.2 12.2H13.8M6.2 15H11"/>)SVG";
+
+    // "123", as CS6 draws the Count tool.
+    case EyedropperType::Count:
+        return R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.35"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M2.2 8.4 3.9 6.9V13.6"/>
+                  <path d="M7.3 8.2a1.9 1.9 0 1 1 3.4 1.2L7.2 13.6h3.7"/>
+                  <path d="M13.9 7.2h3.6l-2.1 2.6a2.1 2.1 0 1 1-1.7 3.3"/></g>)SVG";
+
+    case EyedropperType::Eyedropper:
+        break;
+    }
+    return bodyFor(ToolId::Eyedropper);
+}
+
 /// Per-variant artwork, where a tool's flyout entries need distinct icons.
 ///
-/// Only the marquee group has these: CS6 draws a dashed rectangle, ellipse,
-/// horizontal band and vertical band. Everything else reuses its default icon,
-/// since the other groups' variants are not implemented anyway.
+/// The marquee, lasso, quick-selection and crop groups have these; everything
+/// else reuses its default icon, since the other groups' variants are not
+/// implemented anyway.
 QString variantBodyFor(ToolId id, int variant)
 {
+    if (id == ToolId::Crop) {
+        return cropVariantBody(variant);
+    }
+    if (id == ToolId::Lasso) {
+        return lassoVariantBody(variant);
+    }
+    if (id == ToolId::QuickSelect) {
+        return quickSelectVariantBody(variant);
+    }
+    if (id == ToolId::Eyedropper) {
+        return eyedropperVariantBody(variant);
+    }
     if (id != ToolId::Marquee) {
         return bodyFor(id);
     }
@@ -265,6 +413,32 @@ QString ToolIcons::columnToggleSvg(bool pointsLeft)
         R"SVG(<g fill="none" stroke="COLOR" stroke-width="1.6" stroke-linecap="round"
            stroke-linejoin="round"><path d="M10 5 15 10 10 15"/>
            <path d="M4 5 9 10 4 15"/></g>)SVG");
+}
+
+QString ToolIcons::crosshairSvg()
+{
+    // A plus with a short axis pair at the top left, the way CS6 marks the
+    // cursor-position readout.
+    return QStringLiteral(R"SVG(<path stroke-width="1.3" d="M10 3.6V16.4M3.6 10H16.4"/>
+                  <path stroke-width="1.3" d="M2.2 6.4V2.2H6.4"/>)SVG");
+}
+
+QString ToolIcons::boundsSvg()
+{
+    // A dashed marquee with an arrow out of its lower right, for the
+    // selection-size readout.
+    return QStringLiteral(R"SVG(<rect x="2.6" y="2.6" width="10.4" height="10.4" fill="none"
+                  stroke="COLOR" stroke-width="1.2" stroke-dasharray="2.2 1.7"/>
+                  <path stroke-width="1.2" d="M11.6 11.6 17.4 17.4"/>
+                  <path fill="COLOR" stroke="none" d="M17.8 17.8 13.4 17.2 17.2 13.4z"/>)SVG");
+}
+
+QString ToolIcons::protractorSvg()
+{
+    // A wedge with an arc across it — the angle mark CS6 puts on the ruler's
+    // readout block.
+    return QStringLiteral(R"SVG(<path stroke-width="1.3" d="M3 16.4 16.4 16.4 3 5.4z"/>
+                  <path stroke-width="1" fill="none" d="M3 12.4a4 4 0 0 0 3.6 4"/>)SVG");
 }
 
 QString ToolIcons::selectionModeSvg(SelectionMode mode)

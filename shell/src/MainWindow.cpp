@@ -3,6 +3,7 @@
 #include "canvas/CanvasView.h"
 #include "panels/ColorPanel.h"
 #include "panels/HistoryPanel.h"
+#include "panels/InfoPanel.h"
 #include "panels/LayersPanel.h"
 #include "panels/PanelHeader.h"
 #include "shortcuts/CommandRegistry.h"
@@ -13,6 +14,7 @@
 
 #include <QApplication>
 #include <QButtonGroup>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
@@ -85,9 +87,12 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
 
     connect(m_toolStrip, &ToolStrip::toolChanged, this, &MainWindow::onToolChanged);
     connect(m_canvas, &CanvasView::cursorMoved, this, &MainWindow::onCursorMoved);
+    connect(m_canvas, &CanvasView::cursorMoved, m_infoPanel, &InfoPanel::setCursorPosition);
+    connect(m_canvas, &CanvasView::cursorLeft, m_infoPanel, &InfoPanel::clearCursorPosition);
     connect(m_canvas, &CanvasView::zoomChanged, this, &MainWindow::onZoomChanged);
     connect(m_canvas, &CanvasView::contextMenuRequested, this,
             &MainWindow::showSelectionContextMenu);
+    connect(m_canvas, &CanvasView::noteEditRequested, this, &MainWindow::editNote);
     connect(m_canvas, &CanvasView::colorPicked, this, [this](const QColor &c) {
         m_colorPanel->setForegroundColor(c);
         m_toolStrip->swatches()->setForeground(c);
@@ -133,6 +138,8 @@ void MainWindow::createMenus()
                             [this] { saveDocument(); }));
     file->addAction(command(QStringLiteral("file.saveAs"), tr("Save &As..."),
                             [this] { saveDocumentAs(); }));
+    file->addAction(command(QStringLiteral("file.saveSlices"), tr("Save S&lices..."),
+                            &MainWindow::exportSlices));
     file->addSeparator();
     file->addAction(command(QStringLiteral("file.exit"), tr("E&xit"),
                             [this] { close(); }));
@@ -319,16 +326,37 @@ void MainWindow::installShortcuts()
         }
     }
 
-    // Shift+M cycles Rectangular ↔ Elliptical, as CS6 does with its
-    // "Use Shift Key for Tool Switch" preference on by default. Registered
-    // here rather than in the strip so it lands on the window with the rest.
-    QAction *cycle = m_registry->registerCommand(QStringLiteral("tool.marquee.cycle"),
-                                                 tr("Cycle Marquee Tool"),
-                                                 QKeySequence(QStringLiteral("Shift+M")));
-    connect(cycle, &QAction::triggered, this,
-            [this] { m_toolStrip->cycleVariant(ToolId::Marquee); });
-    if (!actions().contains(cycle)) {
-        addAction(cycle);
+    // Shift+letter cycles within a tool group, as CS6 does with its "Use Shift
+    // Key for Tool Switch" preference on by default. Registered here rather
+    // than in the strip so they land on the window with the rest.
+    struct Cycle {
+        const char *id;
+        QString text;
+        QString key;
+        ToolId tool;
+    };
+    const Cycle cycles[] = {
+        {"tool.marquee.cycle", tr("Cycle Marquee Tool"), QStringLiteral("Shift+M"),
+         ToolId::Marquee},
+        {"tool.lasso.cycle", tr("Cycle Lasso Tool"), QStringLiteral("Shift+L"),
+         ToolId::Lasso},
+        {"tool.quickselect.cycle", tr("Cycle Quick Selection Tool"),
+         QStringLiteral("Shift+W"), ToolId::QuickSelect},
+        {"tool.crop.cycle", tr("Cycle Crop Tool"), QStringLiteral("Shift+C"),
+         ToolId::Crop},
+        {"tool.eyedropper.cycle", tr("Cycle Eyedropper Tool"), QStringLiteral("Shift+I"),
+         ToolId::Eyedropper},
+    };
+
+    for (const Cycle &entry : cycles) {
+        QAction *cycle = m_registry->registerCommand(QString::fromUtf8(entry.id), entry.text,
+                                                     QKeySequence(entry.key));
+        const ToolId tool = entry.tool;
+        connect(cycle, &QAction::triggered, this,
+                [this, tool] { m_toolStrip->cycleVariant(tool); });
+        if (!actions().contains(cycle)) {
+            addAction(cycle);
+        }
     }
 }
 
@@ -507,29 +535,65 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         // Feather, as CS6 places it: straight after the combine buttons. The
         // value applies to selections made from now on, not to the current
         // one — Select ▸ Feather is what softens an existing selection.
-        m_optionsBar->addWidget(new QLabel(tr("Feather:"), m_optionsBar));
-        auto *feather = new QSpinBox(m_optionsBar);
-        feather->setRange(0, 1000);
-        feather->setValue(m_featherRadius);
-        feather->setSuffix(tr(" px"));
-        feather->setFixedWidth(72);
-        feather->setToolTip(tr("Soften the edge of new selections"));
-        m_optionsBar->addWidget(feather);
-        connect(feather, &QSpinBox::valueChanged, this, [this](int value) {
-            m_featherRadius = value;
-            m_canvas->setFeatherRadius(value);
-        });
+        //
+        // CS6 gives it to the marquee and lasso families only; the Quick
+        // Selection button's two tools have no Feather field, so neither do
+        // we. The stored radius still applies to them, which is why the canvas
+        // is told either way.
+        if (tool != ToolId::QuickSelect) {
+            m_optionsBar->addWidget(new QLabel(tr("Feather:"), m_optionsBar));
+            auto *feather = new QSpinBox(m_optionsBar);
+            feather->setRange(0, 1000);
+            feather->setValue(m_featherRadius);
+            feather->setSuffix(tr(" px"));
+            feather->setFixedWidth(72);
+            feather->setToolTip(tr("Soften the edge of new selections"));
+            m_optionsBar->addWidget(feather);
+            connect(feather, &QSpinBox::valueChanged, this, [this](int value) {
+                m_featherRadius = value;
+                m_canvas->setFeatherRadius(value);
+            });
+            m_optionsBar->addSeparator();
+        }
         m_canvas->setFeatherRadius(m_featherRadius);
-        m_optionsBar->addSeparator();
 
         const bool lineSelect = tool == ToolId::Marquee
             && (static_cast<MarqueeType>(variant) == MarqueeType::SingleRow
                 || static_cast<MarqueeType>(variant) == MarqueeType::SingleColumn);
-        m_optionsBar->addWidget(new QLabel(
-            lineSelect
-                ? tr("Click to select a line    Ctrl+Shift = add    Ctrl+Alt = subtract")
-                : tr("Ctrl+Shift = add    Ctrl+Alt = subtract    Click = deselect"),
-            m_optionsBar));
+        const LassoType lasso = static_cast<LassoType>(variant);
+        const QuickSelectType quick = static_cast<QuickSelectType>(variant);
+
+        // The Magnetic Lasso's own three controls, in CS6's order. They tune
+        // the edge search, so they only appear for that variant.
+        if (tool == ToolId::Lasso && lasso == LassoType::Magnetic) {
+            addMagneticOptions();
+            m_optionsBar->addSeparator();
+        } else if (tool == ToolId::QuickSelect) {
+            addQuickSelectOptions(quick);
+            m_optionsBar->addSeparator();
+        }
+
+        QString hint;
+        if (lineSelect) {
+            hint = tr("Click to select a line    Ctrl+Shift = add    Ctrl+Alt = subtract");
+        } else if (tool == ToolId::Lasso && lasso != LassoType::Freehand) {
+            hint = tr("Click to place points    Double-click or Enter to close    "
+                      "Backspace undoes one    Esc cancels");
+        } else if (tool == ToolId::QuickSelect && quick == QuickSelectType::MagicWand) {
+            hint = tr("Click to select a matching area    Ctrl+Shift = add    "
+                      "Ctrl+Alt = subtract");
+        } else if (tool == ToolId::QuickSelect) {
+            hint = tr("Drag to grow the selection    Ctrl+Shift = add    "
+                      "Ctrl+Alt = subtract");
+        } else {
+            hint = tr("Ctrl+Shift = add    Ctrl+Alt = subtract    Click = deselect");
+        }
+        m_optionsBar->addWidget(new QLabel(hint, m_optionsBar));
+    } else if (tool == ToolId::Crop) {
+        addCropOptions(static_cast<CropType>(variant));
+    } else if (tool == ToolId::Eyedropper
+               && static_cast<EyedropperType>(variant) != EyedropperType::Eyedropper) {
+        addAnnotationOptions(static_cast<EyedropperType>(variant));
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(
             new QLabel(tr("Click to zoom in    Alt+click to zoom out"), m_optionsBar));
@@ -595,6 +659,444 @@ void MainWindow::addSelectionModeButtons()
     m_optionsBar->addSeparator();
 }
 
+void MainWindow::addMagneticOptions()
+{
+    // Width, Contrast and Frequency, as CS6 labels and orders them. The values
+    // live on MainWindow rather than in the widgets so they survive the
+    // options bar being rebuilt on every tool change.
+    struct Entry {
+        QString label;
+        int min;
+        int max;
+        int *value;
+        QString suffix;
+        QString tip;
+    };
+    const Entry entries[] = {
+        {tr("Width:"), 1, 256, &m_magneticWidth, tr(" px"),
+         tr("How far either side of the cursor an edge is looked for")},
+        {tr("Contrast:"), 1, 100, &m_magneticContrast, QStringLiteral("%"),
+         tr("How strong a gradient has to be to count as an edge")},
+        {tr("Frequency:"), 0, 100, &m_magneticFrequency, QString(),
+         tr("How often a fastening point is dropped automatically")},
+    };
+
+    for (const Entry &entry : entries) {
+        m_optionsBar->addWidget(new QLabel(entry.label, m_optionsBar));
+        auto *spin = new QSpinBox(m_optionsBar);
+        spin->setRange(entry.min, entry.max);
+        spin->setValue(*entry.value);
+        spin->setSuffix(entry.suffix);
+        spin->setFixedWidth(72);
+        spin->setToolTip(entry.tip);
+        spin->setStatusTip(entry.tip);
+        m_optionsBar->addWidget(spin);
+
+        int *slot = entry.value;
+        connect(spin, &QSpinBox::valueChanged, this, [this, slot](int value) {
+            *slot = value;
+            pushMagneticOptions();
+        });
+    }
+
+    pushMagneticOptions();
+}
+
+QString MainWindow::infoHintFor(EyedropperType type) const
+{
+    // CS6 changes the Info panel's footer per tool, and it is the only place
+    // the modifier hints for these tools appear.
+    switch (type) {
+    case EyedropperType::ColorSampler:
+        return tr("Click image to place new color sampler.\n"
+                  "Drag to move it. Use Alt to remove.");
+    case EyedropperType::Ruler:
+        return tr("Click and drag to create ruler.\nDrag either end to adjust.");
+    case EyedropperType::Note:
+        return tr("Click image to add a note.\nClick a note to edit it.");
+    case EyedropperType::Count:
+        return tr("Click image to count. Use Alt to remove a mark.");
+    case EyedropperType::Eyedropper:
+        break;
+    }
+    return tr("Click image to sample a color.");
+}
+
+void MainWindow::addAnnotationOptions(EyedropperType type)
+{
+    // The readout labels are recreated with the bar, so the list of them is
+    // rebuilt here and `updateAnnotationReadouts` fills them in.
+    m_annotationReadouts.clear();
+
+    auto addReadout = [this](const QString &prefix, int width) {
+        auto *label = new QLabel(prefix, m_optionsBar);
+        label->setMinimumWidth(width);
+        label->setProperty("readoutPrefix", prefix);
+        m_optionsBar->addWidget(label);
+        m_annotationReadouts.append(label);
+    };
+
+    switch (type) {
+    case EyedropperType::ColorSampler:
+        // No readouts here: the sampler values live in the Info panel, which
+        // is where CS6 puts them too.
+        break;
+
+    case EyedropperType::Ruler:
+        // Photoshop's own labels, in its order.
+        for (const QString &field : {QStringLiteral("X:"), QStringLiteral("Y:"),
+                                     QStringLiteral("W:"), QStringLiteral("H:"),
+                                     QStringLiteral("A:"), QStringLiteral("D1:")}) {
+            addReadout(field, 62);
+        }
+        break;
+
+    case EyedropperType::Count:
+        addReadout(tr("Count:"), 80);
+        break;
+
+    case EyedropperType::Note:
+        addReadout(tr("Notes:"), 80);
+        break;
+
+    case EyedropperType::Eyedropper:
+        return;
+    }
+
+    m_optionsBar->addSeparator();
+
+    auto *clear = new QToolButton(m_optionsBar);
+    clear->setText(tr("Clear"));
+    m_optionsBar->addWidget(clear);
+    connect(clear, &QToolButton::clicked, this, [this, type] {
+        if (!m_engine) {
+            return;
+        }
+        switch (type) {
+        case EyedropperType::ColorSampler:
+            m_engine->clearMarkers(static_cast<int>(MarkerKind::ColorSampler));
+            break;
+        case EyedropperType::Note:
+            m_engine->clearMarkers(static_cast<int>(MarkerKind::Note));
+            break;
+        case EyedropperType::Count:
+            m_engine->clearMarkers(static_cast<int>(MarkerKind::Count));
+            break;
+        case EyedropperType::Ruler:
+            m_engine->clearRuler();
+            break;
+        case EyedropperType::Eyedropper:
+            break;
+        }
+    });
+
+    m_optionsBar->addSeparator();
+
+    QString hint;
+    switch (type) {
+    case EyedropperType::ColorSampler:
+        hint = tr("Click to place a sampler    Drag to move    Alt+click to remove    "
+                  "Values read out in the Info panel (F8)");
+        break;
+    case EyedropperType::Ruler:
+        hint = tr("Drag to measure    Drag either end to adjust");
+        break;
+    case EyedropperType::Note:
+        hint = tr("Click to add a note    Click a note to edit it    Alt+click to remove");
+        break;
+    case EyedropperType::Count:
+        hint = tr("Click to count    Drag to move a mark    Alt+click to remove");
+        break;
+    case EyedropperType::Eyedropper:
+        break;
+    }
+    m_optionsBar->addWidget(new QLabel(hint, m_optionsBar));
+
+    updateAnnotationReadouts();
+}
+
+void MainWindow::updateAnnotationReadouts()
+{
+    if (m_annotationReadouts.isEmpty() || !m_engine) {
+        return;
+    }
+
+    const auto set = [this](int i, const QString &text) {
+        if (i < m_annotationReadouts.size()) {
+            QLabel *label = m_annotationReadouts.at(i);
+            label->setText(label->property("readoutPrefix").toString() + QLatin1Char(' ') + text);
+        }
+    };
+
+    switch (m_activeTool == ToolId::Eyedropper ? static_cast<EyedropperType>(m_activeVariant)
+                                               : EyedropperType::Eyedropper) {
+    case EyedropperType::ColorSampler:
+        // Handled entirely by the Info panel.
+        break;
+
+    case EyedropperType::Ruler: {
+        const rust::Vec<float> m = m_engine->rulerMeasurement();
+        if (m.size() < 6) {
+            for (int i = 0; i < m_annotationReadouts.size(); ++i) {
+                set(i, QStringLiteral("—"));
+            }
+            break;
+        }
+        for (int i = 0; i < 6; ++i) {
+            // The angle gets a degree sign; the rest are plain pixels.
+            set(i, i == 4 ? QStringLiteral("%1°").arg(m[i], 0, 'f', 1)
+                          : QStringLiteral("%1").arg(m[i], 0, 'f', 1));
+        }
+        break;
+    }
+
+    case EyedropperType::Count:
+        set(0, QString::number(m_engine->markerCount(static_cast<int>(MarkerKind::Count))));
+        break;
+
+    case EyedropperType::Note:
+        set(0, QString::number(m_engine->markerCount(static_cast<int>(MarkerKind::Note))));
+        break;
+
+    case EyedropperType::Eyedropper:
+        break;
+    }
+}
+
+void MainWindow::editNote(int index)
+{
+    if (!m_engine) {
+        return;
+    }
+    const int kind = static_cast<int>(MarkerKind::Note);
+    const QString current = m_engine->markerText(kind, index);
+
+    bool ok = false;
+    const QString text = QInputDialog::getMultiLineText(this, tr("Note"), tr("Note text:"),
+                                                        current, &ok);
+    if (!ok) {
+        // Cancelling a brand-new note removes it again, rather than leaving an
+        // empty marker on the image.
+        if (current.isEmpty()) {
+            m_engine->removeMarker(kind, index);
+        }
+        return;
+    }
+    m_engine->setMarkerText(kind, index, text);
+}
+
+void MainWindow::addCropOptions(CropType type)
+{
+    if (type == CropType::Slice || type == CropType::SliceSelect) {
+        auto *clear = new QToolButton(m_optionsBar);
+        clear->setText(tr("Clear Slices"));
+        clear->setToolTip(tr("Remove every user slice, leaving the whole canvas as one "
+                             "auto slice"));
+        m_optionsBar->addWidget(clear);
+        connect(clear, &QToolButton::clicked, this, [this] {
+            if (m_engine) {
+                m_engine->clearSlices();
+            }
+        });
+
+        if (type == CropType::SliceSelect) {
+            auto *remove = new QToolButton(m_optionsBar);
+            remove->setText(tr("Delete Slice"));
+            remove->setToolTip(tr("Delete the selected slice (Del)"));
+            m_optionsBar->addWidget(remove);
+            connect(remove, &QToolButton::clicked, m_canvas, &CanvasView::deleteSelectedSlice);
+        }
+
+        m_optionsBar->addSeparator();
+
+        auto *save = new QToolButton(m_optionsBar);
+        save->setText(tr("Save Slices..."));
+        save->setToolTip(tr("Write every slice out as its own image file"));
+        m_optionsBar->addWidget(save);
+        connect(save, &QToolButton::clicked, this, &MainWindow::exportSlices);
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(new QLabel(
+            type == CropType::Slice
+                ? tr("Drag to cut a slice    The rest of the canvas is sliced automatically")
+                : tr("Click a slice to select it    Drag it or its handles to adjust    "
+                     "Del to remove it"),
+            m_optionsBar));
+        return;
+    }
+
+    if (type == CropType::Perspective) {
+        // Perspective Crop has neither a ratio preset nor Delete Cropped
+        // Pixels in CS6: the output size comes from the quad the user marked,
+        // and everything outside it is resampled away by definition.
+        auto *cancel = new QToolButton(m_optionsBar);
+        cancel->setText(QStringLiteral("✘"));
+        cancel->setToolTip(tr("Cancel the crop (Esc)"));
+        m_optionsBar->addWidget(cancel);
+        connect(cancel, &QToolButton::clicked, m_canvas, &CanvasView::resetCrop);
+
+        auto *apply = new QToolButton(m_optionsBar);
+        apply->setText(QStringLiteral("✓"));
+        apply->setToolTip(tr("Straighten and crop (Enter)"));
+        m_optionsBar->addWidget(apply);
+        connect(apply, &QToolButton::clicked, m_canvas, &CanvasView::commitCrop);
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(new QLabel(
+            tr("Drag out a box, then pull its corners onto the subject    "
+               "Enter or double-click to straighten    Esc to reset"),
+            m_optionsBar));
+        return;
+    }
+
+    // CS6 opens the Crop bar with a ratio preset. The named ratios are the
+    // ones its own list offers; "Unconstrained" leaves the box free.
+    struct Preset {
+        QString label;
+        double ratio;
+    };
+    const Preset presets[] = {
+        {tr("Unconstrained"), 0.0},
+        {tr("1 : 1 (Square)"), 1.0},
+        {tr("4 : 5 (8:10)"), 4.0 / 5.0},
+        {tr("5 : 7"), 5.0 / 7.0},
+        {tr("2 : 3 (4:6)"), 2.0 / 3.0},
+        {tr("16 : 9"), 16.0 / 9.0},
+    };
+
+    auto *ratio = new QComboBox(m_optionsBar);
+    for (const Preset &preset : presets) {
+        ratio->addItem(preset.label, preset.ratio);
+    }
+    ratio->setCurrentIndex(0);
+    for (int i = 0; i < ratio->count(); ++i) {
+        if (qFuzzyCompare(ratio->itemData(i).toDouble() + 1.0, m_cropRatio + 1.0)) {
+            ratio->setCurrentIndex(i);
+            break;
+        }
+    }
+    ratio->setToolTip(tr("Lock the crop box to an aspect ratio"));
+    m_optionsBar->addWidget(ratio);
+    connect(ratio, &QComboBox::currentIndexChanged, this, [this, ratio](int index) {
+        m_cropRatio = ratio->itemData(index).toDouble();
+        pushCropOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    auto *deletePixels = new QCheckBox(tr("Delete Cropped Pixels"), m_optionsBar);
+    deletePixels->setChecked(m_cropDeletePixels);
+    deletePixels->setToolTip(tr("Discard the pixels outside the crop, rather than keeping "
+                                "them hidden beyond the canvas edge"));
+    m_optionsBar->addWidget(deletePixels);
+    connect(deletePixels, &QCheckBox::toggled, this, [this](bool on) {
+        m_cropDeletePixels = on;
+        pushCropOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    // CS6 puts a cancel/commit pair at the right of the crop bar. The keyboard
+    // route (Esc / Enter) is handled by the canvas.
+    auto *cancel = new QToolButton(m_optionsBar);
+    cancel->setText(QStringLiteral("✘"));
+    cancel->setToolTip(tr("Cancel the crop (Esc)"));
+    m_optionsBar->addWidget(cancel);
+    connect(cancel, &QToolButton::clicked, m_canvas, &CanvasView::resetCrop);
+
+    auto *commit = new QToolButton(m_optionsBar);
+    commit->setText(QStringLiteral("✓"));
+    commit->setToolTip(tr("Apply the crop (Enter)"));
+    m_optionsBar->addWidget(commit);
+    connect(commit, &QToolButton::clicked, m_canvas, &CanvasView::commitCrop);
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(
+        tr("Drag to set the crop    Enter or double-click to apply    Esc to reset"),
+        m_optionsBar));
+
+    pushCropOptions();
+}
+
+void MainWindow::pushCropOptions()
+{
+    m_canvas->setCropOptions(m_cropRatio, m_cropDeletePixels);
+}
+
+void MainWindow::addQuickSelectOptions(QuickSelectType type)
+{
+    if (type == QuickSelectType::Brush) {
+        // CS6 gives Quick Selection a full brush picker; the diameter is the
+        // part that changes the result, so that is what is here. Notably it
+        // has no Tolerance — the tool works that out from the pixels under the
+        // brush (see core/src/wand.rs).
+        m_optionsBar->addWidget(new QLabel(tr("Size:"), m_optionsBar));
+        auto *size = new QSpinBox(m_optionsBar);
+        size->setRange(1, 5000);
+        size->setValue(m_quickBrushSize);
+        size->setSuffix(tr(" px"));
+        size->setFixedWidth(80);
+        size->setToolTip(tr("Diameter of the brush the selection grows from"));
+        m_optionsBar->addWidget(size);
+        connect(size, &QSpinBox::valueChanged, this, [this](int value) {
+            m_quickBrushSize = value;
+            pushQuickSelectOptions();
+        });
+        pushQuickSelectOptions();
+        return;
+    }
+
+    // Magic Wand: Tolerance, then the two checkboxes, in CS6's order.
+    m_optionsBar->addWidget(new QLabel(tr("Tolerance:"), m_optionsBar));
+    auto *tolerance = new QSpinBox(m_optionsBar);
+    tolerance->setRange(0, 255);
+    tolerance->setValue(m_wandTolerance);
+    tolerance->setFixedWidth(64);
+    tolerance->setToolTip(tr("How far a pixel may differ, per channel, and still match"));
+    m_optionsBar->addWidget(tolerance);
+    connect(tolerance, &QSpinBox::valueChanged, this, [this](int value) {
+        m_wandTolerance = value;
+        pushQuickSelectOptions();
+    });
+
+    struct Toggle {
+        QString label;
+        bool *value;
+        QString tip;
+    };
+    const Toggle toggles[] = {
+        {tr("Anti-alias"), &m_wandAntialias, tr("Soften the edge of the selection")},
+        {tr("Contiguous"), &m_wandContiguous,
+         tr("Select only the connected area, rather than every matching pixel")},
+    };
+
+    for (const Toggle &toggle : toggles) {
+        auto *box = new QCheckBox(toggle.label, m_optionsBar);
+        box->setChecked(*toggle.value);
+        box->setToolTip(toggle.tip);
+        m_optionsBar->addWidget(box);
+
+        bool *slot = toggle.value;
+        connect(box, &QCheckBox::toggled, this, [this, slot](bool on) {
+            *slot = on;
+            pushQuickSelectOptions();
+        });
+    }
+
+    pushQuickSelectOptions();
+}
+
+void MainWindow::pushQuickSelectOptions()
+{
+    m_canvas->setQuickSelectOptions(m_quickBrushSize, m_wandTolerance, m_wandAntialias,
+                                    m_wandContiguous);
+}
+
+void MainWindow::pushMagneticOptions()
+{
+    m_canvas->setMagneticOptions(m_magneticWidth, m_magneticContrast, m_magneticFrequency);
+}
+
 void MainWindow::pushBrushSettings()
 {
     if (!m_engine || !m_brushSize) {
@@ -650,6 +1152,12 @@ void MainWindow::createDocks()
     QDockWidget *swatchesDock =
         addPanel(tr("Swatches"), swatchesPlaceholder, Qt::RightDockWidgetArea);
 
+    // CS6 tabs Info in with Properties; we have no Properties panel, so it
+    // joins the Color/Swatches group in the same corner of the dock area.
+    m_infoPanel = new InfoPanel(m_engine, this);
+    m_infoDock = addPanel(tr("Info"), m_infoPanel, Qt::RightDockWidgetArea,
+                          QStringLiteral("window.info"));
+
     m_historyPanel = new HistoryPanel(m_engine, this);
     QDockWidget *historyDock = addPanel(tr("History"), m_historyPanel,
                                         Qt::RightDockWidgetArea);
@@ -663,6 +1171,9 @@ void MainWindow::createDocks()
     if (QDockWidget *colorDock =
             findChild<QDockWidget *>(tr("Color") + QStringLiteral("Dock"))) {
         tabifyDockWidget(colorDock, swatchesDock);
+        if (m_infoDock) {
+            tabifyDockWidget(swatchesDock, m_infoDock);
+        }
         colorDock->raise();
     }
 
@@ -700,6 +1211,17 @@ void MainWindow::connectEngine()
     connect(m_engine, &Engine::layersChanged, m_layersPanel, &LayersPanel::refresh);
     connect(m_engine, &Engine::historyChanged, m_historyPanel, &HistoryPanel::refresh);
     connect(m_engine, &Engine::selectionChanged, m_canvas, &CanvasView::refreshSelection);
+    connect(m_engine, &Engine::slicesChanged, m_canvas, &CanvasView::refreshSlices);
+    connect(m_engine, &Engine::annotationsChanged, m_canvas, &CanvasView::refreshAnnotations);
+    connect(m_engine, &Engine::annotationsChanged, this,
+            &MainWindow::updateAnnotationReadouts);
+    connect(m_engine, &Engine::annotationsChanged, m_infoPanel, &InfoPanel::refreshSamplers);
+    connect(m_engine, &Engine::annotationsChanged, m_infoPanel, &InfoPanel::refreshRuler);
+    connect(m_engine, &Engine::selectionChanged, m_infoPanel, &InfoPanel::refreshSelection);
+    // The samplers read the pixels beneath them, so an edit changes their
+    // values even when the samplers themselves have not moved.
+    connect(m_engine, &Engine::canvasChanged, m_infoPanel, &InfoPanel::refreshSamplers);
+    connect(m_engine, &Engine::layersChanged, m_infoPanel, &InfoPanel::refreshDocumentSize);
     connect(m_engine, &Engine::documentTitleChanged, this, &MainWindow::updateWindowTitle);
 }
 
@@ -805,6 +1327,62 @@ bool MainWindow::saveDocumentAs()
 
     updateWindowTitle();
     return true;
+}
+
+void MainWindow::exportSlices()
+{
+    if (!m_engine) {
+        return;
+    }
+    const int count = m_engine->sliceCount();
+    if (count <= 0) {
+        return;
+    }
+
+    const QString dir = QFileDialog::getExistingDirectory(this, tr("Save Slices To"));
+    if (dir.isEmpty()) {
+        return;
+    }
+
+    // Photoshop names slice files after the document with the slice number
+    // appended, which is what makes a sliced layout reassemblable.
+    QString base = QFileInfo(m_engine->getDocumentTitle()).completeBaseName();
+    base.remove(QLatin1Char('*'));
+    if (base.isEmpty()) {
+        base = QStringLiteral("slice");
+    }
+
+    int written = 0;
+    QStringList failures;
+    for (int i = 0; i < count; ++i) {
+        const rust::Vec<::std::int32_t> info = m_engine->sliceAt(i);
+        if (info.size() < 6) {
+            continue;
+        }
+        const QImage image = m_engine->sliceImage(i);
+        if (image.isNull()) {
+            continue;
+        }
+
+        const QString path =
+            QStringLiteral("%1/%2_%3.png")
+                .arg(dir, base, QString::number(info[4]).rightJustified(2, QLatin1Char('0')));
+        if (image.save(path)) {
+            ++written;
+        } else {
+            failures.append(QFileInfo(path).fileName());
+        }
+    }
+
+    if (failures.isEmpty()) {
+        statusBar()->showMessage(tr("Wrote %n slice(s) to %1", nullptr, written).arg(dir), 4000);
+    } else {
+        QMessageBox::warning(this, tr("Save Slices"),
+                             tr("Wrote %1 of %2 slices. Could not write: %3")
+                                 .arg(written)
+                                 .arg(count)
+                                 .arg(failures.join(QStringLiteral(", "))));
+    }
 }
 
 void MainWindow::undo()
@@ -962,6 +1540,31 @@ void MainWindow::onToolChanged(ToolId tool, int variant)
     m_canvas->setActiveTool(tool);
     if (tool == ToolId::Marquee) {
         m_canvas->setMarqueeType(static_cast<MarqueeType>(variant));
+    } else if (tool == ToolId::Lasso) {
+        m_canvas->setLassoType(static_cast<LassoType>(variant));
+    } else if (tool == ToolId::QuickSelect) {
+        m_canvas->setQuickSelectType(static_cast<QuickSelectType>(variant));
+    } else if (tool == ToolId::Crop) {
+        m_canvas->setCropType(static_cast<CropType>(variant));
+    } else if (tool == ToolId::Eyedropper) {
+        const auto kind = static_cast<EyedropperType>(variant);
+        m_canvas->setEyedropperType(kind);
+        // Both the Color Sampler and the Ruler put their numbers in the Info
+        // panel rather than the options bar, so bring it forward for either.
+        const bool wantsInfo = kind == EyedropperType::ColorSampler
+            || kind == EyedropperType::Ruler;
+        if (wantsInfo && m_infoDock) {
+            m_infoDock->show();
+            m_infoDock->raise();
+        }
+        if (m_infoPanel) {
+            m_infoPanel->setRulerMode(kind == EyedropperType::Ruler);
+            m_infoPanel->setHint(infoHintFor(kind));
+        }
+    } else if (m_infoPanel) {
+        // Leaving the eyedropper group puts the panel back to CMYK.
+        m_infoPanel->setRulerMode(false);
+        m_infoPanel->setHint(infoHintFor(EyedropperType::Eyedropper));
     }
     populateOptionsBar(tool, variant);
     statusBar()->showMessage(toolVariantName(tool, variant), 2000);

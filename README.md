@@ -36,10 +36,33 @@ paint, manage layers, select, filter and undo.
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
   opacity; a whole stroke is one undo step.
 - Selections: all four marquee variants (rectangular, elliptical, single row,
-  single column) with antialiased edges, plus add/subtract/intersect, invert,
-  and feather. `M` selects the marquee and `Shift+M` cycles rectangular ↔
-  elliptical, as CS6 does. Marching ants trace the mask's real 50% contour, so
-  an ellipse reads as an ellipse and a subtracted region shows its hole.
+  single column), all three lassos (freehand, polygonal, and magnetic with
+  live-wire edge snapping), and both colour tools (Quick Selection's
+  edge-stopping region growing, and the Magic Wand) — all with antialiased
+  edges, add/subtract/intersect, invert and feather. `Shift+M`, `Shift+L` and
+  `Shift+W` cycle within each group, as CS6 does. Marching ants trace the
+  mask's real 50% contour, so an ellipse reads as an ellipse and a subtracted
+  region shows its hole.
+- Crop: a CS6-style box with eight handles, a dimmed shield outside it and a
+  rule-of-thirds overlay, aspect-ratio presets, and CS6's Delete Cropped Pixels
+  option — clear it and the pixels outside are kept, hanging off the canvas
+  edge, ready to come back.
+- Perspective Crop: mark the four corners of something that should be
+  rectangular and it is straightened onto a rectangle through a homography,
+  with bilinear resampling. Every layer and mask goes through the same
+  transform, so the stack stays in register.
+- Annotation tools: colour samplers (ten, as in CS6), a ruler reporting
+  X/Y/W/H/angle/distance, pinned text notes, and numbered count markers. None
+  of them touch pixels — they are document data alongside slices.
+- An **Info panel** (`F8`) in CS6's layout: live RGB and CMYK under the cursor,
+  cursor position, selection size, a numbered grid of sampler values, and the
+  document's memory footprint. With the Ruler active it switches to CS6's
+  ruler layout — angle and length in place of CMYK, and the ruler's deltas in
+  place of the selection size.
+- Slices: cut the canvas with the Slice tool and the rest is auto-sliced around
+  it, numbered in reading order with CS6's blue and grey badges. Slice Select
+  moves, resizes and deletes them, and File ▸ Save Slices writes each one out
+  as its own PNG.
 - Adjustments (destructive and as non-destructive adjustment layers) and
   filters (Gaussian blur, sharpen, unsharp mask, noise).
 - A Photoshop-style **Color Picker**: square field + vertical ramp driven by
@@ -47,6 +70,8 @@ paint, manage layers, select, filter and undo.
   new/current comparison, HSB/RGB/Lab/CMYK readouts, hex entry, and web-safe
   snapping.
 - Undo/redo with a linear History panel, bounded by state count and memory.
+  A snapshot carries the canvas size as well as the layer stack, so Crop and
+  Canvas Size step back correctly.
 - Photoshop CS6 default keymap, loaded from data and user-remappable.
 
 **Not yet implemented**
@@ -60,10 +85,10 @@ paint, manage layers, select, filter and undo.
   renderer described in CLAUDE.md §7 has not been built.
 - Text, shapes, paths, gradients, transforms, layer effects, adjustment-layer
   parameter dialogs, Channels/Paths/Navigator panels.
-- The Marquee is the only fully implemented strip group. For every other tool
-  the flyout lists the full CS6 group, but only the first entry works; the
-  rest are shown disabled rather than silently falling back to the parent
-  tool. Quick Mask toggles its button but does not yet change editing
+- Marquee, Lasso and Quick Selection are the fully implemented strip groups.
+  For every other tool the flyout lists the full CS6 group, but only the first
+  entry works; the rest are shown disabled rather than silently falling back to
+  the parent tool. Quick Mask toggles its button but does not yet change editing
   behaviour, and screen modes are not implemented.
 - Tool icons are line-art reconstructions in CS6's visual language, not
   Adobe's artwork.
@@ -128,7 +153,7 @@ what gives it a launcher, a name and a file association for `.psd`.
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 221 tests
+cd core && cargo test        # 293 tests
 ```
 
 or through CTest, which runs them as part of the project:
@@ -149,6 +174,11 @@ core/                 Rust image engine
   src/compositor.rs     stack → final image (parallel, rayon)
   src/brush.rs          dab-based stroke rendering
   src/selection.rs      coverage-mask selections
+  src/magnetic.rs       edge snapping for the Magnetic Lasso
+  src/wand.rs           Magic Wand flood and Quick Selection region growing
+  src/perspective.rs    homography warp for the Perspective Crop tool
+  src/slice.rs          web-export slices and auto-slice generation
+  src/annotation.rs     colour samplers, notes, count markers, ruler
   src/filters/          adjustments and convolutions
   src/history.rs        bounded linear undo
   src/document.rs       one open image; ties the above together

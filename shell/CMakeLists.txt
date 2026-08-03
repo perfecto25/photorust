@@ -19,6 +19,8 @@ set(SHELL_SOURCES
     src/panels/ColorPanel.h
     src/panels/HistoryPanel.cpp
     src/panels/HistoryPanel.h
+    src/panels/InfoPanel.cpp
+    src/panels/InfoPanel.h
     src/panels/LayersPanel.cpp
     src/panels/LayersPanel.h
     src/panels/PanelHeader.cpp

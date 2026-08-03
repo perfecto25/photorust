@@ -4,7 +4,10 @@
 //! stepping back and then performing a new action discards everything after the
 //! cursor. That is exactly what this models.
 //!
-//! States are full snapshots of the layer stack. That is memory-hungry but
+//! States are full snapshots of the layer stack **and the canvas size**. The
+//! size matters because Crop and Canvas Size change it: restoring the pixels
+//! without the dimensions they were taken at would leave the document
+//! inconsistent. That is memory-hungry but
 //! simple and always correct; the stack is bounded by both a step count and a
 //! byte budget, and evicts from the oldest end. Replacing snapshots with tile
 //! deltas is the obvious later optimisation.
@@ -16,6 +19,8 @@ pub struct HistoryState {
     /// Label shown in the panel, e.g. "Brush Tool" or "New Layer".
     pub name: String,
     pub stack: LayerStack,
+    /// Canvas size when the state was recorded.
+    pub size: (u32, u32),
 }
 
 impl HistoryState {
@@ -42,11 +47,12 @@ impl History {
     pub const DEFAULT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
     /// Create a history seeded with the document's opening state.
-    pub fn new(initial: LayerStack) -> Self {
+    pub fn new(initial: LayerStack, size: (u32, u32)) -> Self {
         Self {
             states: vec![HistoryState {
                 name: "Open".to_string(),
                 stack: initial,
+                size,
             }],
             cursor: 0,
             max_states: Self::DEFAULT_MAX_STATES,
@@ -117,46 +123,52 @@ impl History {
     ///
     /// Anything after the cursor is discarded — the redo branch is lost, which
     /// is what Photoshop does.
-    pub fn push(&mut self, name: impl Into<String>, stack: LayerStack) {
+    pub fn push(&mut self, name: impl Into<String>, stack: LayerStack, size: (u32, u32)) {
         self.states.truncate(self.cursor + 1);
         self.states.push(HistoryState {
             name: name.into(),
             stack,
+            size,
         });
         self.cursor = self.states.len() - 1;
         self.evict();
     }
 
-    /// Step back one state, returning the stack to restore.
-    pub fn undo(&mut self) -> Option<&LayerStack> {
+    /// Step back one state, returning the state to restore.
+    pub fn undo(&mut self) -> Option<&HistoryState> {
         if !self.can_undo() {
             return None;
         }
         self.cursor -= 1;
-        Some(&self.states[self.cursor].stack)
+        Some(&self.states[self.cursor])
     }
 
     /// Step forward one state.
-    pub fn redo(&mut self) -> Option<&LayerStack> {
+    pub fn redo(&mut self) -> Option<&HistoryState> {
         if !self.can_redo() {
             return None;
         }
         self.cursor += 1;
-        Some(&self.states[self.cursor].stack)
+        Some(&self.states[self.cursor])
     }
 
     /// Jump directly to a state, as clicking a row in the History panel does.
-    pub fn jump_to(&mut self, index: usize) -> Option<&LayerStack> {
+    pub fn jump_to(&mut self, index: usize) -> Option<&HistoryState> {
         if index >= self.states.len() {
             return None;
         }
         self.cursor = index;
-        Some(&self.states[self.cursor].stack)
+        Some(&self.states[self.cursor])
     }
 
     /// The stack at the cursor.
     pub fn current(&self) -> &LayerStack {
         &self.states[self.cursor].stack
+    }
+
+    /// The canvas size at the cursor.
+    pub fn current_size(&self) -> (u32, u32) {
+        self.states[self.cursor].size
     }
 
     /// Total bytes held by all snapshots.
@@ -195,7 +207,7 @@ mod tests {
 
     #[test]
     fn starts_with_a_single_open_state() {
-        let h = History::new(LayerStack::new());
+        let h = History::new(LayerStack::new(), (16, 16));
         assert_eq!(h.len(), 1);
         assert_eq!(h.cursor(), 0);
         assert!(!h.can_undo());
@@ -205,8 +217,8 @@ mod tests {
 
     #[test]
     fn push_advances_the_cursor() {
-        let mut h = History::new(LayerStack::new());
-        h.push("New Layer", stack_with_name("a"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("New Layer", stack_with_name("a"), (16, 16));
         assert_eq!(h.len(), 2);
         assert_eq!(h.cursor(), 1);
         assert!(h.can_undo());
@@ -215,50 +227,50 @@ mod tests {
 
     #[test]
     fn undo_then_redo_returns_to_the_same_state() {
-        let mut h = History::new(LayerStack::new());
-        h.push("New Layer", stack_with_name("a"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("New Layer", stack_with_name("a"), (16, 16));
 
-        assert_eq!(h.undo().unwrap().len(), 0);
+        assert_eq!(h.undo().unwrap().stack.len(), 0);
         assert_eq!(h.cursor(), 0);
         assert!(h.can_redo());
 
-        assert_eq!(h.redo().unwrap().len(), 1);
+        assert_eq!(h.redo().unwrap().stack.len(), 1);
         assert_eq!(h.cursor(), 1);
     }
 
     #[test]
     fn undo_at_the_start_returns_none() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         assert!(h.undo().is_none());
         assert_eq!(h.cursor(), 0);
     }
 
     #[test]
     fn redo_at_the_end_returns_none() {
-        let mut h = History::new(LayerStack::new());
-        h.push("x", stack_with_name("a"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("x", stack_with_name("a"), (16, 16));
         assert!(h.redo().is_none());
     }
 
     #[test]
     fn pushing_after_undo_discards_the_redo_branch() {
-        let mut h = History::new(LayerStack::new());
-        h.push("first", stack_with_name("a"));
-        h.push("second", stack_with_name("b"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("first", stack_with_name("a"), (16, 16));
+        h.push("second", stack_with_name("b"), (16, 16));
         h.undo();
         assert!(h.can_redo());
 
-        h.push("third", stack_with_name("c"));
+        h.push("third", stack_with_name("c"), (16, 16));
         assert!(!h.can_redo(), "redo branch survived a new action");
         assert_eq!(h.state_names(), vec!["Open", "first", "third"]);
     }
 
     #[test]
     fn undo_and_redo_names_describe_the_right_steps() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         assert_eq!(h.undo_name(), None);
 
-        h.push("Brush Tool", stack_with_name("a"));
+        h.push("Brush Tool", stack_with_name("a"), (16, 16));
         assert_eq!(h.undo_name(), Some("Brush Tool"));
         assert_eq!(h.redo_name(), None);
 
@@ -269,9 +281,9 @@ mod tests {
 
     #[test]
     fn jump_to_moves_the_cursor_anywhere() {
-        let mut h = History::new(LayerStack::new());
-        h.push("a", stack_with_name("a"));
-        h.push("b", stack_with_name("b"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("a", stack_with_name("a"), (16, 16));
+        h.push("b", stack_with_name("b"), (16, 16));
 
         assert!(h.jump_to(0).is_some());
         assert_eq!(h.cursor(), 0);
@@ -283,10 +295,10 @@ mod tests {
 
     #[test]
     fn state_count_limit_evicts_the_oldest() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         h.set_max_states(3);
         for i in 0..5 {
-            h.push(format!("s{}", i), stack_with_name("x"));
+            h.push(format!("s{}", i), stack_with_name("x"), (16, 16));
         }
         assert_eq!(h.len(), 3);
         // The oldest entries, including "Open", were dropped.
@@ -296,17 +308,17 @@ mod tests {
 
     #[test]
     fn eviction_keeps_the_cursor_pointing_at_the_same_state() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         h.set_max_states(2);
-        h.push("a", stack_with_name("a"));
-        h.push("b", stack_with_name("b"));
+        h.push("a", stack_with_name("a"), (16, 16));
+        h.push("b", stack_with_name("b"), (16, 16));
         // The cursor must still address the newest state.
         assert_eq!(h.state_names()[h.cursor()], "b");
     }
 
     #[test]
     fn max_states_is_never_below_one() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         h.set_max_states(0);
         assert_eq!(h.max_states(), 1);
         assert!(!h.is_empty());
@@ -314,7 +326,7 @@ mod tests {
 
     #[test]
     fn byte_budget_evicts_old_snapshots() {
-        let mut h = History::new(LayerStack::new());
+        let mut h = History::new(LayerStack::new(), (16, 16));
         // Each pushed stack holds one 64x64 RGBA layer = 16 KiB.
         let big = || {
             let mut s = LayerStack::new();
@@ -324,7 +336,7 @@ mod tests {
         };
         h.set_max_bytes(40 * 1024);
         for _ in 0..6 {
-            h.push("big", big());
+            h.push("big", big(), (16, 16));
         }
         assert!(h.byte_size() <= 40 * 1024, "budget exceeded: {}", h.byte_size());
         assert!(h.len() >= 1);
@@ -332,8 +344,8 @@ mod tests {
 
     #[test]
     fn current_reflects_the_cursor() {
-        let mut h = History::new(LayerStack::new());
-        h.push("a", stack_with_name("a"));
+        let mut h = History::new(LayerStack::new(), (16, 16));
+        h.push("a", stack_with_name("a"), (16, 16));
         assert_eq!(h.current().len(), 1);
         h.undo();
         assert_eq!(h.current().len(), 0);

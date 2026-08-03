@@ -1,5 +1,5 @@
 /*
- * Photoshop CS6 "Kona" dark theme.
+ * CS6 "Kona" dark theme.
  *
  * Palette sampled from the CS6 UI. The four greys that do most of the work:
  *
@@ -207,6 +207,40 @@ QWidget#panelTitleBar QToolButton#panelTitleBarButton {
 
 QWidget#panelTitleBar QToolButton#panelTitleBarButton:hover {
     background-color: #5e5e5e;
+}
+
+/* The Info panel. CS6 sets each readout in a slightly sunken block, with the
+   keys dimmer than their values so the numbers are what the eye lands on. */
+QWidget#infoBlock {
+    background-color: #4a4a4a;
+    border: 1px solid #3a3a3a;
+}
+
+QWidget#infoPanel QLabel#infoKey {
+    color: #b0b0b0;
+}
+
+QWidget#infoPanel QLabel#infoValue {
+    color: #e8e8e8;
+}
+
+QWidget#infoPanel QLabel#infoTag {
+    color: #e8e8e8;
+    font-weight: bold;
+}
+
+QWidget#infoPanel QLabel#infoFooter {
+    color: #9a9a9a;
+}
+
+QWidget#infoPanel QLabel#infoDocSize,
+QWidget#infoPanel QLabel#infoHint {
+    color: #b6b6b6;
+}
+
+QWidget#infoPanel QFrame#infoRule {
+    color: #3a3a3a;
+    max-height: 1px;
 }
 
 /* The hidden-tools flyout. CS6 pops this to the right of the button with the
