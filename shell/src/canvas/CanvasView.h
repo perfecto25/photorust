@@ -72,6 +72,28 @@ public:
     /// Selection tool grows from, and the wand's tolerance and checkboxes.
     void setQuickSelectOptions(int brushSize, int tolerance, bool antialias, bool contiguous);
 
+    /// The Spot Healing Brush's Type — how the covered region is rebuilt.
+    void setHealType(HealType type);
+    HealType healType() const { return m_healType; }
+
+    /// Which healing-group variant is active.
+    void setHealingType(HealingType type);
+    HealingType healingType() const { return m_healingType; }
+
+    /// Patch options, from CS6's bar: Content-Aware rebuilds in place and
+    /// ignores the drag, Destination reverses which end of the drag is
+    /// repaired, and Transparent transfers texture without colour.
+    void setPatchOptions(bool contentAware, bool destination, bool transparent);
+
+    /// Red Eye options: CS6's Pupil Size and Darken Amount, both 0-100.
+    void setRedEyeOptions(int pupilSize, int darkenAmount);
+    /// Content-Aware Move: Extend duplicates the region instead of moving it.
+    void setContentAwareExtend(bool extend) { m_camExtend = extend; }
+
+    /// Apply the pending Patch / Content-Aware Move drag. Nothing happens
+    /// unless a region has been dragged.
+    void commitHealingDrag();
+
     /// Which eyedropper-group variant is active.
     void setEyedropperType(EyedropperType type);
     EyedropperType eyedropperType() const { return m_eyedropperType; }
@@ -148,6 +170,12 @@ signals:
     /// A note needs its text edited. The canvas does not own dialogs, so
     /// `MainWindow` puts one up and writes the result back to the engine.
     void noteEditRequested(int index);
+    /// Something worth telling the user, for the status bar — a tool that
+    /// needs a step taken first, for instance.
+    void statusMessage(const QString &text);
+    /// The Healing Brush was used before a source was set. `MainWindow` puts up
+    /// the warning; the canvas does not own dialogs.
+    void healingSourceRequired();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -255,6 +283,30 @@ private:
     void commitPerspectiveCrop();
     /// Paint the perspective quad: shield, grid, edges and corner handles.
     void paintCropQuad(QPainter &painter);
+
+    /// True when the active healing variant is stroked with the brush.
+    bool healingIsStroked() const
+    {
+        return m_tool == ToolId::Healing && healingIsBrush(m_healingType);
+    }
+    /// True when the active healing variant works on a dragged region.
+    bool healingIsRegion() const
+    {
+        return m_tool == ToolId::Healing
+            && (m_healingType == HealingType::Patch
+                || m_healingType == HealingType::ContentAwareMove);
+    }
+    /// True while a freehand outline is being traced, by the lasso or by one of
+    /// the region-based healing tools.
+    bool freehandTracing() const { return lassoIsDragged() || m_healingTracing; }
+    /// Press, drag and release for the healing group's non-brush variants.
+    /// Returns true when the event was consumed.
+    bool healingPress(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    bool healingDrag(const QPointF &doc);
+    bool healingRelease();
+    /// Paint the healing tools' overlays: the sampled source, the region drag
+    /// and the red-eye rectangle.
+    void paintHealing(QPainter &painter);
 
     /// True when the eyedropper button is holding one of the annotation
     /// tools rather than the eyedropper itself.
@@ -394,6 +446,28 @@ private:
 
     // -- annotations --
     EyedropperType m_eyedropperType = EyedropperType::Eyedropper;
+    /// CS6's default healing type.
+    HealType m_healType = HealType::ContentAware;
+    HealingType m_healingType = HealingType::SpotHealing;
+    /// The Healing Brush's Alt-clicked source, in document coordinates.
+    QPointF m_healSource;
+    bool m_healSourceValid = false;
+    /// True while one of the region healing tools is tracing its outline; it
+    /// borrows the lasso's freehand path.
+    bool m_healingTracing = false;
+    /// The Patch / Content-Aware Move drag: where it started and where it is.
+    bool m_regionDragging = false;
+    QPointF m_regionDragStart;
+    QPointF m_regionDragNow;
+    bool m_camExtend = false;
+    bool m_patchContentAware = false;
+    bool m_patchDestination = false;
+    bool m_patchTransparent = false;
+    /// The Red Eye tool's rectangle while it is being dragged.
+    QRectF m_redEyeRect;
+    bool m_redEyeDragging = false;
+    int m_pupilSize = RedEyeDefaults::kPupilSize;
+    int m_darkenAmount = RedEyeDefaults::kDarkenAmount;
     /// Cached marker positions, indexed by MarkerKind.
     QList<QPointF> m_markers[3];
     /// The ruler's two endpoints, empty when there is none.

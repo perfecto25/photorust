@@ -59,12 +59,14 @@ QString bodyFor(ToolId id)
                   <path d="M12.3 4.3 3.5 13.1 2.4 17.6 6.9 16.5 15.7 7.7"/>
                   <path d="M11 6.4 13.6 9"/>)SVG";
 
-    // Spot Healing Brush: the bandage, angled as CS6 draws it.
+    // Spot Healing Brush: the bandage, angled as CS6 draws it, with the small
+    // spot that tells it apart from the plain Healing Brush.
     case ToolId::Healing:
         return R"SVG(<g transform="rotate(-45 10 10)">
                   <rect x="2.4" y="7.3" width="15.2" height="5.4" rx="2.7" fill="none"
                   stroke="COLOR" stroke-width="1.25"/>
-                  <path d="M7.6 7.3V12.7M12.4 7.3V12.7"/></g>)SVG";
+                  <path d="M7.6 7.3V12.7M12.4 7.3V12.7"/></g>
+                  <circle cx="15.9" cy="4.1" r="1.9" fill="COLOR" stroke="none"/>)SVG";
 
     case ToolId::Brush:
         return R"SVG(<path fill="COLOR" stroke="none" d="M17.1 2.9c.9.9.9 2 0 2.9l-6.3 6.3-2.9-2.9
@@ -273,6 +275,46 @@ QString eyedropperVariantBody(int variant)
     return bodyFor(ToolId::Eyedropper);
 }
 
+/// Per-variant artwork for the healing group.
+///
+/// CS6 gives the two brushes the same bandage, distinguished by the spot on the
+/// Spot Healing one, then a stitched patch, crossing arrows and an eye.
+QString healingVariantBody(int variant)
+{
+    switch (static_cast<HealingType>(variant)) {
+    // The plain bandage: this brush is told where to sample from, so it has no
+    // spot on it.
+    case HealingType::Healing:
+        return R"SVG(<g transform="rotate(-45 10 10)">
+                  <rect x="2.4" y="7.3" width="15.2" height="5.4" rx="2.7" fill="none"
+                  stroke="COLOR" stroke-width="1.25"/>
+                  <path d="M7.6 7.3V12.7M12.4 7.3V12.7"/></g>)SVG";
+
+    // A patch with a stitched seam across it, as CS6 draws it.
+    case HealingType::Patch:
+        return R"SVG(<path stroke-width="1.2" d="M3.4 6.2 9.4 2.8 16.6 6.6 14.2 15.4 6.2 17.2z"/>
+                  <path stroke-width="1" stroke-dasharray="1.9 1.6"
+                  d="M4.6 11.2 15.4 10.6"/>)SVG";
+
+    // Two crossing arrows: the region goes one way, what fills its place comes
+    // from the other.
+    case HealingType::ContentAwareMove:
+        return R"SVG(<path stroke-width="1.25" d="M4.4 15.6 15.2 4.8M15.6 15.2 4.8 4.4"/>
+                  <path fill="COLOR" stroke="none" d="M17.6 2.4 16.4 7.6 11.6 3.6z"/>
+                  <path fill="COLOR" stroke="none" d="M17.6 17.6 12.4 16.4 16.4 11.6z"/>)SVG";
+
+    // An eye with a crosshair through the pupil.
+    case HealingType::RedEye:
+        return R"SVG(<circle cx="10" cy="10" r="3.4" fill="none" stroke="COLOR"
+                  stroke-width="1.3"/>
+                  <path stroke-width="1.15" d="M10 2.4V6M10 14V17.6M2.4 10H6M14 10H17.6"/>)SVG";
+
+    case HealingType::SpotHealing:
+        break;
+    }
+    return bodyFor(ToolId::Healing);
+}
+
 /// Per-variant artwork, where a tool's flyout entries need distinct icons.
 ///
 /// The marquee, lasso, quick-selection and crop groups have these; everything
@@ -291,6 +333,9 @@ QString variantBodyFor(ToolId id, int variant)
     }
     if (id == ToolId::Eyedropper) {
         return eyedropperVariantBody(variant);
+    }
+    if (id == ToolId::Healing) {
+        return healingVariantBody(variant);
     }
     if (id != ToolId::Marquee) {
         return bodyFor(id);

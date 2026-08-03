@@ -10,11 +10,27 @@ use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::compositor;
 use crate::filters::{Adjustment, Filter};
+use crate::healing::{self, HealMode, Transfer};
 use crate::history::History;
 use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
 use crate::perspective;
 use crate::selection::{Selection, SelectionOp};
 use crate::slice::{Slice, SliceSet};
+
+/// What the Patch tool was asked to do — CS6's options bar, as one value.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PatchOptions {
+    /// The drag, in document pixels.
+    pub dx: i32,
+    pub dy: i32,
+    /// Rebuild the selection from its surroundings and ignore the drag.
+    pub content_aware: bool,
+    /// Treat the selection as the source and the dragged-to area as the target,
+    /// rather than the other way round.
+    pub destination: bool,
+    /// Transfer texture only, keeping the patched area's own colour.
+    pub transparent: bool,
+}
 
 /// One open image.
 pub struct Document {
@@ -522,6 +538,225 @@ impl Document {
 
         self.commit("Brush Tool");
         dirty
+    }
+
+    /// Finish the stroke by *healing* what it covered rather than painting it.
+    ///
+    /// The Spot Healing Brush works this way round: the brush marks a region,
+    /// and the region is then rebuilt from the pixels around it. That is why it
+    /// happens here at the end of the stroke and not dab by dab — every dab
+    /// would otherwise heal from the previous dab's output and the stroke would
+    /// smear along itself.
+    pub fn end_heal_stroke(&mut self, mode: HealMode) -> Rect {
+        self.finish_stroke_with("Spot Healing Brush", |pixels, region, coverage| {
+            healing::heal_region(pixels, region, coverage, mode)
+        })
+    }
+
+    /// Finish the stroke by cloning from an offset source — the Healing Brush.
+    ///
+    /// Unlike the Spot Healing Brush this takes an explicit source (Alt-clicked
+    /// by the user), and transplants its texture with the destination's own
+    /// lighting.
+    pub fn end_heal_clone_stroke(&mut self, dx: i32, dy: i32) -> Rect {
+        self.finish_stroke_with("Healing Brush", |pixels, region, coverage| {
+            healing::clone_region(pixels, region, coverage, (dx, dy), Transfer::Full)
+        })
+    }
+
+    /// Shared tail of the healing strokes: take the stroke mask, turn it into
+    /// coverage in the layer's own coordinates, run `op`, and commit.
+    fn finish_stroke_with<F>(&mut self, name: &str, op: F) -> Rect
+    where
+        F: FnOnce(&mut Pixmap, Rect, &[f32]) -> Rect,
+    {
+        let Some(mask) = self.stroke.take() else {
+            return Rect::default();
+        };
+        self.stroke_undo_base = None;
+
+        if mask.is_empty() {
+            return Rect::default();
+        }
+        let region = mask.dirty();
+        if region.is_empty() {
+            return Rect::default();
+        }
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return Rect::default();
+        };
+        if layer.lock_pixels {
+            return Rect::default();
+        }
+        let offset = layer.offset;
+
+        let mut coverage = vec![0.0f32; (region.width as usize) * (region.height as usize)];
+        for y in 0..region.height as i32 {
+            for x in 0..region.width as i32 {
+                let (doc_x, doc_y) = (region.x + x, region.y + y);
+                let mut c = mask.coverage_at(doc_x, doc_y);
+                if let Some(sel) = selection.as_ref() {
+                    c *= sel.coverage_at(doc_x, doc_y);
+                }
+                coverage[(y as usize) * (region.width as usize) + x as usize] = c;
+            }
+        }
+
+        let local = Rect::new(
+            region.x - offset.0,
+            region.y - offset.1,
+            region.width,
+            region.height,
+        );
+        let dirty = op(&mut layer.pixels, local, &coverage);
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+
+        self.commit(name);
+        Rect::new(dirty.x + offset.0, dirty.y + offset.1, dirty.width, dirty.height)
+    }
+
+    /// Apply the Patch tool.
+    ///
+    /// The options mirror CS6's bar:
+    ///
+    /// * **Source** (`destination = false`) — the selection is the flaw, and the
+    ///   drag says where to sample the repair from.
+    /// * **Destination** — the roles reverse: the selection is good material,
+    ///   and the drag says where to apply it.
+    /// * **Transparent** — transfer only the source's texture, leaving the
+    ///   patched area its own colour.
+    /// * **Content-Aware** — ignore the drag entirely and rebuild the selection
+    ///   from its surroundings, as the Spot Healing Brush does.
+    pub fn patch_selection(&mut self, options: PatchOptions) -> Rect {
+        if options.content_aware {
+            // Nothing is sampled from a drag in this mode; the selection is
+            // simply reconstructed in place.
+            return self.apply_to_selection_at("Patch Tool", (0, 0), |pixels, region, cov| {
+                healing::heal_region(pixels, region, cov, HealMode::ContentAware)
+            });
+        }
+
+        let transfer = if options.transparent {
+            Transfer::TextureOnly
+        } else {
+            Transfer::Full
+        };
+        let (dx, dy) = (options.dx, options.dy);
+
+        if options.destination {
+            // Patch the area the selection was dragged *to*, taking its content
+            // from where the selection sits.
+            self.apply_to_selection_at("Patch Tool", (dx, dy), move |pixels, region, cov| {
+                healing::clone_region(pixels, region, cov, (-dx, -dy), transfer)
+            })
+        } else {
+            self.apply_to_selection_at("Patch Tool", (0, 0), move |pixels, region, cov| {
+                healing::clone_region(pixels, region, cov, (dx, dy), transfer)
+            })
+        }
+    }
+
+    /// Move the selection's contents by `(dx, dy)` and heal what it leaves —
+    /// the Content-Aware Move tool. `extend` duplicates instead of moving.
+    pub fn content_aware_move(&mut self, dx: i32, dy: i32, extend: bool) -> Rect {
+        self.apply_to_selection_at("Content-Aware Move", (0, 0), |pixels, region, coverage| {
+            healing::move_region(pixels, region, coverage, dx, dy, extend)
+        })
+    }
+
+    /// Neutralise red-eye inside `rect` — the Red Eye tool.
+    ///
+    /// This one takes a rectangle rather than the selection: CS6's Red Eye tool
+    /// is dragged over an eye directly.
+    pub fn remove_red_eye(&mut self, rect: Rect, pupil: u32, darken: u32) -> Rect {
+        let rect = rect.intersect(&Rect::from_size(self.width, self.height));
+        if rect.is_empty() {
+            return Rect::default();
+        }
+        let coverage = vec![1.0f32; (rect.width as usize) * (rect.height as usize)];
+
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return Rect::default();
+        };
+        if layer.lock_pixels {
+            return Rect::default();
+        }
+        let offset = layer.offset;
+        let local = Rect::new(rect.x - offset.0, rect.y - offset.1, rect.width, rect.height);
+
+        let dirty = healing::red_eye_region(&mut layer.pixels, local, &coverage, pupil, darken);
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+        self.commit("Red Eye Tool");
+        Rect::new(dirty.x + offset.0, dirty.y + offset.1, dirty.width, dirty.height)
+    }
+
+    /// Run a healing operation over the active selection, optionally displaced.
+    ///
+    /// The Patch and Content-Aware Move tools both work on a selection rather
+    /// than a brush stroke, and both need it as coverage over its bounding box.
+    /// `offset` moves where that coverage is *applied* while keeping its shape —
+    /// which is what the Patch tool's Destination mode needs.
+    fn apply_to_selection_at<F>(&mut self, name: &str, offset: (i32, i32), op: F) -> Rect
+    where
+        F: FnOnce(&mut Pixmap, Rect, &[f32]) -> Rect,
+    {
+        if self.selection.is_empty() {
+            return Rect::default();
+        }
+        let bounds = self.selection.bounds();
+        if bounds.is_empty() {
+            return Rect::default();
+        }
+
+        let mut coverage = vec![0.0f32; (bounds.width as usize) * (bounds.height as usize)];
+        for y in 0..bounds.height as i32 {
+            for x in 0..bounds.width as i32 {
+                coverage[(y as usize) * (bounds.width as usize) + x as usize] =
+                    self.selection.coverage_at(bounds.x + x, bounds.y + y);
+            }
+        }
+
+        let region = Rect::new(
+            bounds.x + offset.0,
+            bounds.y + offset.1,
+            bounds.width,
+            bounds.height,
+        );
+
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return Rect::default();
+        };
+        if layer.lock_pixels {
+            return Rect::default();
+        }
+        let offset = layer.offset;
+        let local = Rect::new(
+            region.x - offset.0,
+            region.y - offset.1,
+            region.width,
+            region.height,
+        );
+
+        let dirty = op(&mut layer.pixels, local, &coverage);
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+        self.commit(name);
+        Rect::new(dirty.x + offset.0, dirty.y + offset.1, dirty.width, dirty.height)
     }
 
     /// Abandon the in-progress stroke without applying it.
@@ -1303,6 +1538,233 @@ mod tests {
         let mask = layer.mask.as_ref().expect("the mask was dropped");
         assert_eq!(mask.width(), layer.pixels.width());
         assert_eq!(mask.height(), layer.pixels.height());
+    }
+
+    #[test]
+    fn healing_a_stroke_rebuilds_it_from_the_surroundings() {
+        let mut d = Document::new(64, 64, Rgba8::new(190, 160, 140, 255));
+        // A dark blemish for the brush to remove.
+        if let Some(layer) = d.active_layer_mut() {
+            for y in 28..36 {
+                for x in 28..36 {
+                    layer.pixels.set(x, y, Rgba8::new(60, 30, 30, 255));
+                }
+            }
+        }
+
+        let mut brush = Brush::default();
+        brush.size = 22.0;
+        brush.hardness = 100.0;
+        assert!(d.begin_stroke(&brush, 32.0, 32.0, 1.0));
+        let dirty = d.end_heal_stroke(HealMode::ProximityMatch);
+        assert!(!dirty.is_empty(), "healing reported nothing changed");
+
+        let px = d.composite().get(32, 32);
+        assert!(
+            (px.r as i32 - 190).abs() <= 6,
+            "the blemish survived healing: {:?}",
+            px
+        );
+    }
+
+    #[test]
+    fn healing_is_one_undo_step() {
+        let mut d = Document::new(64, 64, Rgba8::new(190, 160, 140, 255));
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.set(32, 32, Rgba8::BLACK);
+        }
+        // Record the setup, so undo has the blemish to come back to rather than
+        // the blank document underneath it.
+        d.commit("Setup");
+        let before = d.composite().get(32, 32);
+
+        let mut brush = Brush::default();
+        brush.size = 18.0;
+        d.begin_stroke(&brush, 32.0, 32.0, 1.0);
+        // Several dabs, as a real drag would produce.
+        d.extend_stroke(&brush, 34.0, 32.0, 1.0);
+        d.extend_stroke(&brush, 36.0, 32.0, 1.0);
+        d.end_heal_stroke(HealMode::ContentAware);
+        assert_ne!(d.composite().get(32, 32), before);
+
+        assert!(d.undo(), "nothing to undo after healing");
+        assert_eq!(d.composite().get(32, 32), before, "one undo did not restore the stroke");
+    }
+
+    #[test]
+    fn healing_respects_a_locked_layer() {
+        let mut d = Document::new(32, 32, Rgba8::WHITE);
+        let mut brush = Brush::default();
+        brush.size = 10.0;
+        d.begin_stroke(&brush, 16.0, 16.0, 1.0);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.lock_pixels = true;
+        }
+        assert!(d.end_heal_stroke(HealMode::ProximityMatch).is_empty());
+    }
+
+    #[test]
+    fn healing_outside_the_selection_is_confined() {
+        let mut d = Document::new(64, 64, Rgba8::new(200, 200, 200, 255));
+        if let Some(layer) = d.active_layer_mut() {
+            for y in 20..44 {
+                for x in 20..44 {
+                    layer.pixels.set(x, y, Rgba8::BLACK);
+                }
+            }
+        }
+        // Only the left half is selected.
+        d.select_rect(Rect::new(0, 0, 32, 64), SelectionOp::Replace, 0);
+
+        let mut brush = Brush::default();
+        brush.size = 40.0;
+        brush.hardness = 100.0;
+        d.begin_stroke(&brush, 32.0, 32.0, 1.0);
+        d.end_heal_stroke(HealMode::ProximityMatch);
+
+        // Right of the selection edge the black blot must be untouched.
+        assert_eq!(d.composite().get(40, 32), Rgba8::BLACK, "healing escaped the selection");
+    }
+
+    /// A light field with a dark blot on the left, for the Patch tests.
+    fn patch_doc() -> Document {
+        let mut d = Document::new(140, 60, Rgba8::new(210, 200, 190, 255));
+        if let Some(layer) = d.active_layer_mut() {
+            for y in 20..40 {
+                for x in 20..40 {
+                    layer.pixels.set(x, y, Rgba8::new(40, 30, 30, 255));
+                }
+            }
+        }
+        d.commit("Setup");
+        d
+    }
+
+    #[test]
+    fn patch_in_source_mode_repairs_the_selection() {
+        let mut d = patch_doc();
+        d.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+
+        let options = PatchOptions { dx: 60, dy: 0, ..PatchOptions::default() };
+        assert!(!d.patch_selection(options).is_empty());
+
+        // The selected blot is gone, and the sampled area is untouched.
+        assert!(d.composite().get(30, 30).r > 140, "the blot survived the patch");
+        assert!(d.composite().get(90, 30).r > 140, "the source area was modified");
+    }
+
+    #[test]
+    fn patch_in_destination_mode_patches_where_it_was_dragged() {
+        // Select clean pixels and drag them onto the blot: the blot end changes
+        // and the selection itself does not.
+        let mut d = patch_doc();
+        d.select_rect(Rect::new(80, 20, 20, 20), SelectionOp::Replace, 0);
+
+        let options = PatchOptions {
+            dx: -60,
+            dy: 0,
+            destination: true,
+            ..PatchOptions::default()
+        };
+        assert!(!d.patch_selection(options).is_empty());
+
+        assert!(d.composite().get(30, 30).r > 140, "the destination was not patched");
+    }
+
+    #[test]
+    fn source_and_destination_modes_change_opposite_ends() {
+        // The same drag in the two modes must edit different places.
+        let mut source = patch_doc();
+        source.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+        source.patch_selection(PatchOptions { dx: 60, dy: 0, ..PatchOptions::default() });
+
+        let mut destination = patch_doc();
+        destination.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+        destination.patch_selection(PatchOptions {
+            dx: 60,
+            dy: 0,
+            destination: true,
+            ..PatchOptions::default()
+        });
+
+        // Source mode fixed the blot; destination mode copied the blot rightward
+        // and left it where it was.
+        assert!(source.composite().get(30, 30).r > 140);
+        assert!(destination.composite().get(30, 30).r < 120,
+                "destination mode should have left the selection alone");
+        assert!(destination.composite().get(90, 30).r < 160,
+                "destination mode did not apply the patch at the drag target");
+    }
+
+    #[test]
+    fn transparent_patch_keeps_the_destination_colour() {
+        // A blue field with a blot, patched from a red area. Without
+        // Transparent the patch is neutral; with it the blue survives.
+        let build = || {
+            let mut d = Document::new(140, 60, Rgba8::new(60, 90, 200, 255));
+            if let Some(layer) = d.active_layer_mut() {
+                for y in 20..40 {
+                    for x in 80..120 {
+                        layer.pixels.set(x, y, Rgba8::new(200, 80, 40, 255));
+                    }
+                }
+            }
+            d.commit("Setup");
+            d.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+            d
+        };
+
+        let mut transparent = build();
+        transparent.patch_selection(PatchOptions {
+            dx: 70,
+            dy: 0,
+            transparent: true,
+            ..PatchOptions::default()
+        });
+
+        // Blue must still dominate red in the patched area.
+        let px = transparent.composite().get(30, 30);
+        assert!(px.b > px.r, "the destination colour was lost: {:?}", px);
+    }
+
+    #[test]
+    fn content_aware_patch_ignores_the_drag() {
+        // Two very different drags must give the same result, because this mode
+        // rebuilds from the surroundings rather than sampling.
+        let mut a = patch_doc();
+        a.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+        a.patch_selection(PatchOptions {
+            dx: 60,
+            dy: 0,
+            content_aware: true,
+            ..PatchOptions::default()
+        });
+
+        let mut b = patch_doc();
+        b.select_rect(Rect::new(20, 20, 20, 20), SelectionOp::Replace, 0);
+        b.patch_selection(PatchOptions {
+            dx: -10,
+            dy: 25,
+            content_aware: true,
+            ..PatchOptions::default()
+        });
+
+        assert_eq!(
+            a.composite().as_bytes(),
+            b.composite().as_bytes(),
+            "content-aware patch depended on the drag"
+        );
+        assert!(a.composite().get(30, 30).r > 140, "content-aware patch left the blot");
+    }
+
+    #[test]
+    fn patch_without_a_selection_does_nothing() {
+        let mut d = patch_doc();
+        let before = d.composite().as_bytes().to_vec();
+        assert!(d
+            .patch_selection(PatchOptions { dx: 40, dy: 0, ..PatchOptions::default() })
+            .is_empty());
+        assert_eq!(d.composite().as_bytes(), &before[..]);
     }
 
     #[test]

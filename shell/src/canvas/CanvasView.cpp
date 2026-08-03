@@ -211,6 +211,10 @@ void CanvasView::setActiveTool(ToolId tool)
     m_sliceDragging = false;
     m_sliceDrag = QRectF();
     m_sliceGrip = CropGrip::None;
+    m_healingTracing = false;
+    m_regionDragging = false;
+    m_redEyeDragging = false;
+    m_redEyeRect = QRectF();
 
     m_draggedMarker = -1;
     m_draggedRulerEnd = -1;
@@ -229,6 +233,10 @@ void CanvasView::setActiveTool(ToolId tool)
 
     if (m_engine) {
         m_engine->setEraseMode(tool == ToolId::Eraser);
+        // Healing runs through the same stroke path as a brush; this is what
+        // tells the engine to rebuild the region at the end instead of filling
+        // it with the foreground colour.
+        m_engine->setHealMode(toolHeals(tool) ? static_cast<int>(m_healType) : -1);
     }
     updateCursor();
     update();
@@ -274,6 +282,243 @@ void CanvasView::setCropOptions(double aspectRatio, bool deleteCropped)
     if (m_tool == ToolId::Crop && m_cropRatio > 0.0) {
         applyCropRatio(CropGrip::BottomRight);
         update();
+    }
+}
+
+void CanvasView::setHealingType(HealingType type)
+{
+    if (m_healingType == type) {
+        return;
+    }
+    m_healingType = type;
+    // Each variant is a different gesture, so nothing half-done should survive
+    // the switch.
+    m_healingTracing = false;
+    m_regionDragging = false;
+    m_redEyeDragging = false;
+    m_redEyeRect = QRectF();
+    m_lassoPath.clear();
+    m_marqueeActive = false;
+    // The source belongs to the Healing Brush; picking another variant drops it.
+    if (type != HealingType::Healing) {
+        m_healSourceValid = false;
+    }
+    if (m_engine) {
+        m_engine->setHealSource(false, 0, 0);
+    }
+    updateCursor();
+    update();
+}
+
+void CanvasView::setPatchOptions(bool contentAware, bool destination, bool transparent)
+{
+    m_patchContentAware = contentAware;
+    m_patchDestination = destination;
+    m_patchTransparent = transparent;
+}
+
+void CanvasView::setRedEyeOptions(int pupilSize, int darkenAmount)
+{
+    m_pupilSize = qBound(0, pupilSize, 100);
+    m_darkenAmount = qBound(0, darkenAmount, 100);
+}
+
+bool CanvasView::healingPress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_engine) {
+        return false;
+    }
+
+    switch (m_healingType) {
+    case HealingType::Healing:
+        // Alt-click sets where to sample from, exactly as CS6 does. It is a
+        // one-off action, not the start of a stroke.
+        if (modifiers.testFlag(Qt::AltModifier)) {
+            m_healSource = doc;
+            m_healSourceValid = true;
+            emit statusMessage(tr("Healing source set to %1, %2")
+                                   .arg(int(doc.x()))
+                                   .arg(int(doc.y())));
+            update();
+            return true;
+        }
+        // Without a source there is nothing to repair from, and Photoshop
+        // refuses the stroke rather than guessing. Consuming the press means no
+        // stroke begins and no undo state is created.
+        if (!m_healSourceValid) {
+            emit healingSourceRequired();
+            return true;
+        }
+        // Tell the engine where the source sits relative to this stroke.
+        m_engine->setHealSource(true, int(std::round(m_healSource.x() - doc.x())),
+                                int(std::round(m_healSource.y() - doc.y())));
+        // Fall through to the ordinary stroke path.
+        return false;
+
+    case HealingType::Patch:
+    case HealingType::ContentAwareMove: {
+        // Inside an existing selection, a drag moves it; anywhere else starts a
+        // fresh outline. That is CS6's two-step: define the region, then drag.
+        const rust::Vec<::std::int32_t> bounds = m_engine->selectionBounds();
+        const bool haveSelection = bounds.size() >= 4 && (bounds[2] > 0 || bounds[3] > 0);
+        const QRectF selectionRect =
+            haveSelection ? QRectF(bounds[0], bounds[1], bounds[2], bounds[3]) : QRectF();
+
+        if (haveSelection && selectionRect.contains(doc)) {
+            m_regionDragging = true;
+            m_regionDragStart = doc;
+            m_regionDragNow = doc;
+        } else {
+            m_healingTracing = true;
+            m_marqueeActive = true;
+            m_gestureModifiers = modifiers;
+            m_lassoPath.clear();
+            m_lassoPath.append(doc);
+        }
+        update();
+        return true;
+    }
+
+    case HealingType::RedEye:
+        m_redEyeDragging = true;
+        m_redEyeRect = QRectF(doc, doc);
+        update();
+        return true;
+
+    case HealingType::SpotHealing:
+        // Nothing special: the plain stroke path handles it.
+        m_engine->setHealSource(false, 0, 0);
+        return false;
+    }
+    return false;
+}
+
+bool CanvasView::healingDrag(const QPointF &doc)
+{
+    if (m_regionDragging) {
+        m_regionDragNow = doc;
+        update();
+        return true;
+    }
+    if (m_redEyeDragging) {
+        m_redEyeRect = QRectF(m_redEyeRect.topLeft(), doc).normalized();
+        update();
+        return true;
+    }
+    return false;
+}
+
+bool CanvasView::healingRelease()
+{
+    if (m_regionDragging) {
+        m_regionDragging = false;
+        commitHealingDrag();
+        update();
+        return true;
+    }
+
+    if (m_redEyeDragging) {
+        m_redEyeDragging = false;
+        const QRectF r = m_redEyeRect.normalized();
+        if (m_engine) {
+            // A click rather than a drag still means "the eye is here", so a
+            // bare click gets a default-sized box around it.
+            QRectF target = r;
+            if (target.width() < 2.0 || target.height() < 2.0) {
+                target = QRectF(r.center().x() - 12, r.center().y() - 12, 24, 24);
+            }
+            m_engine->removeRedEye(int(std::floor(target.x())), int(std::floor(target.y())),
+                                   int(std::round(target.width())),
+                                   int(std::round(target.height())), m_pupilSize,
+                                   m_darkenAmount);
+        }
+        m_redEyeRect = QRectF();
+        update();
+        return true;
+    }
+    return false;
+}
+
+void CanvasView::commitHealingDrag()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QPointF delta = m_regionDragNow - m_regionDragStart;
+    const int dx = int(std::round(delta.x()));
+    const int dy = int(std::round(delta.y()));
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    if (m_healingType == HealingType::Patch) {
+        // CS6's Patch drags the selection *to* the area to sample from, so the
+        // drag delta is the source offset. Destination mode reverses that, and
+        // the engine handles the swap.
+        m_engine->patchSelection(dx, dy, m_patchContentAware, m_patchDestination,
+                                 m_patchTransparent);
+    } else if (m_healingType == HealingType::ContentAwareMove) {
+        m_engine->contentAwareMove(dx, dy, m_camExtend);
+    }
+}
+
+void CanvasView::paintHealing(QPainter &painter)
+{
+    if (m_tool != ToolId::Healing) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    // The Healing Brush's sampled source, so the user can see what it will
+    // transplant from.
+    if (m_healingType == HealingType::Healing && m_healSourceValid) {
+        const QPointF p = documentToWidget(m_healSource);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(Qt::white, 2.5));
+        painter.drawLine(QPointF(p.x() - 7, p.y()), QPointF(p.x() + 7, p.y()));
+        painter.drawLine(QPointF(p.x(), p.y() - 7), QPointF(p.x(), p.y() + 7));
+        painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.2));
+        painter.drawLine(QPointF(p.x() - 7, p.y()), QPointF(p.x() + 7, p.y()));
+        painter.drawLine(QPointF(p.x(), p.y() - 7), QPointF(p.x(), p.y() + 7));
+        painter.drawEllipse(p, 4.0, 4.0);
+    }
+
+    // The region drag: the selection outline shown at the offset it would take.
+    if (m_regionDragging && !m_selectionPath.isEmpty()) {
+        const QPointF delta = m_regionDragNow - m_regionDragStart;
+        const QPointF origin = documentOrigin();
+        QTransform toWidget;
+        toWidget.translate(origin.x() + delta.x() * m_zoom, origin.y() + delta.y() * m_zoom);
+        toWidget.scale(m_zoom, m_zoom);
+
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(Qt::white, 1));
+        painter.drawPath(toWidget.map(m_selectionPath));
+        QPen dashed(Qt::black, 1, Qt::DashLine);
+        dashed.setDashPattern({4, 4});
+        painter.setPen(dashed);
+        painter.drawPath(toWidget.map(m_selectionPath));
+    }
+
+    // The red-eye box.
+    if (m_redEyeDragging && !m_redEyeRect.isNull()) {
+        const QRectF r(documentToWidget(m_redEyeRect.topLeft()),
+                       documentToWidget(m_redEyeRect.bottomRight()));
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(QColor(0xd6, 0x3c, 0x2c), 1));
+        painter.drawRect(r);
+    }
+
+    painter.restore();
+}
+
+void CanvasView::setHealType(HealType type)
+{
+    m_healType = type;
+    if (m_engine && toolHeals(m_tool)) {
+        m_engine->setHealMode(static_cast<int>(type));
     }
 }
 
@@ -1267,11 +1512,12 @@ void CanvasView::paintEvent(QPaintEvent *event)
     if (toolIsAnnotation()) {
         paintAnnotations(painter);
     }
+    paintHealing(painter);
 
     // Live marquee while the user is dragging one out. Drawn as the shape the
     // active variant will actually produce, so an elliptical drag previews an
     // ellipse rather than its bounding box.
-    if (m_marqueeActive && toolIsLasso()) {
+    if (m_marqueeActive && (toolIsLasso() || m_healingTracing)) {
         // The outline so far, plus whatever segment the cursor is currently
         // pulling — the rubber band for polygonal, the live wire for
         // magnetic — and the straight line back to the start that closing it
@@ -1581,6 +1827,12 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         break;
     }
 
+    // The healing group's non-brush variants have their own gestures; the two
+    // brushes fall through to the stroke path below.
+    if (m_tool == ToolId::Healing && healingPress(doc, event->modifiers())) {
+        return;
+    }
+
     if (toolPaints(m_tool) && m_engine) {
         // A tablet would supply real pressure here; a mouse reports full.
         if (m_engine->beginStroke(float(doc.x()), float(doc.y()), 1.0f)) {
@@ -1693,6 +1945,11 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_tool == ToolId::Healing && healingDrag(doc)) {
+        m_lastMousePos = pos;
+        return;
+    }
+
     // The click-driven lassos track the cursor with no button held, so this
     // runs before the drag-gesture branch below.
     if (m_marqueeActive && lassoIsClicked()) {
@@ -1706,7 +1963,7 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
     }
 
     if (m_marqueeActive) {
-        if (lassoIsDragged()) {
+        if (freehandTracing()) {
             // Sample the path rather than recording every motion event: one
             // vertex per document pixel of travel is finer than the mask can
             // represent, and keeps the polygon small enough to rasterise
@@ -1853,6 +2110,10 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_tool == ToolId::Healing && healingRelease()) {
+        return;
+    }
+
     if (toolIsAnnotation()) {
         m_draggedMarker = -1;
         m_draggedRulerEnd = -1;
@@ -1881,7 +2142,7 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
             return;
         }
 
-        if (lassoIsDragged()) {
+        if (freehandTracing()) {
             // Photoshop closes the lasso with a straight line from where you
             // let go back to where you started, however far apart they are.
             if (!m_lassoPath.isEmpty() && (doc - m_lassoPath.back()).manhattanLength() >= 1.0) {
@@ -1889,6 +2150,7 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
             }
             commitLasso(m_gestureModifiers);
             m_lassoPath.clear();
+            m_healingTracing = false;
             m_marquee = QRectF();
             update();
             return;

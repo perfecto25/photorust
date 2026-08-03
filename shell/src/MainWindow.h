@@ -119,6 +119,17 @@ private:
     void addCropOptions(CropType type);
     /// The Info panel's footer text for an eyedropper-group tool.
     QString infoHintFor(EyedropperType type) const;
+    /// Add the Spot Healing Brush's Type radio set.
+    void addHealTypeButtons();
+    /// Add the Patch tool's own options: combine modes, Patch mode, the
+    /// Source/Destination pair, Transparent and Use Pattern.
+    void addPatchOptions();
+    /// Push those into the canvas.
+    void pushPatchOptions();
+    /// Tell the user the Healing Brush needs a source point first.
+    void warnHealingSourceRequired();
+    /// Add the options for the healing group's region-based variants.
+    void addHealingRegionOptions(HealingType type);
     /// Add the annotation tools' readouts and Clear button.
     void addAnnotationOptions(EyedropperType type);
     /// Refill those readouts from the engine.
@@ -173,6 +184,16 @@ private:
     /// Crop settings. 0 leaves the box unconstrained.
     double m_cropRatio = 0.0;
     bool m_cropDeletePixels = true;
+    /// Spot Healing Brush type. CS6 defaults to Content-Aware.
+    HealType m_healType = HealType::ContentAware;
+    /// Content-Aware Move mode, and the Red Eye tool's two settings.
+    bool m_camExtend = false;
+    /// Patch tool options, which persist across tool switches.
+    bool m_patchContentAware = false;
+    bool m_patchDestination = false;
+    bool m_patchTransparent = false;
+    int m_pupilSize = RedEyeDefaults::kPupilSize;
+    int m_darkenAmount = RedEyeDefaults::kDarkenAmount;
     /// Options-bar readout labels for the annotation tools. Recreated with the
     /// bar, so this list is only valid while one of those tools is active.
     QList<QLabel *> m_annotationReadouts;

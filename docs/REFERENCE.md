@@ -109,7 +109,8 @@ shape without pretending to work.
 
 Flyout entries get their own artwork where CS6 gives them distinct icons: the
 marquee group's four shapes; the lasso group's freehand loop, straight-segment
-polygon and beaded magnetic curve; the Quick Selection brush and Magic Wand;
+polygon and beaded magnetic curve; the healing group's spotted and plain
+bandages, stitched patch, crossing arrows and eye; the Quick Selection brush and Magic Wand;
 the eyedropper group's targeted pipette, ruler, note page and 1-2-3; and the
 crop group's brackets, perspective mesh, slice blade and slice pointer. Other
 groups' entries reuse the parent icon.
@@ -132,7 +133,7 @@ Separators mark CS6's four functional groups.
 | Two overlapping corners | **Crop** | `C` | Crop ✅ · Perspective Crop ✅ · Slice ✅ · Slice Select ✅ | ✅ all four |
 | Pipette | **Eyedropper** | `I` | Eyedropper ✅ · Color Sampler ✅ · Ruler ✅ · Note ✅ · Count ✅ | ✅ all five |
 | | | | | |
-| Angled bandage | Spot Healing Brush | `J` | Spot Healing ✅ · Healing ⛔ · Patch ⛔ · Content-Aware Move ⛔ · Red Eye ⛔ | first only |
+| Angled bandage + spot | **Spot Healing Brush** | `J` | Spot Healing ✅ · Healing ✅ · Patch ✅ · Content-Aware Move ✅ · Red Eye ✅ | ✅ all five |
 | Brush with bristles | **Brush** | `B` | Brush ✅ · Pencil ⛔ · Color Replacement ⛔ · Mixer Brush ⛔ | first only |
 | Rubber stamp | Clone Stamp | `S` | Clone Stamp ✅ · Pattern Stamp ⛔ | first only |
 | Brush + circular arrow | History Brush | `Y` | History Brush ✅ · Art History Brush ⛔ | first only |
@@ -154,9 +155,9 @@ flyout being populated. Pen, Type, Path Selection and Shape are present in the
 strip with correct icons and shortcuts, but selecting them does nothing on the
 canvas yet.
 
-Marquee, Lasso, Eyedropper and Crop are fully implemented groups, and Quick
-Selection has both of its entries. `Shift+M`, `Shift+L`, `Shift+W`, `Shift+I`
-and `Shift+C` cycle within them, as CS6 does.
+Marquee, Lasso, Eyedropper, Healing and Crop are fully implemented groups, and
+Quick Selection has both of its entries. `Shift+M`, `Shift+L`, `Shift+W`,
+`Shift+I`, `Shift+J` and `Shift+C` cycle within them, as CS6 does.
 
 ### Strip footer
 
@@ -179,6 +180,11 @@ the active variant's name in bold — switching to Elliptical says
 | Active tool | Options shown |
 |---|---|
 | Brush, Eraser, Spot Healing, Clone Stamp, History Brush | **Size** (1–5000 px), **Hardness** (0–100%), **Opacity** (0–100%), **Flow** (1–100%) — all live, pushed to the engine on change |
+| Spot Healing Brush | Additionally **Type**: Proximity Match · Create Texture · Content-Aware (CS6's default). Opacity and Flow are disabled — the region is rebuilt, not painted, so they have nothing to act on |
+| Healing Brush | Brush controls, and a reminder to `Alt`+click a source point first |
+| Patch | **Combine mode** buttons, **Patch** mode (Normal · Content-Aware), the **Source** / **Destination** pair, **Transparent**, and **Use Pattern** (disabled — no patterns yet). Source, Destination and Transparent grey out under Content-Aware, which does not sample from the drag at all |
+| Content-Aware Move | **Mode**: Move (heals the gap) or Extend (leaves the original) |
+| Red Eye | **Pupil Size** and **Darken Amount**, both 0–100% |
 | Marquee, Lasso, Quick Selection | **Combine mode** buttons (new / add / subtract / intersect), **Feather** (0–1000 px), then a modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
 | Lasso (Polygonal / Magnetic) | Same controls; the hint becomes: click to place points · double-click or `Enter` to close · `Backspace` undoes one · `Esc` cancels |
 | Lasso (Magnetic) | Additionally **Width** (1–256 px), **Contrast** (1–100%) and **Frequency** (0–100), CS6's three edge-detection settings |
@@ -338,6 +344,7 @@ anything is [§3](#3-the-tool-strip).
 | `Shift+W` | Cycle Quick Selection ↔ Magic Wand ✅ | | | |
 | `Shift+C` | Cycle Crop → Perspective → Slice → Slice Select ✅ | | | |
 | `Shift+I` | Cycle Eyedropper → Color Sampler → Ruler → Note → Count ✅ | | | |
+| `Shift+J` | Cycle Spot Healing → Healing → Patch → Content-Aware Move → Red Eye ✅ | | | |
 | `W` | Quick Selection ✅ | | `O` | Dodge ✅ |
 | `C` | Crop ✅ | | `P` | Pen ⚪ |
 | `I` | Eyedropper ✅ | | `T` | Horizontal Type ⚪ |
@@ -543,6 +550,12 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | `Esc` with Crop | Reset the box to the whole canvas |
 | Drag with Perspective Crop | Drag out a box, then drag each corner onto the subject's corners; drag inside to move the whole quad |
 | `Enter` or double-click with Perspective Crop | Straighten the quad into a rectangle and crop to it |
+| `Alt`+click with Healing Brush | Set the source to sample from |
+| Drag with Healing Brush | Transplant the source's texture, taking the destination's own lighting. With no source set the stroke is refused and a dialog says so, as in Photoshop |
+| Drag with Patch / Content-Aware Move | Outline a region; drag inside it to choose where to sample from, or where to move it |
+| Patch, Source mode | The selection is the flaw; the drag says where to repair it from |
+| Patch, Destination mode | The selection is good material; the drag says where to apply it |
+| Drag or click with Red Eye | Neutralise red in the area |
 | Drag with Slice | Cut a user slice; the rest of the canvas re-slices automatically around it |
 | Click with Slice Select | Select a user slice; drag it or its handles to adjust |
 | `Del` with Slice Select | Delete the selected slice |

@@ -36,6 +36,7 @@ pub mod buffer;
 pub mod compositor;
 pub mod document;
 pub mod filters;
+pub mod healing;
 pub mod history;
 pub mod layer;
 pub mod magnetic;

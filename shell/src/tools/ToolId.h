@@ -231,10 +231,10 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Count Tool", "I", true}};
     case ToolId::Healing:
         return {{"Spot Healing Brush Tool", "J", true},
-                {"Healing Brush Tool", nullptr, false},
-                {"Patch Tool", nullptr, false},
-                {"Content-Aware Move Tool", nullptr, false},
-                {"Red Eye Tool", nullptr, false}};
+                {"Healing Brush Tool", "J", true},
+                {"Patch Tool", "J", true},
+                {"Content-Aware Move Tool", "J", true},
+                {"Red Eye Tool", "J", true}};
     case ToolId::Brush:
         return {{"Brush Tool", "B", true},
                 {"Pencil Tool", nullptr, false},
@@ -355,6 +355,62 @@ inline bool toolPaints(ToolId id)
 {
     return id == ToolId::Brush || id == ToolId::Eraser || id == ToolId::Healing
         || id == ToolId::CloneStamp || id == ToolId::HistoryBrush;
+}
+
+/// True when the tool strokes a region and then *rebuilds* it from the
+/// surroundings instead of applying a colour.
+///
+/// It still goes through the same stroke machinery as a brush — the difference
+/// is what happens when the stroke ends (see core/src/healing.rs).
+inline bool toolHeals(ToolId id)
+{
+    return id == ToolId::Healing;
+}
+
+/// The variants behind the healing button.
+///
+/// They divide into three kinds of gesture: the two brushes are stroked, the
+/// Patch and Content-Aware Move tools work on a region the user drags, and the
+/// Red Eye tool is dragged over an eye. What they share is that none of them
+/// paints a colour — every one reconstructs pixels from other pixels.
+enum class HealingType {
+    SpotHealing = 0,
+    Healing = 1,
+    Patch = 2,
+    ContentAwareMove = 3,
+    RedEye = 4,
+};
+
+/// True when the variant is stroked with the brush rather than dragged as a
+/// region.
+inline bool healingIsBrush(HealingType type)
+{
+    return type == HealingType::SpotHealing || type == HealingType::Healing;
+}
+
+/// CS6's defaults for the Red Eye tool's options bar.
+namespace RedEyeDefaults {
+constexpr int kPupilSize = 50;
+constexpr int kDarkenAmount = 50;
+} // namespace RedEyeDefaults
+
+/// The Spot Healing Brush's Type, mirroring `healing::HealMode` across the
+/// bridge. CS6 defaults to Content-Aware.
+enum class HealType {
+    ProximityMatch = 0,
+    CreateTexture = 1,
+    ContentAware = 2,
+};
+
+/// Label for a Type button.
+inline QString healTypeName(HealType type)
+{
+    switch (type) {
+    case HealType::ProximityMatch: return QStringLiteral("Proximity Match");
+    case HealType::CreateTexture:  return QStringLiteral("Create Texture");
+    case HealType::ContentAware:   return QStringLiteral("Content-Aware");
+    }
+    return {};
 }
 
 /// True when the tool defines a selection by dragging.

@@ -35,6 +35,16 @@ paint, manage layers, select, filter and undo.
   Saturation, Color, Luminosity, Darker/Lighter Color).
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
   opacity; a whole stroke is one undo step.
+- The whole healing family. **Spot Healing Brush** with CS6's three types:
+  Proximity Match (a Laplace solve that continues the surrounding shading),
+  Create Texture (the same, plus grain matched to the neighbourhood) and
+  Content-Aware (patch synthesis inward from the boundary, so edges carry
+  across). **Healing Brush**, which transplants an `Alt`-clicked source's
+  texture by Poisson solve, so it takes the destination's lighting rather than
+  the source's; it refuses to paint until a source is set, as Photoshop does. **Patch** with CS6's full options — Normal or Content-Aware, Source or
+  Destination, and Transparent for transferring texture without colour — and
+  **Content-Aware Move** (with Extend), both working on a dragged region. **Red Eye**, which neutralises only where red genuinely
+  dominates, so it can be dragged loosely over an eye. Each is one undo step.
 - Selections: all four marquee variants (rectangular, elliptical, single row,
   single column), all three lassos (freehand, polygonal, and magnetic with
   live-wire edge snapping), and both colour tools (Quick Selection's
@@ -153,7 +163,7 @@ what gives it a launcher, a name and a file association for `.psd`.
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 293 tests
+cd core && cargo test        # 323 tests
 ```
 
 or through CTest, which runs them as part of the project:
@@ -173,6 +183,7 @@ core/                 Rust image engine
   src/layer.rs          layer model and stack
   src/compositor.rs     stack → final image (parallel, rayon)
   src/brush.rs          dab-based stroke rendering
+  src/healing.rs        inpainting, Poisson cloning and red-eye removal
   src/selection.rs      coverage-mask selections
   src/magnetic.rs       edge snapping for the Magnetic Lasso
   src/wand.rs           Magic Wand flood and Quick Selection region growing
@@ -225,3 +236,12 @@ User keymap overrides are written to
 `~/.config/PhotoRust/shortcuts.json` (Linux) or the equivalent
 `AppConfigLocation` on macOS; only bindings that differ from the defaults are
 stored, so future default changes still reach the user.
+
+
+## Development progress
+
+ToolTip bar
+
+- move tool (done)
+- marquee tool (done)
+- lasso tool (done)

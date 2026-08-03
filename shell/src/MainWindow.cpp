@@ -93,6 +93,11 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_canvas, &CanvasView::contextMenuRequested, this,
             &MainWindow::showSelectionContextMenu);
     connect(m_canvas, &CanvasView::noteEditRequested, this, &MainWindow::editNote);
+    connect(m_canvas, &CanvasView::statusMessage, this, [this](const QString &text) {
+        statusBar()->showMessage(text, 4000);
+    });
+    connect(m_canvas, &CanvasView::healingSourceRequired, this,
+            &MainWindow::warnHealingSourceRequired);
     connect(m_canvas, &CanvasView::colorPicked, this, [this](const QColor &c) {
         m_colorPanel->setForegroundColor(c);
         m_toolStrip->swatches()->setForeground(c);
@@ -346,6 +351,8 @@ void MainWindow::installShortcuts()
          ToolId::Crop},
         {"tool.eyedropper.cycle", tr("Cycle Eyedropper Tool"), QStringLiteral("Shift+I"),
          ToolId::Eyedropper},
+        {"tool.healing.cycle", tr("Cycle Healing Tool"), QStringLiteral("Shift+J"),
+         ToolId::Healing},
     };
 
     for (const Cycle &entry : cycles) {
@@ -484,7 +491,13 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     m_optionsBar->addWidget(label);
     m_optionsBar->addSeparator();
 
-    if (toolPaints(tool)) {
+    // The healing group is mostly brush-driven, but Patch, Content-Aware Move
+    // and Red Eye are not — they have no brush at all, so they must not take the
+    // Size/Hardness/Opacity/Flow branch below.
+    const bool paintsWithBrush = toolPaints(tool)
+        && (!toolHeals(tool) || healingIsBrush(static_cast<HealingType>(variant)));
+
+    if (paintsWithBrush) {
         m_optionsBar->addWidget(new QLabel(tr("Size:"), m_optionsBar));
         m_brushSize = new QDoubleSpinBox(m_optionsBar);
         m_brushSize->setRange(1.0, 5000.0);
@@ -529,6 +542,29 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
                 &MainWindow::pushBrushSettings);
 
         pushBrushSettings();
+
+        // The Spot Healing Brush adds CS6's Type buttons after the brush
+        // controls. Opacity and Flow have no meaning for it — the region is
+        // rebuilt, not painted — so they are hidden rather than left there
+        // doing nothing.
+        if (toolHeals(tool)) {
+            m_brushOpacity->setEnabled(false);
+            m_brushOpacity->setToolTip(tr("Not used when healing"));
+            m_brushFlow->setEnabled(false);
+            m_brushFlow->setToolTip(tr("Not used when healing"));
+
+            m_optionsBar->addSeparator();
+            const auto healing = static_cast<HealingType>(variant);
+            if (healing == HealingType::SpotHealing) {
+                // Only the Spot Healing Brush chooses how to reconstruct; the
+                // Healing Brush is told where to sample from instead.
+                addHealTypeButtons();
+            } else {
+                m_optionsBar->addWidget(new QLabel(
+                    tr("Alt+click to define a source point, then drag to repair"),
+                    m_optionsBar));
+            }
+        }
     } else if (toolSelects(tool)) {
         addSelectionModeButtons();
 
@@ -589,6 +625,8 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
             hint = tr("Ctrl+Shift = add    Ctrl+Alt = subtract    Click = deselect");
         }
         m_optionsBar->addWidget(new QLabel(hint, m_optionsBar));
+    } else if (tool == ToolId::Healing) {
+        addHealingRegionOptions(static_cast<HealingType>(variant));
     } else if (tool == ToolId::Crop) {
         addCropOptions(static_cast<CropType>(variant));
     } else if (tool == ToolId::Eyedropper
@@ -720,6 +758,230 @@ QString MainWindow::infoHintFor(EyedropperType type) const
         break;
     }
     return tr("Click image to sample a color.");
+}
+
+void MainWindow::addPatchOptions()
+{
+    // CS6's Patch bar, left to right: the selection combine buttons, the Patch
+    // mode, the Source/Destination pair, Transparent, and Use Pattern.
+    addSelectionModeButtons();
+
+    m_optionsBar->addWidget(new QLabel(tr("Patch:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    mode->addItem(tr("Normal"), false);
+    mode->addItem(tr("Content-Aware"), true);
+    mode->setCurrentIndex(m_patchContentAware ? 1 : 0);
+    mode->setToolTip(tr("Normal samples from where you drag; Content-Aware rebuilds the "
+                        "selection from its surroundings and ignores the drag"));
+    m_optionsBar->addWidget(mode);
+
+    m_optionsBar->addSeparator();
+
+    // Source and Destination are a radio pair, drawn as two buttons.
+    auto *direction = new QButtonGroup(m_optionsBar);
+    direction->setExclusive(true);
+    QToolButton *sourceButton = nullptr;
+    QToolButton *destinationButton = nullptr;
+    struct Entry {
+        QString label;
+        bool destination;
+        QString tip;
+    };
+    const Entry entries[] = {
+        {tr("Source"), false,
+         tr("The selection is the flaw; drag it onto the pixels to repair it with")},
+        {tr("Destination"), true,
+         tr("The selection is good material; drag it onto the area to repair")},
+    };
+    for (const Entry &entry : entries) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setText(entry.label);
+        button->setToolTip(entry.tip);
+        button->setStatusTip(entry.tip);
+        button->setChecked(entry.destination == m_patchDestination);
+        direction->addButton(button, entry.destination ? 1 : 0);
+        m_optionsBar->addWidget(button);
+        if (entry.destination) {
+            destinationButton = button;
+        } else {
+            sourceButton = button;
+        }
+    }
+    connect(direction, &QButtonGroup::idClicked, this, [this](int id) {
+        m_patchDestination = id == 1;
+        pushPatchOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    auto *transparent = new QCheckBox(tr("Transparent"), m_optionsBar);
+    transparent->setChecked(m_patchTransparent);
+    transparent->setToolTip(tr("Transfer only the source's texture, keeping the patched "
+                               "area's own colour"));
+    m_optionsBar->addWidget(transparent);
+    connect(transparent, &QCheckBox::toggled, this, [this](bool on) {
+        m_patchTransparent = on;
+        pushPatchOptions();
+    });
+
+    // No pattern support yet, so this is present for CS6's shape but disabled —
+    // the same treatment the unimplemented flyout entries get.
+    auto *usePattern = new QToolButton(m_optionsBar);
+    usePattern->setText(tr("Use Pattern"));
+    usePattern->setEnabled(false);
+    usePattern->setToolTip(tr("Not implemented yet: there are no patterns to fill with"));
+    m_optionsBar->addWidget(usePattern);
+
+    // Source, Destination and Transparent all describe how to sample from the
+    // drag, and Content-Aware does not sample at all — so they switch off
+    // together rather than sitting there having no effect.
+    const auto syncEnabled = [sourceButton, destinationButton, transparent](bool contentAware) {
+        sourceButton->setEnabled(!contentAware);
+        destinationButton->setEnabled(!contentAware);
+        transparent->setEnabled(!contentAware);
+    };
+    syncEnabled(m_patchContentAware);
+    connect(mode, &QComboBox::currentIndexChanged, this,
+            [this, mode, syncEnabled](int index) {
+                m_patchContentAware = mode->itemData(index).toBool();
+                syncEnabled(m_patchContentAware);
+                pushPatchOptions();
+            });
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(
+        tr("Drag to outline a region, then drag the outline to patch"), m_optionsBar));
+
+    pushPatchOptions();
+}
+
+void MainWindow::pushPatchOptions()
+{
+    m_canvas->setPatchOptions(m_patchContentAware, m_patchDestination, m_patchTransparent);
+}
+
+void MainWindow::warnHealingSourceRequired()
+{
+    // Photoshop's own wording and its error icon. The Healing Brush cannot
+    // guess where to repair from, so this is a hard stop rather than a hint in
+    // the status bar.
+#ifdef Q_OS_MACOS
+    const QString message = tr("Option-click to define a source point to be used to "
+                               "repair the image.");
+#else
+    const QString message = tr("Alt-click to define a source point to be used to "
+                               "repair the image.");
+#endif
+    QMessageBox box(QMessageBox::Critical, tr("PhotoRust"), message, QMessageBox::Ok, this);
+    box.exec();
+}
+
+void MainWindow::addHealingRegionOptions(HealingType type)
+{
+    switch (type) {
+    case HealingType::Patch:
+        addPatchOptions();
+        break;
+
+    case HealingType::ContentAwareMove: {
+        // CS6's Mode: Move relocates the region and heals the gap; Extend
+        // leaves the original, so the subject is lengthened.
+        m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+        auto *mode = new QComboBox(m_optionsBar);
+        mode->addItem(tr("Move"), false);
+        mode->addItem(tr("Extend"), true);
+        mode->setCurrentIndex(m_camExtend ? 1 : 0);
+        m_optionsBar->addWidget(mode);
+        connect(mode, &QComboBox::currentIndexChanged, this, [this, mode](int index) {
+            m_camExtend = mode->itemData(index).toBool();
+            m_canvas->setContentAwareExtend(m_camExtend);
+        });
+        m_canvas->setContentAwareExtend(m_camExtend);
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(new QLabel(
+            tr("Drag to outline a subject, then drag it where it should go"),
+            m_optionsBar));
+        break;
+    }
+
+    case HealingType::RedEye: {
+        struct Field {
+            QString label;
+            int *value;
+        };
+        const Field fields[] = {
+            {tr("Pupil Size:"), &m_pupilSize},
+            {tr("Darken Amount:"), &m_darkenAmount},
+        };
+        for (const Field &field : fields) {
+            m_optionsBar->addWidget(new QLabel(field.label, m_optionsBar));
+            auto *spin = new QSpinBox(m_optionsBar);
+            spin->setRange(0, 100);
+            spin->setValue(*field.value);
+            spin->setSuffix(QStringLiteral("%"));
+            spin->setFixedWidth(64);
+            m_optionsBar->addWidget(spin);
+
+            int *slot = field.value;
+            connect(spin, &QSpinBox::valueChanged, this, [this, slot](int v) {
+                *slot = v;
+                m_canvas->setRedEyeOptions(m_pupilSize, m_darkenAmount);
+            });
+        }
+        m_canvas->setRedEyeOptions(m_pupilSize, m_darkenAmount);
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(
+            new QLabel(tr("Drag over an eye, or click it"), m_optionsBar));
+        break;
+    }
+
+    case HealingType::SpotHealing:
+    case HealingType::Healing:
+        // Handled with the brush controls.
+        break;
+    }
+}
+
+void MainWindow::addHealTypeButtons()
+{
+    // CS6's Type: a radio set of three. The choice persists across tool
+    // switches, so it lives on MainWindow rather than in the widgets.
+    m_optionsBar->addWidget(new QLabel(tr("Type:"), m_optionsBar));
+
+    auto *group = new QButtonGroup(m_optionsBar);
+    group->setExclusive(true);
+
+    const HealType types[] = {HealType::ProximityMatch, HealType::CreateTexture,
+                              HealType::ContentAware};
+    const QString tips[] = {
+        tr("Fill smoothly from the pixels around the brush — best for a blemish "
+           "on skin, sky or any other gradient"),
+        tr("Fill smoothly, then add grain matched to the surroundings"),
+        tr("Rebuild from nearby patches, so edges and texture carry across"),
+    };
+
+    for (int i = 0; i < 3; ++i) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setText(healTypeName(types[i]));
+        button->setChecked(types[i] == m_healType);
+        button->setToolTip(tips[i]);
+        button->setStatusTip(tips[i]);
+        group->addButton(button, static_cast<int>(types[i]));
+        m_optionsBar->addWidget(button);
+    }
+
+    connect(group, &QButtonGroup::idClicked, this, [this](int id) {
+        m_healType = static_cast<HealType>(id);
+        m_canvas->setHealType(m_healType);
+    });
+
+    m_canvas->setHealType(m_healType);
 }
 
 void MainWindow::addAnnotationOptions(EyedropperType type)
@@ -1538,6 +1800,9 @@ void MainWindow::onToolChanged(ToolId tool, int variant)
     m_activeVariant = variant;
 
     m_canvas->setActiveTool(tool);
+    if (tool == ToolId::Healing) {
+        m_canvas->setHealingType(static_cast<HealingType>(variant));
+    }
     if (tool == ToolId::Marquee) {
         m_canvas->setMarqueeType(static_cast<MarqueeType>(variant));
     } else if (tool == ToolId::Lasso) {

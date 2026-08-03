@@ -17,8 +17,9 @@ use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
 use crate::brush::Brush;
 use crate::buffer::{Pixmap, Rect, Rgba8};
-use crate::document::Document;
+use crate::document::{Document, PatchOptions};
 use crate::filters::{Adjustment, Filter};
+use crate::healing::HealMode;
 use crate::layer::LayerId;
 use crate::magnetic::EdgeMap;
 use crate::selection::{Selection, SelectionOp};
@@ -470,6 +471,60 @@ pub mod ffi {
         #[cxx_name = "setEraseMode"]
         fn set_erase_mode(self: Pin<&mut Engine>, erasing: bool);
 
+        /// Put the brush into healing mode: `endStroke` then rebuilds what the
+        /// stroke covered from its surroundings instead of painting a colour.
+        ///
+        /// `mode` is CS6's Type: 0 = Proximity Match, 1 = Create Texture,
+        /// 2 = Content-Aware. A negative value turns healing off.
+        #[qinvokable]
+        #[cxx_name = "setHealMode"]
+        fn set_heal_mode(self: Pin<&mut Engine>, mode: i32);
+
+        /// Point the Healing Brush at a source. `dx`/`dy` are added to each
+        /// destination pixel to find where it samples from, so they are the
+        /// offset from the stroke to the Alt-clicked source point.
+        ///
+        /// With `active` false the brush inpaints from its own surroundings,
+        /// which is the Spot Healing Brush's behaviour.
+        #[qinvokable]
+        #[cxx_name = "setHealSource"]
+        fn set_heal_source(self: Pin<&mut Engine>, active: bool, dx: i32, dy: i32);
+
+        /// Apply the Patch tool. `(dx, dy)` is the drag; the flags are CS6's
+        /// options bar — Content-Aware ignores the drag and rebuilds the
+        /// selection in place, `destination` reverses which end of the drag is
+        /// repaired, and `transparent` transfers texture without colour.
+        #[qinvokable]
+        #[cxx_name = "patchSelection"]
+        fn patch_selection(
+            self: Pin<&mut Engine>,
+            dx: i32,
+            dy: i32,
+            content_aware: bool,
+            destination: bool,
+            transparent: bool,
+        );
+
+        /// Move the selection's contents and heal the hole — the Content-Aware
+        /// Move tool. `extend` duplicates instead of moving.
+        #[qinvokable]
+        #[cxx_name = "contentAwareMove"]
+        fn content_aware_move(self: Pin<&mut Engine>, dx: i32, dy: i32, extend: bool);
+
+        /// Neutralise red-eye inside a rectangle. `pupil` and `darken` are
+        /// CS6's Pupil Size and Darken Amount, both 0-100.
+        #[qinvokable]
+        #[cxx_name = "removeRedEye"]
+        fn remove_red_eye(
+            self: Pin<&mut Engine>,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            pupil: i32,
+            darken: i32,
+        );
+
         /// Fill the selection with the foreground colour.
         #[qinvokable]
         #[cxx_name = "fillForeground"]
@@ -736,6 +791,12 @@ pub struct EngineRust {
     foreground: Rgba8,
     background: Rgba8,
     erasing: bool,
+    /// Set while the Spot Healing Brush is active. `None` for every other tool,
+    /// which is what makes `end_stroke` paint normally.
+    heal_mode: Option<HealMode>,
+    /// Source offset for the Healing Brush, which samples an explicit point
+    /// rather than inpainting from the stroke's own surroundings.
+    heal_source: Option<(i32, i32)>,
     /// Edge field for the Magnetic Lasso, live only for the duration of one
     /// gesture. `None` the rest of the time so a large document is not paying
     /// for a float per pixel it is not using.
@@ -766,6 +827,8 @@ impl Default for EngineRust {
             foreground: Rgba8::BLACK,
             background: Rgba8::WHITE,
             erasing: false,
+            heal_mode: None,
+            heal_source: None,
             edge_map: None,
             quick_select: None,
             quick_base: None,
@@ -1013,8 +1076,15 @@ impl ffi::Engine {
     }
 
     fn preview_image(&self) -> QImage {
-        let color = self.paint_color();
-        let opacity = self.brush.opacity;
+        // While healing, the stroke is only a marker for where to work — it is
+        // not paint. Showing it as a translucent grey wash tells the user what
+        // the brush has covered without implying the foreground colour is about
+        // to be applied, which is how CS6 previews it too.
+        let (color, opacity) = if self.heal_mode.is_some() {
+            (Rgba8::new(128, 128, 128, 255), 0.45)
+        } else {
+            (self.paint_color(), self.brush.opacity)
+        };
         match self.doc.preview_stroke(color, opacity) {
             Some(pm) => pixmap_to_qimage(pm),
             None => self.composite_image(),
@@ -1569,6 +1639,23 @@ impl ffi::Engine {
     }
 
     fn end_stroke(mut self: core::pin::Pin<&mut Self>) {
+        // The Spot Healing Brush uses the same stroke machinery but a different
+        // ending: the covered region is reconstructed rather than filled.
+        if let Some(mode) = self.heal_mode {
+            // With a source set this is the Healing Brush: transplant from
+            // there. Without one it is the Spot Healing Brush, which works out
+            // what belongs from the surroundings alone.
+            match self.heal_source {
+                Some((dx, dy)) => {
+                    self.as_mut().rust_mut().doc.end_heal_clone_stroke(dx, dy);
+                }
+                None => {
+                    self.as_mut().rust_mut().doc.end_heal_stroke(mode);
+                }
+            }
+            self.sync();
+            return;
+        }
         let color = self.paint_color();
         let opacity = self.brush.opacity;
         self.as_mut().rust_mut().doc.end_stroke(color, opacity);
@@ -1586,6 +1673,65 @@ impl ffi::Engine {
 
     fn set_erase_mode(mut self: core::pin::Pin<&mut Self>, erasing: bool) {
         self.as_mut().rust_mut().erasing = erasing;
+    }
+
+    fn set_heal_mode(mut self: core::pin::Pin<&mut Self>, mode: i32) {
+        self.as_mut().rust_mut().heal_mode = if mode < 0 {
+            None
+        } else {
+            Some(HealMode::from_i32(mode))
+        };
+    }
+
+    fn set_heal_source(mut self: core::pin::Pin<&mut Self>, active: bool, dx: i32, dy: i32) {
+        self.as_mut().rust_mut().heal_source = if active { Some((dx, dy)) } else { None };
+    }
+
+    fn patch_selection(
+        mut self: core::pin::Pin<&mut Self>,
+        dx: i32,
+        dy: i32,
+        content_aware: bool,
+        destination: bool,
+        transparent: bool,
+    ) {
+        let options = PatchOptions {
+            dx,
+            dy,
+            content_aware,
+            destination,
+            transparent,
+        };
+        self.as_mut().rust_mut().doc.patch_selection(options);
+        self.sync();
+    }
+
+    fn content_aware_move(
+        mut self: core::pin::Pin<&mut Self>,
+        dx: i32,
+        dy: i32,
+        extend: bool,
+    ) {
+        self.as_mut().rust_mut().doc.content_aware_move(dx, dy, extend);
+        self.sync();
+    }
+
+    fn remove_red_eye(
+        mut self: core::pin::Pin<&mut Self>,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        pupil: i32,
+        darken: i32,
+    ) {
+        let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
+        self.as_mut().rust_mut().doc.remove_red_eye(
+            rect,
+            pupil.clamp(0, 100) as u32,
+            darken.clamp(0, 100) as u32,
+        );
+        self.sync();
     }
 
     fn fill_foreground(mut self: core::pin::Pin<&mut Self>) {
