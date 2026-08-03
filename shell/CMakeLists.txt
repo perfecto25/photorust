@@ -15,6 +15,8 @@ set(SHELL_SOURCES
     src/dialogs/ColorPickerDialog.cpp
     src/dialogs/ColorPickerDialog.h
 
+    src/panels/BrushPresetPicker.cpp
+    src/panels/BrushPresetPicker.h
     src/panels/ColorPanel.cpp
     src/panels/ColorPanel.h
     src/panels/HistoryPanel.cpp
@@ -60,13 +62,28 @@ target_compile_options(photorust PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
 )
 
+# The application icon lives at the top of the repository, so it can be edited
+# in place without hunting through the source tree. It is staged and installed
+# under the name the .desktop file's `Icon=` key refers to.
+set(PHOTORUST_ICON "${PROJECT_SOURCE_DIR}/icons/photorust.svg")
+if(NOT EXISTS "${PHOTORUST_ICON}")
+    message(FATAL_ERROR "Application icon not found at ${PHOTORUST_ICON}")
+endif()
+# Re-run the staging step when the icon is edited.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PHOTORUST_ICON}")
+
 # Copy the theme and keymap next to the executable so a fresh build runs
 # correctly without an install step.
 add_custom_command(TARGET photorust POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/resources
         $<TARGET_FILE_DIR:photorust>/resources
-    COMMENT "Staging shell resources (theme.qss, shortcuts.json)"
+    # After the directory copy, so it lands in the staged tree rather than being
+    # overwritten by it.
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PHOTORUST_ICON}"
+        $<TARGET_FILE_DIR:photorust>/resources/icons/photorust.svg
+    COMMENT "Staging shell resources (theme.qss, shortcuts.json, icon)"
 )
 
 # ---------------------------------------------------------------- install ---
@@ -82,8 +99,16 @@ if(APPLE)
     # Inside a bundle, resources belong in Contents/Resources.
     set_source_files_properties(resources/theme.qss resources/shortcuts.json
         PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
-    set_source_files_properties(resources/icons/photorust.svg
-        PROPERTIES MACOSX_PACKAGE_LOCATION Resources/icons)
+    # The icon is copied rather than declared as a source, since it lives outside
+    # this directory.
+    add_custom_command(TARGET photorust POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_BUNDLE_CONTENT_DIR:photorust>/Resources/icons
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PHOTORUST_ICON}"
+            $<TARGET_BUNDLE_CONTENT_DIR:photorust>/Resources/icons/photorust.svg
+        COMMENT "Staging the application icon into the bundle"
+    )
     # That covers the window icon, which Qt loads from the SVG. The Finder
     # icon is a separate thing: it needs an .icns, which has to be generated
     # from the SVG with iconutil and pointed at by MACOSX_BUNDLE_ICON_FILE.
@@ -101,8 +126,9 @@ if(NOT APPLE)
     # the .desktop file's `Icon=` key refers to, which is how launchers, the
     # task switcher and the window list all find it.
     include(GNUInstallDirs)
-    install(FILES resources/icons/photorust.svg
-        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps)
+    install(FILES "${PHOTORUST_ICON}"
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps
+        RENAME photorust.svg)
     install(FILES resources/org.photorust.PhotoRust.desktop
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
 endif()

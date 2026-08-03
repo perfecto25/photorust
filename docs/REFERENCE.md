@@ -71,10 +71,11 @@ serves both targets.
 |---|---|
 | **Menu bar** | Eight menus; see [§6](#6-menus). |
 | **Options bar** | The active tool's name in bold, then its settings. Rebuilt on every tool change. |
+| **Document tabs** | One tab per open document, above the canvas. Click to switch, × to close. Untitled documents are numbered as CS6's are. The last document cannot be closed — the rest of the interface assumes there is one to act on. |
 | **Tool strip** | Single column of 20 tools in four groups, then the colour swatch, Quick Mask and screen-mode buttons. |
 | **Canvas viewport** | The document, centred, on the CS6 grey surround. Transparent pixels show a fixed-size checkerboard that does not scale with zoom, as in Photoshop. |
 | **Dock area** | Right-hand side. Color, Swatches and Info share a tab group; History and Layers stack below. Panels are dockable left or right, and float when dragged out. |
-| **Status bar** | Zoom percentage, document size, and the live cursor position in document coordinates. |
+| **Status bar** | An **editable zoom field**, the document size, and the live cursor position in document coordinates. |
 
 The colour palette is the CS6 "Kona" dark theme, in
 [shell/resources/theme.qss](../shell/resources/theme.qss):
@@ -134,7 +135,7 @@ Separators mark CS6's four functional groups.
 | Pipette | **Eyedropper** | `I` | Eyedropper ✅ · Color Sampler ✅ · Ruler ✅ · Note ✅ · Count ✅ | ✅ all five |
 | | | | | |
 | Angled bandage + spot | **Spot Healing Brush** | `J` | Spot Healing ✅ · Healing ✅ · Patch ✅ · Content-Aware Move ✅ · Red Eye ✅ | ✅ all five |
-| Brush with bristles | **Brush** | `B` | Brush ✅ · Pencil ⛔ · Color Replacement ⛔ · Mixer Brush ⛔ | first only |
+| Brush with bristles | **Brush** | `B` | Brush ✅ · Pencil ✅ · Color Replacement ✅ · Mixer Brush ⛔ | ✅ first three |
 | Rubber stamp | Clone Stamp | `S` | Clone Stamp ✅ · Pattern Stamp ⛔ | first only |
 | Brush + circular arrow | History Brush | `Y` | History Brush ✅ · Art History Brush ⛔ | first only |
 | Angled eraser block | Eraser | `E` | Eraser ✅ · Background Eraser ⛔ · Magic Eraser ⛔ | first only |
@@ -179,11 +180,13 @@ the active variant's name in bold — switching to Elliptical says
 
 | Active tool | Options shown |
 |---|---|
-| Brush, Eraser, Spot Healing, Clone Stamp, History Brush | **Size** (1–5000 px), **Hardness** (0–100%), **Opacity** (0–100%), **Flow** (1–100%) — all live, pushed to the engine on change |
+| Brush, Eraser, Spot Healing, Clone Stamp, History Brush | A **brush tip button** showing the current tip and its diameter — click for the preset picker — then **Opacity** (0–100%) and **Flow** (1–100%). All live, pushed to the engine on change |
+| Color Replacement | The tip button and **Opacity**, then **Mode** (Hue · Saturation · Color · Luminosity), **Sampling** (Continuous · Once · Background Swatch), **Limits** (Discontiguous · Contiguous · Find Edges), **Tolerance** and **Anti-alias** |
+| Pencil | The tip button and **Opacity**, then **Auto Erase**. No Flow — the Pencil lays whole pixels, so there is nothing to build up gradually |
 | Spot Healing Brush | Additionally **Type**: Proximity Match · Create Texture · Content-Aware (CS6's default). Opacity and Flow are disabled — the region is rebuilt, not painted, so they have nothing to act on |
 | Healing Brush | Brush controls, and a reminder to `Alt`+click a source point first |
 | Patch | **Combine mode** buttons, **Patch** mode (Normal · Content-Aware), the **Source** / **Destination** pair, **Transparent**, and **Use Pattern** (disabled — no patterns yet). Source, Destination and Transparent grey out under Content-Aware, which does not sample from the drag at all |
-| Content-Aware Move | **Mode**: Move (heals the gap) or Extend (leaves the original) |
+| Content-Aware Move | **Combine mode** buttons, **Mode** (Move · Extend), **Structure** (1–7, how strictly the fill follows edges), **Color** (0–10, how far the moved pixels adapt to their new surroundings), **Sample All Layers**, and CS6's transform-on-drop **T** (disabled — transforms are not implemented) |
 | Red Eye | **Pupil Size** and **Darken Amount**, both 0–100% |
 | Marquee, Lasso, Quick Selection | **Combine mode** buttons (new / add / subtract / intersect), **Feather** (0–1000 px), then a modifier hint: `Ctrl+Shift` = add · `Ctrl+Alt` = subtract · click = deselect |
 | Lasso (Polygonal / Magnetic) | Same controls; the hint becomes: click to place points · double-click or `Enter` to close · `Backspace` undoes one · `Esc` cancels |
@@ -253,6 +256,52 @@ management yet.
 The linear undo stack, newest at the bottom. Click any state to jump to it.
 The stack is bounded by both state count and total memory. A whole brush stroke
 is one entry, not one per dab.
+
+### Brush Preset Picker
+
+The popup behind the options bar's tip button, in CS6's layout: a preview with a
+centre crosshair, **Size** (1–5000 px) and **Hardness** (0–100%) as a slider and
+a number each, the current diameter, and a grid of preset thumbnails with their
+diameters printed under them.
+
+Size and Hardness live here rather than on the bar, as they do in CS6. Editing
+either keeps the rest of the tip, so nudging Size does not turn a spatter brush
+back into a plain circle.
+
+The set covers CS6's families: **soft** and **hard round**, **flat** and
+**chisel** (a squashed, rotated tip), **charcoal** and **chalk** (broad tips with
+the edge broken by jitter), **spatter**, **star**, and **grass** and **dune
+grass**. Each preset carries a full tip — size, hardness, roundness, angle,
+scatter, dab count, the three jitter amounts and spacing — which is what the
+engine's brush is (see `core/src/brush.rs`).
+
+The **Color Replacement Brush** paints the foreground colour onto pixels that
+already resemble a sampled one. In its default **Color** mode it replaces hue and
+saturation while keeping each pixel's own brightness, so recolouring shaded
+material keeps the shading rather than flattening it to a sticker. It edits the
+layer per dab rather than accumulating a stroke, because what it replaces depends
+on what is already there — and with Continuous sampling the reference colour
+changes as the brush moves. A stroke is still one undo step, and `Esc` abandons it.
+
+The **Pencil** is the same engine with antialiasing switched off: every pixel is
+either fully painted or untouched. That is the whole difference, and it is why
+hardness has no effect on it and why it is the tool for touching up single-pixel
+lines. Its **Auto Erase** is decided once from the pixel the stroke begins on —
+start on the foreground colour and the whole stroke paints the background colour
+instead.
+
+Hardness 100 still leaves about a pixel and a half of feather, as Photoshop's
+hard round does, and dab edges are area-sampled rather than point-sampled — a
+sharp edge crosses a pixel, and one sample per pixel would land either fully
+inside or fully outside, which is what makes a brush look pixelated.
+
+Thumbnails are rendered **by the engine**: it lays one step of the brush into a
+small image and that image is the thumbnail, so a thumbnail cannot drift from
+what the brush paints. The diameter is printed under each, as CS6 does.
+
+The one gap is the brushes built from a bitmap tip image, such as the oil and
+texture-comb ones. Those are approximated with scatter and jitter rather than
+omitted, since an approximation that paints is more use than an empty slot.
 
 ### Info · `F8`
 
@@ -345,6 +394,7 @@ anything is [§3](#3-the-tool-strip).
 | `Shift+C` | Cycle Crop → Perspective → Slice → Slice Select ✅ | | | |
 | `Shift+I` | Cycle Eyedropper → Color Sampler → Ruler → Note → Count ✅ | | | |
 | `Shift+J` | Cycle Spot Healing → Healing → Patch → Content-Aware Move → Red Eye ✅ | | | |
+| `Shift+B` | Cycle Brush → Pencil → Color Replacement ✅ | | | |
 | `W` | Quick Selection ✅ | | `O` | Dodge ✅ |
 | `C` | Crop ✅ | | `P` | Pen ⚪ |
 | `I` | Eyedropper ✅ | | `T` | Horizontal Type ⚪ |
@@ -371,7 +421,7 @@ brush, `/` toggle preserve transparency.
 | `Ctrl+N` | `Cmd+N` | New… | ✅ |
 | `Ctrl+O` | `Cmd+O` | Open… | ✅ |
 | `Alt+Ctrl+O` | `Opt+Cmd+O` | Browse in Bridge… | ⚪ |
-| `Ctrl+W` | `Cmd+W` | Close | ⚪ |
+| `Ctrl+W` | `Cmd+W` | Close | ✅ closes the active document, prompting if it has unsaved changes |
 | `Alt+Ctrl+W` | `Opt+Cmd+W` | Close All | ⚪ |
 | `Ctrl+S` | `Cmd+S` | Save | ✅ |
 | `Shift+Ctrl+S` | `Shift+Cmd+S` | Save As… | ✅ |
@@ -555,6 +605,17 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | Drag with Patch / Content-Aware Move | Outline a region; drag inside it to choose where to sample from, or where to move it |
 | Patch, Source mode | The selection is the flaw; the drag says where to repair it from |
 | Patch, Destination mode | The selection is good material; the drag says where to apply it |
+
+Patch and Content-Aware Move reconstruct every pixel of the region, so a large
+area takes a moment; the cursor changes to a wait cursor while it works.
+
+A **move copies** its pixels rather than re-solving them — only the overall
+colour is adapted, by the amount **Color** asks for — so detail survives intact.
+The gap left behind is filled in two stages: an inward sweep from the boundary
+for a first guess, then search-and-vote passes in which every patch covering a
+pixel votes on its colour, weighted by how well that patch fits. The voting is
+what keeps the fill smooth; giving each pixel the centre of its own best match
+mosaics unrelated sources together and shows as blocks.
 | Drag or click with Red Eye | Neutralise red in the area |
 | Drag with Slice | Cut a user slice; the rest of the canvas re-slices automatically around it |
 | Click with Slice Select | Select a user slice; drag it or its handles to adjust |
@@ -565,6 +626,19 @@ macOS-only in CS6: Minimize `Ctrl+Cmd+M`. On macOS, CS6 also binds Help to
 | `Backspace` with an open lasso | Take back the last fastening point |
 | Click without dragging | Deselect (for Rectangular / Elliptical / Lasso) |
 | Right-click with a selection tool | CS6's marquee context menu |
+
+**Unsaved changes are only ever asked about when something would actually be
+lost.** File ▸ New and File ▸ Open add a tab, so they never prompt. Closing a
+document — its tab's ×, or File ▸ Close — prompts for that document. Quitting
+prompts once per modified document, bringing each into view first so the
+decision is made while looking at the right image.
+
+The status bar's **zoom field** is editable, as Photoshop's is: type a percentage
+and press Enter. It accepts `400`, `400%` and `66,7` alike, clamps out-of-range
+values to the nearest limit rather than rejecting them, and puts the real value
+back if what was typed makes no sense. It follows zoom changed anywhere else —
+the wheel, the View menu, Fit on Screen — but leaves itself alone while being
+typed into.
 
 Zoom steps through CS6's own sequence (0.67%, 1%, 1.67%, … 1600%, 3200%) rather
 than a smooth ramp. Below 200% the canvas is drawn smoothed; at 200% and above

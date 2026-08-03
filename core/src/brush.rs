@@ -12,6 +12,12 @@
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::selection::Selection;
 
+/// Seed every stroke's randomness starts from.
+///
+/// Fixed rather than time-based so a stroke is reproducible: the live preview
+/// draws the same dabs the commit does, and redo matches undo.
+const STROKE_SEED: u32 = 0x1D87_2B41;
+
 /// Brush settings, mirroring the tool options bar.
 #[derive(Clone, Copy, Debug)]
 pub struct Brush {
@@ -25,6 +31,36 @@ pub struct Brush {
     pub flow: f32,
     /// Dab spacing as a fraction of diameter. Photoshop's default is 25%.
     pub spacing: f32,
+
+    // -- tip shape, the Brush panel's "Brush Tip Shape" section --
+    /// Minor axis as a fraction of the major one: `1.0` is round, lower values
+    /// flatten the tip into a chisel. Photoshop calls this Roundness.
+    pub roundness: f32,
+    /// Rotation of the tip in degrees. Only visible when `roundness < 1`.
+    pub angle: f32,
+
+    // -- scattering, the panel's "Scattering" section --
+    /// How far dabs stray from the stroke, as a fraction of diameter. `0.0`
+    /// keeps them on the path.
+    pub scatter: f32,
+    /// Dabs laid at each step. Photoshop's Count; more than one is what makes a
+    /// spatter or grass brush deposit a cluster rather than a single mark.
+    pub count: u32,
+
+    // -- shape dynamics --
+    /// Random size variation per dab, `0.0..=1.0` of the diameter.
+    pub size_jitter: f32,
+    /// Random rotation per dab, in degrees.
+    pub angle_jitter: f32,
+    /// Random roundness variation per dab, `0.0..=1.0`.
+    pub roundness_jitter: f32,
+
+    /// Whether dab edges are antialiased.
+    ///
+    /// False is the **Pencil**: every pixel is either fully painted or not
+    /// touched at all. That hard, stepped edge is the whole point of the tool,
+    /// and it is the only thing that distinguishes it from a hard brush.
+    pub antialias: bool,
 }
 
 impl Default for Brush {
@@ -35,6 +71,14 @@ impl Default for Brush {
             opacity: 1.0,
             flow: 1.0,
             spacing: 0.25,
+            roundness: 1.0,
+            angle: 0.0,
+            scatter: 0.0,
+            count: 1,
+            size_jitter: 0.0,
+            angle_jitter: 0.0,
+            roundness_jitter: 0.0,
+            antialias: true,
         }
     }
 }
@@ -42,6 +86,89 @@ impl Default for Brush {
 impl Brush {
     pub fn radius(&self) -> f32 {
         self.size / 2.0
+    }
+
+    /// Coverage at an offset from the dab's centre, honouring tip shape.
+    ///
+    /// The offset is rotated into the tip's own frame and the minor axis
+    /// stretched back to circular, so an elliptical chisel tip can reuse the
+    /// same radial falloff curve as a round one.
+    pub fn coverage_at(&self, dx: f32, dy: f32, angle: f32, roundness: f32) -> f32 {
+        self.falloff(self.tip_distance(dx, dy, angle, roundness))
+    }
+
+    /// Where the dab's solid centre ends and the falloff begins.
+    ///
+    /// A full pixel is always left for the edge, even at maximum hardness — a
+    /// hard round brush in Photoshop still has about a pixel of softness, and
+    /// without it the stroke is a staircase rather than a line.
+    pub fn core_radius(&self) -> f32 {
+        let r = self.radius();
+        // About a pixel and a half of feather at maximum hardness, which is what
+        // Photoshop's hard round has. Scaled down on tiny brushes, where a fixed
+        // 1.5px would leave no solid core at all.
+        let feather = 1.5f32.min(r * 0.5);
+        (r * self.hardness.clamp(0.0, 1.0)).min(r - feather).max(0.0)
+    }
+
+    /// Distance from the dab centre in the tip's own frame, where an elliptical
+    /// tip has been mapped back onto a circle.
+    pub fn tip_distance(&self, dx: f32, dy: f32, angle: f32, roundness: f32) -> f32 {
+        let roundness = roundness.clamp(0.05, 1.0);
+        let (sin, cos) = (-angle.to_radians()).sin_cos();
+        let rx = dx * cos - dy * sin;
+        let ry = dx * sin + dy * cos;
+        (rx * rx + (ry / roundness) * (ry / roundness)).sqrt()
+    }
+
+    /// Coverage of the whole pixel centred `(dx, dy)` from the dab's centre.
+    ///
+    /// One sample per pixel is exact wherever the falloff is flat, but a sharp
+    /// edge crosses a pixel and the single sample lands either fully inside or
+    /// fully outside — which is what makes a hard brush look pixelated. Where
+    /// the edge is sharp, the pixel's *area* is sampled instead, so boundary
+    /// pixels get partial coverage and the stroke reads as smooth.
+    pub fn pixel_coverage(&self, dx: f32, dy: f32, angle: f32, roundness: f32) -> f32 {
+        let r = self.radius();
+
+        // The Pencil: a pixel is in or out, with nothing between. Hardness has
+        // no meaning here — there is no edge to soften.
+        if !self.antialias {
+            return if self.tip_distance(dx, dy, angle, roundness) <= r {
+                1.0
+            } else {
+                0.0
+            };
+        }
+
+        let core = self.core_radius();
+
+        // A ramp two pixels wide or more is already a smooth gradient; averaging
+        // it would be indistinguishable from sampling it once.
+        if r - core >= 2.5 {
+            return self.coverage_at(dx, dy, angle, roundness);
+        }
+
+        let t = self.tip_distance(dx, dy, angle, roundness);
+        // Only the band the edge passes through needs the extra work. 1.2 covers
+        // a pixel's half-diagonal with room to spare.
+        if t < core - 1.2 {
+            return 1.0;
+        }
+        if t > r + 1.2 {
+            return 0.0;
+        }
+
+        const GRID: i32 = 4;
+        let mut sum = 0.0;
+        for sy in 0..GRID {
+            for sx in 0..GRID {
+                let ox = (sx as f32 + 0.5) / GRID as f32 - 0.5;
+                let oy = (sy as f32 + 0.5) / GRID as f32 - 0.5;
+                sum += self.coverage_at(dx + ox, dy + oy, angle, roundness);
+            }
+        }
+        sum / (GRID * GRID) as f32
     }
 
     /// Coverage of a single dab at distance `d` from its centre, `0.0..=1.0`.
@@ -56,10 +183,7 @@ impl Brush {
         if d >= r {
             return 0.0;
         }
-        let hardness = self.hardness.clamp(0.0, 1.0);
-        // Where the solid core ends. Always leave ~1px for antialiasing so a
-        // fully hard brush still has a smooth edge.
-        let core = (r * hardness).min(r - 0.5).max(0.0);
+        let core = self.core_radius();
         if d <= core {
             return 1.0;
         }
@@ -83,6 +207,12 @@ pub struct StrokeMask {
     /// Distance carried over from the previous segment, so spacing stays even
     /// across event boundaries rather than resetting at each mouse-move.
     residual: f32,
+    /// Random state for scatter and jitter.
+    ///
+    /// Advanced per dab and reset at the start of each stroke, so a stroke
+    /// renders identically every time it is replayed — the live preview and the
+    /// committed result must agree, and so must undo and redo.
+    rng: u32,
 }
 
 impl StrokeMask {
@@ -92,6 +222,7 @@ impl StrokeMask {
             dirty: Rect::default(),
             last_point: None,
             residual: 0.0,
+            rng: STROKE_SEED,
         }
     }
 
@@ -112,6 +243,7 @@ impl StrokeMask {
     pub fn begin(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) {
         self.last_point = None;
         self.residual = 0.0;
+        self.rng = STROKE_SEED;
         self.stamp(brush, x, y, pressure);
         self.last_point = Some((x, y));
     }
@@ -146,10 +278,66 @@ impl StrokeMask {
         self.last_point = Some((x, y));
     }
 
-    /// Stamp one dab, taking the maximum against existing coverage.
+    /// A deterministic random value in `0.0..1.0`.
+    fn random(&mut self) -> f32 {
+        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((self.rng >> 8) & 0xFF_FFFF) as f32 / 16_777_215.0
+    }
+
+    /// A deterministic random value in `-1.0..1.0`.
+    fn signed_random(&mut self) -> f32 {
+        self.random() * 2.0 - 1.0
+    }
+
+    /// Lay one step of the brush: `count` dabs, scattered and jittered.
+    ///
+    /// Photoshop's Count and Scattering work at this level rather than per
+    /// stroke — one position along the path deposits a whole cluster, which is
+    /// what gives spatter and grass brushes their texture.
     fn stamp(&mut self, brush: &Brush, cx: f32, cy: f32, pressure: f32) {
+        let count = brush.count.clamp(1, 16);
+        for _ in 0..count {
+            let (mut x, mut y) = (cx, cy);
+            if brush.scatter > 0.0 {
+                // Scatter is a fraction of diameter, spread either side of the
+                // path in both axes.
+                let reach = brush.size * brush.scatter;
+                x += self.signed_random() * reach;
+                y += self.signed_random() * reach;
+            }
+
+            let size = if brush.size_jitter > 0.0 {
+                // Jitter only ever shrinks, as Photoshop's does: the setting is
+                // the *minimum* fraction the dab may fall to.
+                brush.size * (1.0 - brush.size_jitter * self.random()).max(0.05)
+            } else {
+                brush.size
+            };
+            let angle = brush.angle + brush.angle_jitter * self.signed_random();
+            let roundness = if brush.roundness_jitter > 0.0 {
+                (brush.roundness - brush.roundness_jitter * self.random()).clamp(0.05, 1.0)
+            } else {
+                brush.roundness
+            };
+
+            self.stamp_dab(brush, x, y, pressure, size, angle, roundness);
+        }
+    }
+
+    /// Stamp one dab, taking the maximum against existing coverage.
+    #[allow(clippy::too_many_arguments)]
+    fn stamp_dab(
+        &mut self,
+        brush: &Brush,
+        cx: f32,
+        cy: f32,
+        pressure: f32,
+        size: f32,
+        angle: f32,
+        roundness: f32,
+    ) {
         let pressure = pressure.clamp(0.0, 1.0);
-        let radius = brush.radius() * pressure.max(0.05);
+        let radius = (size / 2.0) * pressure.max(0.05);
         if radius <= 0.0 {
             return;
         }
@@ -158,7 +346,9 @@ impl StrokeMask {
             return;
         }
 
-        // A dab affects the disc of `radius`, plus a pixel for antialiasing.
+        // A rotated ellipse's extent in x and y is bounded by its major axis, so
+        // the disc of `radius` covers it whatever the angle. Plus a pixel for
+        // antialiasing.
         let x0 = (cx - radius - 1.0).floor() as i32;
         let y0 = (cy - radius - 1.0).floor() as i32;
         let x1 = (cx + radius + 1.0).ceil() as i32;
@@ -167,6 +357,21 @@ impl StrokeMask {
         let bounds = Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32);
         let clipped = bounds.intersect(&self.coverage.rect());
         if clipped.is_empty() {
+            return;
+        }
+
+        // A 1px brush has a radius of 0.5, and every surrounding pixel centre is
+        // at least 0.707 away from a dab landing on a pixel boundary — so the
+        // falloff below would find no coverage anywhere and paint nothing at
+        // all. Photoshop's 1px brush marks exactly one pixel, so do that.
+        if radius < 0.75 {
+            let (px, py) = (cx.floor() as i32, cy.floor() as i32);
+            if self.coverage.rect().contains(px, py) {
+                let existing = self.coverage.get(px, py).a as f32 / 255.0;
+                let v = (existing.max(flow) * 255.0 + 0.5) as u8;
+                self.coverage.set(px, py, Rgba8::new(v, v, v, v));
+                self.dirty = self.dirty.union(&Rect::new(px, py, 1, 1));
+            }
             return;
         }
 
@@ -180,8 +385,7 @@ impl StrokeMask {
             for x in clipped.x..clipped.right() {
                 let dx = x as f32 + 0.5 - cx;
                 let dy = y as f32 + 0.5 - cy;
-                let d = (dx * dx + dy * dy).sqrt();
-                let cov = scaled.falloff(d) * flow;
+                let cov = scaled.pixel_coverage(dx, dy, angle, roundness) * flow;
                 if cov <= 0.0 {
                     continue;
                 }
@@ -619,5 +823,340 @@ mod tests {
         assert_eq!(out.r, 200);
         assert_eq!(out.g, 100);
         assert!((out.a as i32 - 128).abs() <= 2);
+    }
+
+    #[test]
+    fn a_flat_tip_paints_wider_than_it_is_tall() {
+        // Roundness squashes the minor axis; at angle 0 that is the vertical.
+        let brush = Brush { size: 40.0, hardness: 1.0, roundness: 0.25, ..Brush::default() };
+        let mut mask = StrokeMask::new(80, 80);
+        mask.begin(&brush, 40.0, 40.0, 1.0);
+
+        let across = |horizontal: bool| {
+            let mut n = 0;
+            for i in 0..80 {
+                let (x, y) = if horizontal { (i, 40) } else { (40, i) };
+                if mask.coverage_at(x, y) > 0.5 {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let (w, h) = (across(true), across(false));
+        assert!(w > h * 2, "a flat tip should be much wider than tall, got {}x{}", w, h);
+    }
+
+    #[test]
+    fn tip_angle_rotates_the_shape() {
+        // The same flat tip at 90 degrees should be tall rather than wide.
+        let brush = Brush {
+            size: 40.0,
+            hardness: 1.0,
+            roundness: 0.25,
+            angle: 90.0,
+            ..Brush::default()
+        };
+        let mut mask = StrokeMask::new(80, 80);
+        mask.begin(&brush, 40.0, 40.0, 1.0);
+
+        let across = |horizontal: bool| {
+            let mut n = 0;
+            for i in 0..80 {
+                let (x, y) = if horizontal { (i, 40) } else { (40, i) };
+                if mask.coverage_at(x, y) > 0.5 {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let (w, h) = (across(true), across(false));
+        assert!(h > w * 2, "at 90 degrees the tip should be tall, got {}x{}", w, h);
+    }
+
+    #[test]
+    fn a_round_tip_is_unaffected_by_angle() {
+        let mut a = StrokeMask::new(60, 60);
+        a.begin(&Brush { size: 20.0, ..Brush::default() }, 30.0, 30.0, 1.0);
+        let mut b = StrokeMask::new(60, 60);
+        b.begin(&Brush { size: 20.0, angle: 37.0, ..Brush::default() }, 30.0, 30.0, 1.0);
+
+        for y in 0..60 {
+            for x in 0..60 {
+                assert!(
+                    (a.coverage_at(x, y) - b.coverage_at(x, y)).abs() < 1e-6,
+                    "rotating a round tip changed it at {}, {}",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_spreads_dabs_off_the_path() {
+        let plain = Brush { size: 8.0, hardness: 1.0, ..Brush::default() };
+        let scattered = Brush { scatter: 1.5, count: 8, ..plain };
+
+        let extent = |brush: &Brush| -> i32 {
+            let mut mask = StrokeMask::new(120, 120);
+            mask.begin(brush, 60.0, 60.0, 1.0);
+            let mut top = 120;
+            let mut bottom = -1;
+            for y in 0..120 {
+                for x in 0..120 {
+                    if mask.coverage_at(x, y) > 0.1 {
+                        top = top.min(y);
+                        bottom = bottom.max(y);
+                    }
+                }
+            }
+            bottom - top
+        };
+
+        let spread = extent(&scattered);
+        let tight = extent(&plain);
+        assert!(spread > tight * 2, "scatter did not spread the dabs: {} vs {}", spread, tight);
+    }
+
+    #[test]
+    fn count_deposits_more_than_one_dab() {
+        // With scatter, a higher count must cover more ground.
+        let one = Brush { size: 6.0, hardness: 1.0, scatter: 1.0, count: 1, ..Brush::default() };
+        let many = Brush { count: 12, ..one };
+
+        let inked = |brush: &Brush| -> usize {
+            let mut mask = StrokeMask::new(100, 100);
+            mask.begin(brush, 50.0, 50.0, 1.0);
+            let mut n = 0;
+            for y in 0..100 {
+                for x in 0..100 {
+                    if mask.coverage_at(x, y) > 0.1 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert!(inked(&many) > inked(&one) * 3, "a high count deposited no extra ink");
+    }
+
+    #[test]
+    fn a_stroke_renders_the_same_way_twice() {
+        // Scatter and jitter are random, but a stroke has to be reproducible:
+        // the live preview must match the commit, and redo must match undo.
+        let brush = Brush {
+            size: 12.0,
+            scatter: 1.0,
+            count: 6,
+            size_jitter: 0.6,
+            angle_jitter: 90.0,
+            roundness: 0.4,
+            ..Brush::default()
+        };
+
+        let render = || {
+            let mut mask = StrokeMask::new(120, 60);
+            mask.begin(&brush, 20.0, 30.0, 1.0);
+            mask.extend(&brush, 60.0, 30.0, 1.0);
+            mask.extend(&brush, 100.0, 30.0, 1.0);
+            let mut out = Vec::new();
+            for y in 0..60 {
+                for x in 0..120 {
+                    out.push((mask.coverage_at(x, y) * 255.0) as u8);
+                }
+            }
+            out
+        };
+        assert_eq!(render(), render(), "the same stroke rendered differently");
+    }
+
+    #[test]
+    fn size_jitter_only_ever_shrinks() {
+        // Photoshop's jitter varies downward from the set size, so a jittered
+        // brush must never paint wider than an unjittered one.
+        let plain = Brush { size: 30.0, hardness: 1.0, ..Brush::default() };
+        let jittered = Brush { size_jitter: 0.9, ..plain };
+
+        let width = |brush: &Brush| -> i32 {
+            let mut mask = StrokeMask::new(80, 80);
+            mask.begin(brush, 40.0, 40.0, 1.0);
+            let mut n = 0;
+            for x in 0..80 {
+                if mask.coverage_at(x, 40) > 0.1 {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert!(width(&jittered) <= width(&plain), "jitter made the dab larger");
+    }
+
+    #[test]
+    fn a_one_pixel_brush_marks_exactly_one_pixel() {
+        // A radius of 0.5 puts every neighbouring pixel centre beyond the dab,
+        // so without a special case this painted nothing at all.
+        let brush = Brush { size: 1.0, hardness: 1.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(20, 20);
+        mask.begin(&brush, 10.0, 10.0, 1.0);
+
+        let mut inked = Vec::new();
+        for y in 0..20 {
+            for x in 0..20 {
+                if mask.coverage_at(x, y) > 0.5 {
+                    inked.push((x, y));
+                }
+            }
+        }
+        assert_eq!(inked, vec![(10, 10)], "a 1px brush should mark one pixel");
+    }
+
+    #[test]
+    fn a_one_pixel_brush_draws_a_continuous_line() {
+        let brush = Brush { size: 1.0, hardness: 1.0, spacing: 0.25, ..Brush::default() };
+        let mut mask = StrokeMask::new(40, 20);
+        mask.begin(&brush, 5.0, 10.0, 1.0);
+        mask.extend(&brush, 34.0, 10.0, 1.0);
+
+        let mut gaps = 0;
+        for x in 5..34 {
+            if mask.coverage_at(x, 10) <= 0.5 {
+                gaps += 1;
+            }
+        }
+        assert_eq!(gaps, 0, "the 1px line had {} gaps", gaps);
+    }
+
+    #[test]
+    fn a_hard_brush_still_has_an_antialiased_edge() {
+        // The bug this guards: coverage used to be sampled once at each pixel
+        // centre, so a sharp edge landed either fully in or fully out and a hard
+        // brush painted a staircase. Boundary pixels must get partial coverage.
+        let brush = Brush { size: 9.0, hardness: 1.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(30, 30);
+        mask.begin(&brush, 15.0, 15.0, 1.0);
+
+        let mut partial = 0;
+        for x in 0..30 {
+            let c = mask.coverage_at(x, 15);
+            if c > 0.02 && c < 0.98 {
+                partial += 1;
+            }
+        }
+        assert!(partial >= 2, "no antialiasing across the dab: {} partial pixels", partial);
+    }
+
+    #[test]
+    fn a_stroke_edge_is_graded_rather_than_a_step() {
+        // Along a horizontal stroke the top edge should fade over a row or two,
+        // not jump straight from nothing to solid.
+        let brush = Brush { size: 9.0, hardness: 1.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(60, 30);
+        mask.begin(&brush, 10.0, 15.0, 1.0);
+        mask.extend(&brush, 50.0, 15.0, 1.0);
+
+        let mut graded = 0;
+        for y in 0..30 {
+            let c = mask.coverage_at(30, y);
+            if c > 0.02 && c < 0.98 {
+                graded += 1;
+            }
+        }
+        assert!(graded >= 2, "the stroke edge is a hard step: {} graded rows", graded);
+    }
+
+    #[test]
+    fn a_tiny_brush_keeps_a_solid_core() {
+        // The feather is capped at half the radius, so a 3px hard brush is not
+        // reduced to a soft blob with nothing solid in it.
+        let brush = Brush { size: 3.0, hardness: 1.0, ..Brush::default() };
+        assert!(brush.core_radius() > 0.0, "a 3px hard brush has no solid core");
+
+        // Centred on a pixel rather than a boundary, so the middle pixel really
+        // is the middle. A 3px tip has little room for a core, so the bar is
+        // "clearly the darkest thing here" rather than fully opaque.
+        let mut mask = StrokeMask::new(20, 20);
+        mask.begin(&brush, 10.5, 10.5, 1.0);
+        let centre = mask.coverage_at(10, 10);
+        assert!(centre > 0.9, "the centre of a 3px brush is only {:.2}", centre);
+        assert!(centre > mask.coverage_at(11, 10) + 0.1, "the tip has no discernible core");
+    }
+
+    #[test]
+    fn a_soft_brush_is_not_area_sampled_needlessly() {
+        // A wide falloff is already smooth, so it takes the cheap path — this
+        // checks the cheap path still produces the same gradient.
+        let brush = Brush { size: 40.0, hardness: 0.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(60, 60);
+        mask.begin(&brush, 30.0, 30.0, 1.0);
+
+        // Coverage should fall monotonically from the centre outward.
+        let mut last = 1.1f32;
+        for x in 30..50 {
+            let c = mask.coverage_at(x, 30);
+            assert!(c <= last + 1e-3, "soft falloff rose at x = {}", x);
+            last = c;
+        }
+        assert!(mask.coverage_at(30, 30) > 0.9, "the centre should be solid");
+    }
+
+    #[test]
+    fn the_pencil_paints_no_partial_pixels() {
+        // Aliased by definition: every pixel is fully painted or untouched.
+        let pencil = Brush { size: 9.0, antialias: false, ..Brush::default() };
+        let mut mask = StrokeMask::new(40, 40);
+        mask.begin(&pencil, 20.0, 20.0, 1.0);
+        mask.extend(&pencil, 34.0, 30.0, 1.0);
+
+        for y in 0..40 {
+            for x in 0..40 {
+                let c = mask.coverage_at(x, y);
+                assert!(
+                    c <= 0.001 || c >= 0.999,
+                    "the pencil left a partial pixel at {}, {}: {:.3}",
+                    x, y, c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pencil_ignores_hardness() {
+        // There is no edge to soften, so a soft setting must paint the same disc.
+        let hard = Brush { size: 11.0, hardness: 1.0, antialias: false, ..Brush::default() };
+        let soft = Brush { hardness: 0.0, ..hard };
+
+        let render = |brush: &Brush| {
+            let mut mask = StrokeMask::new(30, 30);
+            mask.begin(brush, 15.0, 15.0, 1.0);
+            let mut out = Vec::new();
+            for y in 0..30 {
+                for x in 0..30 {
+                    out.push(mask.coverage_at(x, y) > 0.5);
+                }
+            }
+            out
+        };
+        assert_eq!(render(&hard), render(&soft), "hardness changed the pencil's mark");
+    }
+
+    #[test]
+    fn the_pencil_still_covers_the_same_ground_as_the_brush() {
+        // Aliasing must not shrink the mark: a pencil and a hard brush of the
+        // same size should paint close to the same width.
+        let width = |brush: &Brush| {
+            let mut mask = StrokeMask::new(40, 40);
+            mask.begin(brush, 20.0, 20.0, 1.0);
+            let mut n = 0;
+            for x in 0..40 {
+                if mask.coverage_at(x, 20) > 0.5 {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let brush = Brush { size: 12.0, hardness: 1.0, ..Brush::default() };
+        let pencil = Brush { antialias: false, ..brush };
+        let (b, p) = (width(&brush), width(&pencil));
+        assert!((b as i32 - p as i32).abs() <= 2, "pencil {} vs brush {} px wide", p, b);
     }
 }

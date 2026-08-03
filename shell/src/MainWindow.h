@@ -9,12 +9,16 @@ class CanvasView;
 class ColorPanel;
 class CommandRegistry;
 class Engine;
+class BrushPresetPicker;
 class HistoryPanel;
 class InfoPanel;
 class LayersPanel;
 class ToolStrip;
+class QLineEdit;
 class QComboBox;
 class QDockWidget;
+class QTabBar;
+class QToolButton;
 class QDoubleSpinBox;
 class QSpinBox;
 class QToolBar;
@@ -69,6 +73,8 @@ private slots:
     void onDocumentChanged();
     void onCursorMoved(const QPointF &pos);
     void onZoomChanged(double zoom);
+    /// Parse the zoom field and apply it to the canvas.
+    void applyTypedZoom();
     void refreshAll();
     void updateWindowTitle();
 
@@ -80,6 +86,12 @@ private:
     void showSelectionContextMenu(const QPoint &globalPos);
     void createOptionsBar();
     void createDocks();
+    /// Rebuild the document tab bar from the engine's open documents.
+    void refreshDocumentTabs();
+    /// The user picked a tab.
+    void onTabSelected(int index);
+    /// The user clicked a tab's close button.
+    void onTabCloseRequested(int index);
     void createStatusBar();
     void connectEngine();
 
@@ -88,9 +100,13 @@ private:
     template <typename Slot>
     QAction *command(const QString &id, const QString &text, Slot slot);
 
-    /// Prompt to save when the document has unsaved changes.
+    /// Prompt to save the active document if it has unsaved changes.
     /// Returns false if the user cancelled.
     bool confirmDiscardChanges();
+    /// Prompt about every open document's unsaved changes, for quitting.
+    bool confirmDiscardAll();
+    /// Close the active document — File ▸ Close.
+    void closeDocument();
 
     /// Make every registered command's shortcut live.
     ///
@@ -119,8 +135,18 @@ private:
     void addCropOptions(CropType type);
     /// The Info panel's footer text for an eyedropper-group tool.
     QString infoHintFor(EyedropperType type) const;
+    /// Add the Color Replacement Brush's Mode, Sampling, Limits, Tolerance and
+    /// Anti-alias controls.
+    void addColorReplaceOptions();
+    /// Push those into the engine.
+    void pushColorReplaceOptions();
     /// Add the Spot Healing Brush's Type radio set.
     void addHealTypeButtons();
+    /// Add the Content-Aware Move tool's options: Mode, Structure, Color,
+    /// Sample All Layers and the transform toggle.
+    void addContentAwareMoveOptions();
+    /// Push those into the canvas.
+    void pushContentAwareMoveOptions();
     /// Add the Patch tool's own options: combine modes, Patch mode, the
     /// Source/Destination pair, Transparent and Use Pattern.
     void addPatchOptions();
@@ -140,6 +166,11 @@ private:
     void pushCropOptions();
     /// Push the current brush settings into the engine.
     void pushBrushSettings();
+    /// The brush preset picker, created on first use. It outlives the options
+    /// bar because it holds the current tip.
+    BrushPresetPicker *brushPicker();
+    /// Redraw the options-bar tip button from the current size and hardness.
+    void refreshBrushTipButton();
 
     Engine *m_engine = nullptr;
     CommandRegistry *m_registry = nullptr;
@@ -148,6 +179,8 @@ private:
     ToolStrip *m_toolStrip = nullptr;
     QDockWidget *m_toolsDock = nullptr;
     QToolBar *m_optionsBar = nullptr;
+    /// One tab per open document, above the canvas.
+    QTabBar *m_documentTabs = nullptr;
 
     LayersPanel *m_layersPanel = nullptr;
     ColorPanel *m_colorPanel = nullptr;
@@ -157,13 +190,28 @@ private:
 
     // Options-bar widgets for the brush family. Recreated per tool, so these
     // are only valid while a painting tool is active.
-    QDoubleSpinBox *m_brushSize = nullptr;
-    QSpinBox *m_brushHardness = nullptr;
     QSpinBox *m_brushOpacity = nullptr;
     QSpinBox *m_brushFlow = nullptr;
+    QToolButton *m_brushTipButton = nullptr;
+
+    /// The brush tip. Held here rather than in a widget because the picker that
+    /// edits it is a popup and the bar is rebuilt on every tool change.
+    /// True while the Brush button is holding the Pencil, which paints aliased.
+    bool m_pencilMode = false;
+    /// The Pencil's Auto Erase option.
+    bool m_autoErase = false;
+    /// Color Replacement Brush options, which persist across tool switches.
+    int m_replaceMode = int(ReplaceDefaults::kMode);
+    int m_replaceSampling = int(ReplaceDefaults::kSampling);
+    int m_replaceLimits = int(ReplaceDefaults::kLimits);
+    int m_replaceTolerance = ReplaceDefaults::kTolerancePercent;
+    bool m_replaceAntialias = ReplaceDefaults::kAntialias;
+    double m_brushSizeValue = 20.0;
+    int m_brushHardnessValue = 100;
+    BrushPresetPicker *m_brushPicker = nullptr;
 
     QLabel *m_statusPosition = nullptr;
-    QLabel *m_statusZoom = nullptr;
+    QLineEdit *m_statusZoom = nullptr;
     QLabel *m_statusDocSize = nullptr;
 
     ToolId m_activeTool = ToolId::Brush;
@@ -188,6 +236,9 @@ private:
     HealType m_healType = HealType::ContentAware;
     /// Content-Aware Move mode, and the Red Eye tool's two settings.
     bool m_camExtend = false;
+    int m_camStructure = CamDefaults::kStructure;
+    int m_camColor = CamDefaults::kColor;
+    bool m_camSampleAllLayers = false;
     /// Patch tool options, which persist across tool switches.
     bool m_patchContentAware = false;
     bool m_patchDestination = false;

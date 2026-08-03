@@ -15,12 +15,13 @@
 
 use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
-use crate::brush::Brush;
+use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::document::{Document, PatchOptions};
 use crate::filters::{Adjustment, Filter};
-use crate::healing::HealMode;
+use crate::healing::{HealMode, MoveOptions};
 use crate::layer::LayerId;
+use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
 use crate::magnetic::EdgeMap;
 use crate::selection::{Selection, SelectionOp};
 use crate::wand::{self, QuickSelector};
@@ -81,7 +82,44 @@ pub mod ffi {
 
     // -- document ----------------------------------------------------------
     unsafe extern "RustQt" {
-        /// Replace the document with a new one.
+        /// How many documents are open. Each gets a tab in the shell.
+        #[qinvokable]
+        #[cxx_name = "documentCount"]
+        fn document_count(self: &Engine) -> i32;
+
+        /// Which document is active, as an index into the tab order.
+        #[qinvokable]
+        #[cxx_name = "activeDocument"]
+        fn active_document(self: &Engine) -> i32;
+
+        /// Title of the document at a tab index, with its modified marker.
+        #[qinvokable]
+        #[cxx_name = "documentTitleAt"]
+        fn document_title_at(self: &Engine, index: i32) -> QString;
+
+        /// Whether the document at a tab index has unsaved changes.
+        #[qinvokable]
+        #[cxx_name = "documentModifiedAt"]
+        fn document_modified_at(self: &Engine, index: i32) -> bool;
+
+        /// Switch to a document. Everything downstream — canvas, panels,
+        /// history — follows the usual change signals.
+        #[qinvokable]
+        #[cxx_name = "setActiveDocument"]
+        fn set_active_document(self: Pin<&mut Engine>, index: i32);
+
+        /// Close a document. Refuses to close the last one, since there is no
+        /// such thing here as an open application with no document.
+        #[qinvokable]
+        #[cxx_name = "closeDocument"]
+        fn close_document(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// The open documents changed: one was added, closed, or switched to.
+        #[qsignal]
+        #[cxx_name = "documentsChanged"]
+        fn documents_changed(self: Pin<&mut Engine>);
+
+        /// Open a new document in its own tab.
         /// `fill`: 0 = white, 1 = transparent, 2 = background colour.
         #[qinvokable]
         #[cxx_name = "newDocument"]
@@ -404,6 +442,33 @@ pub mod ffi {
     unsafe extern "RustQt" {
         /// Configure the brush from the tool options bar.
         /// `hardness`, `opacity` and `flow` are percentages, 0-100.
+        /// Tip shape and scattering — Photoshop's Brush Tip Shape, Scattering
+        /// and Shape Dynamics, as far as the engine models them.
+        ///
+        /// `roundness` 5-100 (%), `angle` in degrees, `scatter` as a percentage
+        /// of diameter, `count` dabs per step, and the three jitter amounts.
+        #[qinvokable]
+        #[cxx_name = "setBrushShape"]
+        fn set_brush_shape(
+            self: Pin<&mut Engine>,
+            roundness: i32,
+            angle: i32,
+            scatter: i32,
+            count: i32,
+            size_jitter: i32,
+            angle_jitter: i32,
+            roundness_jitter: i32,
+        );
+
+        /// One step of the current brush, rendered centred in a `width` by
+        /// `height` image — the preset thumbnails and the tip preview.
+        ///
+        /// Drawn by the brush engine itself, so a thumbnail cannot drift from
+        /// what the brush actually paints.
+        #[qinvokable]
+        #[cxx_name = "brushPreview"]
+        fn brush_preview(self: &Engine, width: i32, height: i32) -> QImage;
+
         #[qinvokable]
         #[cxx_name = "setBrush"]
         fn set_brush(
@@ -476,6 +541,55 @@ pub mod ffi {
         ///
         /// `mode` is CS6's Type: 0 = Proximity Match, 1 = Create Texture,
         /// 2 = Content-Aware. A negative value turns healing off.
+        /// Whether dab edges are antialiased. False is the Pencil, which paints
+        /// whole pixels only.
+        #[qinvokable]
+        #[cxx_name = "setBrushAntialias"]
+        fn set_brush_antialias(self: Pin<&mut Engine>, antialias: bool);
+
+        /// The Pencil's Auto Erase: a stroke begun on a pixel already the
+        /// foreground colour paints the background colour instead.
+        #[qinvokable]
+        #[cxx_name = "setAutoErase"]
+        fn set_auto_erase(self: Pin<&mut Engine>, enabled: bool);
+
+        /// The Color Replacement Brush's options bar.
+        ///
+        /// `mode` 0-3 (Hue, Saturation, Color, Luminosity), `sampling` 0-2
+        /// (Continuous, Once, Background Swatch), `limits` 0-2 (Discontiguous,
+        /// Contiguous, Find Edges), `tolerance` 0-255.
+        #[qinvokable]
+        #[cxx_name = "setReplaceOptions"]
+        fn set_replace_options(
+            self: Pin<&mut Engine>,
+            mode: i32,
+            sampling: i32,
+            limits: i32,
+            tolerance: i32,
+            antialias: bool,
+        );
+
+        /// Begin a colour-replacement stroke. Returns false if the active layer
+        /// cannot be painted.
+        #[qinvokable]
+        #[cxx_name = "beginReplace"]
+        fn begin_replace(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// Continue one.
+        #[qinvokable]
+        #[cxx_name = "extendReplace"]
+        fn extend_replace(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32);
+
+        /// Finish one, recording a single undo step.
+        #[qinvokable]
+        #[cxx_name = "endReplace"]
+        fn end_replace(self: Pin<&mut Engine>);
+
+        /// Abandon one, restoring what it changed.
+        #[qinvokable]
+        #[cxx_name = "cancelReplace"]
+        fn cancel_replace(self: Pin<&mut Engine>);
+
         #[qinvokable]
         #[cxx_name = "setHealMode"]
         fn set_heal_mode(self: Pin<&mut Engine>, mode: i32);
@@ -506,10 +620,22 @@ pub mod ffi {
         );
 
         /// Move the selection's contents and heal the hole — the Content-Aware
-        /// Move tool. `extend` duplicates instead of moving.
+        /// Move tool.
+        ///
+        /// `extend` duplicates instead of moving. `structure` (1-7) and `color`
+        /// (0-10) are CS6's two adaptation sliders, and `sampleAllLayers` reads
+        /// the composite rather than the active layer.
         #[qinvokable]
         #[cxx_name = "contentAwareMove"]
-        fn content_aware_move(self: Pin<&mut Engine>, dx: i32, dy: i32, extend: bool);
+        fn content_aware_move(
+            self: Pin<&mut Engine>,
+            dx: i32,
+            dy: i32,
+            extend: bool,
+            structure: i32,
+            color: i32,
+            sample_all_layers: bool,
+        );
 
         /// Neutralise red-eye inside a rectangle. `pupil` and `darken` are
         /// CS6's Pupil Size and Darken Amount, both 0-100.
@@ -786,11 +912,32 @@ pub struct EngineRust {
     document_title: QString,
 
     // -- engine state --
+    /// The document the user is working on. Kept as a plain field rather than an
+    /// index into a list so every operation in this file reads `self.doc`
+    /// unchanged; the other open documents wait on the shelf.
     doc: Document,
+    /// The open documents *other* than the active one, in tab order.
+    ///
+    /// Switching tabs puts `doc` back where it belongs in this list and takes
+    /// the requested one out. The full tab order is therefore `shelf` with `doc`
+    /// inserted at `active`.
+    shelf: Vec<Document>,
+    /// Which tab `doc` occupies.
+    active: usize,
+    /// Next "Untitled-N" number to hand out, so new documents get distinct
+    /// names the way Photoshop's do.
+    next_untitled: u32,
     brush: Brush,
     foreground: Rgba8,
     background: Rgba8,
     erasing: bool,
+    /// The Pencil's Auto Erase option, and whether it applies to the stroke in
+    /// progress — decided at the first dab, since it depends on what was under
+    /// the cursor then.
+    auto_erase: bool,
+    auto_erase_active: bool,
+    /// The Color Replacement Brush's options, held between strokes.
+    replace_options: ReplaceOptions,
     /// Set while the Spot Healing Brush is active. `None` for every other tool,
     /// which is what makes `end_stroke` paint normally.
     heal_mode: Option<HealMode>,
@@ -823,10 +970,16 @@ impl Default for EngineRust {
             modified: false,
             document_title: QString::from("Untitled-1"),
             doc,
+            shelf: Vec::new(),
+            active: 0,
+            next_untitled: 2,
             brush: Brush::default(),
             foreground: Rgba8::BLACK,
             background: Rgba8::WHITE,
             erasing: false,
+            auto_erase: false,
+            auto_erase_active: false,
+            replace_options: ReplaceOptions::default(),
             heal_mode: None,
             heal_source: None,
             edge_map: None,
@@ -943,9 +1096,29 @@ impl EngineRust {
             .map_or(-1, |i| (count - 1 - i) as i32)
     }
 
+    /// How many documents are open: the shelved ones plus the active one.
+    fn tab_count(&self) -> usize {
+        self.shelf.len() + 1
+    }
+
+    /// The document at a tab index, active or shelved.
+    fn document_at(&self, index: i32) -> Option<&Document> {
+        let index = usize::try_from(index).ok()?;
+        if index == self.active {
+            return Some(&self.doc);
+        }
+        if index >= self.tab_count() {
+            return None;
+        }
+        // The shelf is the tab order with the active document taken out, so
+        // anything past it shifts down by one.
+        let shelf_index = if index < self.active { index } else { index - 1 };
+        self.shelf.get(shelf_index)
+    }
+
     /// The colour a stroke should paint with, honouring erase mode.
     fn paint_color(&self) -> Rgba8 {
-        if self.erasing {
+        if self.erasing || self.auto_erase_active {
             self.background
         } else {
             self.foreground
@@ -992,12 +1165,14 @@ impl ffi::Engine {
         let h = height.clamp(1, 30_000) as u32;
         let background = self.background;
 
-        let doc = match fill {
+        let mut doc = match fill {
             1 => Document::new_transparent(w, h),
             2 => Document::new(w, h, background),
             _ => Document::new(w, h, Rgba8::WHITE),
         };
-        self.as_mut().rust_mut().doc = doc;
+        doc.untitled_number = self.next_untitled;
+        self.as_mut().rust_mut().next_untitled += 1;
+        self.as_mut().add_document(doc);
         self.sync();
     }
 
@@ -1025,7 +1200,7 @@ impl ffi::Engine {
         let mut doc = Document::from_pixmap(pixmap);
         doc.path = Some(path);
         doc.mark_saved();
-        self.as_mut().rust_mut().doc = doc;
+        self.as_mut().add_document(doc);
         self.sync();
         true
     }
@@ -1040,7 +1215,7 @@ impl ffi::Engine {
             doc.path = Some(path);
         }
         doc.mark_saved();
-        self.as_mut().rust_mut().doc = doc;
+        self.as_mut().add_document(doc);
         self.sync();
         true
     }
@@ -1320,6 +1495,94 @@ impl ffi::Engine {
         pixmap_to_qimage(self.doc.composite().crop(slice.rect))
     }
 
+    /// Open `doc` in a new tab, at the end, and make it active.
+    fn add_document(mut self: core::pin::Pin<&mut Self>, doc: Document) {
+        {
+            let mut rust = self.as_mut().rust_mut();
+            let previous = rust.active;
+            let current = std::mem::replace(&mut rust.doc, doc);
+            rust.shelf.insert(previous, current);
+            rust.active = rust.shelf.len();
+        }
+        self.as_mut().documents_changed();
+    }
+
+    fn document_count(&self) -> i32 {
+        self.tab_count() as i32
+    }
+
+    fn active_document(&self) -> i32 {
+        self.active as i32
+    }
+
+    fn document_title_at(&self, index: i32) -> QString {
+        match self.document_at(index) {
+            Some(doc) => QString::from(doc.display_name().as_str()),
+            None => QString::default(),
+        }
+    }
+
+    fn document_modified_at(&self, index: i32) -> bool {
+        self.document_at(index).is_some_and(|doc| doc.is_dirty())
+    }
+
+    fn set_active_document(mut self: core::pin::Pin<&mut Self>, index: i32) {
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        if index >= self.tab_count() || index == self.active {
+            return;
+        }
+
+        {
+            let mut rust = self.as_mut().rust_mut();
+            let previous = rust.active;
+            // Put the active document back in its slot, then lift out the one
+            // being switched to. Doing it in this order keeps the tab order
+            // stable: every other document stays where it was.
+            let doc = std::mem::replace(&mut rust.doc, Document::new(1, 1, Rgba8::WHITE));
+            rust.shelf.insert(previous, doc);
+            rust.doc = rust.shelf.remove(index);
+            rust.active = index;
+        }
+
+        // A different document means different pixels, layers, history and
+        // selection, so this is the same broadcast as opening a file.
+        self.as_mut().documents_changed();
+        self.sync();
+    }
+
+    fn close_document(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        if index >= self.tab_count() || self.shelf.is_empty() {
+            // The last document stays open: the rest of the interface assumes
+            // there is always one to act on.
+            return false;
+        }
+
+        if index == self.active {
+            // Closing the active tab moves to its neighbour, preferring the one
+            // to the left as Photoshop does.
+            let next = if index > 0 { index - 1 } else { 0 };
+            let mut rust = self.as_mut().rust_mut();
+            rust.doc = rust.shelf.remove(next);
+            rust.active = next;
+        } else {
+            let mut rust = self.as_mut().rust_mut();
+            let shelf_index = if index < rust.active { index } else { index - 1 };
+            rust.shelf.remove(shelf_index);
+            if index < rust.active {
+                rust.active -= 1;
+            }
+        }
+
+        self.as_mut().documents_changed();
+        self.sync();
+        true
+    }
+
     fn document_size_bytes(&self) -> Vec<f64> {
         let (w, h) = self.doc.size();
         // Flattened is one RGBA8 buffer; the layered figure is what the stack
@@ -1582,14 +1845,64 @@ impl ffi::Engine {
         flow: i32,
         spacing: i32,
     ) {
-        let brush = Brush {
-            size: size.clamp(1.0, 5000.0),
-            hardness: hardness.clamp(0, 100) as f32 / 100.0,
-            opacity: opacity.clamp(0, 100) as f32 / 100.0,
-            flow: flow.clamp(0, 100) as f32 / 100.0,
-            spacing: spacing.clamp(1, 1000) as f32 / 100.0,
-        };
-        self.as_mut().rust_mut().brush = brush;
+        // Tip shape and scattering are set separately, so a size or opacity
+        // change does not silently reset the chosen preset's character.
+        let mut rust = self.as_mut().rust_mut();
+        rust.brush.size = size.clamp(1.0, 5000.0);
+        rust.brush.hardness = hardness.clamp(0, 100) as f32 / 100.0;
+        rust.brush.opacity = opacity.clamp(0, 100) as f32 / 100.0;
+        rust.brush.flow = flow.clamp(0, 100) as f32 / 100.0;
+        rust.brush.spacing = spacing.clamp(1, 1000) as f32 / 100.0;
+    }
+
+    fn set_brush_shape(
+        mut self: core::pin::Pin<&mut Self>,
+        roundness: i32,
+        angle: i32,
+        scatter: i32,
+        count: i32,
+        size_jitter: i32,
+        angle_jitter: i32,
+        roundness_jitter: i32,
+    ) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.brush.roundness = (roundness.clamp(5, 100) as f32) / 100.0;
+        rust.brush.angle = angle as f32;
+        rust.brush.scatter = (scatter.clamp(0, 1000) as f32) / 100.0;
+        rust.brush.count = count.clamp(1, 16) as u32;
+        rust.brush.size_jitter = (size_jitter.clamp(0, 100) as f32) / 100.0;
+        rust.brush.angle_jitter = angle_jitter.clamp(0, 180) as f32;
+        rust.brush.roundness_jitter = (roundness_jitter.clamp(0, 100) as f32) / 100.0;
+    }
+
+    fn brush_preview(&self, width: i32, height: i32) -> QImage {
+        let w = width.clamp(1, 512) as u32;
+        let h = height.clamp(1, 512) as u32;
+
+        // Render through the real stroke machinery, so a thumbnail is exactly
+        // what the brush deposits rather than an approximation drawn twice.
+        let mut mask = StrokeMask::new(w, h);
+        let mut brush = self.brush;
+        brush.opacity = 1.0;
+        brush.flow = 1.0;
+        // Fit the tip inside the thumbnail, keeping scatter proportional.
+        let fit = (w.min(h) as f32 - 4.0).max(1.0);
+        if brush.size + brush.size * brush.scatter * 2.0 > fit {
+            brush.size = (fit / (1.0 + brush.scatter * 2.0)).max(1.0);
+        }
+        mask.begin(&brush, w as f32 / 2.0, h as f32 / 2.0, 1.0);
+
+        let mut pm = Pixmap::new(w, h);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let a = mask.coverage_at(x, y);
+                if a > 0.0 {
+                    let v = (a * 255.0 + 0.5) as u8;
+                    pm.set(x, y, Rgba8::new(240, 240, 240, v));
+                }
+            }
+        }
+        pixmap_to_qimage(pm)
     }
 
     fn set_foreground_color(mut self: core::pin::Pin<&mut Self>, color: &QColor) {
@@ -1623,6 +1936,17 @@ impl ffi::Engine {
     }
 
     fn begin_stroke(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) -> bool {
+        // Auto Erase is decided once, from the pixel the stroke starts on: begin
+        // on the foreground colour and the whole stroke paints the background
+        // instead. Photoshop's Pencil works exactly this way, which is what makes
+        // it usable for touching up 1px lines.
+        let erase = self.auto_erase && {
+            let under = self.doc.composite().get(x as i32, y as i32);
+            let fg = self.foreground;
+            under.r == fg.r && under.g == fg.g && under.b == fg.b && under.a == fg.a
+        };
+        self.as_mut().rust_mut().auto_erase_active = erase;
+
         let brush = self.brush;
         self.as_mut()
             .rust_mut()
@@ -1675,6 +1999,75 @@ impl ffi::Engine {
         self.as_mut().rust_mut().erasing = erasing;
     }
 
+    fn set_brush_antialias(mut self: core::pin::Pin<&mut Self>, antialias: bool) {
+        self.as_mut().rust_mut().brush.antialias = antialias;
+    }
+
+    fn set_auto_erase(mut self: core::pin::Pin<&mut Self>, enabled: bool) {
+        self.as_mut().rust_mut().auto_erase = enabled;
+    }
+
+    fn set_replace_options(
+        mut self: core::pin::Pin<&mut Self>,
+        mode: i32,
+        sampling: i32,
+        limits: i32,
+        tolerance: i32,
+        antialias: bool,
+    ) {
+        self.as_mut().rust_mut().replace_options = ReplaceOptions {
+            mode: ReplaceMode::from_i32(mode),
+            sampling: ReplaceSampling::from_i32(sampling),
+            limits: ReplaceLimits::from_i32(limits),
+            tolerance: tolerance.clamp(0, 255) as u32,
+            antialias,
+        };
+    }
+
+    fn begin_replace(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) -> bool {
+        let brush = self.brush;
+        let options = self.replace_options;
+        // Once sampling reads the pixel the stroke starts on; Background Swatch
+        // uses the swatch itself and samples nothing.
+        let reference = match options.sampling {
+            ReplaceSampling::Once => Some(self.doc.composite().get(x as i32, y as i32)),
+            ReplaceSampling::BackgroundSwatch => Some(self.background),
+            ReplaceSampling::Continuous => None,
+        };
+        let replacement = self.foreground;
+        let started = self.as_mut().rust_mut().doc.begin_replace(
+            &brush, options, reference, replacement, x, y, pressure,
+        );
+        if started {
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn extend_replace(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) {
+        let brush = self.brush;
+        let replacement = self.foreground;
+        let dirty = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .extend_replace(&brush, x, y, pressure, replacement);
+        if !dirty.is_empty() {
+            self.as_mut().canvas_changed();
+        }
+    }
+
+    fn end_replace(mut self: core::pin::Pin<&mut Self>) {
+        if self.as_mut().rust_mut().doc.end_replace() {
+            self.sync();
+        }
+    }
+
+    fn cancel_replace(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.cancel_replace();
+        self.sync();
+    }
+
     fn set_heal_mode(mut self: core::pin::Pin<&mut Self>, mode: i32) {
         self.as_mut().rust_mut().heal_mode = if mode < 0 {
             None
@@ -1711,8 +2104,21 @@ impl ffi::Engine {
         dx: i32,
         dy: i32,
         extend: bool,
+        structure: i32,
+        color: i32,
+        sample_all_layers: bool,
     ) {
-        self.as_mut().rust_mut().doc.content_aware_move(dx, dy, extend);
+        let options = MoveOptions {
+            dx,
+            dy,
+            extend,
+            structure: structure.clamp(1, 7) as u32,
+            color: color.clamp(0, 10) as u32,
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .content_aware_move(&options, sample_all_layers);
         self.sync();
     }
 

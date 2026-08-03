@@ -23,27 +23,46 @@ paint, manage layers, select, filter and undo.
 **Working**
 
 - CS6-style dark UI: menu bar, options bar, left tool strip, dockable panels
-  (Color/Swatches tabbed, History, Layers), status bar.
+  (Color/Swatches/Info tabbed, History, Layers), status bar.
+- **Several documents open at once**, one tab each above the canvas. Each keeps
+  its own layers, selection, history and zoom; File ▸ New and File ▸ Open add a
+  tab rather than replacing what you had.
 - Tool strip with SVG line-art icons, the corner triangle marking tools that
   have hidden tools, press-and-hold (or right-click) flyout menus listing each
   CS6 tool group, and the footer swatch / Quick Mask / screen-mode controls.
-- Canvas viewport with zoom (CS6's zoom stops), cursor-anchored wheel zoom,
+- Canvas viewport with zoom (CS6's zoom stops), an editable zoom field in the
+  status bar, cursor-anchored wheel zoom,
   pan (space-drag or middle-drag), and a transparency checkerboard.
 - Layers: add, delete, duplicate, reorder, merge down, flatten, rename,
   show/hide, opacity, fill opacity, clipping masks, layer masks, thumbnails.
 - All **27 Photoshop blend modes**, including the non-separable ones (Hue,
   Saturation, Color, Luminosity, Darker/Lighter Color).
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
-  opacity; a whole stroke is one undo step.
+  opacity; a whole stroke is one undo step. Dab edges are **area-sampled**, so a
+  hard brush has a genuinely antialiased edge rather than a staircase. **Tip shape** (roundness and angle),
+  **scattering** (spread and dab count) and **shape dynamics** (size, angle and
+  roundness jitter), all reproducible from a fixed per-stroke seed so the live
+  preview matches the commit.
+- **Pencil** tool: the same engine with antialiasing off, so it lays whole
+  pixels only, plus CS6's Auto Erase.
+- **Color Replacement Brush**: recolours pixels matching a sampled colour,
+  blending in Hue, Saturation, Color or Luminosity, with CS6's Sampling
+  (Continuous, Once, Background Swatch), Limits (Discontiguous, Contiguous,
+  Find Edges), Tolerance and Anti-alias. Color mode keeps each pixel's
+  brightness, so shading survives being recoloured.
+- A CS6-style **brush preset picker** behind the options bar's tip button:
+  preview, Size and Hardness sliders, and a grid covering CS6's families — soft
+  and hard round, flat and chisel, charcoal and chalk, spatter, star, grass.
+  Thumbnails are rendered by the brush engine itself, so they cannot drift from
+  what the brush paints.
 - The whole healing family. **Spot Healing Brush** with CS6's three types:
   Proximity Match (a Laplace solve that continues the surrounding shading),
   Create Texture (the same, plus grain matched to the neighbourhood) and
   Content-Aware (patch synthesis inward from the boundary, so edges carry
   across). **Healing Brush**, which transplants an `Alt`-clicked source's
   texture by Poisson solve, so it takes the destination's lighting rather than
-  the source's; it refuses to paint until a source is set, as Photoshop does. **Patch** with CS6's full options — Normal or Content-Aware, Source or
-  Destination, and Transparent for transferring texture without colour — and
-  **Content-Aware Move** (with Extend), both working on a dragged region. **Red Eye**, which neutralises only where red genuinely
+  the source's. **Patch** and **Content-Aware Move** (with Extend), both working
+  on a dragged region. **Red Eye**, which neutralises only where red genuinely
   dominates, so it can be dragged loosely over an eye. Each is one undo step.
 - Selections: all four marquee variants (rectangular, elliptical, single row,
   single column), all three lassos (freehand, polygonal, and magnetic with
@@ -163,7 +182,7 @@ what gives it a launcher, a name and a file association for `.psd`.
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 323 tests
+cd core && cargo test        # 358 tests
 ```
 
 or through CTest, which runs them as part of the project:
@@ -184,6 +203,7 @@ core/                 Rust image engine
   src/compositor.rs     stack → final image (parallel, rayon)
   src/brush.rs          dab-based stroke rendering
   src/healing.rs        inpainting, Poisson cloning and red-eye removal
+  src/replace.rs        colour replacement for the Color Replacement Brush
   src/selection.rs      coverage-mask selections
   src/magnetic.rs       edge snapping for the Magnetic Lasso
   src/wand.rs           Magic Wand flood and Quick Selection region growing
@@ -240,8 +260,32 @@ stored, so future default changes still reach the user.
 
 ## Development progress
 
-ToolTip bar
+```
+ToolTip floating bar
 
 - move tool (done)
-- marquee tool (done)
-- lasso tool (done)
+- marquee tools (done)
+- lasso tools (done)
+- quick selection tools (done)
+- crop tools (done)
+- eye dropper tools (done)
+- healing tools - (done))
+- brush tools - in progress
+- stamp tools - not started
+- history brush tool - not started
+- eraser tools - not started
+- gradient tools - not started
+- blur tools - not started
+- dodge tools - not started
+- pen tools - not started
+- type tools - not started
+- selection tools - not started
+- shape tools - not started
+- hand tools - not started
+- zoom tools - 80% done, need work
+- Color picker tool - basic functionality, need to add eye dropper picker
+
+Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
+
+
+```

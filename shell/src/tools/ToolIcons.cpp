@@ -315,6 +315,31 @@ QString healingVariantBody(int variant)
     return bodyFor(ToolId::Healing);
 }
 
+/// Per-variant artwork for the brush group.
+QString brushVariantBody(int variant)
+{
+    // A pencil: hexagonal barrel, sharpened tip, on the same diagonal CS6 draws
+    // its brush on so the two read as a pair.
+    if (static_cast<BrushType>(variant) == BrushType::Pencil) {
+        return R"SVG(<g transform="rotate(45 10 10)">
+                  <path stroke-width="1.2" d="M7.6 2.6H12.4V13.4L10 17.4 7.6 13.4z"/>
+                  <path stroke-width="1" d="M7.6 13.4H12.4"/>
+                  <path fill="COLOR" stroke="none" d="M8.7 15.3H11.3L10 17.4z"/>
+                  <path stroke-width="1" d="M10 2.6V13.4"/></g>)SVG";
+    }
+    // Colour Replacement: the brush with the swap arrows CS6 puts beside it.
+    if (static_cast<BrushType>(variant) == BrushType::ColorReplacement) {
+        return R"SVG(<g transform="translate(-2.6 2.6) scale(0.82)">
+                  <path fill="COLOR" stroke="none" d="M17.1 2.9c.9.9.9 2 0 2.9l-6.3 6.3-2.9-2.9
+                  6.3-6.3c.9-.9 2-.9 2.9 0z"/>
+                  <path d="M7.9 9.2 10.8 12.1c.3 2.4-1.2 4.2-3.2 4.9-1.6.5-4 .5-4 .5
+                  1.1-1 1.7-1.7 2-3 .3-1.6.6-3.9 2.3-5.3z"/></g>
+                  <path stroke-width="1.1" d="M12.6 3.4H17.4M17.4 3.4 15.8 1.8M17.4 3.4 15.8 5"/>
+                  <path stroke-width="1.1" d="M17.4 7.6H12.6M12.6 7.6 14.2 6M12.6 7.6 14.2 9.2"/>)SVG";
+    }
+    return bodyFor(ToolId::Brush);
+}
+
 /// Per-variant artwork, where a tool's flyout entries need distinct icons.
 ///
 /// The marquee, lasso, quick-selection and crop groups have these; everything
@@ -336,6 +361,9 @@ QString variantBodyFor(ToolId id, int variant)
     }
     if (id == ToolId::Healing) {
         return healingVariantBody(variant);
+    }
+    if (id == ToolId::Brush) {
+        return brushVariantBody(variant);
     }
     if (id != ToolId::Marquee) {
         return bodyFor(id);

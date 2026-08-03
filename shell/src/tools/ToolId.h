@@ -237,8 +237,8 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Red Eye Tool", "J", true}};
     case ToolId::Brush:
         return {{"Brush Tool", "B", true},
-                {"Pencil Tool", nullptr, false},
-                {"Color Replacement Tool", nullptr, false},
+                {"Pencil Tool", "B", true},
+                {"Color Replacement Tool", "B", true},
                 {"Mixer Brush Tool", nullptr, false}};
     case ToolId::CloneStamp:
         return {{"Clone Stamp Tool", "S", true},
@@ -388,11 +388,61 @@ inline bool healingIsBrush(HealingType type)
     return type == HealingType::SpotHealing || type == HealingType::Healing;
 }
 
+/// CS6's defaults for the Content-Aware Move tool's two adaptation sliders.
+namespace CamDefaults {
+/// How strictly the fill follows the edges it finds, 1-7.
+constexpr int kStructure = 4;
+/// How far the moved pixels adapt to their new surroundings, 0-10.
+constexpr int kColor = 0;
+} // namespace CamDefaults
+
 /// CS6's defaults for the Red Eye tool's options bar.
 namespace RedEyeDefaults {
 constexpr int kPupilSize = 50;
 constexpr int kDarkenAmount = 50;
 } // namespace RedEyeDefaults
+
+/// The variants behind the Brush button.
+///
+/// The Pencil differs from the Brush in exactly one way that matters: it paints
+/// **aliased**, whole pixels only. That is what makes it the tool for touching up
+/// single-pixel lines, and why hardness has no effect on it.
+enum class BrushType {
+    Brush = 0,
+    Pencil = 1,
+    ColorReplacement = 2,
+    MixerBrush = 3,
+};
+
+/// True when the variant paints aliased, whole pixels only.
+inline bool brushIsPencil(BrushType type)
+{
+    return type == BrushType::Pencil;
+}
+
+/// True when the variant recolours what is already there rather than painting
+/// over it, and so needs its own stroke path.
+inline bool brushReplacesColor(BrushType type)
+{
+    return type == BrushType::ColorReplacement;
+}
+
+/// The Color Replacement Brush's Mode, mirroring `replace::ReplaceMode`.
+enum class ReplaceMode { Hue = 0, Saturation = 1, Color = 2, Luminosity = 3 };
+/// Its Sampling, mirroring `replace::ReplaceSampling`.
+enum class ReplaceSampling { Continuous = 0, Once = 1, BackgroundSwatch = 2 };
+/// Its Limits, mirroring `replace::ReplaceLimits`.
+enum class ReplaceLimits { Discontiguous = 0, Contiguous = 1, FindEdges = 2 };
+
+/// CS6's defaults for the Color Replacement Brush.
+namespace ReplaceDefaults {
+constexpr ReplaceMode kMode = ReplaceMode::Color;
+constexpr ReplaceSampling kSampling = ReplaceSampling::Continuous;
+constexpr ReplaceLimits kLimits = ReplaceLimits::Contiguous;
+/// CS6 shows Tolerance as a percentage; the engine wants 0-255.
+constexpr int kTolerancePercent = 30;
+constexpr bool kAntialias = true;
+} // namespace ReplaceDefaults
 
 /// The Spot Healing Brush's Type, mirroring `healing::HealMode` across the
 /// bridge. CS6 defaults to Content-Aware.

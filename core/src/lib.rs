@@ -42,6 +42,7 @@ pub mod layer;
 pub mod magnetic;
 pub mod perspective;
 pub mod psd;
+pub mod replace;
 pub mod selection;
 pub mod slice;
 pub mod wand;

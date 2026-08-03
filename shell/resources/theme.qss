@@ -150,8 +150,9 @@ QToolBar QToolButton:checked {
 
 /* The Tools panel contents. Lives in a QDockWidget with a PanelHeader
    title bar, so this rule only styles the button field itself. */
+
 QWidget#toolStrip {
-    background-color: #454545;
+    background-color: #2D3C48;    /* Tool tip floating bar background color */
     border: none;
 }
 
@@ -207,6 +208,104 @@ QWidget#panelTitleBar QToolButton#panelTitleBarButton {
 
 QWidget#panelTitleBar QToolButton#panelTitleBarButton:hover {
     background-color: #5e5e5e;
+}
+
+/* The brush preset picker. A floating panel, so it carries its own border —
+   nothing else frames a Qt::Popup. */
+QWidget#brushPicker {
+    background-color: #454545;
+    border: 1px solid #2a2a2a;
+}
+
+QLabel#brushPickerPreview {
+    background-color: #383838;
+    border: 1px solid #2a2a2a;
+}
+
+QLabel#brushPickerCurrent {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+    color: #d4d4d4;
+    padding: 3px;
+}
+
+QListWidget#brushPickerGrid {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+}
+
+QListWidget#brushPickerGrid::item:selected,
+QListWidget#brushPickerGrid::item:hover {
+    background-color: #5e5e5e;
+    border: 1px solid #6e6e6e;
+}
+
+/* The options-bar tip button: the swatch plus its diameter. */
+QToolButton#brushTipButton {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+    color: #d4d4d4;
+    padding: 1px 6px 1px 2px;
+}
+
+QToolButton#brushTipButton:hover {
+    background-color: #4e4e4e;
+}
+
+/* The editable zoom field in the status bar. Sunk like any other input, but
+   compact enough not to look out of place among the read-only readouts. */
+QLineEdit#statusZoom {
+    background-color: #3c3c3c;
+    color: #d4d4d4;
+    border: 1px solid #2a2a2a;
+    padding: 0px 3px;
+    selection-background-color: #4b6eaf;
+}
+
+QLineEdit#statusZoom:focus {
+    border: 1px solid #4b6eaf;
+}
+
+/* Document tabs, above the canvas. CS6 draws the active one raised in the panel
+   grey with the inactive ones sunk into the darker surround, and puts no base
+   line under the row — the canvas surround runs straight into it. */
+QTabBar#documentTabs {
+    background-color: #2b2b2b;
+    border: none;
+    qproperty-drawBase: 0;
+}
+
+QTabBar#documentTabs::tab {
+    background-color: #3a3a3a;
+    color: #a8a8a8;
+    border: 1px solid #2a2a2a;
+    border-bottom: none;
+    padding: 4px 8px 4px 10px;
+    margin-right: 1px;
+    /* Wide enough for a file name, but elided rather than pushing the row out. */
+    min-width: 90px;
+    max-width: 220px;
+}
+
+QTabBar#documentTabs::tab:selected {
+    background-color: #535353;
+    color: #f0f0f0;
+}
+
+QTabBar#documentTabs::tab:hover:!selected {
+    background-color: #464646;
+}
+
+/* Qt draws the × itself; this only positions it and gives it breathing room. */
+QTabBar#documentTabs::close-button {
+    subcontrol-position: right;
+    margin-left: 4px;
+    margin-right: 2px;
+}
+
+QTabBar#documentTabs QToolButton {
+    background-color: #3a3a3a;
+    border: 1px solid #2a2a2a;
 }
 
 /* The Info panel. CS6 sets each readout in a slightly sunken block, with the

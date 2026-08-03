@@ -34,6 +34,7 @@
     { "id": "tool.crop.cycle",      "key": "Shift+C", "name": "Cycle Crop Tool" },
     { "id": "tool.eyedropper.cycle", "key": "Shift+I", "name": "Cycle Eyedropper Tool" },
     { "id": "tool.healing.cycle",   "key": "Shift+J", "name": "Cycle Healing Tool" },
+    { "id": "tool.brush.cycle",     "key": "Shift+B", "name": "Cycle Brush Tool" },
     { "id": "tool.lasso",           "key": "L", "name": "Lasso Tool" },
     { "id": "tool.quickselect",     "key": "W", "name": "Quick Selection Tool" },
     { "id": "tool.crop",            "key": "C", "name": "Crop Tool" },

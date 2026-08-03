@@ -4,6 +4,7 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QContextMenuEvent>
+#include <QGuiApplication>
 #include <algorithm>
 #include <QEnterEvent>
 #include <QKeyEvent>
@@ -197,6 +198,10 @@ void CanvasView::setActiveTool(ToolId tool)
 
     // Switching tools mid-gesture would leave the engine holding a half-built
     // stroke, so end the gesture cleanly first.
+    if (m_replacing && m_engine) {
+        m_engine->cancelReplace();
+        m_replacing = false;
+    }
     if (m_dragging && m_engine) {
         m_engine->cancelStroke();
     }
@@ -285,6 +290,18 @@ void CanvasView::setCropOptions(double aspectRatio, bool deleteCropped)
     }
 }
 
+void CanvasView::setReplaceMode(bool active)
+{
+    if (m_replaceMode == active) {
+        return;
+    }
+    if (m_replacing && m_engine) {
+        m_engine->cancelReplace();
+        m_replacing = false;
+    }
+    m_replaceMode = active;
+}
+
 void CanvasView::setHealingType(HealingType type)
 {
     if (m_healingType == type) {
@@ -308,6 +325,15 @@ void CanvasView::setHealingType(HealingType type)
     }
     updateCursor();
     update();
+}
+
+void CanvasView::setContentAwareMoveOptions(bool extend, int structure, int color,
+                                            bool sampleAllLayers)
+{
+    m_camExtend = extend;
+    m_camStructure = qBound(1, structure, 7);
+    m_camColor = qBound(0, color, 10);
+    m_camSampleAllLayers = sampleAllLayers;
 }
 
 void CanvasView::setPatchOptions(bool contentAware, bool destination, bool transparent)
@@ -451,6 +477,14 @@ void CanvasView::commitHealingDrag()
         return;
     }
 
+    // These reconstruct every pixel of the region and run on the GUI thread, so
+    // a large area takes long enough to notice. A wait cursor is the difference
+    // between "working" and "hung".
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    const struct CursorGuard {
+        ~CursorGuard() { QGuiApplication::restoreOverrideCursor(); }
+    } guard;
+
     if (m_healingType == HealingType::Patch) {
         // CS6's Patch drags the selection *to* the area to sample from, so the
         // drag delta is the source offset. Destination mode reverses that, and
@@ -458,7 +492,8 @@ void CanvasView::commitHealingDrag()
         m_engine->patchSelection(dx, dy, m_patchContentAware, m_patchDestination,
                                  m_patchTransparent);
     } else if (m_healingType == HealingType::ContentAwareMove) {
-        m_engine->contentAwareMove(dx, dy, m_camExtend);
+        m_engine->contentAwareMove(dx, dy, m_camExtend, m_camStructure, m_camColor,
+                                   m_camSampleAllLayers);
     }
 }
 
@@ -1833,6 +1868,17 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         return;
     }
 
+    // The Color Replacement Brush recolours what is already there, so it edits
+    // the layer per dab rather than accumulating a stroke to composite.
+    if (m_replaceMode && m_engine) {
+        if (m_engine->beginReplace(float(doc.x()), float(doc.y()), 1.0f)) {
+            m_replacing = true;
+            m_dragging = true;
+            refresh();
+        }
+        return;
+    }
+
     if (toolPaints(m_tool) && m_engine) {
         // A tablet would supply real pressure here; a mouse reports full.
         if (m_engine->beginStroke(float(doc.x()), float(doc.y()), 1.0f)) {
@@ -1982,6 +2028,12 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
             m_marquee = QRectF(m_dragStartDoc, doc).normalized();
         }
         update();
+        m_lastMousePos = pos;
+        return;
+    }
+
+    if (m_replacing && m_engine) {
+        m_engine->extendReplace(float(doc.x()), float(doc.y()), 1.0f);
         m_lastMousePos = pos;
         return;
     }
@@ -2172,6 +2224,14 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_replacing && m_engine) {
+        m_engine->endReplace();
+        m_replacing = false;
+        m_dragging = false;
+        refresh();
+        return;
+    }
+
     if (m_dragging && m_engine && toolPaints(m_tool)) {
         m_engine->endStroke();
         refresh();
@@ -2286,6 +2346,12 @@ void CanvasView::keyPressEvent(QKeyEvent *event)
 
     // Escape abandons an in-progress stroke or marquee.
     if (event->key() == Qt::Key_Escape) {
+        if (m_replacing && m_engine) {
+            m_engine->cancelReplace();
+            m_replacing = false;
+            m_dragging = false;
+            refresh();
+        }
         if (m_dragging && m_engine) {
             m_engine->cancelStroke();
             m_dragging = false;

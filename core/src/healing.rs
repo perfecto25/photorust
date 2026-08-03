@@ -20,6 +20,7 @@
 //!   instead of being smoothed away.
 
 use crate::buffer::{Pixmap, Rect, Rgba8};
+use rayon::prelude::*;
 
 /// Which reconstruction to use. Mirrors CS6's Type buttons.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -66,6 +67,29 @@ const PATCH_RADIUS: i32 = 2;
 /// How far from a hole pixel content-aware search looks for a source patch.
 const SEARCH_RADIUS: i32 = 24;
 
+/// CS6's default Structure setting.
+pub const DEFAULT_STRUCTURE: u32 = 4;
+
+/// Search-and-vote passes over the fill after the first inward sweep.
+///
+/// The nearest-neighbour field settles quickly, but each vote also feeds the
+/// next pass's comparisons, so a few extra passes keep sharpening the result.
+const REFINE_PASSES: usize = 8;
+
+/// Scale for turning a patch's match cost into a voting weight.
+///
+/// Costs are mean squared differences per channel, so this is roughly "how far
+/// off, in levels, still counts as a decent match".
+const VOTE_FALLOFF: f32 = 250.0;
+
+/// Coarsest candidate spacing the search will drop to.
+///
+/// Striding is what keeps a large region affordable, but past a few pixels the
+/// surviving candidates are too sparse to match against and the fill comes out
+/// in visible blocks. Beyond this cap, extra area is paid for rather than
+/// traded away.
+const MAX_STRIDE: i32 = 4;
+
 /// Heal the region of `pixels` marked by `coverage`.
 ///
 /// `region` is in pixmap coordinates and `coverage` holds
@@ -76,6 +100,23 @@ const SEARCH_RADIUS: i32 = 24;
 /// The pixmap is edited in place, and the pixels outside the hole are read but
 /// never written, so a caller can hand this the layer's own buffer.
 pub fn heal_region(pixels: &mut Pixmap, region: Rect, coverage: &[f32], mode: HealMode) -> Rect {
+    heal_region_with(pixels, None, region, coverage, mode, DEFAULT_STRUCTURE)
+}
+
+/// As [`heal_region`], reading from a separate image and with an explicit
+/// structure setting.
+///
+/// `source` is where the known pixels are read from — the Content-Aware Move
+/// tool's Sample All Layers option passes the composite here while still writing
+/// to one layer. `None` reads from `pixels` itself, which is the ordinary case.
+pub fn heal_region_with(
+    pixels: &mut Pixmap,
+    source: Option<&Pixmap>,
+    region: Rect,
+    coverage: &[f32],
+    mode: HealMode,
+    structure: u32,
+) -> Rect {
     if coverage.len() != (region.width as usize) * (region.height as usize) {
         debug_assert!(false, "coverage size does not match the region");
         return Rect::default();
@@ -103,7 +144,9 @@ pub fn heal_region(pixels: &mut Pixmap, region: Rect, coverage: &[f32], mode: He
     for y in work.y..work.bottom() {
         for x in work.x..work.right() {
             let index = at(x, y);
-            let px = pixels.get(x, y);
+            // Reading before any write, so borrowing `pixels` immutably here is
+            // safe even though it is the buffer being edited.
+            let px = source.map_or_else(|| pixels.get(x, y), |s| s.get(x, y));
             rgba[index] = [px.r as f32, px.g as f32, px.b as f32, px.a as f32];
 
             // Coverage only exists inside `region`; the surrounding ring is
@@ -138,7 +181,7 @@ pub fn heal_region(pixels: &mut Pixmap, region: Rect, coverage: &[f32], mode: He
             add_matched_noise(&mut smooth, &rgba, &hole, w, h);
             smooth
         }
-        HealMode::ContentAware => content_aware_fill(&rgba, &hole, w, h),
+        HealMode::ContentAware => content_aware_fill(&rgba, &hole, w, h, structure),
     };
 
     // Blend by coverage so a soft brush edge fades into the original.
@@ -333,27 +376,65 @@ fn add_matched_noise(
 /// match. Filling from the outside in ("onion peeling") means every pixel is
 /// decided with as much context as possible, which is what lets an edge running
 /// into the hole continue across it.
-fn content_aware_fill(rgba: &[[f32; 4]], hole: &[bool], w: usize, h: usize) -> Vec<[f32; 4]> {
+///
+/// Cost is the thing to watch here. A naive version compares every hole pixel
+/// against every candidate in the working area, which grows as the *square* of
+/// the region's area — fine for a spot brush, unusable for a Content-Aware Move
+/// of a few hundred pixels square. Three things keep it bounded:
+///
+/// * candidates come from a fixed window around each hole pixel, so the search
+///   does not grow with the region;
+/// * that window is sampled with a stride that widens as the hole gets bigger,
+///   holding the total roughly constant;
+/// * each boundary layer is resolved in parallel, since within one pass the
+///   pixels do not depend on each other.
+fn content_aware_fill(
+    rgba: &[[f32; 4]],
+    hole: &[bool],
+    w: usize,
+    h: usize,
+    structure: u32,
+) -> Vec<[f32; 4]> {
+    // Two stages. The onion peel gets a plausible answer quickly by filling
+    // inward from the boundary, then PatchMatch refines it globally.
+    //
+    // The peel alone is what produced visible blocks: it gives each hole pixel
+    // the *centre* of one best-matching patch, and neighbouring pixels are free
+    // to choose unrelated sources, so the result is a mosaic. The refinement
+    // fixes that by letting every patch that covers a pixel vote on it, which is
+    // what averages the seams away.
+    let mut out = onion_peel_fill(rgba, hole, w, h, structure);
+    patchmatch_refine(&mut out, hole, w, h, structure);
+    out
+}
+
+/// First pass: fill inward from the boundary, one layer at a time.
+fn onion_peel_fill(
+    rgba: &[[f32; 4]],
+    hole: &[bool],
+    w: usize,
+    h: usize,
+    structure: u32,
+) -> Vec<[f32; 4]> {
     let mut out = rgba.to_vec();
     let mut unknown = hole.to_vec();
     let mut remaining = unknown.iter().filter(|&&u| u).count();
-
-    // Candidate sources: known pixels far enough from any edge to have a full
-    // patch around them.
-    let mut sources: Vec<(i32, i32)> = Vec::new();
-    for y in PATCH_RADIUS..(h as i32 - PATCH_RADIUS) {
-        for x in PATCH_RADIUS..(w as i32 - PATCH_RADIUS) {
-            if !hole[(y as usize) * w + x as usize] {
-                sources.push((x, y));
-            }
-        }
-    }
-    if sources.is_empty() {
-        return laplace_fill(rgba, hole, w, h);
+    if remaining == 0 {
+        return out;
     }
 
-    // Bounded so a large brush cannot turn one stroke into a long stall. Each
-    // pass fills at least the current boundary layer, so this cannot spin.
+    let patch = patch_radius(structure);
+    // Candidates are sampled more sparsely as the hole grows, which is what
+    // keeps a large region affordable — but only up to MAX_STRIDE, past which
+    // the matches get too sparse and the fill breaks into blocks. A high
+    // Structure tightens the spacing again.
+    let coarse = (((remaining as f32) / 4_000.0).sqrt().ceil() as i32).max(1);
+    let stride = coarse
+        .min(MAX_STRIDE)
+        .min(if structure >= 6 { 2 } else { MAX_STRIDE })
+        .max(1);
+
+    // Each pass fills at least the current boundary layer, so this cannot spin.
     let max_passes = w.max(h) + 2;
     let mut passes = 0;
 
@@ -374,50 +455,12 @@ fn content_aware_fill(rgba: &[[f32; 4]], hole: &[bool], w: usize, h: usize) -> V
             break;
         }
 
-        let mut resolved: Vec<((i32, i32), [f32; 4])> = Vec::with_capacity(layer.len());
-        for &(hx, hy) in &layer {
-            let mut best = f32::MAX;
-            let mut best_value = out[(hy as usize) * w + hx as usize];
+        let resolved: Vec<[f32; 4]> = layer
+            .par_iter()
+            .map(|&(hx, hy)| best_match(&out, &unknown, w, h, hx, hy, patch, stride))
+            .collect();
 
-            for &(sx, sy) in &sources {
-                if (sx - hx).abs() > SEARCH_RADIUS || (sy - hy).abs() > SEARCH_RADIUS {
-                    continue;
-                }
-                // Sum of squared differences over the part of the patch that is
-                // already known, so the match is judged only on real data.
-                let mut cost = 0.0f32;
-                let mut counted = 0;
-                for dy in -PATCH_RADIUS..=PATCH_RADIUS {
-                    for dx in -PATCH_RADIUS..=PATCH_RADIUS {
-                        let (px, py) = (hx + dx, hy + dy);
-                        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-                            continue;
-                        }
-                        let pi = (py as usize) * w + px as usize;
-                        if unknown[pi] {
-                            continue;
-                        }
-                        let qi = ((sy + dy) as usize) * w + (sx + dx) as usize;
-                        for c in 0..3 {
-                            let d = out[pi][c] - out[qi][c];
-                            cost += d * d;
-                        }
-                        counted += 1;
-                    }
-                }
-                if counted == 0 {
-                    continue;
-                }
-                let cost = cost / counted as f32;
-                if cost < best {
-                    best = cost;
-                    best_value = out[(sy as usize) * w + sx as usize];
-                }
-            }
-            resolved.push(((hx, hy), best_value));
-        }
-
-        for ((x, y), value) in resolved {
+        for (&(x, y), value) in layer.iter().zip(resolved) {
             let i = (y as usize) * w + x as usize;
             out[i] = value;
             unknown[i] = false;
@@ -436,6 +479,279 @@ fn content_aware_fill(rgba: &[[f32; 4]], hole: &[bool], w: usize, h: usize) -> V
         }
     }
     out
+}
+
+/// The value to give one hole pixel: the centre of the nearby known patch whose
+/// surroundings best match this pixel's own.
+///
+/// Candidates are taken from a window around `(hx, hy)`, stepped by `stride`.
+/// Matching is sum of squared differences over only the part of the patch that
+/// is already known, so the comparison is judged on real data alone.
+#[allow(clippy::too_many_arguments)]
+fn best_match(
+    out: &[[f32; 4]],
+    unknown: &[bool],
+    w: usize,
+    h: usize,
+    hx: i32,
+    hy: i32,
+    patch: i32,
+    stride: i32,
+) -> [f32; 4] {
+    let mut best = f32::MAX;
+    let mut best_value = out[(hy as usize) * w + hx as usize];
+
+    let x0 = (hx - SEARCH_RADIUS).max(patch);
+    let x1 = (hx + SEARCH_RADIUS).min(w as i32 - 1 - patch);
+    let y0 = (hy - SEARCH_RADIUS).max(patch);
+    let y1 = (hy + SEARCH_RADIUS).min(h as i32 - 1 - patch);
+
+    let mut sy = y0;
+    while sy <= y1 {
+        let mut sx = x0;
+        while sx <= x1 {
+            // Only known pixels are candidate sources.
+            if unknown[(sy as usize) * w + sx as usize] {
+                sx += stride;
+                continue;
+            }
+
+            let mut cost = 0.0f32;
+            let mut counted = 0;
+            for dy in -patch..=patch {
+                for dx in -patch..=patch {
+                    let (px, py) = (hx + dx, hy + dy);
+                    if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                        continue;
+                    }
+                    let pi = (py as usize) * w + px as usize;
+                    if unknown[pi] {
+                        continue;
+                    }
+                    let qi = ((sy + dy) as usize) * w + (sx + dx) as usize;
+                    for c in 0..3 {
+                        let d = out[pi][c] - out[qi][c];
+                        cost += d * d;
+                    }
+                    counted += 1;
+                }
+            }
+            if counted > 0 {
+                let cost = cost / counted as f32;
+                if cost < best {
+                    best = cost;
+                    best_value = out[(sy as usize) * w + sx as usize];
+                }
+            }
+            sx += stride;
+        }
+        sy += stride;
+    }
+    best_value
+}
+
+/// Refinement passes over the whole fill, PatchMatch style.
+///
+/// Each pass does two things:
+///
+/// 1. **Search** — improve every hole pixel's choice of source patch, by trying
+///    what its neighbours chose (shifted to line up) and then a few random
+///    guesses at shrinking distance. Propagating a good match to neighbours is
+///    what makes this converge in a handful of passes instead of needing an
+///    exhaustive search.
+/// 2. **Vote** — recolour the hole from every patch that covers each pixel,
+///    averaged. A pixel near the middle of the hole is covered by `(2r+1)²`
+///    patches, so it settles on what they agree about. This is the step that
+///    removes the blockiness: the fill can no longer jump between unrelated
+///    sources from one pixel to the next.
+fn patchmatch_refine(out: &mut [[f32; 4]], hole: &[bool], w: usize, h: usize, structure: u32) {
+    let patch = patch_radius(structure);
+
+    let holes: Vec<(i32, i32)> = (0..h as i32)
+        .flat_map(|y| (0..w as i32).map(move |x| (x, y)))
+        .filter(|&(x, y)| hole[(y as usize) * w + x as usize])
+        .collect();
+    if holes.is_empty() {
+        return;
+    }
+
+    // Where each hole pixel sits in `nnf`, so a neighbour's choice can be found.
+    let mut slot = vec![usize::MAX; w * h];
+    for (i, &(x, y)) in holes.iter().enumerate() {
+        slot[(y as usize) * w + x as usize] = i;
+    }
+
+    // A source is a known pixel with a whole patch inside the image.
+    let usable = |x: i32, y: i32| -> bool {
+        x >= patch
+            && y >= patch
+            && x < w as i32 - patch
+            && y < h as i32 - patch
+            && !hole[(y as usize) * w + x as usize]
+    };
+    let sources: Vec<(i32, i32)> = (patch..h as i32 - patch)
+        .flat_map(|y| (patch..w as i32 - patch).map(move |x| (x, y)))
+        .filter(|&(x, y)| !hole[(y as usize) * w + x as usize])
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+
+    // Fixed seed, so the same fill runs the same way twice — undo and redo have
+    // to agree.
+    let mut rng: u32 = 0x2545_F491;
+    let mut roll = |limit: u32| -> u32 {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) % limit.max(1)
+    };
+
+    let mut nnf: Vec<(i32, i32)> = (0..holes.len())
+        .map(|_| sources[roll(sources.len() as u32) as usize])
+        .collect();
+
+    let mut accumulator = vec![[0.0f32; 4]; w * h];
+    let mut weights = vec![0.0f32; w * h];
+    // How well each hole pixel's chosen patch actually fits. Votes are weighted
+    // by this, so a confident match outweighs a poor one instead of both
+    // counting the same — which is what stops one bad source smearing across
+    // everything it overlaps.
+    let mut quality = vec![f32::MAX; holes.len()];
+
+    for pass in 0..REFINE_PASSES {
+        // Alternating scan direction, so information propagates both ways.
+        let forward = pass % 2 == 0;
+        let step: i32 = if forward { -1 } else { 1 };
+
+        for k in 0..holes.len() {
+            let i = if forward { k } else { holes.len() - 1 - k };
+            let (hx, hy) = holes[i];
+            let mut best = patch_cost(out, w, h, hx, hy, nnf[i].0, nnf[i].1, patch);
+
+            // What the neighbour already visited this pass settled on, shifted
+            // to line up with this pixel.
+            for (nx, ny) in [(hx + step, hy), (hx, hy + step)] {
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let neighbour = slot[(ny as usize) * w + nx as usize];
+                if neighbour == usize::MAX {
+                    continue;
+                }
+                let candidate = (nnf[neighbour].0 + (hx - nx), nnf[neighbour].1 + (hy - ny));
+                if !usable(candidate.0, candidate.1) {
+                    continue;
+                }
+                let cost = patch_cost(out, w, h, hx, hy, candidate.0, candidate.1, patch);
+                if cost < best {
+                    best = cost;
+                    nnf[i] = candidate;
+                }
+            }
+
+            // Random guesses, halving the radius each time: a coarse jump can
+            // escape a bad local match, the fine ones polish it.
+            let mut radius = (w.max(h) as i32 / 2).max(1);
+            while radius >= 1 {
+                let span = (radius * 2 + 1) as u32;
+                let candidate = (
+                    nnf[i].0 + roll(span) as i32 - radius,
+                    nnf[i].1 + roll(span) as i32 - radius,
+                );
+                if usable(candidate.0, candidate.1) {
+                    let cost = patch_cost(out, w, h, hx, hy, candidate.0, candidate.1, patch);
+                    if cost < best {
+                        best = cost;
+                        nnf[i] = candidate;
+                    }
+                }
+                radius /= 2;
+            }
+            quality[i] = best;
+        }
+
+        // Vote.
+        accumulator.iter_mut().for_each(|px| *px = [0.0; 4]);
+        weights.iter_mut().for_each(|v| *v = 0.0);
+
+        for (i, &(hx, hy)) in holes.iter().enumerate() {
+            let (sx, sy) = nnf[i];
+            // Squared differences are large numbers; this scale puts a good
+            // match near weight 1 and a poor one near zero.
+            let weight = 1.0 / (1.0 + quality[i] / VOTE_FALLOFF);
+            for dy in -patch..=patch {
+                for dx in -patch..=patch {
+                    let (tx, ty) = (hx + dx, hy + dy);
+                    if tx < 0 || ty < 0 || tx >= w as i32 || ty >= h as i32 {
+                        continue;
+                    }
+                    let target = (ty as usize) * w + tx as usize;
+                    // Known pixels are never rewritten.
+                    if !hole[target] {
+                        continue;
+                    }
+                    let sample = ((sy + dy) as usize) * w + (sx + dx) as usize;
+                    for c in 0..4 {
+                        accumulator[target][c] += out[sample][c] * weight;
+                    }
+                    weights[target] += weight;
+                }
+            }
+        }
+
+        for i in 0..w * h {
+            if hole[i] && weights[i] > 0.0 {
+                for c in 0..4 {
+                    out[i][c] = accumulator[i][c] / weights[i];
+                }
+            }
+        }
+    }
+}
+
+/// Sum of squared differences between the patch around `(hx, hy)` and the one
+/// around `(sx, sy)`, averaged over the pixels compared.
+#[allow(clippy::too_many_arguments)]
+fn patch_cost(
+    out: &[[f32; 4]],
+    w: usize,
+    h: usize,
+    hx: i32,
+    hy: i32,
+    sx: i32,
+    sy: i32,
+    patch: i32,
+) -> f32 {
+    let mut cost = 0.0f32;
+    let mut counted = 0;
+    for dy in -patch..=patch {
+        for dx in -patch..=patch {
+            let (px, py) = (hx + dx, hy + dy);
+            if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                continue;
+            }
+            let a = (py as usize) * w + px as usize;
+            let b = ((sy + dy) as usize) * w + (sx + dx) as usize;
+            for c in 0..3 {
+                let d = out[a][c] - out[b][c];
+                cost += d * d;
+            }
+            counted += 1;
+        }
+    }
+    if counted == 0 {
+        return f32::MAX;
+    }
+    cost / counted as f32
+}
+
+/// Patch radius for a Structure setting. Bigger patches follow an edge more
+/// faithfully and cost more to compare.
+fn patch_radius(structure: u32) -> i32 {
+    match structure.clamp(1, 7) {
+        1..=2 => 1,
+        3..=5 => PATCH_RADIUS,
+        _ => 3,
+    }
 }
 
 /// True when an unknown pixel is 4-adjacent to something already known.
@@ -622,52 +938,188 @@ fn keep_destination_colour(solved: &mut [[f32; 4]], dest: &[[f32; 4]], hole: &[b
     }
 }
 
+/// CS6's Content-Aware Move options.
+#[derive(Clone, Copy, Debug)]
+pub struct MoveOptions {
+    /// The drag, in pixels.
+    pub dx: i32,
+    pub dy: i32,
+    /// Leave the original in place, duplicating rather than moving. CS6's
+    /// Extend mode, for lengthening something like a wall or a branch.
+    pub extend: bool,
+    /// **Structure**, 1–7: how strictly the fill follows the edges it finds.
+    /// Higher compares larger patches more finely, which follows structure
+    /// better and costs more.
+    pub structure: u32,
+    /// **Color**, 0–10: how far the moved pixels are shifted to match the
+    /// colour of their new surroundings. 0 moves them untouched.
+    pub color: u32,
+}
+
+impl Default for MoveOptions {
+    fn default() -> Self {
+        // CS6's own defaults.
+        Self { dx: 0, dy: 0, extend: false, structure: 4, color: 0 }
+    }
+}
+
 /// Move the covered region by `(dx, dy)`, healing the hole it leaves behind —
 /// the Content-Aware Move tool.
 ///
-/// With `extend` set the original is left in place, so the region is duplicated
-/// rather than moved. That is CS6's Extend mode, used for lengthening things
-/// like a wall or a branch.
+/// The moved pixels are **copied**, not re-solved. That distinction matters: a
+/// Poisson blend transplants only a region's gradients and reconstructs the
+/// interior from its boundary, which is right for healing a blemish but destroys
+/// the content of anything larger than the solver can propagate across. A move
+/// is supposed to relocate what is there, so the copy is verbatim and only its
+/// overall colour is adapted, by the amount `color` asks for.
 ///
-/// The moved copy is blended with a Poisson solve so it settles into its new
-/// surroundings, and the vacated area is rebuilt content-aware.
+/// `source` is what to read from — the layer itself, or the composite when
+/// Sample All Layers is on. Writes always go to `target`.
 pub fn move_region(
-    pixels: &mut Pixmap,
+    target: &mut Pixmap,
+    source: &Pixmap,
     region: Rect,
     coverage: &[f32],
-    dx: i32,
-    dy: i32,
-    extend: bool,
+    options: &MoveOptions,
 ) -> Rect {
     if coverage.len() != (region.width as usize) * (region.height as usize) {
         debug_assert!(false, "coverage size does not match the region");
         return Rect::default();
     }
+    let (dx, dy) = (options.dx, options.dy);
     if (dx, dy) == (0, 0) {
         return Rect::default();
     }
 
-    let canvas = pixels.rect();
+    let canvas = target.rect();
     let destination = Rect::new(region.x + dx, region.y + dy, region.width, region.height);
     if destination.intersect(&canvas).is_empty() {
         return Rect::default();
     }
 
-    // Drop the moved copy in first, sampling backwards from where it came.
-    let placed = clone_region(pixels, destination, coverage, (-dx, -dy), Transfer::Full);
-    if placed.is_empty() {
+    // Close the hole first, while the surroundings are still untouched. Doing it
+    // after the copy would let the moved pixels be sampled as if they belonged
+    // where the subject used to be.
+    let filled = if options.extend {
+        Rect::default()
+    } else {
+        heal_region_with(
+            target,
+            Some(source),
+            region,
+            coverage,
+            HealMode::ContentAware,
+            options.structure,
+        )
+    };
+
+    let placed = place_region(target, source, region, destination, coverage, options.color);
+    placed.union(&filled)
+}
+
+/// Composite the pixels of `region` at `destination`, blended by coverage.
+///
+/// `color` is CS6's Color adaptation, 0–10. It shifts the copy by a fraction of
+/// the difference between the colour just outside where it lands and the colour
+/// at its own border, so a subject moved into differently-lit surroundings
+/// settles in instead of looking pasted on.
+fn place_region(
+    target: &mut Pixmap,
+    source: &Pixmap,
+    region: Rect,
+    destination: Rect,
+    coverage: &[f32],
+    color: u32,
+) -> Rect {
+    let canvas = target.rect();
+    let visible = destination.intersect(&canvas);
+    if visible.is_empty() {
         return Rect::default();
     }
 
-    if extend {
-        return destination.intersect(&canvas);
+    let stride = region.width as usize;
+    let cov_at = |x: i32, y: i32| -> f32 {
+        if !region.contains(x, y) {
+            return 0.0;
+        }
+        coverage[((y - region.y) as usize) * stride + (x - region.x) as usize].clamp(0.0, 1.0)
+    };
+
+    // The colour shift, measured between the destination's surroundings and the
+    // moved region's own border.
+    let mut offset = [0.0f32; 3];
+    if color > 0 {
+        let mut ring = ([0.0f32; 3], 0.0f32);
+        let mut edge = ([0.0f32; 3], 0.0f32);
+
+        let outside = destination.inflate(BORDER).intersect(&canvas);
+        for y in outside.y..outside.bottom() {
+            for x in outside.x..outside.right() {
+                // Just outside where the copy will land.
+                if cov_at(x - destination.x + region.x, y - destination.y + region.y) < 0.05 {
+                    let px = target.get(x, y);
+                    ring.0[0] += px.r as f32;
+                    ring.0[1] += px.g as f32;
+                    ring.0[2] += px.b as f32;
+                    ring.1 += 1.0;
+                }
+            }
+        }
+        for y in region.y..region.bottom() {
+            for x in region.x..region.right() {
+                // The region's own rim: solid, but with a thinner neighbour.
+                let c = cov_at(x, y);
+                if c < 0.5 {
+                    continue;
+                }
+                let thin = cov_at(x - 1, y) < 0.5
+                    || cov_at(x + 1, y) < 0.5
+                    || cov_at(x, y - 1) < 0.5
+                    || cov_at(x, y + 1) < 0.5;
+                if !thin {
+                    continue;
+                }
+                let px = source.get(x, y);
+                edge.0[0] += px.r as f32;
+                edge.0[1] += px.g as f32;
+                edge.0[2] += px.b as f32;
+                edge.1 += 1.0;
+            }
+        }
+
+        if ring.1 > 0.0 && edge.1 > 0.0 {
+            let strength = (color.min(10) as f32) / 10.0;
+            for c in 0..3 {
+                offset[c] = (ring.0[c] / ring.1 - edge.0[c] / edge.1) * strength;
+            }
+        }
     }
 
-    // Then close the hole. Content-aware, because what belongs there is
-    // whatever the surroundings continue into — the same question the Spot
-    // Healing Brush asks.
-    let filled = heal_region(pixels, region, coverage, HealMode::ContentAware);
-    destination.intersect(&canvas).union(&filled)
+    for y in visible.y..visible.bottom() {
+        for x in visible.x..visible.right() {
+            let (sx, sy) = (x - destination.x + region.x, y - destination.y + region.y);
+            let t = cov_at(sx, sy);
+            if t <= 0.0 {
+                continue;
+            }
+            let src = source.get(sx, sy);
+            let dst = target.get(x, y);
+            let mix = |from: u8, to: f32| {
+                (from as f32 + (to - from as f32) * t).round().clamp(0.0, 255.0) as u8
+            };
+            target.set(
+                x,
+                y,
+                Rgba8::new(
+                    mix(dst.r, src.r as f32 + offset[0]),
+                    mix(dst.g, src.g as f32 + offset[1]),
+                    mix(dst.b, src.b as f32 + offset[2]),
+                    mix(dst.a, src.a as f32),
+                ),
+            );
+        }
+    }
+    visible
 }
 
 /// Take the red out of a red-eye flash reflection.
@@ -1072,7 +1524,9 @@ mod tests {
         }
 
         let region = Rect::new(16, 16, 16, 16);
-        let dirty = move_region(&mut pm, region, &all_ones(region), 40, 0, false);
+        let source = pm.clone();
+        let dirty = move_region(&mut pm, &source, region, &all_ones(region),
+                                &MoveOptions { dx: 40, dy: 0, ..MoveOptions::default() });
         assert!(!dirty.is_empty());
 
         let vacated = pm.get(24, 24);
@@ -1094,9 +1548,230 @@ mod tests {
         let before = pm.get(24, 24);
 
         let region = Rect::new(16, 16, 16, 16);
-        move_region(&mut pm, region, &all_ones(region), 40, 0, true);
+        let source = pm.clone();
+        move_region(&mut pm, &source, region, &all_ones(region),
+                    &MoveOptions { dx: 40, dy: 0, extend: true, ..MoveOptions::default() });
 
         assert_eq!(pm.get(24, 24), before, "extend mode erased the original");
+    }
+
+    #[test]
+    fn a_large_region_fills_in_bounded_time() {
+        // A 400x400 hole. The original search compared every hole pixel against
+        // every candidate in the working area, which made this take tens of
+        // seconds — long enough that the interface looked hung. The windowed,
+        // strided, parallel search keeps it well under a second, so this test
+        // completing at all is the regression guard.
+        let mut pm = Pixmap::filled(900, 700, Rgba8::new(200, 190, 180, 255));
+        // Some structure, so the fill has something to match against.
+        for y in 0..700 {
+            for x in 0..900 {
+                if (x / 16 + y / 16) % 2 == 0 {
+                    pm.set(x, y, Rgba8::new(170, 160, 150, 255));
+                }
+            }
+        }
+
+        let region = Rect::new(200, 150, 400, 400);
+        let source = pm.clone();
+        let dirty = move_region(&mut pm, &source, region, &all_ones(region),
+                                &MoveOptions { dx: 260, dy: 0, ..MoveOptions::default() });
+        assert!(!dirty.is_empty(), "a large move did nothing");
+
+        // The vacated area is filled with something like its surroundings.
+        let px = pm.get(400, 350);
+        assert!(px.a == 255, "the hole was left transparent");
+        assert!(
+            px.r > 140 && px.r < 220,
+            "the fill does not resemble the surroundings: {:?}",
+            px
+        );
+    }
+
+    #[test]
+    fn a_move_relocates_the_pixels_verbatim() {
+        // The bug this guards: the moved region used to be reconstructed by a
+        // Poisson solve, which only transplants gradients and rebuilds the
+        // interior from the boundary. Over anything larger than the solver can
+        // propagate across, that turned detailed content into streaks. A move
+        // must carry the pixels themselves.
+        let mut pm = Pixmap::filled(200, 100, Rgba8::new(150, 150, 150, 255));
+        // A recognisable pattern to move: vertical bars of known colours.
+        for y in 20..60 {
+            for x in 20..60 {
+                let c = if (x / 4) % 2 == 0 { 10u8 } else { 240u8 };
+                pm.set(x, y, Rgba8::new(c, c, c, 255));
+            }
+        }
+
+        let region = Rect::new(20, 20, 40, 40);
+        let source = pm.clone();
+        move_region(
+            &mut pm,
+            &source,
+            region,
+            &all_ones(region),
+            &MoveOptions { dx: 100, dy: 0, ..MoveOptions::default() },
+        );
+
+        // Every pixel of the pattern must appear unchanged at the new location.
+        let mut wrong = 0;
+        for y in 20..60 {
+            for x in 20..60 {
+                let want = source.get(x, y);
+                let got = pm.get(x + 100, y);
+                if got != want {
+                    wrong += 1;
+                }
+            }
+        }
+        assert_eq!(wrong, 0, "{} of 1600 moved pixels were altered", wrong);
+    }
+
+    #[test]
+    fn colour_adaptation_only_acts_when_asked() {
+        // Colour 0 copies untouched; a high setting shifts toward the new
+        // surroundings.
+        let build = || {
+            let mut pm = Pixmap::filled(240, 100, Rgba8::new(40, 60, 40, 255));
+            // A brighter area to move into.
+            for y in 0..100 {
+                for x in 120..240 {
+                    pm.set(x, y, Rgba8::new(200, 210, 200, 255));
+                }
+            }
+            // The subject, mid-grey, sitting in the dark half.
+            for y in 30..70 {
+                for x in 30..70 {
+                    pm.set(x, y, Rgba8::new(120, 120, 120, 255));
+                }
+            }
+            pm
+        };
+        let region = Rect::new(30, 30, 40, 40);
+
+        let mut plain = build();
+        let src_a = plain.clone();
+        move_region(&mut plain, &src_a, region, &all_ones(region),
+                    &MoveOptions { dx: 130, dy: 0, color: 0, ..MoveOptions::default() });
+        assert_eq!(plain.get(180, 50), Rgba8::new(120, 120, 120, 255),
+                   "Color 0 should copy the subject untouched");
+
+        let mut adapted = build();
+        let src_b = adapted.clone();
+        move_region(&mut adapted, &src_b, region, &all_ones(region),
+                    &MoveOptions { dx: 130, dy: 0, color: 10, ..MoveOptions::default() });
+        assert!(adapted.get(180, 50).r > 130,
+                "Color 10 did not lighten the subject toward its new surroundings: {:?}",
+                adapted.get(180, 50));
+    }
+
+    #[test]
+    fn structure_changes_the_fill_without_breaking_it() {
+        // Both extremes must produce a filled, opaque hole; the point is that
+        // the setting is wired through rather than ignored.
+        for structure in [1u32, 4, 7] {
+            let mut pm = Pixmap::filled(240, 160, Rgba8::new(190, 180, 170, 255));
+            for y in 0..160 {
+                for x in 0..240 {
+                    if (x / 8 + y / 8) % 2 == 0 {
+                        pm.set(x, y, Rgba8::new(160, 150, 140, 255));
+                    }
+                }
+            }
+            let region = Rect::new(40, 40, 60, 60);
+            let source = pm.clone();
+            let dirty = move_region(
+                &mut pm,
+                &source,
+                region,
+                &all_ones(region),
+                &MoveOptions { dx: 120, dy: 0, structure, ..MoveOptions::default() },
+            );
+            assert!(!dirty.is_empty(), "structure {} did nothing", structure);
+            let px = pm.get(70, 70);
+            assert_eq!(px.a, 255, "structure {} left the hole transparent", structure);
+            assert!(px.r > 130 && px.r < 220,
+                    "structure {} filled with something unlike the surroundings: {:?}",
+                    structure, px);
+        }
+    }
+
+    /// A texture whose rows are *constant in x* but vary in y: horizontal
+    /// banding over a slow vertical ramp, so it never repeats exactly.
+    ///
+    /// This makes blockiness measurable. Because every row is a single value,
+    /// any variation along x inside the filled area is an artefact — the fill
+    /// jumping between sources that do not line up. There is nothing to eyeball.
+    fn banded_texture(w: u32, h: u32) -> Pixmap {
+        let mut pm = Pixmap::new(w, h);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let ramp = (y as f32) * 0.35;
+                let band = if (y / 5) % 2 == 0 { 45.0 } else { -45.0 };
+                let v = (110.0 + ramp + band).clamp(0.0, 255.0) as u8;
+                pm.set(x, y, Rgba8::new(v, 120, 255 - v, 255));
+            }
+        }
+        pm
+    }
+
+    /// Mean absolute difference between horizontally adjacent pixels.
+    fn horizontal_roughness(img: &Pixmap, r: Rect) -> f64 {
+        let mut sum = 0.0;
+        let mut n = 0.0f64;
+        for y in r.y..r.bottom() {
+            for x in r.x..r.right() - 1 {
+                sum += (img.get(x, y).r as f64 - img.get(x + 1, y).r as f64).abs();
+                n += 1.0;
+            }
+        }
+        sum / n.max(1.0)
+    }
+
+    #[test]
+    fn the_fill_does_not_break_up_into_blocks() {
+        // Rows are constant in x, so a smooth fill has near-zero horizontal
+        // variation. A fill that gives each pixel the centre of its own
+        // best-matching patch mosaics unrelated sources together and scores far
+        // worse; the voting pass is what closes the gap.
+        let truth = banded_texture(200, 200);
+        let mut pm = truth.clone();
+        let region = Rect::new(70, 70, 60, 60);
+        assert!(!heal_region(&mut pm, region, &all_ones(region), HealMode::ContentAware)
+            .is_empty());
+
+        // Measured well inside the fill, away from the boundary.
+        let inner = Rect::new(80, 80, 40, 40);
+        let rough = horizontal_roughness(&pm, inner);
+        // Around 2.7 with voting; the single-pixel fill this replaced scored
+        // 12.6, so the threshold catches a regression to that behaviour.
+        assert!(
+            rough < 5.0,
+            "the fill varies along rows that should be flat — it is blocky ({:.1}/255)",
+            rough
+        );
+    }
+
+    #[test]
+    fn the_fill_reconstructs_the_texture_closely() {
+        let truth = banded_texture(200, 200);
+        let mut pm = truth.clone();
+        let region = Rect::new(70, 70, 60, 60);
+        heal_region(&mut pm, region, &all_ones(region), HealMode::ContentAware);
+
+        let mut error = 0.0f64;
+        let mut count = 0.0f64;
+        for y in region.y..region.bottom() {
+            for x in region.x..region.right() {
+                let (a, b) = (pm.get(x, y), truth.get(x, y));
+                error += (a.r as f64 - b.r as f64).abs() + (a.b as f64 - b.b as f64).abs();
+                count += 2.0;
+                assert_eq!(a.a, 255, "the fill left a hole in the alpha at {}, {}", x, y);
+            }
+        }
+        let mae = error / count;
+        assert!(mae < 20.0, "poor reconstruction (mean error {:.1}/255)", mae);
     }
 
     #[test]
@@ -1104,7 +1779,10 @@ mod tests {
         let mut pm = Pixmap::filled(48, 48, Rgba8::new(100, 110, 120, 255));
         let before = pm.as_bytes().to_vec();
         let region = Rect::new(10, 10, 10, 10);
-        assert!(move_region(&mut pm, region, &all_ones(region), 0, 0, false).is_empty());
+        let source = pm.clone();
+        assert!(move_region(&mut pm, &source, region, &all_ones(region),
+                            &MoveOptions::default())
+            .is_empty());
         assert_eq!(pm.as_bytes(), &before[..]);
     }
 

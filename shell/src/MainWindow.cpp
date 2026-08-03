@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "canvas/CanvasView.h"
+#include "panels/BrushPresetPicker.h"
 #include "panels/ColorPanel.h"
 #include "panels/HistoryPanel.h"
 #include "panels/InfoPanel.h"
@@ -26,11 +27,16 @@
 #include <QFormLayout>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLayout>
+#include <QLineEdit>
+#include <QPushButton>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QSpinBox>
+#include <QSignalBlocker>
 #include <QStatusBar>
+#include <QTabBar>
 #include <QToolBar>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -57,6 +63,23 @@ const char *const kSaveFilter =
 /// Line-art tint for options-bar icons, matching the tool strip.
 const QColor kOptionsIconColor(0xd4, 0xd4, 0xd4);
 
+/// Stop a dialog's buttons being squeezed narrower than their text.
+///
+/// A message box sizes itself from its message, and its button row is allowed to
+/// shrink below what the buttons asked for — so a long label ends up clipped
+/// mid-word. Pinning each button's minimum to its own size hint forces the
+/// dialog to widen instead. This bites hardest with the platform-substituted
+/// labels: Qt's "Discard" role becomes "Close without Saving" under GTK.
+void unsqueezeButtons(QDialog *dialog)
+{
+    for (QAbstractButton *button : dialog->findChildren<QAbstractButton *>()) {
+        button->setMinimumWidth(button->sizeHint().width());
+    }
+    if (QLayout *layout = dialog->layout()) {
+        layout->activate();
+    }
+}
+
 } // namespace
 
 MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *parent)
@@ -71,8 +94,28 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
                    | QMainWindow::AllowTabbedDocks);
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
 
+    // The canvas sits under a tab bar, one tab per open document, as CS6 does.
     m_canvas = new CanvasView(m_engine, this);
-    setCentralWidget(m_canvas);
+
+    m_documentTabs = new QTabBar(this);
+    m_documentTabs->setObjectName(QStringLiteral("documentTabs"));
+    m_documentTabs->setExpanding(false);
+    m_documentTabs->setTabsClosable(true);
+    m_documentTabs->setMovable(true);
+    m_documentTabs->setDrawBase(false);
+    m_documentTabs->setElideMode(Qt::ElideRight);
+    m_documentTabs->setUsesScrollButtons(true);
+
+    auto *centre = new QWidget(this);
+    auto *centreLayout = new QVBoxLayout(centre);
+    centreLayout->setContentsMargins(0, 0, 0, 0);
+    centreLayout->setSpacing(0);
+    centreLayout->addWidget(m_documentTabs);
+    centreLayout->addWidget(m_canvas, 1);
+    setCentralWidget(centre);
+
+    connect(m_documentTabs, &QTabBar::currentChanged, this, &MainWindow::onTabSelected);
+    connect(m_documentTabs, &QTabBar::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
 
     createToolPanel();
 
@@ -111,6 +154,7 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     });
 
     onToolChanged(ToolId::Brush, 0);
+    refreshDocumentTabs();
     updateWindowTitle();
     // Wait for the first layout pass so the canvas knows its real size.
     QMetaObject::invokeMethod(this, &MainWindow::fitOnScreen, Qt::QueuedConnection);
@@ -145,6 +189,10 @@ void MainWindow::createMenus()
                             [this] { saveDocumentAs(); }));
     file->addAction(command(QStringLiteral("file.saveSlices"), tr("Save S&lices..."),
                             &MainWindow::exportSlices));
+    file->addSeparator();
+    // Closing one document is the deliberate act that *does* prompt.
+    file->addAction(command(QStringLiteral("file.close"), tr("&Close"),
+                            &MainWindow::closeDocument));
     file->addSeparator();
     file->addAction(command(QStringLiteral("file.exit"), tr("E&xit"),
                             [this] { close(); }));
@@ -353,6 +401,8 @@ void MainWindow::installShortcuts()
          ToolId::Eyedropper},
         {"tool.healing.cycle", tr("Cycle Healing Tool"), QStringLiteral("Shift+J"),
          ToolId::Healing},
+        {"tool.brush.cycle", tr("Cycle Brush Tool"), QStringLiteral("Shift+B"),
+         ToolId::Brush},
     };
 
     for (const Cycle &entry : cycles) {
@@ -477,10 +527,9 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
 {
     m_optionsBar->clear();
     // These point into the widgets we just deleted.
-    m_brushSize = nullptr;
-    m_brushHardness = nullptr;
     m_brushOpacity = nullptr;
     m_brushFlow = nullptr;
+    m_brushTipButton = nullptr;
 
     // Name the active variant, so switching to Elliptical says so.
     auto *label = new QLabel(QStringLiteral("  %1  ").arg(toolVariantName(tool, variant)),
@@ -498,23 +547,21 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         && (!toolHeals(tool) || healingIsBrush(static_cast<HealingType>(variant)));
 
     if (paintsWithBrush) {
-        m_optionsBar->addWidget(new QLabel(tr("Size:"), m_optionsBar));
-        m_brushSize = new QDoubleSpinBox(m_optionsBar);
-        m_brushSize->setRange(1.0, 5000.0);
-        m_brushSize->setValue(20.0);
-        m_brushSize->setSuffix(tr(" px"));
-        m_brushSize->setFixedWidth(80);
-        m_optionsBar->addWidget(m_brushSize);
-
-        m_optionsBar->addWidget(new QLabel(tr("Hardness:"), m_optionsBar));
-        m_brushHardness = new QSpinBox(m_optionsBar);
-        m_brushHardness->setRange(0, 100);
-        m_brushHardness->setValue(100);
-        m_brushHardness->setSuffix(QStringLiteral("%"));
-        m_brushHardness->setFixedWidth(64);
-        m_optionsBar->addWidget(m_brushHardness);
-
-        m_optionsBar->addSeparator();
+        // CS6 puts Size and Hardness inside the brush preset picker rather than
+        // on the bar; the bar carries the tip button that opens it, showing the
+        // current tip and its diameter.
+        m_brushTipButton = new QToolButton(m_optionsBar);
+        m_brushTipButton->setObjectName(QStringLiteral("brushTipButton"));
+        m_brushTipButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        m_brushTipButton->setPopupMode(QToolButton::InstantPopup);
+        m_brushTipButton->setIconSize(QSize(20, 20));
+        m_brushTipButton->setToolTip(tr("Brush preset picker: size, hardness and presets"));
+        m_optionsBar->addWidget(m_brushTipButton);
+        refreshBrushTipButton();
+        connect(m_brushTipButton, &QToolButton::clicked, this, [this] {
+            brushPicker()->setValues(m_brushSizeValue, m_brushHardnessValue);
+            brushPicker()->popUpUnder(m_brushTipButton);
+        });
 
         m_optionsBar->addWidget(new QLabel(tr("Opacity:"), m_optionsBar));
         m_brushOpacity = new QSpinBox(m_optionsBar);
@@ -524,18 +571,40 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         m_brushOpacity->setFixedWidth(64);
         m_optionsBar->addWidget(m_brushOpacity);
 
-        m_optionsBar->addWidget(new QLabel(tr("Flow:"), m_optionsBar));
-        m_brushFlow = new QSpinBox(m_optionsBar);
-        m_brushFlow->setRange(1, 100);
-        m_brushFlow->setValue(100);
-        m_brushFlow->setSuffix(QStringLiteral("%"));
-        m_brushFlow->setFixedWidth(64);
-        m_optionsBar->addWidget(m_brushFlow);
+        // The Pencil has no Flow in CS6 — it lays whole pixels, so there is
+        // nothing to build up gradually — and gains Auto Erase instead.
+        const bool pencil = tool == ToolId::Brush
+            && brushIsPencil(static_cast<BrushType>(variant));
 
-        connect(m_brushSize, &QDoubleSpinBox::valueChanged, this,
-                &MainWindow::pushBrushSettings);
-        connect(m_brushHardness, &QSpinBox::valueChanged, this,
-                &MainWindow::pushBrushSettings);
+        const bool replacing = tool == ToolId::Brush
+            && brushReplacesColor(static_cast<BrushType>(variant));
+
+        if (replacing) {
+            addColorReplaceOptions();
+        } else if (!pencil) {
+            m_optionsBar->addWidget(new QLabel(tr("Flow:"), m_optionsBar));
+            m_brushFlow = new QSpinBox(m_optionsBar);
+            m_brushFlow->setRange(1, 100);
+            m_brushFlow->setValue(100);
+            m_brushFlow->setSuffix(QStringLiteral("%"));
+            m_brushFlow->setFixedWidth(64);
+            m_optionsBar->addWidget(m_brushFlow);
+        } else {
+            m_optionsBar->addSeparator();
+            auto *autoErase = new QCheckBox(tr("Auto Erase"), m_optionsBar);
+            autoErase->setChecked(m_autoErase);
+            autoErase->setToolTip(tr("Begin a stroke on a pixel that is already the "
+                                     "foreground colour and it paints the background "
+                                     "colour instead"));
+            m_optionsBar->addWidget(autoErase);
+            connect(autoErase, &QCheckBox::toggled, this, [this](bool on) {
+                m_autoErase = on;
+                if (m_engine) {
+                    m_engine->setAutoErase(on);
+                }
+            });
+        }
+
         connect(m_brushOpacity, &QSpinBox::valueChanged, this,
                 &MainWindow::pushBrushSettings);
         connect(m_brushFlow, &QSpinBox::valueChanged, this,
@@ -760,6 +829,93 @@ QString MainWindow::infoHintFor(EyedropperType type) const
     return tr("Click image to sample a color.");
 }
 
+void MainWindow::addContentAwareMoveOptions()
+{
+    // CS6's bar, left to right: combine buttons, Mode, Structure, Color,
+    // Sample All Layers, and the transform-on-drop toggle.
+    addSelectionModeButtons();
+
+    // Mode: Move relocates the subject and heals the gap; Extend leaves the
+    // original, so the subject is lengthened instead.
+    m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    mode->addItem(tr("Move"), false);
+    mode->addItem(tr("Extend"), true);
+    mode->setCurrentIndex(m_camExtend ? 1 : 0);
+    m_optionsBar->addWidget(mode);
+    connect(mode, &QComboBox::currentIndexChanged, this, [this, mode](int index) {
+        m_camExtend = mode->itemData(index).toBool();
+        pushContentAwareMoveOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    struct Slider {
+        QString label;
+        int min;
+        int max;
+        int *value;
+        QString tip;
+    };
+    const Slider sliders[] = {
+        {tr("Structure:"), 1, 7, &m_camStructure,
+         tr("How strictly the filled area follows the edges around it. Higher matches "
+            "larger patches more finely")},
+        {tr("Color:"), 0, 10, &m_camColor,
+         tr("How far the moved pixels shift toward the colour of their new "
+            "surroundings. 0 moves them untouched")},
+    };
+    for (const Slider &slider : sliders) {
+        m_optionsBar->addWidget(new QLabel(slider.label, m_optionsBar));
+        auto *spin = new QSpinBox(m_optionsBar);
+        spin->setRange(slider.min, slider.max);
+        spin->setValue(*slider.value);
+        spin->setFixedWidth(52);
+        spin->setToolTip(slider.tip);
+        spin->setStatusTip(slider.tip);
+        m_optionsBar->addWidget(spin);
+
+        int *slot = slider.value;
+        connect(spin, &QSpinBox::valueChanged, this, [this, slot](int v) {
+            *slot = v;
+            pushContentAwareMoveOptions();
+        });
+    }
+
+    m_optionsBar->addSeparator();
+
+    auto *sampleAll = new QCheckBox(tr("Sample All Layers"), m_optionsBar);
+    sampleAll->setChecked(m_camSampleAllLayers);
+    sampleAll->setToolTip(tr("Read the pixels to move from the composite rather than the "
+                             "active layer alone. The result is still written to the "
+                             "active layer"));
+    m_optionsBar->addWidget(sampleAll);
+    connect(sampleAll, &QCheckBox::toggled, this, [this](bool on) {
+        m_camSampleAllLayers = on;
+        pushContentAwareMoveOptions();
+    });
+
+    // CS6's T: show transform handles on the dropped region. Transforms are not
+    // implemented, so this is present for the bar's shape but disabled.
+    auto *transform = new QCheckBox(tr("T"), m_optionsBar);
+    transform->setEnabled(false);
+    transform->setToolTip(tr("Not implemented yet: transform on drop needs the transform "
+                             "tools"));
+    m_optionsBar->addWidget(transform);
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(
+        tr("Drag to outline a subject, then drag it where it should go"), m_optionsBar));
+
+    pushContentAwareMoveOptions();
+}
+
+void MainWindow::pushContentAwareMoveOptions()
+{
+    m_canvas->setContentAwareMoveOptions(m_camExtend, m_camStructure, m_camColor,
+                                        m_camSampleAllLayers);
+}
+
 void MainWindow::addPatchOptions()
 {
     // CS6's Patch bar, left to right: the selection combine buttons, the Patch
@@ -875,6 +1031,7 @@ void MainWindow::warnHealingSourceRequired()
                                "repair the image.");
 #endif
     QMessageBox box(QMessageBox::Critical, tr("PhotoRust"), message, QMessageBox::Ok, this);
+    unsqueezeButtons(&box);
     box.exec();
 }
 
@@ -885,27 +1042,9 @@ void MainWindow::addHealingRegionOptions(HealingType type)
         addPatchOptions();
         break;
 
-    case HealingType::ContentAwareMove: {
-        // CS6's Mode: Move relocates the region and heals the gap; Extend
-        // leaves the original, so the subject is lengthened.
-        m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
-        auto *mode = new QComboBox(m_optionsBar);
-        mode->addItem(tr("Move"), false);
-        mode->addItem(tr("Extend"), true);
-        mode->setCurrentIndex(m_camExtend ? 1 : 0);
-        m_optionsBar->addWidget(mode);
-        connect(mode, &QComboBox::currentIndexChanged, this, [this, mode](int index) {
-            m_camExtend = mode->itemData(index).toBool();
-            m_canvas->setContentAwareExtend(m_camExtend);
-        });
-        m_canvas->setContentAwareExtend(m_camExtend);
-
-        m_optionsBar->addSeparator();
-        m_optionsBar->addWidget(new QLabel(
-            tr("Drag to outline a subject, then drag it where it should go"),
-            m_optionsBar));
+    case HealingType::ContentAwareMove:
+        addContentAwareMoveOptions();
         break;
-    }
 
     case HealingType::RedEye: {
         struct Field {
@@ -944,6 +1083,104 @@ void MainWindow::addHealingRegionOptions(HealingType type)
         // Handled with the brush controls.
         break;
     }
+}
+
+void MainWindow::addColorReplaceOptions()
+{
+    // CS6's bar: Mode, the three Sampling buttons, Limits, Tolerance and
+    // Anti-alias. Opacity and Flow have already been added above.
+    struct Choice {
+        QString label;
+        int value;
+        QString tip;
+    };
+
+    const auto addChoices = [this](const QString &label, const QList<Choice> &choices,
+                                   int *slot) {
+        m_optionsBar->addWidget(new QLabel(label, m_optionsBar));
+        auto *combo = new QComboBox(m_optionsBar);
+        for (const Choice &choice : choices) {
+            combo->addItem(choice.label, choice.value);
+            combo->setItemData(combo->count() - 1, choice.tip, Qt::ToolTipRole);
+            if (choice.value == *slot) {
+                combo->setCurrentIndex(combo->count() - 1);
+            }
+        }
+        m_optionsBar->addWidget(combo);
+        connect(combo, &QComboBox::currentIndexChanged, this, [this, combo, slot](int index) {
+            *slot = combo->itemData(index).toInt();
+            pushColorReplaceOptions();
+        });
+    };
+
+    addChoices(tr("Mode:"),
+               {{tr("Hue"), int(ReplaceMode::Hue), tr("Replace the hue alone")},
+                {tr("Saturation"), int(ReplaceMode::Saturation),
+                 tr("Replace how saturated the pixel is")},
+                {tr("Color"), int(ReplaceMode::Color),
+                 tr("Replace hue and saturation, keeping the pixel's brightness — so "
+                    "shading survives")},
+                {tr("Luminosity"), int(ReplaceMode::Luminosity),
+                 tr("Replace the brightness, keeping the pixel's colour")}},
+               &m_replaceMode);
+
+    m_optionsBar->addSeparator();
+
+    addChoices(tr("Sampling:"),
+               {{tr("Continuous"), int(ReplaceSampling::Continuous),
+                 tr("Re-read the colour under the brush as it moves")},
+                {tr("Once"), int(ReplaceSampling::Once),
+                 tr("Read the colour where the stroke begins, and keep it")},
+                {tr("Background Swatch"), int(ReplaceSampling::BackgroundSwatch),
+                 tr("Replace whatever matches the background colour")}},
+               &m_replaceSampling);
+
+    addChoices(tr("Limits:"),
+               {{tr("Discontiguous"), int(ReplaceLimits::Discontiguous),
+                 tr("Every matching pixel under the brush")},
+                {tr("Contiguous"), int(ReplaceLimits::Contiguous),
+                 tr("Only pixels joined to the one under the cursor")},
+                {tr("Find Edges"), int(ReplaceLimits::FindEdges),
+                 tr("As contiguous, but stopping at edges so colour does not leak "
+                    "across a boundary")}},
+               &m_replaceLimits);
+
+    m_optionsBar->addWidget(new QLabel(tr("Tolerance:"), m_optionsBar));
+    auto *tolerance = new QSpinBox(m_optionsBar);
+    tolerance->setRange(0, 100);
+    tolerance->setValue(m_replaceTolerance);
+    tolerance->setSuffix(QStringLiteral("%"));
+    tolerance->setFixedWidth(64);
+    tolerance->setToolTip(tr("How far a pixel may differ from the sampled colour and "
+                             "still be replaced"));
+    m_optionsBar->addWidget(tolerance);
+    connect(tolerance, &QSpinBox::valueChanged, this, [this](int v) {
+        m_replaceTolerance = v;
+        pushColorReplaceOptions();
+    });
+
+    auto *antialias = new QCheckBox(tr("Anti-alias"), m_optionsBar);
+    antialias->setChecked(m_replaceAntialias);
+    antialias->setToolTip(tr("Soften the edge of the replaced area"));
+    m_optionsBar->addWidget(antialias);
+    connect(antialias, &QCheckBox::toggled, this, [this](bool on) {
+        m_replaceAntialias = on;
+        pushColorReplaceOptions();
+    });
+
+    pushColorReplaceOptions();
+}
+
+void MainWindow::pushColorReplaceOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    // CS6 shows Tolerance as a percentage; the engine matches per channel in
+    // 0-255.
+    const int tolerance = qRound(m_replaceTolerance * 255.0 / 100.0);
+    m_engine->setReplaceOptions(m_replaceMode, m_replaceSampling, m_replaceLimits, tolerance,
+                                m_replaceAntialias);
 }
 
 void MainWindow::addHealTypeButtons()
@@ -1361,12 +1598,50 @@ void MainWindow::pushMagneticOptions()
 
 void MainWindow::pushBrushSettings()
 {
-    if (!m_engine || !m_brushSize) {
+    if (!m_engine) {
         return;
     }
-    m_engine->setBrush(float(m_brushSize->value()), m_brushHardness->value(),
-                       m_brushOpacity->value(), m_brushFlow->value(),
-                       /*spacing=*/25);
+    // Opacity and Flow live on the bar and only exist while a painting tool is
+    // active; size and hardness are kept here, since the picker that edits them
+    // is created once and outlives any one options bar.
+    const int opacity = m_brushOpacity ? m_brushOpacity->value() : 100;
+    const int flow = m_brushFlow ? m_brushFlow->value() : 100;
+    // Spacing belongs to the tip, so it comes from the picker's preset rather
+    // than a fixed value — a spatter brush needs a much wider step than a round
+    // one to read as spatter instead of a solid line.
+    const int spacing = m_brushPicker ? m_brushPicker->current().spacing : 25;
+    m_engine->setBrush(float(m_brushSizeValue), m_brushHardnessValue, opacity, flow, spacing);
+    // The Pencil paints aliased; every other tool in the family antialiases.
+    m_engine->setBrushAntialias(!m_pencilMode);
+    m_engine->setAutoErase(m_pencilMode && m_autoErase);
+}
+
+BrushPresetPicker *MainWindow::brushPicker()
+{
+    // Built on first use and kept: it holds the current tip, so it must not be
+    // recreated with the options bar.
+    if (!m_brushPicker) {
+        m_brushPicker = new BrushPresetPicker(m_engine, this);
+        connect(m_brushPicker, &BrushPresetPicker::tipChanged, this,
+                [this](const BrushPresetPicker::Preset &preset) {
+                    m_brushSizeValue = preset.size;
+                    m_brushHardnessValue = preset.hardness;
+                    refreshBrushTipButton();
+                    // The picker has already pushed the tip shape; this adds the
+                    // options bar's Opacity and Flow on top.
+                    pushBrushSettings();
+                });
+    }
+    return m_brushPicker;
+}
+
+void MainWindow::refreshBrushTipButton()
+{
+    if (!m_brushTipButton) {
+        return;
+    }
+    m_brushTipButton->setIcon(QIcon(brushPicker()->tipPreview(20)));
+    m_brushTipButton->setText(QString::number(int(m_brushSizeValue)));
 }
 
 // ------------------------------------------------------------------- docks --
@@ -1449,9 +1724,22 @@ void MainWindow::createDocks()
 
 void MainWindow::createStatusBar()
 {
-    m_statusZoom = new QLabel(QStringLiteral("100%"), this);
-    m_statusZoom->setMinimumWidth(56);
+    // Editable, as Photoshop's is: type a percentage and press Enter.
+    m_statusZoom = new QLineEdit(QStringLiteral("100%"), this);
+    m_statusZoom->setObjectName(QStringLiteral("statusZoom"));
+    m_statusZoom->setFixedWidth(58);
+    m_statusZoom->setAlignment(Qt::AlignRight);
+    m_statusZoom->setToolTip(tr("Zoom level. Type a percentage and press Enter."));
     statusBar()->addWidget(m_statusZoom);
+
+    connect(m_statusZoom, &QLineEdit::returnPressed, this, &MainWindow::applyTypedZoom);
+    // Clicking away without pressing Enter puts the real value back, rather than
+    // leaving a half-typed number sitting there looking authoritative.
+    connect(m_statusZoom, &QLineEdit::editingFinished, this, [this] {
+        if (!m_statusZoom->hasFocus()) {
+            onZoomChanged(m_canvas->zoom());
+        }
+    });
 
     m_statusDocSize = new QLabel(this);
     m_statusDocSize->setMinimumWidth(140);
@@ -1460,6 +1748,57 @@ void MainWindow::createStatusBar()
     m_statusPosition = new QLabel(this);
     m_statusPosition->setMinimumWidth(120);
     statusBar()->addPermanentWidget(m_statusPosition);
+}
+
+void MainWindow::refreshDocumentTabs()
+{
+    if (!m_engine || !m_documentTabs) {
+        return;
+    }
+    // Rebuilding emits currentChanged, which would bounce straight back into
+    // the engine and fight with what it just told us.
+    const QSignalBlocker blocker(m_documentTabs);
+
+    const int count = m_engine->documentCount();
+    while (m_documentTabs->count() > count) {
+        m_documentTabs->removeTab(m_documentTabs->count() - 1);
+    }
+    while (m_documentTabs->count() < count) {
+        m_documentTabs->addTab(QString());
+    }
+    for (int i = 0; i < count; ++i) {
+        m_documentTabs->setTabText(i, m_engine->documentTitleAt(i));
+        m_documentTabs->setTabToolTip(i, m_engine->documentTitleAt(i));
+    }
+    m_documentTabs->setCurrentIndex(m_engine->activeDocument());
+}
+
+void MainWindow::onTabSelected(int index)
+{
+    if (m_engine && index >= 0) {
+        m_engine->setActiveDocument(index);
+    }
+}
+
+void MainWindow::onTabCloseRequested(int index)
+{
+    if (!m_engine || index < 0) {
+        return;
+    }
+    // Switch to the tab first, so an unsaved-changes prompt names that document
+    // and Save writes the right one.
+    if (m_engine->documentModifiedAt(index)) {
+        m_engine->setActiveDocument(index);
+        refreshDocumentTabs();
+        if (!confirmDiscardChanges()) {
+            return;
+        }
+        index = m_engine->activeDocument();
+    }
+
+    if (!m_engine->closeDocument(index)) {
+        statusBar()->showMessage(tr("The last document cannot be closed."), 4000);
+    }
 }
 
 void MainWindow::connectEngine()
@@ -1485,16 +1824,18 @@ void MainWindow::connectEngine()
     connect(m_engine, &Engine::canvasChanged, m_infoPanel, &InfoPanel::refreshSamplers);
     connect(m_engine, &Engine::layersChanged, m_infoPanel, &InfoPanel::refreshDocumentSize);
     connect(m_engine, &Engine::documentTitleChanged, this, &MainWindow::updateWindowTitle);
+    connect(m_engine, &Engine::documentTitleChanged, this, &MainWindow::refreshDocumentTabs);
+    connect(m_engine, &Engine::documentsChanged, this, &MainWindow::refreshDocumentTabs);
+    // A document swap changes everything downstream, so treat it like a reload.
+    connect(m_engine, &Engine::documentsChanged, this, &MainWindow::onDocumentChanged);
 }
 
 // ---------------------------------------------------------------- commands --
 
 void MainWindow::newDocument()
 {
-    if (!confirmDiscardChanges()) {
-        return;
-    }
-
+    // No prompt: this opens a tab alongside whatever is already open rather
+    // than replacing it, so there is nothing to lose.
     QDialog dialog(this);
     dialog.setWindowTitle(tr("New"));
     auto *form = new QFormLayout(&dialog);
@@ -1532,9 +1873,7 @@ void MainWindow::newDocument()
 
 void MainWindow::openDocument()
 {
-    if (!confirmDiscardChanges()) {
-        return;
-    }
+    // Opens in its own tab, so nothing already open is at risk.
     const QString path = QFileDialog::getOpenFileName(this, tr("Open"), QString(),
                                                       QLatin1String(kOpenFilter));
     if (path.isEmpty()) {
@@ -1803,6 +2142,11 @@ void MainWindow::onToolChanged(ToolId tool, int variant)
     if (tool == ToolId::Healing) {
         m_canvas->setHealingType(static_cast<HealingType>(variant));
     }
+    // Aliasing follows the brush variant, and has to be set before the options
+    // bar pushes the rest of the brush settings.
+    m_pencilMode = tool == ToolId::Brush && brushIsPencil(static_cast<BrushType>(variant));
+    m_canvas->setReplaceMode(tool == ToolId::Brush
+                             && brushReplacesColor(static_cast<BrushType>(variant)));
     if (tool == ToolId::Marquee) {
         m_canvas->setMarqueeType(static_cast<MarqueeType>(variant));
     } else if (tool == ToolId::Lasso) {
@@ -1850,7 +2194,48 @@ void MainWindow::onCursorMoved(const QPointF &pos)
 
 void MainWindow::onZoomChanged(double zoom)
 {
-    m_statusZoom->setText(QStringLiteral("%1%").arg(zoom * 100.0, 0, 'f', 1));
+    if (!m_statusZoom) {
+        return;
+    }
+    // Leave the field alone while it is being typed into: overwriting it
+    // mid-edit would fight the user, and zoom changes arrive from the wheel and
+    // the View menu too.
+    if (m_statusZoom->hasFocus()) {
+        return;
+    }
+    // Whole numbers read as "400%", not "400.0%"; fractional stops such as
+    // 66.7% keep their decimal.
+    const double percent = zoom * 100.0;
+    const int decimals = qFuzzyCompare(percent, qRound(percent)) ? 0 : 1;
+    m_statusZoom->setText(QStringLiteral("%1%").arg(percent, 0, 'f', decimals));
+}
+
+void MainWindow::applyTypedZoom()
+{
+    if (!m_statusZoom || !m_canvas) {
+        return;
+    }
+    // Accept "400", "400%", "400 %" and a comma decimal separator, since the
+    // field is small and people type what is quickest.
+    QString text = m_statusZoom->text().trimmed();
+    text.remove(QLatin1Char('%'));
+    text.replace(QLatin1Char(','), QLatin1Char('.'));
+
+    bool ok = false;
+    const double percent = text.trimmed().toDouble(&ok);
+    if (!ok || percent <= 0.0) {
+        // Unparseable: put the real value back rather than guessing.
+        onZoomChanged(m_canvas->zoom());
+        return;
+    }
+
+    // The canvas clamps to the range CS6 allows, so out-of-range input lands on
+    // the nearest limit rather than being rejected.
+    m_canvas->setZoom(percent / 100.0);
+    // setZoom only signals when the value actually changed, so refresh the text
+    // directly — typing 400% when already at 400% should still tidy up "400".
+    m_statusZoom->clearFocus();
+    onZoomChanged(m_canvas->zoom());
 }
 
 void MainWindow::refreshAll()
@@ -1882,24 +2267,57 @@ bool MainWindow::confirmDiscardChanges()
     if (!m_engine || !m_engine->getModified()) {
         return true;
     }
-    const auto choice = QMessageBox::question(
-        this, tr("PhotoRust"),
-        tr("Save changes to \"%1\" before closing?").arg(m_engine->getDocumentTitle()),
-        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+    // Built by hand rather than through QMessageBox::question so the buttons
+    // carry Photoshop's own wording instead of whatever the platform theme
+    // substitutes for the standard roles.
+    QMessageBox box(QMessageBox::Question, tr("PhotoRust"),
+                    tr("Save changes to \"%1\" before closing?")
+                        .arg(m_engine->getDocumentTitle()),
+                    QMessageBox::NoButton, this);
+    QPushButton *save = box.addButton(tr("&Yes"), QMessageBox::AcceptRole);
+    QPushButton *discard = box.addButton(tr("&No"), QMessageBox::DestructiveRole);
+    box.addButton(tr("Cancel"), QMessageBox::RejectRole);
+    box.setDefaultButton(save);
+    unsqueezeButtons(&box);
+    box.exec();
 
-    switch (choice) {
-    case QMessageBox::Save:
+    if (box.clickedButton() == save) {
         return saveDocument();
-    case QMessageBox::Discard:
+    }
+    return box.clickedButton() == discard;
+}
+
+bool MainWindow::confirmDiscardAll()
+{
+    if (!m_engine) {
         return true;
-    default:
-        return false;
+    }
+    // Every open document gets its own prompt, and is brought into view first so
+    // the decision is made while looking at the right image. Any Cancel stops
+    // the whole thing.
+    for (int i = 0; i < m_engine->documentCount(); ++i) {
+        if (!m_engine->documentModifiedAt(i)) {
+            continue;
+        }
+        m_engine->setActiveDocument(i);
+        refreshDocumentTabs();
+        if (!confirmDiscardChanges()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MainWindow::closeDocument()
+{
+    if (m_documentTabs) {
+        onTabCloseRequested(m_documentTabs->currentIndex());
     }
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    if (confirmDiscardChanges()) {
+    if (confirmDiscardAll()) {
         event->accept();
     } else {
         event->ignore();

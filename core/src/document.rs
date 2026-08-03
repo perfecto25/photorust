@@ -10,10 +10,11 @@ use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::compositor;
 use crate::filters::{Adjustment, Filter};
-use crate::healing::{self, HealMode, Transfer};
+use crate::healing::{self, HealMode, MoveOptions, Transfer};
 use crate::history::History;
 use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
 use crate::perspective;
+use crate::replace::{ColorReplacer, ReplaceOptions, ReplaceSampling};
 use crate::selection::{Selection, SelectionOp};
 use crate::slice::{Slice, SliceSet};
 
@@ -56,8 +57,18 @@ pub struct Document {
     /// step rather than one per mouse-move.
     stroke_undo_base: Option<LayerStack>,
 
+    /// State for a Color Replacement stroke. That tool edits the layer directly
+    /// as it goes rather than accumulating into a mask, because what it replaces
+    /// depends on what is already there.
+    replacer: Option<ColorReplacer>,
+    /// Where the replacement stroke last reached, for even dab spacing.
+    replace_last: Option<(f32, f32)>,
+
     /// File path, once saved.
     pub path: Option<String>,
+    /// Which "Untitled-N" this is, for a document that has never been saved.
+    /// Photoshop numbers them from 1 upward across the session.
+    pub untitled_number: u32,
     /// Set on every mutation, cleared on save.
     dirty: bool,
 }
@@ -81,7 +92,10 @@ impl Document {
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
+            replacer: None,
+            replace_last: None,
             path: None,
+            untitled_number: 1,
             dirty: false,
         }
     }
@@ -117,7 +131,10 @@ impl Document {
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
+            replacer: None,
+            replace_last: None,
             path: None,
+            untitled_number: 1,
             dirty: false,
         }
     }
@@ -146,11 +163,12 @@ impl Document {
 
     /// Title-bar text: file name (or "Untitled") plus a modified marker.
     pub fn display_name(&self) -> String {
+        let untitled = format!("Untitled-{}", self.untitled_number);
         let base = self
             .path
             .as_deref()
             .and_then(|p| p.rsplit('/').next())
-            .unwrap_or("Untitled-1");
+            .unwrap_or(&untitled);
         if self.dirty {
             format!("{}*", base)
         } else {
@@ -666,11 +684,35 @@ impl Document {
         }
     }
 
-    /// Move the selection's contents by `(dx, dy)` and heal what it leaves —
-    /// the Content-Aware Move tool. `extend` duplicates instead of moving.
-    pub fn content_aware_move(&mut self, dx: i32, dy: i32, extend: bool) -> Rect {
-        self.apply_to_selection_at("Content-Aware Move", (0, 0), |pixels, region, coverage| {
-            healing::move_region(pixels, region, coverage, dx, dy, extend)
+    /// Move the selection's contents and heal what it leaves — the
+    /// Content-Aware Move tool.
+    ///
+    /// With `sample_all_layers` the pixels read come from the composite rather
+    /// than the active layer, so a subject spread across layers moves as it
+    /// looks. The result is still written to the active layer alone.
+    pub fn content_aware_move(
+        &mut self,
+        options: &MoveOptions,
+        sample_all_layers: bool,
+    ) -> Rect {
+        let sampled = if sample_all_layers {
+            Some(self.composite())
+        } else {
+            None
+        };
+        let options = *options;
+
+        self.apply_to_selection_at("Content-Aware Move", (0, 0), move |pixels, region, cov| {
+            // Without Sample All Layers the layer is both source and target;
+            // reading its own pixels needs a snapshot, since the move writes
+            // into it as it goes.
+            match sampled {
+                Some(source) => healing::move_region(pixels, &source, region, cov, &options),
+                None => {
+                    let snapshot = pixels.clone();
+                    healing::move_region(pixels, &snapshot, region, cov, &options)
+                }
+            }
         })
     }
 
@@ -757,6 +799,172 @@ impl Document {
         }
         self.commit(name);
         Rect::new(dirty.x + offset.0, dirty.y + offset.1, dirty.width, dirty.height)
+    }
+
+    /// Begin a Color Replacement stroke.
+    ///
+    /// `reference` is the colour to match for the sampling modes that fix it up
+    /// front; Continuous sampling reads the layer as the brush moves and ignores
+    /// it. `replacement` is the colour being painted. Returns false if the layer
+    /// cannot be painted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_replace(
+        &mut self,
+        brush: &Brush,
+        options: ReplaceOptions,
+        reference: Option<Rgba8>,
+        replacement: Rgba8,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        self.stroke_undo_base = Some(self.stack.clone());
+        let (w, h) = {
+            let pixels = &self.active_layer().unwrap().pixels;
+            (pixels.width(), pixels.height())
+        };
+        // Background Swatch sampling matches a colour that may appear nowhere
+        // under the brush, so it still needs a reference even though nothing is
+        // sampled from the image.
+        let reference = match options.sampling {
+            ReplaceSampling::Continuous => None,
+            _ => reference,
+        };
+        self.replacer = Some(ColorReplacer::new(w, h, options, reference));
+        self.replace_last = None;
+        // The first dab must paint the replacement colour like every other one.
+        // Passing anything else here marks its pixels as done, and the colour the
+        // user actually chose never reaches them.
+        self.extend_replace(brush, x, y, pressure, replacement);
+        true
+    }
+
+    /// Continue a Color Replacement stroke, laying dabs to `(x, y)`.
+    ///
+    /// `replacement` is the colour being painted — the foreground.
+    pub fn extend_replace(
+        &mut self,
+        brush: &Brush,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        replacement: Rgba8,
+    ) -> Rect {
+        if self.replacer.is_none() {
+            return Rect::default();
+        }
+        let id = self.active_layer;
+        let offset = match self.stack.by_id(id) {
+            Some(layer) => layer.offset,
+            None => return Rect::default(),
+        };
+
+        // Dab positions along the segment, spaced as the brush asks.
+        let step = (brush.size * brush.spacing.max(0.01)).max(0.5);
+        let mut points = Vec::new();
+        match self.replace_last {
+            None => points.push((x, y)),
+            Some((lx, ly)) => {
+                let (dx, dy) = (x - lx, y - ly);
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance < 1e-6 {
+                    return Rect::default();
+                }
+                let mut travelled = step;
+                while travelled <= distance {
+                    let t = travelled / distance;
+                    points.push((lx + dx * t, ly + dy * t));
+                    travelled += step;
+                }
+                if points.is_empty() {
+                    // Too short a move to warrant a dab; wait for the next one
+                    // rather than bunching dabs up at the start.
+                    return Rect::default();
+                }
+            }
+        }
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let mut dirty = Rect::default();
+        let (Some(replacer), Some(layer)) = (self.replacer.as_mut(), self.stack.by_id_mut(id))
+        else {
+            return Rect::default();
+        };
+
+        for (px, py) in points {
+            // The replacer works in the layer's own coordinates.
+            let touched = replacer.apply_dab(
+                &mut layer.pixels,
+                brush,
+                px - offset.0 as f32,
+                py - offset.1 as f32,
+                pressure,
+                replacement,
+            );
+            if !touched.is_empty() {
+                dirty = dirty.union(&Rect::new(
+                    touched.x + offset.0,
+                    touched.y + offset.1,
+                    touched.width,
+                    touched.height,
+                ));
+            }
+        }
+
+        // A marquee confines this exactly as it confines painting. Applied after
+        // the fact by restoring what fell outside, which keeps the replacer's own
+        // logic free of selection handling.
+        if let Some(sel) = selection.as_ref() {
+            if let (Some(base), Some(layer)) =
+                (self.stroke_undo_base.as_ref(), self.stack.by_id_mut(id))
+            {
+                if let Some(original) = base.by_id(id) {
+                    for y in dirty.y..dirty.bottom() {
+                        for x in dirty.x..dirty.right() {
+                            if sel.coverage_at(x, y) <= 0.0 {
+                                let (lx, ly) = (x - offset.0, y - offset.1);
+                                layer.pixels.set(lx, ly, original.pixels.get(lx, ly));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.replace_last = Some((x, y));
+        dirty
+    }
+
+    /// Finish a Color Replacement stroke, recording it as one undo step.
+    pub fn end_replace(&mut self) -> bool {
+        if self.replacer.take().is_none() {
+            return false;
+        }
+        self.replace_last = None;
+        self.stroke_undo_base = None;
+        self.commit("Color Replacement Tool");
+        true
+    }
+
+    /// Abandon a Color Replacement stroke, restoring what it changed.
+    pub fn cancel_replace(&mut self) {
+        self.replacer = None;
+        self.replace_last = None;
+        if let Some(base) = self.stroke_undo_base.take() {
+            self.stack = base;
+        }
     }
 
     /// Abandon the in-progress stroke without applying it.
@@ -1538,6 +1746,64 @@ mod tests {
         let mask = layer.mask.as_ref().expect("the mask was dropped");
         assert_eq!(mask.width(), layer.pixels.width());
         assert_eq!(mask.height(), layer.pixels.height());
+    }
+
+    #[test]
+    fn a_replacement_stroke_recolours_from_the_first_dab() {
+        // The bug this guards: begin_replace used to apply its opening dab with
+        // the *reference* colour rather than the replacement. In Color mode a
+        // grey reference is a no-op, so those pixels were marked done and the
+        // colour the user picked never reached them.
+        let mut d = Document::new(60, 40, Rgba8::new(120, 120, 120, 255));
+        d.commit("Setup");
+
+        let brush = Brush { size: 30.0, hardness: 1.0, ..Brush::default() };
+        let options = ReplaceOptions {
+            mode: crate::replace::ReplaceMode::Color,
+            sampling: ReplaceSampling::Continuous,
+            limits: crate::replace::ReplaceLimits::Discontiguous,
+            tolerance: 100,
+            antialias: false,
+        };
+        let red = Rgba8::new(220, 30, 30, 255);
+        assert!(d.begin_replace(&brush, options, None, red, 30.0, 20.0, 1.0));
+        d.end_replace();
+
+        let px = d.composite().get(30, 20);
+        assert!(px.r > px.g + 20, "the very first dab did not recolour: {:?}", px);
+    }
+
+    #[test]
+    fn a_replacement_stroke_is_one_undo_step() {
+        let mut d = Document::new(60, 40, Rgba8::new(120, 120, 120, 255));
+        d.commit("Setup");
+        let before = d.composite().get(30, 20);
+
+        let brush = Brush { size: 24.0, hardness: 1.0, ..Brush::default() };
+        let options = ReplaceOptions { tolerance: 100, ..ReplaceOptions::default() };
+        d.begin_replace(&brush, options, None, Rgba8::new(30, 30, 220, 255), 20.0, 20.0, 1.0);
+        d.extend_replace(&brush, 30.0, 20.0, 1.0, Rgba8::new(30, 30, 220, 255));
+        d.extend_replace(&brush, 40.0, 20.0, 1.0, Rgba8::new(30, 30, 220, 255));
+        d.end_replace();
+        assert_ne!(d.composite().get(30, 20), before);
+
+        assert!(d.undo(), "nothing to undo");
+        assert_eq!(d.composite().get(30, 20), before, "one undo did not restore the stroke");
+    }
+
+    #[test]
+    fn cancelling_a_replacement_stroke_restores_the_layer() {
+        let mut d = Document::new(40, 40, Rgba8::new(120, 120, 120, 255));
+        d.commit("Setup");
+        let before = d.composite().get(20, 20);
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        let options = ReplaceOptions { tolerance: 100, ..ReplaceOptions::default() };
+        d.begin_replace(&brush, options, None, Rgba8::new(30, 220, 30, 255), 20.0, 20.0, 1.0);
+        assert_ne!(d.composite().get(20, 20), before, "the stroke did nothing to cancel");
+
+        d.cancel_replace();
+        assert_eq!(d.composite().get(20, 20), before, "cancel left the change behind");
     }
 
     #[test]

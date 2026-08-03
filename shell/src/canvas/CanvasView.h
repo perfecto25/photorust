@@ -76,6 +76,10 @@ public:
     void setHealType(HealType type);
     HealType healType() const { return m_healType; }
 
+    /// Route strokes through the Color Replacement path, which recolours the
+    /// layer per dab instead of compositing a stroke at the end.
+    void setReplaceMode(bool active);
+
     /// Which healing-group variant is active.
     void setHealingType(HealingType type);
     HealingType healingType() const { return m_healingType; }
@@ -87,8 +91,12 @@ public:
 
     /// Red Eye options: CS6's Pupil Size and Darken Amount, both 0-100.
     void setRedEyeOptions(int pupilSize, int darkenAmount);
-    /// Content-Aware Move: Extend duplicates the region instead of moving it.
-    void setContentAwareExtend(bool extend) { m_camExtend = extend; }
+    /// Content-Aware Move options, from CS6's bar: Extend duplicates instead
+    /// of moving, Structure (1-7) sets how strictly the fill follows edges,
+    /// Color (0-10) how far the moved pixels adapt to their new surroundings,
+    /// and Sample All Layers reads the composite rather than one layer.
+    void setContentAwareMoveOptions(bool extend, int structure, int color,
+                                    bool sampleAllLayers);
 
     /// Apply the pending Patch / Content-Aware Move drag. Nothing happens
     /// unless a region has been dragged.
@@ -449,6 +457,10 @@ private:
     /// CS6's default healing type.
     HealType m_healType = HealType::ContentAware;
     HealingType m_healingType = HealingType::SpotHealing;
+    /// True while the Color Replacement Brush is the active tool, and while one
+    /// of its strokes is in progress.
+    bool m_replaceMode = false;
+    bool m_replacing = false;
     /// The Healing Brush's Alt-clicked source, in document coordinates.
     QPointF m_healSource;
     bool m_healSourceValid = false;
@@ -460,6 +472,9 @@ private:
     QPointF m_regionDragStart;
     QPointF m_regionDragNow;
     bool m_camExtend = false;
+    int m_camStructure = CamDefaults::kStructure;
+    int m_camColor = CamDefaults::kColor;
+    bool m_camSampleAllLayers = false;
     bool m_patchContentAware = false;
     bool m_patchDestination = false;
     bool m_patchTransparent = false;
