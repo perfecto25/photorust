@@ -1,5 +1,8 @@
 # PhotoRust
 
+![Photorust](icons/icon_small.svg)
+
+
 A from-scratch clone of Adobe Photoshop CS6 (the 2012–2013 "Kona" dark UI).
 
 A **C++/Qt QWidgets shell** over a **Rust image engine**, joined by
