@@ -14,7 +14,14 @@
 //! | [`compositor`] | Walks the stack and produces the final image |
 //! | [`selection`] | Coverage-mask selections |
 //! | [`brush`] | Dab-based stroke rendering |
+//! | [`stamp`] | Clone Stamp sampling |
 //! | [`filters`] | Adjustments and convolutions |
+//! | [`gradient`] | Colour ramps and the five gradient shapes |
+//! | [`bucket`] | Flood filling for the Paint Bucket |
+//! | [`focus`] | The Blur and Sharpen tools |
+//! | [`smudge`] | The Smudge tool |
+//! | [`tone`] | The Dodge, Burn and Sponge tools |
+//! | [`path`] | Vector paths for the Pen tool and Paths panel |
 //! | [`history`] | Bounded linear undo |
 //! | [`document`] | One open image; ties the above together |
 //! | [`psd`] | `.psd` parsing and writing |
@@ -32,19 +39,27 @@ pub mod annotation;
 pub mod blend;
 pub mod bridge;
 pub mod brush;
+pub mod bucket;
 pub mod buffer;
 pub mod compositor;
 pub mod document;
 pub mod filters;
+pub mod focus;
+pub mod gradient;
 pub mod healing;
 pub mod history;
 pub mod layer;
 pub mod magnetic;
+pub mod mixer;
+pub mod path;
 pub mod perspective;
 pub mod psd;
 pub mod replace;
 pub mod selection;
 pub mod slice;
+pub mod smudge;
+pub mod stamp;
+pub mod tone;
 pub mod wand;
 
 pub use blend::BlendMode;

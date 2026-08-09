@@ -66,8 +66,13 @@ pub struct Layer {
     /// Clip to the layer below, forming a clipping group.
     pub clipping: bool,
 
+    /// Painting may not change a transparent pixel's alpha — Photoshop's Lock
+    /// Transparent Pixels.
     pub lock_transparency: bool,
+    /// Nothing may edit the layer's pixels at all — Lock Image Pixels. This is
+    /// the lock that makes a layer untouchable by the tools.
     pub lock_pixels: bool,
+    /// The layer may not be moved — Lock Position.
     pub lock_position: bool,
 }
 
@@ -125,6 +130,18 @@ impl Layer {
             self.pixels.width(),
             self.pixels.height(),
         )
+    }
+
+    /// Whether any lock is on, which is what puts the padlock badge on the
+    /// layer's row.
+    pub fn is_locked(&self) -> bool {
+        self.lock_transparency || self.lock_pixels || self.lock_position
+    }
+
+    /// Whether every lock is on — Photoshop's Lock All. A fully locked layer
+    /// cannot be deleted or merged either, not merely painted on.
+    pub fn is_fully_locked(&self) -> bool {
+        self.lock_transparency && self.lock_pixels && self.lock_position
     }
 
     /// Effective alpha multiplier: master opacity times fill opacity.

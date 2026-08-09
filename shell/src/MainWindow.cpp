@@ -6,6 +6,7 @@
 #include "panels/HistoryPanel.h"
 #include "panels/InfoPanel.h"
 #include "panels/LayersPanel.h"
+#include "panels/PathsPanel.h"
 #include "panels/PanelHeader.h"
 #include "shortcuts/CommandRegistry.h"
 #include "tools/ToolIcons.h"
@@ -32,6 +33,7 @@
 #include <QPushButton>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPainter>
 #include <QMessageBox>
 #include <QSpinBox>
 #include <QSignalBlocker>
@@ -139,6 +141,12 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_canvas, &CanvasView::statusMessage, this, [this](const QString &text) {
         statusBar()->showMessage(text, 4000);
     });
+    connect(m_canvas, &CanvasView::mixerLoadChanged, this,
+            &MainWindow::refreshMixerLoadSwatch);
+    connect(m_canvas, &CanvasView::lockedLayerRefused, this,
+            &MainWindow::warnLayerLocked);
+    connect(m_canvas, &CanvasView::cloneSourceRequired, this,
+            &MainWindow::warnCloneSourceRequired);
     connect(m_canvas, &CanvasView::healingSourceRequired, this,
             &MainWindow::warnHealingSourceRequired);
     connect(m_canvas, &CanvasView::colorPicked, this, [this](const QColor &c) {
@@ -152,6 +160,16 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_colorPanel, &ColorPanel::foregroundChanged, this, [this](const QColor &c) {
         m_toolStrip->swatches()->setForeground(c);
     });
+    // "Foreground to Background" means the colours as they are now, so the
+    // options-bar swatch has to follow them.
+    connect(m_colorPanel, &ColorPanel::foregroundChanged, this,
+            [this] { refreshGradientSwatch(); });
+    // The Color panel only reports the foreground; the tool strip's swatch is
+    // where the background pair is edited.
+    connect(m_toolStrip->swatches(), &ColorSwatchWidget::backgroundChanged, this,
+            [this] { refreshGradientSwatch(); });
+    connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged, this,
+            [this] { refreshGradientSwatch(); });
 
     onToolChanged(ToolId::Brush, 0);
     refreshDocumentTabs();
@@ -530,6 +548,9 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     m_brushOpacity = nullptr;
     m_brushFlow = nullptr;
     m_brushTipButton = nullptr;
+    m_mixerLoadButton = nullptr;
+    m_mixerPresetCombo = nullptr;
+    m_gradientSwatch = nullptr;
 
     // Name the active variant, so switching to Elliptical says so.
     auto *label = new QLabel(QStringLiteral("  %1  ").arg(toolVariantName(tool, variant)),
@@ -563,14 +584,6 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
             brushPicker()->popUpUnder(m_brushTipButton);
         });
 
-        m_optionsBar->addWidget(new QLabel(tr("Opacity:"), m_optionsBar));
-        m_brushOpacity = new QSpinBox(m_optionsBar);
-        m_brushOpacity->setRange(0, 100);
-        m_brushOpacity->setValue(100);
-        m_brushOpacity->setSuffix(QStringLiteral("%"));
-        m_brushOpacity->setFixedWidth(64);
-        m_optionsBar->addWidget(m_brushOpacity);
-
         // The Pencil has no Flow in CS6 — it lays whole pixels, so there is
         // nothing to build up gradually — and gains Auto Erase instead.
         const bool pencil = tool == ToolId::Brush
@@ -579,8 +592,26 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         const bool replacing = tool == ToolId::Brush
             && brushReplacesColor(static_cast<BrushType>(variant));
 
+        // The Mixer Brush has no Opacity in CS6: how much paint reaches the
+        // canvas is Wet, Load and Flow's business, and a master opacity on top
+        // of them would mean two controls for one thing.
+        const bool mixing = tool == ToolId::Brush
+            && brushMixesColor(static_cast<BrushType>(variant));
+
+        if (!mixing) {
+            m_optionsBar->addWidget(new QLabel(tr("Opacity:"), m_optionsBar));
+            m_brushOpacity = new QSpinBox(m_optionsBar);
+            m_brushOpacity->setRange(0, 100);
+            m_brushOpacity->setValue(100);
+            m_brushOpacity->setSuffix(QStringLiteral("%"));
+            m_brushOpacity->setFixedWidth(64);
+            m_optionsBar->addWidget(m_brushOpacity);
+        }
+
         if (replacing) {
             addColorReplaceOptions();
+        } else if (mixing) {
+            addMixerOptions();
         } else if (!pencil) {
             m_optionsBar->addWidget(new QLabel(tr("Flow:"), m_optionsBar));
             m_brushFlow = new QSpinBox(m_optionsBar);
@@ -605,12 +636,54 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
             });
         }
 
-        connect(m_brushOpacity, &QSpinBox::valueChanged, this,
-                &MainWindow::pushBrushSettings);
-        connect(m_brushFlow, &QSpinBox::valueChanged, this,
-                &MainWindow::pushBrushSettings);
+        if (m_brushOpacity) {
+            connect(m_brushOpacity, &QSpinBox::valueChanged, this,
+                    &MainWindow::pushBrushSettings);
+        }
+        if (m_brushFlow) {
+            connect(m_brushFlow, &QSpinBox::valueChanged, this,
+                    &MainWindow::pushBrushSettings);
+        }
 
         pushBrushSettings();
+
+        // Neither do the toning tools: Exposure (or the Sponge's Flow) is the
+        // only strength they have.
+        if (tool == ToolId::Dodge) {
+            const QString unused = tr("Not used by this tool; see Exposure");
+            if (m_brushOpacity) {
+                m_brushOpacity->setEnabled(false);
+                m_brushOpacity->setToolTip(unused);
+            }
+            if (m_brushFlow) {
+                m_brushFlow->setEnabled(false);
+                m_brushFlow->setToolTip(unused);
+            }
+            addToneOptions(static_cast<ToneTool>(variant));
+        }
+
+        // None of the Blur button's three has Opacity or Flow in CS6 — how much
+        // they do is Strength's business — so they are disabled rather than left
+        // there doing nothing, the same treatment the healing brushes get.
+        if (tool == ToolId::Blur) {
+            const QString unused = tr("Not used by this tool; see Strength");
+            if (m_brushOpacity) {
+                m_brushOpacity->setEnabled(false);
+                m_brushOpacity->setToolTip(unused);
+            }
+            if (m_brushFlow) {
+                m_brushFlow->setEnabled(false);
+                m_brushFlow->setToolTip(unused);
+            }
+            addBlurOptions(static_cast<BlurTool>(variant));
+        }
+
+        // The Clone Stamp adds CS6's Aligned and Sample after the brush
+        // controls — the stroke is an ordinary one, so everything above applies
+        // to it unchanged.
+        if (tool == ToolId::CloneStamp) {
+            addCloneOptions();
+        }
 
         // The Spot Healing Brush adds CS6's Type buttons after the brush
         // controls. Opacity and Flow have no meaning for it — the region is
@@ -696,6 +769,21 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         m_optionsBar->addWidget(new QLabel(hint, m_optionsBar));
     } else if (tool == ToolId::Healing) {
         addHealingRegionOptions(static_cast<HealingType>(variant));
+    } else if (tool == ToolId::Gradient) {
+        if (static_cast<GradientTool>(variant) == GradientTool::PaintBucket) {
+            addBucketOptions();
+        } else {
+            addGradientOptions();
+        }
+    } else if (tool == ToolId::Pen) {
+        addPenOptions(static_cast<PenTool>(variant));
+    } else if (tool == ToolId::PathSelect) {
+        m_optionsBar->addWidget(new QLabel(
+            static_cast<PathSelectTool>(variant) == PathSelectTool::PathSelection
+                ? tr("Drag a subpath to move it")
+                : tr("Drag an anchor or handle to reshape the path. Alt+drag a handle "
+                     "breaks it free of its smooth point"),
+            m_optionsBar));
     } else if (tool == ToolId::Crop) {
         addCropOptions(static_cast<CropType>(variant));
     } else if (tool == ToolId::Eyedropper
@@ -1018,6 +1106,19 @@ void MainWindow::pushPatchOptions()
     m_canvas->setPatchOptions(m_patchContentAware, m_patchDestination, m_patchTransparent);
 }
 
+void MainWindow::warnLayerLocked()
+{
+    // Photoshop's own wording, naming the tool that was refused, with its error
+    // icon. A modal alert rather than a status-bar line, because the click the
+    // user just made did nothing at all.
+    const QString tool = toolVariantName(m_activeTool, m_activeVariant).toLower();
+    QMessageBox box(QMessageBox::Critical, tr("PhotoRust"),
+                    tr("Could not use the %1 because the layer is locked.").arg(tool),
+                    QMessageBox::Ok, this);
+    unsqueezeButtons(&box);
+    box.exec();
+}
+
 void MainWindow::warnHealingSourceRequired()
 {
     // Photoshop's own wording and its error icon. The Healing Brush cannot
@@ -1181,6 +1282,793 @@ void MainWindow::pushColorReplaceOptions()
     const int tolerance = qRound(m_replaceTolerance * 255.0 / 100.0);
     m_engine->setReplaceOptions(m_replaceMode, m_replaceSampling, m_replaceLimits, tolerance,
                                 m_replaceAntialias);
+}
+
+void MainWindow::addMixerOptions()
+{
+    // CS6's bar, left to right after the tip: the load swatch with its Load and
+    // Clean menu, the two after-each-stroke toggles, the Wet/Load/Mix preset
+    // menu, the four sliders themselves, and Sample All Layers.
+    m_mixerLoadButton = new QToolButton(m_optionsBar);
+    m_mixerLoadButton->setPopupMode(QToolButton::InstantPopup);
+    m_mixerLoadButton->setIconSize(QSize(20, 20));
+    m_mixerLoadButton->setToolTip(tr("The paint currently on the brush"));
+
+    auto *loadMenu = new QMenu(m_mixerLoadButton);
+    QAction *loadPaint = loadMenu->addAction(tr("Load Brush"));
+    loadPaint->setToolTip(tr("Fill the brush with the foreground colour"));
+    QAction *cleanBrush = loadMenu->addAction(tr("Clean Brush"));
+    cleanBrush->setToolTip(tr("Empty the brush, so a wet one smears without adding "
+                              "colour of its own"));
+    m_mixerLoadButton->setMenu(loadMenu);
+    m_optionsBar->addWidget(m_mixerLoadButton);
+    connect(loadPaint, &QAction::triggered, this, [this] {
+        if (m_engine) {
+            m_engine->loadMixerBrush();
+            refreshMixerLoadSwatch();
+        }
+    });
+    connect(cleanBrush, &QAction::triggered, this, [this] {
+        if (m_engine) {
+            m_engine->cleanMixerBrush();
+            refreshMixerLoadSwatch();
+        }
+    });
+    refreshMixerLoadSwatch();
+
+    struct Toggle {
+        QString label;
+        QString tip;
+        bool *value;
+    };
+    const Toggle toggles[] = {
+        {tr("Load After Stroke"), tr("Refill the brush from the foreground colour when "
+                                     "each stroke ends"),
+         &m_mixerLoadAfterStroke},
+        {tr("Clean After Stroke"), tr("Empty the brush when each stroke ends, so the "
+                                      "next one starts with no paint of its own"),
+         &m_mixerCleanAfterStroke},
+    };
+    for (const Toggle &toggle : toggles) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setText(toggle.label);
+        button->setToolTip(toggle.tip);
+        button->setStatusTip(toggle.tip);
+        button->setChecked(*toggle.value);
+        m_optionsBar->addWidget(button);
+
+        bool *slot = toggle.value;
+        connect(button, &QToolButton::toggled, this, [this, slot](bool on) {
+            *slot = on;
+            pushMixerOptions();
+        });
+    }
+
+    m_optionsBar->addSeparator();
+
+    m_mixerPresetCombo = new QComboBox(m_optionsBar);
+    for (const MixerPreset &preset : mixerPresets()) {
+        m_mixerPresetCombo->addItem(tr(preset.name));
+    }
+    m_mixerPresetCombo->setToolTip(tr("Ready-made Wet, Load and Mix combinations"));
+    m_optionsBar->addWidget(m_mixerPresetCombo);
+    syncMixerPresetCombo();
+    connect(m_mixerPresetCombo, &QComboBox::activated, this, [this](int index) {
+        const QList<MixerPreset> &presets = mixerPresets();
+        if (index < 0 || index >= presets.size() || presets[index].wet < 0) {
+            // Custom carries no values: choosing it changes nothing, it is only
+            // what the menu falls back to once a slider is moved by hand.
+            return;
+        }
+        m_mixerWet = presets[index].wet;
+        m_mixerLoad = presets[index].load;
+        m_mixerMix = presets[index].mix;
+        // The sliders are rebuilt from the new values rather than updated one by
+        // one, which keeps this from having to hold three more pointers.
+        populateOptionsBar(m_activeTool, m_activeVariant);
+    });
+
+    struct Field {
+        QString label;
+        QString tip;
+        int *value;
+    };
+    const Field fields[] = {
+        {tr("Wet:"), tr("How wet the canvas is: at 0 the paint sits on top like an "
+                        "ordinary brush, higher and the colour already there joins in"),
+         &m_mixerWet},
+        {tr("Load:"), tr("How much paint the brush holds. It runs down as the stroke "
+                         "goes, and a wet brush that has run out only smears"),
+         &m_mixerLoad},
+        {tr("Mix:"), tr("The balance between the canvas colour and the brush's own: at "
+                        "100% the stroke is a pure smear"),
+         &m_mixerMix},
+        {tr("Flow:"), tr("How fast each dab deposits"), &m_mixerFlow},
+    };
+    QSpinBox *spins[4] = {};
+    int index = 0;
+    for (const Field &field : fields) {
+        m_optionsBar->addWidget(new QLabel(field.label, m_optionsBar));
+        auto *spin = new QSpinBox(m_optionsBar);
+        spin->setRange(0, 100);
+        spin->setValue(*field.value);
+        spin->setSuffix(QStringLiteral("%"));
+        spin->setFixedWidth(64);
+        spin->setToolTip(field.tip);
+        m_optionsBar->addWidget(spin);
+        spins[index++] = spin;
+
+        int *slot = field.value;
+        connect(spin, &QSpinBox::valueChanged, this, [this, slot](int v) {
+            *slot = v;
+            pushMixerOptions();
+            syncMixerPresetCombo();
+        });
+    }
+
+    // Load and Mix have no say while the canvas is dry: a dry brush paints its
+    // own paint, never runs out and has nothing to mix with. CS6 greys them out
+    // rather than letting them look effective.
+    const auto followWet = [spins](int wet) {
+        spins[1]->setEnabled(wet > 0);
+        spins[2]->setEnabled(wet > 0);
+    };
+    followWet(m_mixerWet);
+    connect(spins[0], &QSpinBox::valueChanged, this,
+            [followWet](int wet) { followWet(wet); });
+
+    m_optionsBar->addSeparator();
+
+    auto *sampleAll = new QCheckBox(tr("Sample All Layers"), m_optionsBar);
+    sampleAll->setChecked(m_mixerSampleAllLayers);
+    sampleAll->setToolTip(tr("Pick colour up from every visible layer. The paint still "
+                             "lands on the active one"));
+    m_optionsBar->addWidget(sampleAll);
+    connect(sampleAll, &QCheckBox::toggled, this, [this](bool on) {
+        m_mixerSampleAllLayers = on;
+        pushMixerOptions();
+    });
+
+    pushMixerOptions();
+}
+
+void MainWindow::pushMixerOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->setMixerOptions(m_mixerWet, m_mixerLoad, m_mixerMix, m_mixerFlow,
+                              m_mixerSampleAllLayers, m_mixerLoadAfterStroke,
+                              m_mixerCleanAfterStroke);
+}
+
+void MainWindow::refreshMixerLoadSwatch()
+{
+    if (!m_mixerLoadButton || !m_engine) {
+        return;
+    }
+    const QColor paint = m_engine->mixerLoadColor();
+
+    // A clean brush is drawn as the checkerboard alone, so "no paint" reads
+    // differently from "loaded with white".
+    QPixmap swatch(20, 20);
+    QPainter painter(&swatch);
+    const QColor checks[2] = {QColor(0xcc, 0xcc, 0xcc), QColor(0xff, 0xff, 0xff)};
+    for (int y = 0; y < 20; y += 5) {
+        for (int x = 0; x < 20; x += 5) {
+            painter.fillRect(x, y, 5, 5, checks[((x / 5) + (y / 5)) % 2]);
+        }
+    }
+    painter.fillRect(swatch.rect(), paint);
+    painter.setPen(QColor(0x1a, 0x1a, 0x1a));
+    painter.drawRect(0, 0, 19, 19);
+    painter.end();
+
+    m_mixerLoadButton->setIcon(QIcon(swatch));
+}
+
+void MainWindow::syncMixerPresetCombo()
+{
+    if (!m_mixerPresetCombo) {
+        return;
+    }
+    const QList<MixerPreset> &presets = mixerPresets();
+    int match = 0; // Custom, unless one of the presets matches exactly.
+    for (int i = 0; i < presets.size(); ++i) {
+        if (presets[i].wet == m_mixerWet && presets[i].load == m_mixerLoad
+            && presets[i].mix == m_mixerMix) {
+            match = i;
+            break;
+        }
+    }
+    const QSignalBlocker blocker(m_mixerPresetCombo);
+    m_mixerPresetCombo->setCurrentIndex(match);
+}
+
+void MainWindow::addToneOptions(ToneTool tool)
+{
+    m_optionsBar->addSeparator();
+
+    const bool sponge = tool == ToneTool::Sponge;
+
+    // Dodge and Burn choose a tonal band; the Sponge chooses a direction. CS6
+    // puts each in the same place on the bar.
+    m_optionsBar->addWidget(new QLabel(sponge ? tr("Mode:") : tr("Range:"), m_optionsBar));
+    auto *choice = new QComboBox(m_optionsBar);
+    struct Entry {
+        QString label;
+        int value;
+        QString tip;
+    };
+    const QList<Entry> entries = sponge
+        ? QList<Entry>{{tr("Desaturate"), int(SpongeMode::Desaturate),
+                        tr("Drain colour toward grey")},
+                       {tr("Saturate"), int(SpongeMode::Saturate),
+                        tr("Lift colour away from grey")}}
+        : QList<Entry>{{tr("Shadows"), int(ToneRange::Shadows),
+                        tr("Work hardest on the dark end of the scale")},
+                       {tr("Midtones"), int(ToneRange::Midtones),
+                        tr("Work hardest on the middle of the scale")},
+                       {tr("Highlights"), int(ToneRange::Highlights),
+                        tr("Work hardest on the bright end of the scale")}};
+    for (const Entry &entry : entries) {
+        choice->addItem(entry.label, entry.value);
+        choice->setItemData(choice->count() - 1, entry.tip, Qt::ToolTipRole);
+        if (entry.value == (sponge ? m_spongeMode : m_toneRange)) {
+            choice->setCurrentIndex(choice->count() - 1);
+        }
+    }
+    m_optionsBar->addWidget(choice);
+    connect(choice, &QComboBox::currentIndexChanged, this, [this, choice, sponge](int index) {
+        (sponge ? m_spongeMode : m_toneRange) = choice->itemData(index).toInt();
+        pushToneOptions();
+    });
+
+    // One number under two names, exactly as CS6 labels it.
+    m_optionsBar->addWidget(new QLabel(sponge ? tr("Flow:") : tr("Exposure:"), m_optionsBar));
+    auto *amount = new QSpinBox(m_optionsBar);
+    amount->setRange(0, 100);
+    amount->setValue(m_toneAmount);
+    amount->setSuffix(QStringLiteral("%"));
+    amount->setFixedWidth(64);
+    amount->setToolTip(sponge
+                           ? tr("How much colour each dab moves. Dwelling on one spot goes "
+                                "on moving it")
+                           : tr("How much each dab lightens or darkens. Dwelling on one "
+                                "spot goes on working it"));
+    m_optionsBar->addWidget(amount);
+    connect(amount, &QSpinBox::valueChanged, this, [this](int v) {
+        m_toneAmount = v;
+        pushToneOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    if (sponge) {
+        auto *vibrance = new QCheckBox(tr("Vibrance"), m_optionsBar);
+        vibrance->setChecked(m_toneVibrance);
+        vibrance->setToolTip(tr("Ease off on colour that is already vivid, so the flat "
+                                "parts of an image lift without the vivid parts clipping"));
+        m_optionsBar->addWidget(vibrance);
+        connect(vibrance, &QCheckBox::toggled, this, [this](bool on) {
+            m_toneVibrance = on;
+            pushToneOptions();
+        });
+    } else {
+        auto *protect = new QCheckBox(tr("Protect Tones"), m_optionsBar);
+        protect->setChecked(m_toneProtectTones);
+        protect->setToolTip(tr("Change brightness and keep the pixel's own colour, rather "
+                               "than scaling its channels — which is what bleaches a "
+                               "dodge and muddies a burn"));
+        m_optionsBar->addWidget(protect);
+        connect(protect, &QCheckBox::toggled, this, [this](bool on) {
+            m_toneProtectTones = on;
+            pushToneOptions();
+        });
+    }
+
+    pushToneOptions();
+}
+
+void MainWindow::pushToneOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->setToneOptions(m_toneAmount, m_toneRange, m_spongeMode, m_toneProtectTones,
+                             m_toneVibrance);
+}
+
+void MainWindow::addBlurOptions(BlurTool tool)
+{
+    m_optionsBar->addSeparator();
+
+    m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    // CS6 offers a cut-down list here, not all 27: see `blurModes()`.
+    for (const auto &entry : blurModes()) {
+        mode->addItem(entry.first, entry.second);
+        if (entry.second == m_blurMode) {
+            mode->setCurrentIndex(mode->count() - 1);
+        }
+    }
+    m_optionsBar->addWidget(mode);
+    connect(mode, &QComboBox::currentIndexChanged, this, [this, mode](int index) {
+        m_blurMode = mode->itemData(index).toInt();
+        pushBlurOptions();
+    });
+
+    m_optionsBar->addWidget(new QLabel(tr("Strength:"), m_optionsBar));
+    auto *strength = new QSpinBox(m_optionsBar);
+    strength->setRange(0, 100);
+    strength->setValue(m_blurStrength);
+    strength->setSuffix(QStringLiteral("%"));
+    strength->setFixedWidth(64);
+    switch (tool) {
+    case BlurTool::Blur:
+        strength->setToolTip(tr("How much each dab softens. Dwelling on one spot goes on "
+                                "softening it"));
+        break;
+    case BlurTool::Sharpen:
+        strength->setToolTip(tr("How much each dab sharpens. Dwelling on one spot goes on "
+                                "sharpening it"));
+        break;
+    case BlurTool::Smudge:
+        strength->setToolTip(tr("How much of what the finger is carrying each dab lays "
+                                "down. At 100% it drags the pixels it started on the "
+                                "whole way"));
+        break;
+    }
+    m_optionsBar->addWidget(strength);
+    connect(strength, &QSpinBox::valueChanged, this, [this](int v) {
+        m_blurStrength = v;
+        pushBlurOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    auto *sampleAll = new QCheckBox(tr("Sample All Layers"), m_optionsBar);
+    sampleAll->setChecked(m_blurSampleAllLayers);
+    sampleAll->setToolTip(tr("Work on what the whole visible image shows. The result "
+                             "still lands on the active layer"));
+    m_optionsBar->addWidget(sampleAll);
+    connect(sampleAll, &QCheckBox::toggled, this, [this](bool on) {
+        m_blurSampleAllLayers = on;
+        pushBlurOptions();
+    });
+
+    // Each of the two has one checkbox of its own, which CS6 shows only for it.
+    if (tool == BlurTool::Sharpen) {
+        auto *protect = new QCheckBox(tr("Protect Detail"), m_optionsBar);
+        protect->setChecked(m_blurProtectDetail);
+        protect->setToolTip(tr("Hold each pixel inside the range its own neighbours span, "
+                               "so repeated passes cannot throw haloes or blown speckle"));
+        m_optionsBar->addWidget(protect);
+        connect(protect, &QCheckBox::toggled, this, [this](bool on) {
+            m_blurProtectDetail = on;
+            pushBlurOptions();
+        });
+    } else if (tool == BlurTool::Smudge) {
+        auto *finger = new QCheckBox(tr("Finger Painting"), m_optionsBar);
+        finger->setChecked(m_blurFingerPainting);
+        finger->setToolTip(tr("Start each stroke with the foreground colour on the finger, "
+                              "so it drags paint in rather than what was already there"));
+        m_optionsBar->addWidget(finger);
+        connect(finger, &QCheckBox::toggled, this, [this](bool on) {
+            m_blurFingerPainting = on;
+            pushBlurOptions();
+        });
+    }
+
+    pushBlurOptions();
+}
+
+void MainWindow::pushBlurOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->setFocusOptions(m_blurStrength, m_blurMode, m_blurSampleAllLayers,
+                              m_blurProtectDetail, m_blurFingerPainting);
+}
+
+void MainWindow::addBucketOptions()
+{
+    // CS6's bar: Fill, Mode, Opacity, Tolerance, then Anti-alias, Contiguous and
+    // All Layers.
+    m_optionsBar->addWidget(new QLabel(tr("Fill:"), m_optionsBar));
+    auto *fill = new QComboBox(m_optionsBar);
+    fill->addItem(tr("Foreground"), int(BucketFill::Foreground));
+    fill->addItem(tr("Pattern"), int(BucketFill::Pattern));
+    // Patterns are a sub-system of their own and there are none to fill with, so
+    // the entry is listed for the bar's shape and disabled — the same treatment
+    // the Patch tool's Use Pattern button gets.
+    fill->setItemData(1, false, Qt::UserRole - 1);
+    fill->setItemData(1, tr("Not implemented yet: there are no patterns to fill with"),
+                      Qt::ToolTipRole);
+    m_optionsBar->addWidget(fill);
+
+    m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    mode->addItems(m_engine->blendModeNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts));
+    mode->setCurrentIndex(m_bucketMode);
+    m_optionsBar->addWidget(mode);
+    connect(mode, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_bucketMode = index;
+        pushBucketOptions();
+    });
+
+    struct Field {
+        QString label;
+        QString suffix;
+        int max;
+        QString tip;
+        int *value;
+    };
+    const Field fields[] = {
+        {tr("Opacity:"), QStringLiteral("%"), 100, tr("How strongly the fill is applied"),
+         &m_bucketOpacity},
+        {tr("Tolerance:"), QString(), 255, tr("How far a pixel may differ from the one "
+                                              "clicked and still be filled — the same "
+                                              "scale as the Magic Wand's"),
+         &m_bucketTolerance},
+    };
+    for (const Field &field : fields) {
+        m_optionsBar->addWidget(new QLabel(field.label, m_optionsBar));
+        auto *spin = new QSpinBox(m_optionsBar);
+        spin->setRange(0, field.max);
+        spin->setValue(*field.value);
+        spin->setSuffix(field.suffix);
+        spin->setFixedWidth(64);
+        spin->setToolTip(field.tip);
+        m_optionsBar->addWidget(spin);
+
+        int *slot = field.value;
+        connect(spin, &QSpinBox::valueChanged, this, [this, slot](int v) {
+            *slot = v;
+            pushBucketOptions();
+        });
+    }
+
+    m_optionsBar->addSeparator();
+
+    struct Toggle {
+        QString label;
+        QString tip;
+        bool *value;
+    };
+    const Toggle toggles[] = {
+        {tr("Anti-alias"), tr("Soften the edge of the filled area"), &m_bucketAntialias},
+        {tr("Contiguous"), tr("Fill only the area joined to the pixel clicked. Off, every "
+                              "matching pixel in the layer is filled"),
+         &m_bucketContiguous},
+        {tr("All Layers"), tr("Decide what matches from the whole visible image. The fill "
+                              "still lands on the active layer"),
+         &m_bucketAllLayers},
+    };
+    for (const Toggle &toggle : toggles) {
+        auto *box = new QCheckBox(toggle.label, m_optionsBar);
+        box->setChecked(*toggle.value);
+        box->setToolTip(toggle.tip);
+        m_optionsBar->addWidget(box);
+
+        bool *slot = toggle.value;
+        connect(box, &QCheckBox::toggled, this, [this, slot](bool on) {
+            *slot = on;
+            pushBucketOptions();
+        });
+    }
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(
+        new QLabel(tr("Click to fill an area with the foreground colour"), m_optionsBar));
+
+    pushBucketOptions();
+}
+
+void MainWindow::pushBucketOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->setBucketOptions(m_bucketMode, m_bucketOpacity, m_bucketTolerance,
+                               m_bucketAntialias, m_bucketContiguous, m_bucketAllLayers);
+}
+
+void MainWindow::addGradientOptions()
+{
+    // CS6's bar: the gradient swatch and its preset menu, the five type buttons,
+    // Mode, Opacity, then Reverse, Dither and Transparency.
+    m_gradientSwatch = new QToolButton(m_optionsBar);
+    m_gradientSwatch->setObjectName(QStringLiteral("gradientSwatch"));
+    m_gradientSwatch->setPopupMode(QToolButton::InstantPopup);
+    m_gradientSwatch->setIconSize(QSize(64, 16));
+    m_gradientSwatch->setToolTip(tr("Click to choose a gradient"));
+
+    auto *presets = new QMenu(m_gradientSwatch);
+    const QStringList names =
+        m_engine->gradientPresetNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    if (m_gradientPreset.isEmpty() && !names.isEmpty()) {
+        m_gradientPreset = names.first();
+    }
+    for (const QString &name : names) {
+        // The preview comes from the engine, so what the menu shows and what the
+        // tool paints cannot drift apart.
+        QAction *action = presets->addAction(QIcon(QPixmap::fromImage(
+                                                m_engine->gradientPreview(name, 64, 16))),
+                                            name);
+        action->setCheckable(true);
+        action->setChecked(name == m_gradientPreset);
+        connect(action, &QAction::triggered, this, [this, name] {
+            m_gradientPreset = name;
+            refreshGradientSwatch();
+            pushGradientOptions();
+        });
+    }
+    m_gradientSwatch->setMenu(presets);
+    m_optionsBar->addWidget(m_gradientSwatch);
+    refreshGradientSwatch();
+
+    m_optionsBar->addSeparator();
+
+    auto *types = new QButtonGroup(m_optionsBar);
+    types->setExclusive(true);
+    for (GradientType type : {GradientType::Linear, GradientType::Radial,
+                              GradientType::Angle, GradientType::Reflected,
+                              GradientType::Diamond}) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setIconSize(QSize(20, 20));
+        button->setIcon(ToolIcons::fromSvgBody(ToolIcons::gradientTypeSvg(type),
+                                               QColor(0x30, 0x30, 0x30)));
+        button->setToolTip(gradientTypeName(type));
+        button->setStatusTip(gradientTypeName(type));
+        button->setChecked(int(type) == m_gradientType);
+        types->addButton(button, int(type));
+        m_optionsBar->addWidget(button);
+    }
+    connect(types, &QButtonGroup::idClicked, this, [this](int id) {
+        m_gradientType = id;
+        pushGradientOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    // The engine owns the blend-mode list and its order, exactly as it does for
+    // the Layers panel.
+    mode->addItems(m_engine->blendModeNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts));
+    mode->setCurrentIndex(m_gradientMode);
+    m_optionsBar->addWidget(mode);
+    connect(mode, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_gradientMode = index;
+        pushGradientOptions();
+    });
+
+    m_optionsBar->addWidget(new QLabel(tr("Opacity:"), m_optionsBar));
+    auto *opacity = new QSpinBox(m_optionsBar);
+    opacity->setRange(0, 100);
+    opacity->setValue(m_gradientOpacity);
+    opacity->setSuffix(QStringLiteral("%"));
+    opacity->setFixedWidth(64);
+    m_optionsBar->addWidget(opacity);
+    connect(opacity, &QSpinBox::valueChanged, this, [this](int v) {
+        m_gradientOpacity = v;
+        pushGradientOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    struct Toggle {
+        QString label;
+        QString tip;
+        bool *value;
+    };
+    const Toggle toggles[] = {
+        {tr("Reverse"), tr("Draw the ramp end to start"), &m_gradientReverse},
+        {tr("Dither"), tr("Break up banding with a little noise"), &m_gradientDither},
+        {tr("Transparency"), tr("Honour the gradient's own opacity. Off, it is drawn "
+                                "solid"),
+         &m_gradientTransparency},
+    };
+    for (const Toggle &toggle : toggles) {
+        auto *box = new QCheckBox(toggle.label, m_optionsBar);
+        box->setChecked(*toggle.value);
+        box->setToolTip(toggle.tip);
+        m_optionsBar->addWidget(box);
+
+        bool *slot = toggle.value;
+        connect(box, &QCheckBox::toggled, this, [this, slot](bool on) {
+            *slot = on;
+            pushGradientOptions();
+        });
+    }
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(
+        tr("Drag to set the gradient's direction and length    Shift constrains the angle"),
+        m_optionsBar));
+
+    pushGradientOptions();
+}
+
+void MainWindow::pushGradientOptions()
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->setGradientOptions(m_gradientPreset, m_gradientType, m_gradientMode,
+                                 m_gradientOpacity, m_gradientReverse, m_gradientDither,
+                                 m_gradientTransparency);
+}
+
+void MainWindow::refreshGradientSwatch()
+{
+    if (!m_gradientSwatch || !m_engine) {
+        return;
+    }
+    m_gradientSwatch->setIcon(
+        QIcon(QPixmap::fromImage(m_engine->gradientPreview(m_gradientPreset, 64, 16))));
+    m_gradientSwatch->setToolTip(tr("%1 — click to choose a gradient").arg(m_gradientPreset));
+}
+
+void MainWindow::addPenOptions(PenTool tool)
+{
+    m_optionsBar->addSeparator();
+
+    if (tool == PenTool::Pen) {
+        auto *autoAddDelete = new QCheckBox(tr("Auto Add/Delete"), m_optionsBar);
+        autoAddDelete->setChecked(m_penAutoAddDelete);
+        autoAddDelete->setToolTip(tr("Hovering the finished part of the path adds an anchor "
+                                     "over a segment, or removes one under the cursor, "
+                                     "without switching tools"));
+        m_optionsBar->addWidget(autoAddDelete);
+        connect(autoAddDelete, &QCheckBox::toggled, this, [this](bool on) {
+            m_penAutoAddDelete = on;
+            pushPenOptions();
+        });
+
+        auto *rubberBand = new QCheckBox(tr("Rubber Band"), m_optionsBar);
+        rubberBand->setChecked(m_penRubberBand);
+        rubberBand->setToolTip(tr("Preview the next segment from the last anchor to the "
+                                  "cursor, before it is placed"));
+        m_optionsBar->addWidget(rubberBand);
+        connect(rubberBand, &QCheckBox::toggled, this, [this](bool on) {
+            m_penRubberBand = on;
+            pushPenOptions();
+        });
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(new QLabel(
+            tr("Click for a corner, drag for a curve    Click the start to close    "
+               "Enter or double-click to finish"),
+            m_optionsBar));
+    } else if (tool == PenTool::FreeformPen) {
+        m_optionsBar->addWidget(new QLabel(tr("Curve Fit:"), m_optionsBar));
+        auto *fit = new QDoubleSpinBox(m_optionsBar);
+        fit->setRange(0.5, 10.0);
+        fit->setSingleStep(0.5);
+        fit->setSuffix(tr(" px"));
+        fit->setValue(m_freeformTolerance);
+        fit->setFixedWidth(72);
+        fit->setToolTip(tr("How closely the fitted path follows the drag. Lower values keep "
+                           "more anchors"));
+        m_optionsBar->addWidget(fit);
+        connect(fit, &QDoubleSpinBox::valueChanged, this, [this](double v) {
+            m_freeformTolerance = v;
+            m_canvas->setFreeformPenTolerance(v);
+        });
+
+        // CS6's Magnetic checkbox reuses the Magnetic Lasso's edge-snapping.
+        // Wiring it up for a *path* — anchors that snap to edges rather than a
+        // selection mask — is a real chunk of its own and is not included
+        // here.
+        auto *magnetic = new QCheckBox(tr("Magnetic"), m_optionsBar);
+        magnetic->setEnabled(false);
+        magnetic->setToolTip(tr("Not implemented yet"));
+        m_optionsBar->addWidget(magnetic);
+
+        m_optionsBar->addSeparator();
+        m_optionsBar->addWidget(new QLabel(
+            tr("Drag to draw freehand    Drag back to the start to close"), m_optionsBar));
+    } else {
+        const QString hint = tool == PenTool::AddAnchor
+            ? tr("Click a segment of the active path to add an anchor there")
+            : tool == PenTool::DeleteAnchor
+                ? tr("Click an anchor on the active path to remove it")
+                : tr("Click a smooth anchor to make it a corner    Drag a corner to pull out "
+                     "new handles    Drag a handle to break it free");
+        m_optionsBar->addWidget(new QLabel(hint, m_optionsBar));
+    }
+
+    pushPenOptions();
+}
+
+void MainWindow::pushPenOptions()
+{
+    m_canvas->setPenOptions(m_penAutoAddDelete, m_penRubberBand);
+    m_canvas->setFreeformPenTolerance(m_freeformTolerance);
+}
+
+void MainWindow::addCloneOptions()
+{
+    m_optionsBar->addSeparator();
+
+    auto *aligned = new QCheckBox(tr("Aligned"), m_optionsBar);
+    aligned->setChecked(m_cloneAligned);
+    aligned->setToolTip(tr("Keep the sample point travelling with the cursor across "
+                           "strokes. Off, every stroke starts copying from the source "
+                           "point again"));
+    m_optionsBar->addWidget(aligned);
+    connect(aligned, &QCheckBox::toggled, this, [this](bool on) {
+        m_cloneAligned = on;
+        pushCloneOptions();
+    });
+
+    m_optionsBar->addWidget(new QLabel(tr("Sample:"), m_optionsBar));
+    auto *sample = new QComboBox(m_optionsBar);
+    struct Choice {
+        QString label;
+        CloneSampling value;
+        QString tip;
+    };
+    const Choice choices[] = {
+        {tr("Current Layer"), CloneSampling::CurrentLayer,
+         tr("Copy from the active layer alone")},
+        {tr("Current & Below"), CloneSampling::CurrentAndBelow,
+         tr("Copy from the active layer composited with everything beneath it")},
+        {tr("All Layers"), CloneSampling::AllLayers,
+         tr("Copy from the whole visible image")},
+    };
+    for (const Choice &choice : choices) {
+        sample->addItem(choice.label, int(choice.value));
+        sample->setItemData(sample->count() - 1, choice.tip, Qt::ToolTipRole);
+        if (int(choice.value) == m_cloneSampling) {
+            sample->setCurrentIndex(sample->count() - 1);
+        }
+    }
+    m_optionsBar->addWidget(sample);
+    connect(sample, &QComboBox::currentIndexChanged, this, [this, sample](int index) {
+        m_cloneSampling = sample->itemData(index).toInt();
+        pushCloneOptions();
+    });
+
+    m_optionsBar->addSeparator();
+#ifdef Q_OS_MACOS
+    m_optionsBar->addWidget(new QLabel(
+        tr("Option+click to set the source point, then drag to clone"), m_optionsBar));
+#else
+    m_optionsBar->addWidget(new QLabel(
+        tr("Alt+click to set the source point, then drag to clone"), m_optionsBar));
+#endif
+
+    pushCloneOptions();
+}
+
+void MainWindow::pushCloneOptions()
+{
+    m_canvas->setCloneOptions(m_cloneAligned, static_cast<CloneSampling>(m_cloneSampling));
+}
+
+void MainWindow::warnCloneSourceRequired()
+{
+    // Photoshop's own wording, down to the parenthesis.
+#ifdef Q_OS_MACOS
+    const QString message = tr("Could not use the clone stamp because the area to clone "
+                               "has not been defined (Option-click to define a source "
+                               "point).");
+#else
+    const QString message = tr("Could not use the clone stamp because the area to clone "
+                               "has not been defined (Alt-click to define a source "
+                               "point).");
+#endif
+    QMessageBox box(QMessageBox::Critical, tr("PhotoRust"), message, QMessageBox::Ok, this);
+    unsqueezeButtons(&box);
+    box.exec();
 }
 
 void MainWindow::addHealTypeButtons()
@@ -1704,6 +2592,11 @@ void MainWindow::createDocks()
                                        Qt::RightDockWidgetArea,
                                        QStringLiteral("window.layers"));
 
+    // CS6 tabs Layers, Channels and Paths together at the bottom right. There
+    // is no Channels panel yet, so Paths joins Layers alone.
+    m_pathsPanel = new PathsPanel(m_engine, this);
+    QDockWidget *pathsDock = addPanel(tr("Paths"), m_pathsPanel, Qt::RightDockWidgetArea);
+
     // Stack Color/Swatches into one tabbed group, as CS6 ships them.
     if (QDockWidget *colorDock =
             findChild<QDockWidget *>(tr("Color") + QStringLiteral("Dock"))) {
@@ -1713,12 +2606,16 @@ void MainWindow::createDocks()
         }
         colorDock->raise();
     }
+    tabifyDockWidget(layersDock, pathsDock);
+    layersDock->raise();
 
     resizeDocks({historyDock, layersDock}, {220, 380}, Qt::Vertical);
 
     connect(m_layersPanel, &LayersPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
     connect(m_historyPanel, &HistoryPanel::documentChanged,
+            this, &MainWindow::onDocumentChanged);
+    connect(m_pathsPanel, &PathsPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
 }
 
@@ -1813,6 +2710,10 @@ void MainWindow::connectEngine()
     connect(m_engine, &Engine::historyChanged, m_historyPanel, &HistoryPanel::refresh);
     connect(m_engine, &Engine::selectionChanged, m_canvas, &CanvasView::refreshSelection);
     connect(m_engine, &Engine::slicesChanged, m_canvas, &CanvasView::refreshSlices);
+    connect(m_engine, &Engine::pathsChanged, m_pathsPanel, &PathsPanel::refresh);
+    // The Pen and Path Selection tools edit the active path directly, with no
+    // C++-side echo of their own — this is what repaints the overlay.
+    connect(m_engine, &Engine::pathsChanged, m_canvas, [this] { m_canvas->update(); });
     connect(m_engine, &Engine::annotationsChanged, m_canvas, &CanvasView::refreshAnnotations);
     connect(m_engine, &Engine::annotationsChanged, this,
             &MainWindow::updateAnnotationReadouts);
@@ -1828,6 +2729,12 @@ void MainWindow::connectEngine()
     connect(m_engine, &Engine::documentsChanged, this, &MainWindow::refreshDocumentTabs);
     // A document swap changes everything downstream, so treat it like a reload.
     connect(m_engine, &Engine::documentsChanged, this, &MainWindow::onDocumentChanged);
+    // Only a *swap* invalidates the Alt-clicked sample points, which is why this
+    // hangs off the engine's signal and not `onDocumentChanged` — the panels
+    // raise that one for every edit, and adding a layer must not silently
+    // forget where the Clone Stamp was told to sample from.
+    connect(m_engine, &Engine::documentsChanged, m_canvas,
+            &CanvasView::forgetSampleSources);
 }
 
 // ---------------------------------------------------------------- commands --
@@ -2147,12 +3054,30 @@ void MainWindow::onToolChanged(ToolId tool, int variant)
     m_pencilMode = tool == ToolId::Brush && brushIsPencil(static_cast<BrushType>(variant));
     m_canvas->setReplaceMode(tool == ToolId::Brush
                              && brushReplacesColor(static_cast<BrushType>(variant)));
+    m_canvas->setMixerMode(tool == ToolId::Brush
+                           && brushMixesColor(static_cast<BrushType>(variant)));
+    m_canvas->setRetouchMode(tool == ToolId::Blur || tool == ToolId::Dodge);
+    if (m_engine && tool == ToolId::Blur) {
+        // Which of the six strokes is decided in the engine, so the canvas has
+        // one path for both buttons rather than six.
+        m_engine->setFocusTool(variant);
+        pushBlurOptions();
+    } else if (m_engine && tool == ToolId::Dodge) {
+        m_engine->setToneTool(variant);
+        pushToneOptions();
+    }
     if (tool == ToolId::Marquee) {
         m_canvas->setMarqueeType(static_cast<MarqueeType>(variant));
     } else if (tool == ToolId::Lasso) {
         m_canvas->setLassoType(static_cast<LassoType>(variant));
     } else if (tool == ToolId::QuickSelect) {
         m_canvas->setQuickSelectType(static_cast<QuickSelectType>(variant));
+    } else if (tool == ToolId::Gradient) {
+        m_canvas->setGradientTool(static_cast<GradientTool>(variant));
+    } else if (tool == ToolId::Pen) {
+        m_canvas->setPenTool(static_cast<PenTool>(variant));
+    } else if (tool == ToolId::PathSelect) {
+        m_canvas->setPathSelectTool(static_cast<PathSelectTool>(variant));
     } else if (tool == ToolId::Crop) {
         m_canvas->setCropType(static_cast<CropType>(variant));
     } else if (tool == ToolId::Eyedropper) {

@@ -13,6 +13,7 @@ class BrushPresetPicker;
 class HistoryPanel;
 class InfoPanel;
 class LayersPanel;
+class PathsPanel;
 class ToolStrip;
 class QLineEdit;
 class QComboBox;
@@ -140,6 +141,50 @@ private:
     void addColorReplaceOptions();
     /// Push those into the engine.
     void pushColorReplaceOptions();
+    /// Add the Mixer Brush's load swatch, preset menu and Wet/Load/Mix/Flow
+    /// controls.
+    void addMixerOptions();
+    /// Push those into the engine.
+    void pushMixerOptions();
+    /// Redraw the load swatch from the paint currently on the brush.
+    void refreshMixerLoadSwatch();
+    /// Move the preset menu to whichever entry matches the current Wet/Load/Mix,
+    /// or to Custom when none does.
+    void syncMixerPresetCombo();
+    /// Add the shared Mode / Strength / Sample All Layers row for the Blur
+    /// button's three tools, plus whichever checkbox that variant owns.
+    void addBlurOptions(BlurTool tool);
+    /// Add the toning tools' Range or Mode, Exposure or Flow, and their
+    /// Protect Tones / Vibrance checkbox.
+    void addToneOptions(ToneTool tool);
+    /// Push those into the engine.
+    void pushToneOptions();
+    /// Push those into the engine.
+    void pushBlurOptions();
+    /// Add the Paint Bucket's Fill menu, Mode, Opacity, Tolerance and its three
+    /// checkboxes.
+    void addBucketOptions();
+    /// Push those into the engine.
+    void pushBucketOptions();
+    /// Add the Gradient tool's preset swatch, five type buttons, Mode, Opacity,
+    /// Reverse, Dither and Transparency.
+    void addGradientOptions();
+    /// Push those into the engine.
+    void pushGradientOptions();
+    /// Redraw the options-bar swatch from the chosen preset.
+    void refreshGradientSwatch();
+    /// Add the Pen button's options: Auto Add/Delete and Rubber Band for the
+    /// Pen tool itself, a Curve Fit slider for Freeform Pen, and a plain hint
+    /// for the three tools with nothing to configure.
+    void addPenOptions(PenTool tool);
+    /// Push Auto Add/Delete and Rubber Band into the canvas.
+    void pushPenOptions();
+    /// Add the Clone Stamp's Aligned checkbox and Sample menu.
+    void addCloneOptions();
+    /// Push those into the canvas, which owns the source point.
+    void pushCloneOptions();
+    /// Tell the user the Clone Stamp needs a source point first.
+    void warnCloneSourceRequired();
     /// Add the Spot Healing Brush's Type radio set.
     void addHealTypeButtons();
     /// Add the Content-Aware Move tool's options: Mode, Structure, Color,
@@ -154,6 +199,8 @@ private:
     void pushPatchOptions();
     /// Tell the user the Healing Brush needs a source point first.
     void warnHealingSourceRequired();
+    /// Tell the user an edit was refused because the layer is locked.
+    void warnLayerLocked();
     /// Add the options for the healing group's region-based variants.
     void addHealingRegionOptions(HealingType type);
     /// Add the annotation tools' readouts and Clear button.
@@ -183,6 +230,7 @@ private:
     QTabBar *m_documentTabs = nullptr;
 
     LayersPanel *m_layersPanel = nullptr;
+    PathsPanel *m_pathsPanel = nullptr;
     ColorPanel *m_colorPanel = nullptr;
     HistoryPanel *m_historyPanel = nullptr;
     InfoPanel *m_infoPanel = nullptr;
@@ -193,6 +241,10 @@ private:
     QSpinBox *m_brushOpacity = nullptr;
     QSpinBox *m_brushFlow = nullptr;
     QToolButton *m_brushTipButton = nullptr;
+
+    // The Mixer Brush's own widgets, valid only while it is the active tool.
+    QToolButton *m_mixerLoadButton = nullptr;
+    QComboBox *m_mixerPresetCombo = nullptr;
 
     /// The brush tip. Held here rather than in a widget because the picker that
     /// edits it is a popup and the bar is rebuilt on every tool change.
@@ -206,6 +258,57 @@ private:
     int m_replaceLimits = int(ReplaceDefaults::kLimits);
     int m_replaceTolerance = ReplaceDefaults::kTolerancePercent;
     bool m_replaceAntialias = ReplaceDefaults::kAntialias;
+    /// Mixer Brush options, which persist across tool switches. The paint on the
+    /// brush is not among them — that lives in the engine, which is what mixes
+    /// with it.
+    int m_mixerWet = MixerDefaults::kWet;
+    int m_mixerLoad = MixerDefaults::kLoad;
+    int m_mixerMix = MixerDefaults::kMix;
+    int m_mixerFlow = MixerDefaults::kFlow;
+    bool m_mixerSampleAllLayers = MixerDefaults::kSampleAllLayers;
+    bool m_mixerLoadAfterStroke = MixerDefaults::kLoadAfterStroke;
+    bool m_mixerCleanAfterStroke = MixerDefaults::kCleanAfterStroke;
+    /// The options-bar swatch showing the chosen gradient, valid only while the
+    /// Gradient tool is active.
+    QToolButton *m_gradientSwatch = nullptr;
+    /// Gradient options, which persist across tool switches. The preset is held
+    /// by name — the engine owns the ramps.
+    QString m_gradientPreset;
+    int m_gradientType = int(GradientDefaults::kType);
+    int m_gradientMode = 0;
+    int m_gradientOpacity = GradientDefaults::kOpacity;
+    bool m_gradientReverse = GradientDefaults::kReverse;
+    bool m_gradientDither = GradientDefaults::kDither;
+    bool m_gradientTransparency = GradientDefaults::kTransparency;
+    /// Options for the Blur button's three tools, which persist across tool
+    /// switches. Strength, Mode and Sample All Layers are shared, as CS6 shares
+    /// them; the last two belong to Sharpen and Smudge respectively.
+    int m_blurMode = 0;
+    int m_blurStrength = BlurDefaults::kStrength;
+    bool m_blurSampleAllLayers = BlurDefaults::kSampleAllLayers;
+    bool m_blurProtectDetail = BlurDefaults::kProtectDetail;
+    bool m_blurFingerPainting = BlurDefaults::kFingerPainting;
+    /// Toning tool options, which persist across tool switches. Exposure and
+    /// Flow are the same number, as they are in the engine.
+    int m_toneRange = int(ToneDefaults::kRange);
+    int m_spongeMode = int(ToneDefaults::kSpongeMode);
+    int m_toneAmount = ToneDefaults::kAmount;
+    bool m_toneProtectTones = ToneDefaults::kProtectTones;
+    bool m_toneVibrance = ToneDefaults::kVibrance;
+    /// Pen tool options, which persist across tool switches.
+    bool m_penAutoAddDelete = PenDefaults::kAutoAddDelete;
+    bool m_penRubberBand = PenDefaults::kRubberBand;
+    double m_freeformTolerance = PenDefaults::kFreeformTolerance;
+    /// Paint Bucket options, which persist across tool switches.
+    int m_bucketMode = 0;
+    int m_bucketOpacity = BucketDefaults::kOpacity;
+    int m_bucketTolerance = BucketDefaults::kTolerance;
+    bool m_bucketAntialias = BucketDefaults::kAntialias;
+    bool m_bucketContiguous = BucketDefaults::kContiguous;
+    bool m_bucketAllLayers = BucketDefaults::kAllLayers;
+    /// Clone Stamp options, which persist across tool switches.
+    bool m_cloneAligned = CloneDefaults::kAligned;
+    int m_cloneSampling = int(CloneDefaults::kSampling);
     double m_brushSizeValue = 20.0;
     int m_brushHardnessValue = 100;
     BrushPresetPicker *m_brushPicker = nullptr;

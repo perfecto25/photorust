@@ -104,9 +104,12 @@ QString bodyFor(ToolId id)
     case ToolId::Blur:
         return R"SVG(<path d="M10 2.2c0 0 5.7 6.4 5.7 9.6a5.7 5.7 0 0 1-11.4 0C4.3 8.6 10 2.2 10 2.2z"/>)SVG";
 
+    // The darkroom dodging paddle: a small disc on a thin wire, held between the
+    // enlarger and the paper. Deliberately slimmer than the Zoom tool's
+    // magnifier, which is otherwise the same silhouette.
     case ToolId::Dodge:
-        return R"SVG(<circle cx="7.9" cy="7.9" r="4.5" fill="none" stroke="COLOR" stroke-width="1.25"/>
-                  <path d="M11.3 11.3 16.8 16.8" stroke-width="2.4"/>)SVG";
+        return R"SVG(<circle cx="7.4" cy="7.4" r="3.9" fill="none" stroke="COLOR" stroke-width="1.25"/>
+                  <path d="M10.2 10.2 17.4 17.4" stroke-width="1.4"/>)SVG";
 
     case ToolId::Pen:
         return R"SVG(<path d="M10 1.8 15.1 9.1 10 18.2 4.9 9.1z"/>
@@ -340,11 +343,67 @@ QString brushVariantBody(int variant)
     return bodyFor(ToolId::Brush);
 }
 
+QString blurVariantBody(int variant)
+{
+    switch (static_cast<BlurTool>(variant)) {
+    // Sharpen: CS6's cone, apex up, with the ruled face that reads as a ground
+    // edge rather than a plain triangle.
+    case BlurTool::Sharpen:
+        return R"SVG(<path stroke-width="1.2" d="M10 2 15.4 17.2 4.6 17.2z"/>
+                  <path stroke-width="1" d="M10 2V17.2"/>)SVG";
+
+    // Smudge: the pointing hand CS6 draws — a fist with the index finger out,
+    // aimed up-left at what it is about to drag.
+    case BlurTool::Smudge:
+        // Tilted, as CS6 tilts it: the finger points up and to the left, at what
+        // the drag is about to pull.
+        return R"SVG(<g transform="rotate(-16 10 10)">
+                  <path stroke-width="1.2" d="M8.1 9.9 8.1 4.3a1.3 1.3 0 0 1 2.6 0v5.1"/>
+                  <path stroke-width="1.2" d="M10.7 9.4V7.6a1.2 1.2 0 0 1 2.4 0v2.2"/>
+                  <path stroke-width="1.2" d="M13.1 9.8V8.6a1.2 1.2 0 0 1 2.4 0v4.2
+                  c0 3-2 5.2-5 5.2-2.6 0-4.1-1.3-5.2-3.3L3.6 12.4a1.3 1.3 0 0 1 2.1-1.5L8.1 13.4"/>
+                  </g>)SVG";
+
+    case BlurTool::Blur:
+        break;
+    }
+    return bodyFor(ToolId::Blur);
+}
+
+QString dodgeVariantBody(int variant)
+{
+    switch (static_cast<ToneTool>(variant)) {
+    // Burn: the cupped hand a printer holds over the paper to keep light off
+    // everything but the gap between finger and thumb. CS6 draws the "O" that
+    // gap makes, with the hand closed around it.
+    case ToneTool::Burn:
+        return R"SVG(<path stroke-width="1.2" d="M12.6 4.4c-1.6-1.1-3.8-1.1-5.4.2
+                  C5.4 6.1 5.1 8.5 6.2 10.2"/>
+                  <path stroke-width="1.2" d="M6.2 10.2 4.1 9.1a1.2 1.2 0 0 0-1.2 2.1l3.1 2
+                  c.6 2.7 3 4.7 5.9 4.7a6 6 0 0 0 6-6c0-2.4-1.4-4.5-3.4-5.5"/>
+                  <circle cx="11.9" cy="11.9" r="2.7" fill="none" stroke="COLOR"
+                  stroke-width="1.2"/>)SVG";
+
+    // Sponge: the rounded block with its pores, as CS6 draws it.
+    case ToneTool::Sponge:
+        return R"SVG(<path stroke-width="1.2" d="M4 8.2c0-2.4 2.7-4.2 6-4.2s6 1.8 6 4.2v4.6
+                  c0 2.4-2.7 4.2-6 4.2s-6-1.8-6-4.2z"/>
+                  <circle cx="7.6" cy="8.8" r="1.1" fill="COLOR" stroke="none"/>
+                  <circle cx="12.4" cy="7.9" r="0.9" fill="COLOR" stroke="none"/>
+                  <circle cx="10.2" cy="12.2" r="1.2" fill="COLOR" stroke="none"/>
+                  <circle cx="13.6" cy="12.6" r="0.8" fill="COLOR" stroke="none"/>
+                  <circle cx="6.8" cy="12.9" r="0.8" fill="COLOR" stroke="none"/>)SVG";
+
+    case ToneTool::Dodge:
+        break;
+    }
+    return bodyFor(ToolId::Dodge);
+}
+
 /// Per-variant artwork, where a tool's flyout entries need distinct icons.
 ///
-/// The marquee, lasso, quick-selection and crop groups have these; everything
-/// else reuses its default icon, since the other groups' variants are not
-/// implemented anyway.
+/// Every group whose variants are implemented has these; the rest reuse their
+/// default icon, since an unimplemented entry is drawn disabled anyway.
 QString variantBodyFor(ToolId id, int variant)
 {
     if (id == ToolId::Crop) {
@@ -364,6 +423,12 @@ QString variantBodyFor(ToolId id, int variant)
     }
     if (id == ToolId::Brush) {
         return brushVariantBody(variant);
+    }
+    if (id == ToolId::Blur) {
+        return blurVariantBody(variant);
+    }
+    if (id == ToolId::Dodge) {
+        return dodgeVariantBody(variant);
     }
     if (id != ToolId::Marquee) {
         return bodyFor(id);
@@ -394,6 +459,26 @@ QString document(const QString &body, const QColor &color)
                       .arg(QLatin1String(kStrokeAttrs), body);
     // Do the substitution last so it also reaches attributes inside the body.
     return svg.replace(QLatin1String("COLOR"), color.name());
+}
+
+QPixmap renderPixmap(const QString &svg, int size)
+{
+    QSvgRenderer renderer(svg.toUtf8());
+    if (!renderer.isValid()) {
+        return {};
+    }
+
+    const qreal ratio = qGuiApp ? qGuiApp->devicePixelRatio() : 1.0;
+    QPixmap pixmap(QSize(size, size) * ratio);
+    pixmap.fill(Qt::transparent);
+    pixmap.setDevicePixelRatio(ratio);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    renderer.render(&painter, QRectF(0, 0, size, size));
+    painter.end();
+
+    return pixmap;
 }
 
 QIcon renderDocument(const QString &svg)
@@ -451,6 +536,11 @@ QIcon ToolIcons::fromSvgBody(const QString &svgBody, const QColor &color)
     return renderDocument(document(svgBody, color));
 }
 
+QPixmap ToolIcons::pixmapFromSvgBody(const QString &svgBody, const QColor &color, int size)
+{
+    return renderPixmap(document(svgBody, color), qMax(1, size));
+}
+
 QString ToolIcons::quickMaskSvg(bool active)
 {
     // Standard mode shows a hollow marquee; Quick Mask fills the surround, the
@@ -464,6 +554,62 @@ QString ToolIcons::quickMaskSvg(bool active)
         R"SVG(<rect x="1.6" y="4.4" width="16.8" height="11.2" fill="none" stroke="COLOR"
            stroke-width="1.25"/>)SVG"
         R"SVG(<circle cx="10" cy="10" r="3.4" fill="COLOR" stroke="none"/>)SVG");
+}
+
+QString ToolIcons::gradientTypeSvg(GradientType type)
+{
+    // Each is a 16px swatch showing the shape's own ramp. SVG gradients are
+    // used rather than hand-stepped bands so they stay smooth at any size; the
+    // stops are greyscale, and `COLOR` tints only the frame.
+    const QString frame =
+        QStringLiteral(R"SVG(<rect x="2" y="2" width="16" height="16" fill="none")SVG"
+                       R"SVG( stroke="COLOR" stroke-width="1"/>)SVG");
+    QString body;
+    switch (type) {
+    case GradientType::Linear:
+        body = QStringLiteral(
+            R"SVG(<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0">)SVG"
+            R"SVG(<stop offset="0" stop-color="#1a1a1a"/><stop offset="1" stop-color="#f0f0f0"/>)SVG"
+            R"SVG(</linearGradient></defs>)SVG"
+            R"SVG(<rect x="2" y="2" width="16" height="16" fill="url(#g)" stroke="none"/>)SVG");
+        break;
+    case GradientType::Radial:
+        body = QStringLiteral(
+            R"SVG(<defs><radialGradient id="g" cx="0.5" cy="0.5" r="0.5">)SVG"
+            R"SVG(<stop offset="0" stop-color="#1a1a1a"/><stop offset="1" stop-color="#f0f0f0"/>)SVG"
+            R"SVG(</radialGradient></defs>)SVG"
+            R"SVG(<rect x="2" y="2" width="16" height="16" fill="url(#g)" stroke="none"/>)SVG");
+        break;
+    // A sweep has no SVG primitive, so it is four quadrant wedges stepping
+    // through the ramp — enough to read as "rotates around a point" at 20px.
+    case GradientType::Angle:
+        body = QStringLiteral(
+            R"SVG(<path d="M10 10 18 10 18 2z" fill="#f0f0f0" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 18 2 10 2z" fill="#b4b4b4" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 10 2 2 2z" fill="#787878" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 2 2 2 10z" fill="#3c3c3c" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 2 10 2 18z" fill="#1a1a1a" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 2 18 10 18z" fill="#3c3c3c" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 10 18 18 18z" fill="#787878" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 10 18 18 18 10z" fill="#b4b4b4" stroke="none"/>)SVG");
+        break;
+    case GradientType::Reflected:
+        body = QStringLiteral(
+            R"SVG(<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0">)SVG"
+            R"SVG(<stop offset="0" stop-color="#f0f0f0"/><stop offset="0.5" stop-color="#1a1a1a"/>)SVG"
+            R"SVG(<stop offset="1" stop-color="#f0f0f0"/></linearGradient></defs>)SVG"
+            R"SVG(<rect x="2" y="2" width="16" height="16" fill="url(#g)" stroke="none"/>)SVG");
+        break;
+    // Concentric diamonds, drawn largest first so the darker centre lands on top.
+    case GradientType::Diamond:
+        body = QStringLiteral(
+            R"SVG(<rect x="2" y="2" width="16" height="16" fill="#f0f0f0" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 2 18 10 10 18 2 10z" fill="#b4b4b4" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 5 15 10 10 15 5 10z" fill="#646464" stroke="none"/>)SVG"
+            R"SVG(<path d="M10 8 12 10 10 12 8 10z" fill="#1a1a1a" stroke="none"/>)SVG");
+        break;
+    }
+    return body + frame;
 }
 
 QString ToolIcons::closeSvg()

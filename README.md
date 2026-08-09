@@ -38,6 +38,15 @@ paint, manage layers, select, filter and undo.
   pan (space-drag or middle-drag), and a transparency checkerboard.
 - Layers: add, delete, duplicate, reorder, merge down, flatten, rename,
   show/hide, opacity, fill opacity, clipping masks, layer masks, thumbnails.
+- **Layer locks**, enforced in the engine rather than by greying out buttons:
+  lock transparent pixels, lock image pixels, lock position, and lock all. A
+  pixel-locked layer refuses every tool — brushes, healing, filters, fills — and
+  a fully locked one cannot be deleted or merged either. Locked rows carry a
+  padlock badge, solid for Lock All and outlined for a partial lock.
+- A **CS6-shaped Layers panel**: the filter row, blend mode and Opacity, the Lock
+  row and Fill, delegate-painted rows (eye column, bordered thumbnail, italic
+  Background, padlock badge) and CS6's seven footer glyphs — all drawn as line
+  art on the same 20×20 grid as the tool icons.
 - All **27 Photoshop blend modes**, including the non-separable ones (Hue,
   Saturation, Color, Luminosity, Darker/Lighter Color).
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
@@ -53,6 +62,47 @@ paint, manage layers, select, filter and undo.
   (Continuous, Once, Background Swatch), Limits (Discontiguous, Contiguous,
   Find Edges), Tolerance and Anti-alias. Color mode keeps each pixel's
   brightness, so shading survives being recoloured.
+- **Dodge**, **Burn** and **Sponge**: the darkroom toning tools, with CS6's Range
+  (shadows / midtones / highlights), Exposure, Protect Tones, and the Sponge's
+  Desaturate / Saturate and Vibrance. Protect Tones works on luminance and keeps
+  the pixel's own colour, so a dodge cannot bleach a hue or clip to white.
+- **Blur**, **Sharpen** and **Smudge**: all three work dab by dab on what they
+  pass over, so dwelling goes on deepening the effect. Blur and Sharpen are one
+  tool with its sign flipped — toward or away from the local average — with CS6's
+  Strength, cut-down Mode list, Sample All Layers and Sharpen's Protect Detail.
+  Smudge carries a *patch* of pixels along the stroke, so structure streaks in the
+  direction of travel, and Finger Painting drags in the foreground colour. Distinct
+  from the Blur and Sharpen *filters*, which are one pass over a whole layer.
+- **Paint Bucket**: the Magic Wand's flood, filled instead of selected — so
+  Tolerance, Contiguous and Anti-alias behave identically to the wand's — plus
+  Mode, Opacity and All Layers.
+- **Pen tool**: full vector paths — corner and smooth anchors, direction
+  handles that stay collinear through a smooth point, Auto Add/Delete, Rubber
+  Band preview, closing a subpath, and Add/Delete Anchor Point and Convert
+  Point as their own tools. Path Selection and Direct Selection edit whole
+  subpaths or individual anchors/handles. A **Paths panel** holds named paths
+  and a Photoshop-style Work Path, with Fill Path, Stroke Path and Load Path
+  as a Selection (nonzero winding, so an oppositely-wound subpath cuts a hole).
+  Freeform Pen fits a drag to corner anchors by simplification rather than
+  true curve-fitting — a deliberate simplification, noted in the reference.
+  Path geometry is not itself undoable, the same choice already made for
+  slices and annotations; what a finished path paints or selects is.
+- **Gradient tool**: all five CS6 shapes (linear, radial, angle, reflected,
+  diamond) over CS6's 15 default presets, with Mode, Opacity, Reverse, Dither and
+  Transparency. Ramps interpolate in straight alpha so a fade to transparent
+  keeps its colour, and dither works on the colour quantisation so hard-edged
+  presets stay hard. Preset swatches are rendered by the engine, so they cannot
+  drift from what the tool paints.
+- **Clone Stamp**: `Alt`+click sets the source, and the stroke copies those
+  pixels verbatim — CS6's **Aligned** and **Sample** (current layer, current and
+  below, all layers) included. Each stroke samples a snapshot taken when it
+  began, so cloning with a short offset repeats the source once instead of
+  smearing it down the stroke.
+- **Mixer Brush**: paint that mixes. CS6's Wet, Load, Mix and Flow, its preset
+  menu, the load swatch with Load and Clean Brush, the two after-each-stroke
+  toggles, `Alt`+click to load paint off the canvas, and Sample All Layers. A wet brush picks colour up as it travels and
+  carries it along, so a stroke across a boundary smears; a dry one paints its
+  own paint like an ordinary brush and stops when the load runs out.
 - A CS6-style **brush preset picker** behind the options bar's tip button:
   preview, Size and Hardness sliders, and a grid covering CS6's families — soft
   and hard round, flat and chisel, charcoal and chalk, spatter, star, grass.
@@ -207,6 +257,14 @@ core/                 Rust image engine
   src/brush.rs          dab-based stroke rendering
   src/healing.rs        inpainting, Poisson cloning and red-eye removal
   src/replace.rs        colour replacement for the Color Replacement Brush
+  src/mixer.rs          wet-paint mixing for the Mixer Brush
+  src/stamp.rs          source sampling for the Clone Stamp
+  src/gradient.rs       colour ramps and the five gradient shapes
+  src/bucket.rs         flood filling for the Paint Bucket
+  src/focus.rs          the Blur and Sharpen tools
+  src/smudge.rs         the Smudge tool's carried patch
+  src/tone.rs           the Dodge, Burn and Sponge tools
+  src/path.rs           vector paths for the Pen tool and Paths panel
   src/selection.rs      coverage-mask selections
   src/magnetic.rs       edge snapping for the Magnetic Lasso
   src/wand.rs           Magic Wand flood and Quick Selection region growing
@@ -222,7 +280,7 @@ core/                 Rust image engine
 shell/                C++ / Qt QWidgets application
   src/MainWindow.*      menus, docks, options bar
   src/canvas/           viewport, zoom/pan, input → document coordinates
-  src/panels/           Layers, Color, History
+  src/panels/           Layers, Paths, Color, History (LayerIcons/PathIcons hold the artwork)
   src/tools/            tool strip and tool metadata
   src/shortcuts/        command registry and keymap loading
   resources/theme.qss       CS6 dark theme
@@ -266,21 +324,21 @@ stored, so future default changes still reach the user.
 ```
 ToolTip floating bar
 
-- move tool (done)
-- marquee tools (done)
-- lasso tools (done)
-- quick selection tools (done)
-- crop tools (done)
-- eye dropper tools (done)
-- healing tools - (done))
-- brush tools - in progress
-- stamp tools - not started
+- move tool - done
+- marquee tools - done
+- lasso tools - done
+- quick selection tools - done
+- crop tools - done
+- eye dropper tools - done
+- healing tools - done
+- brush tools - done
+- stamp and clone tools - in progress
 - history brush tool - not started
-- eraser tools - not started
-- gradient tools - not started
-- blur tools - not started
-- dodge tools - not started
-- pen tools - not started
+- eraser tools - not started. 1/3 done
+- gradient tools - done
+- blur tools - done
+- dodge tools - done
+- pen tools - in progress
 - type tools - not started
 - selection tools - not started
 - shape tools - not started
@@ -290,5 +348,7 @@ ToolTip floating bar
 
 Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
 
+Auto recovery - save working project to temp file for auto recover - not started
 
+Layers - add ability to lock layer from modification - done
 ```

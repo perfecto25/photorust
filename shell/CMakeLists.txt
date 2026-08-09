@@ -23,8 +23,14 @@ set(SHELL_SOURCES
     src/panels/HistoryPanel.h
     src/panels/InfoPanel.cpp
     src/panels/InfoPanel.h
+    src/panels/LayerIcons.cpp
+    src/panels/LayerIcons.h
     src/panels/LayersPanel.cpp
     src/panels/LayersPanel.h
+    src/panels/PathIcons.cpp
+    src/panels/PathIcons.h
+    src/panels/PathsPanel.cpp
+    src/panels/PathsPanel.h
     src/panels/PanelHeader.cpp
     src/panels/PanelHeader.h
 

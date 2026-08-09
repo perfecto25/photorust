@@ -465,6 +465,79 @@ impl StrokeMask {
         region
     }
 
+    /// Composite *source pixels* through the stroke's coverage — the Clone
+    /// Stamp.
+    ///
+    /// The twin of [`StrokeMask::composite_onto`], and deliberately so: opacity,
+    /// the selection and the transparency lock behave identically, and the only
+    /// difference is where the colour comes from. `source` is in `target`'s
+    /// coordinates and `source_offset` is added to a target pixel to find it, so
+    /// `(-40, 0)` clones from forty pixels to the left.
+    ///
+    /// Pixels whose source falls outside the snapshot are left alone. There is
+    /// nothing to clone from there, and painting transparency instead would
+    /// punch holes in the layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_source_onto(
+        &self,
+        target: &mut Pixmap,
+        source: &Pixmap,
+        source_offset: (i32, i32),
+        opacity: f32,
+        offset: (i32, i32),
+        selection: Option<&Selection>,
+        lock_transparency: bool,
+    ) -> Rect {
+        if self.dirty.is_empty() {
+            return Rect::default();
+        }
+        let opacity = opacity.clamp(0.0, 1.0);
+        let selection = selection.filter(|sel| !sel.is_empty());
+
+        let region = Rect::new(
+            self.dirty.x - offset.0,
+            self.dirty.y - offset.1,
+            self.dirty.width,
+            self.dirty.height,
+        )
+        .intersect(&target.rect());
+
+        for y in region.y..region.bottom() {
+            for x in region.x..region.right() {
+                let doc_x = x + offset.0;
+                let doc_y = y + offset.1;
+
+                let mut alpha = self.coverage_at(doc_x, doc_y) * opacity;
+                if alpha <= 0.0 {
+                    continue;
+                }
+                if let Some(sel) = selection {
+                    alpha *= sel.coverage_at(doc_x, doc_y);
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                }
+
+                let (sx, sy) = (x + source_offset.0, y + source_offset.1);
+                if !source.rect().contains(sx, sy) {
+                    continue;
+                }
+                let src = source.get(sx, sy);
+
+                let dst = target.get(x, y);
+                if lock_transparency {
+                    if dst.a == 0 {
+                        continue;
+                    }
+                    alpha *= dst.a as f32 / 255.0;
+                }
+
+                target.set(x, y, source_over(dst, src, alpha));
+            }
+        }
+        region
+    }
+
     /// Discard accumulated coverage, ready for the next stroke.
     pub fn reset(&mut self) {
         if !self.dirty.is_empty() {

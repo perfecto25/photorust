@@ -239,7 +239,7 @@ inline QList<SubTool> subTools(ToolId id)
         return {{"Brush Tool", "B", true},
                 {"Pencil Tool", "B", true},
                 {"Color Replacement Tool", "B", true},
-                {"Mixer Brush Tool", nullptr, false}};
+                {"Mixer Brush Tool", "B", true}};
     case ToolId::CloneStamp:
         return {{"Clone Stamp Tool", "S", true},
                 {"Pattern Stamp Tool", nullptr, false}};
@@ -252,21 +252,21 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Magic Eraser Tool", nullptr, false}};
     case ToolId::Gradient:
         return {{"Gradient Tool", "G", true},
-                {"Paint Bucket Tool", nullptr, false}};
+                {"Paint Bucket Tool", "G", true}};
     case ToolId::Blur:
         return {{"Blur Tool", nullptr, true},
-                {"Sharpen Tool", nullptr, false},
-                {"Smudge Tool", nullptr, false}};
+                {"Sharpen Tool", nullptr, true},
+                {"Smudge Tool", nullptr, true}};
     case ToolId::Dodge:
         return {{"Dodge Tool", "O", true},
-                {"Burn Tool", nullptr, false},
-                {"Sponge Tool", nullptr, false}};
+                {"Burn Tool", "O", true},
+                {"Sponge Tool", "O", true}};
     case ToolId::Pen:
         return {{"Pen Tool", "P", true},
-                {"Freeform Pen Tool", nullptr, false},
-                {"Add Anchor Point Tool", nullptr, false},
-                {"Delete Anchor Point Tool", nullptr, false},
-                {"Convert Point Tool", nullptr, false}};
+                {"Freeform Pen Tool", "P", true},
+                {"Add Anchor Point Tool", nullptr, true},
+                {"Delete Anchor Point Tool", nullptr, true},
+                {"Convert Point Tool", nullptr, true}};
     case ToolId::Type:
         return {{"Horizontal Type Tool", "T", true},
                 {"Vertical Type Tool", nullptr, false},
@@ -274,7 +274,7 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Vertical Type Mask Tool", nullptr, false}};
     case ToolId::PathSelect:
         return {{"Path Selection Tool", "A", true},
-                {"Direct Selection Tool", nullptr, false}};
+                {"Direct Selection Tool", "A", true}};
     case ToolId::Shape:
         return {{"Rectangle Tool", "U", true},
                 {"Rounded Rectangle Tool", nullptr, false},
@@ -353,8 +353,13 @@ inline QString toolName(ToolId id)
 /// True when the tool draws onto the canvas and needs a stroke.
 inline bool toolPaints(ToolId id)
 {
+    // "Paints" here means "is stroked with a brush tip", not "lays down the
+    // foreground colour": the Blur tool softens what it passes over and the
+    // healing brushes rebuild it, but all of them want the tip picker and the
+    // same dab machinery.
     return id == ToolId::Brush || id == ToolId::Eraser || id == ToolId::Healing
-        || id == ToolId::CloneStamp || id == ToolId::HistoryBrush;
+        || id == ToolId::CloneStamp || id == ToolId::HistoryBrush
+        || id == ToolId::Blur || id == ToolId::Dodge;
 }
 
 /// True when the tool strokes a region and then *rebuilds* it from the
@@ -427,6 +432,200 @@ inline bool brushReplacesColor(BrushType type)
     return type == BrushType::ColorReplacement;
 }
 
+/// The variants behind the Gradient button.
+enum class GradientTool {
+    Gradient = 0,
+    PaintBucket = 1,
+};
+
+/// The five gradient shapes, mirroring `gradient::GradientType`. The order is
+/// CS6's options-bar order, and the buttons are drawn in it.
+enum class GradientType {
+    Linear = 0,
+    Radial = 1,
+    Angle = 2,
+    Reflected = 3,
+    Diamond = 4,
+};
+
+/// Name for a gradient type's tooltip.
+inline QString gradientTypeName(GradientType type)
+{
+    switch (type) {
+    case GradientType::Linear:    return QStringLiteral("Linear Gradient");
+    case GradientType::Radial:    return QStringLiteral("Radial Gradient");
+    case GradientType::Angle:     return QStringLiteral("Angle Gradient");
+    case GradientType::Reflected: return QStringLiteral("Reflected Gradient");
+    case GradientType::Diamond:   return QStringLiteral("Diamond Gradient");
+    }
+    return {};
+}
+
+/// The variants behind the Dodge button — Photoshop's *toning* tools.
+enum class ToneTool {
+    Dodge = 0,
+    Burn = 1,
+    Sponge = 2,
+};
+
+/// Label for one of them.
+inline QString toneToolName(ToneTool tool)
+{
+    switch (tool) {
+    case ToneTool::Dodge:  return QStringLiteral("Dodge Tool");
+    case ToneTool::Burn:   return QStringLiteral("Burn Tool");
+    case ToneTool::Sponge: return QStringLiteral("Sponge Tool");
+    }
+    return {};
+}
+
+/// Dodge and Burn's tonal Range, mirroring `tone::ToneRange`.
+enum class ToneRange { Shadows = 0, Midtones = 1, Highlights = 2 };
+/// The Sponge's Mode, mirroring `tone::SpongeMode`.
+enum class SpongeMode { Desaturate = 0, Saturate = 1 };
+
+/// CS6's defaults for the toning tools' options bar.
+namespace ToneDefaults {
+constexpr ToneRange kRange = ToneRange::Midtones;
+constexpr SpongeMode kSpongeMode = SpongeMode::Desaturate;
+/// Exposure on Dodge and Burn, Flow on the Sponge — the same number.
+constexpr int kAmount = 50;
+constexpr bool kProtectTones = true;
+constexpr bool kVibrance = true;
+} // namespace ToneDefaults
+
+/// The variants behind the Blur button.
+enum class BlurTool {
+    Blur = 0,
+    Sharpen = 1,
+    Smudge = 2,
+};
+
+/// CS6's defaults for the options bar the three share.
+namespace BlurDefaults {
+constexpr int kStrength = 50;
+constexpr bool kSampleAllLayers = false;
+/// Sharpen's own, ticked in CS6.
+constexpr bool kProtectDetail = true;
+/// Smudge's own.
+constexpr bool kFingerPainting = false;
+} // namespace BlurDefaults
+
+/// Label for a variant behind the Blur button.
+inline QString blurToolName(BlurTool tool)
+{
+    switch (tool) {
+    case BlurTool::Blur:    return QStringLiteral("Blur Tool");
+    case BlurTool::Sharpen: return QStringLiteral("Sharpen Tool");
+    case BlurTool::Smudge:  return QStringLiteral("Smudge Tool");
+    }
+    return {};
+}
+
+/// The blend modes CS6 offers all three of the Blur button's tools. The full list makes no sense for a
+/// tool whose source *is* its destination, softened — Multiply against a blurred
+/// copy of yourself is not a thing anyone wants — so CS6 cuts it to these, and
+/// the values are `BlendMode` discriminants.
+inline QList<QPair<QString, int>> blurModes()
+{
+    return {{QStringLiteral("Normal"), 0},
+            {QStringLiteral("Darken"), 2},
+            {QStringLiteral("Lighten"), 7},
+            {QStringLiteral("Hue"), 23},
+            {QStringLiteral("Saturation"), 24},
+            {QStringLiteral("Color"), 25},
+            {QStringLiteral("Luminosity"), 26}};
+}
+
+/// What the Paint Bucket fills with, mirroring `bucket::BucketFill`.
+enum class BucketFill { Foreground = 0, Pattern = 1 };
+
+/// CS6's defaults for the Paint Bucket's options bar. Tolerance and the two
+/// checkboxes match the Magic Wand's, because the two tools share the flood.
+namespace BucketDefaults {
+constexpr BucketFill kFill = BucketFill::Foreground;
+constexpr int kOpacity = 100;
+constexpr int kTolerance = 32;
+constexpr bool kAntialias = true;
+constexpr bool kContiguous = true;
+constexpr bool kAllLayers = false;
+} // namespace BucketDefaults
+
+/// CS6's defaults for the Gradient tool's options bar. Dither is on, as it is in
+/// Photoshop — an 8-bit ramp across a wide canvas bands visibly without it.
+namespace GradientDefaults {
+constexpr GradientType kType = GradientType::Linear;
+constexpr int kOpacity = 100;
+constexpr bool kReverse = false;
+constexpr bool kDither = true;
+constexpr bool kTransparency = true;
+} // namespace GradientDefaults
+
+/// The variants behind the Clone Stamp button.
+enum class CloneType {
+    CloneStamp = 0,
+    PatternStamp = 1,
+};
+
+/// Where the Clone Stamp reads from, mirroring `stamp::CloneSampling`.
+enum class CloneSampling { CurrentLayer = 0, CurrentAndBelow = 1, AllLayers = 2 };
+
+/// CS6's defaults for the Clone Stamp's options bar.
+namespace CloneDefaults {
+constexpr bool kAligned = true;
+constexpr CloneSampling kSampling = CloneSampling::CurrentLayer;
+} // namespace CloneDefaults
+
+/// True when the variant blends the brush's own paint with what is already on
+/// the layer — the Mixer Brush, which also needs its own stroke path.
+inline bool brushMixesColor(BrushType type)
+{
+    return type == BrushType::MixerBrush;
+}
+
+/// CS6's Mixer Brush presets: the Wet/Load/Mix combinations its first menu
+/// offers. Flow is not part of a preset — it stays where the user left it.
+///
+/// The values are UI data, so they live here rather than in the engine, which
+/// only ever sees the four numbers the bar sends it.
+struct MixerPreset {
+    /// Menu label. "Custom" is what the menu shows once a slider is moved by
+    /// hand, and carries no values of its own.
+    const char *name;
+    /// Percentages, or -1 each for Custom.
+    int wet;
+    int load;
+    int mix;
+};
+
+inline const QList<MixerPreset> &mixerPresets()
+{
+    static const QList<MixerPreset> presets = {
+        {"Custom", -1, -1, -1},
+        {"Dry", 0, 50, 0},
+        {"Dry, Light Load", 0, 1, 0},
+        {"Moist, Light Mix", 20, 50, 5},
+        {"Moist, Heavy Mix", 20, 50, 60},
+        {"Wet, Light Mix", 50, 50, 5},
+        {"Wet, Heavy Mix", 50, 50, 60},
+        {"Very Wet, Light Mix", 80, 80, 5},
+        {"Very Wet, Heavy Mix", 80, 80, 60},
+    };
+    return presets;
+}
+
+/// CS6's defaults for the Mixer Brush's options bar — the "Dry" preset, with
+/// both between-strokes toggles off and sampling limited to the active layer.
+namespace MixerDefaults {
+constexpr int kWet = 0;
+constexpr int kLoad = 50;
+constexpr int kMix = 0;
+constexpr int kFlow = 100;
+constexpr bool kSampleAllLayers = false;
+constexpr bool kLoadAfterStroke = false;
+constexpr bool kCleanAfterStroke = false;
+} // namespace MixerDefaults
+
 /// The Color Replacement Brush's Mode, mirroring `replace::ReplaceMode`.
 enum class ReplaceMode { Hue = 0, Saturation = 1, Color = 2, Luminosity = 3 };
 /// Its Sampling, mirroring `replace::ReplaceSampling`.
@@ -467,4 +666,41 @@ inline QString healTypeName(HealType type)
 inline bool toolSelects(ToolId id)
 {
     return id == ToolId::Marquee || id == ToolId::Lasso || id == ToolId::QuickSelect;
+}
+
+/// The variants behind the Pen button.
+enum class PenTool {
+    Pen = 0,
+    FreeformPen = 1,
+    AddAnchor = 2,
+    DeleteAnchor = 3,
+    ConvertPoint = 4,
+};
+
+/// The variants behind the Path Selection button.
+enum class PathSelectTool {
+    PathSelection = 0,
+    DirectSelection = 1,
+};
+
+/// CS6's defaults for the Pen tool's options bar.
+namespace PenDefaults {
+/// Hovering the finished part of the active path adds an anchor over a
+/// segment or removes one under the cursor, without switching tools.
+constexpr bool kAutoAddDelete = true;
+/// Preview the segment about to be drawn from the last anchor to the cursor,
+/// before it is placed.
+constexpr bool kRubberBand = true;
+/// How coarsely a Freeform Pen drag is simplified into corner anchors, in
+/// document pixels — CS6's "Curve Fit", 0.5-10px; this sits near its low end,
+/// close enough that the traced shape reads as deliberate.
+constexpr double kFreeformTolerance = 2.5;
+} // namespace PenDefaults
+
+/// True for the tools that edit a vector path rather than pixels: the whole
+/// Pen group and both Path Selection variants. They share one gesture path on
+/// the canvas, dispatching on the variant the way the retouch tools do.
+inline bool toolEditsPaths(ToolId id)
+{
+    return id == ToolId::Pen || id == ToolId::PathSelect;
 }

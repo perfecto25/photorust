@@ -14,8 +14,17 @@ use crate::healing::{self, HealMode, MoveOptions, Transfer};
 use crate::history::History;
 use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
 use crate::perspective;
+use crate::mixer::{MixerBrush, MixerOptions, Sampled};
 use crate::replace::{ColorReplacer, ReplaceOptions, ReplaceSampling};
+use crate::focus::{self, FocusOptions};
+use crate::smudge::{Smudge, SmudgeOptions};
+use crate::tone::{ToneOptions, ToneStroke};
+use crate::bucket::{self, BucketOptions, FloodMask};
+use crate::wand;
+use crate::gradient::{self, Gradient, GradientOptions};
+use crate::stamp::{self, CloneSampling, CloneStroke};
 use crate::selection::{Selection, SelectionOp};
+use crate::path::PathSet;
 use crate::slice::{Slice, SliceSet};
 
 /// What the Patch tool was asked to do — CS6's options bar, as one value.
@@ -47,6 +56,12 @@ pub struct Document {
     /// annotate the document without editing it, and stay off the History
     /// panel for the same reason.
     annotations: Annotations,
+    /// Vector paths from the Pen tool and the Paths panel. Also not part of a
+    /// history state, and for the same reason: they are overlay geometry, not
+    /// pixels, and what a finished path *does* to the image — Fill Path,
+    /// Stroke Path, Make Selection — is what commits, exactly as if the user
+    /// had used the Brush or the Lasso directly.
+    paths: PathSet,
 
     /// Layer the tools act on.
     active_layer: LayerId,
@@ -63,6 +78,32 @@ pub struct Document {
     replacer: Option<ColorReplacer>,
     /// Where the replacement stroke last reached, for even dab spacing.
     replace_last: Option<(f32, f32)>,
+
+    /// State for a Mixer Brush stroke. Direct-to-layer for the same reason the
+    /// replacer is: each dab mixes with what the last one left.
+    mixer: Option<MixerBrush>,
+    /// Where the mixer stroke last reached, for even dab spacing.
+    mixer_last: Option<(f32, f32)>,
+
+    /// The Blur or Sharpen stroke in progress. Like the mixer's, it edits the
+    /// layer dab by dab — each dab has to work on what the last one left, which
+    /// is what makes dwelling deepen the effect.
+    focus: Option<FocusOptions>,
+    /// The Smudge stroke in progress, which additionally carries the patch of
+    /// pixels the finger is dragging.
+    smudge: Option<Smudge>,
+    /// The Dodge, Burn or Sponge stroke in progress. It carries the coverage it
+    /// has already applied, so a pass tones once rather than once per dab.
+    tone: Option<ToneStroke>,
+    /// Where the retouch stroke last reached, for even dab spacing. Only one of
+    /// the six can be running at a time, so one field serves all.
+    retouch_last: Option<(f32, f32)>,
+
+    /// The source of the clone stroke in progress. Set only between
+    /// `begin_clone_stroke` and the end of that stroke: what the Clone Stamp
+    /// copies is the image as it was when the stroke started, so the snapshot
+    /// belongs to the stroke rather than to the document.
+    clone: Option<CloneStroke>,
 
     /// File path, once saved.
     pub path: Option<String>,
@@ -89,11 +130,19 @@ impl Document {
             history,
             slices: SliceSet::new(),
             annotations: Annotations::new(),
+            paths: PathSet::new(),
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
             replacer: None,
             replace_last: None,
+            mixer: None,
+            mixer_last: None,
+            focus: None,
+            smudge: None,
+            tone: None,
+            retouch_last: None,
+            clone: None,
             path: None,
             untitled_number: 1,
             dirty: false,
@@ -128,11 +177,19 @@ impl Document {
             history,
             slices: SliceSet::new(),
             annotations: Annotations::new(),
+            paths: PathSet::new(),
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
             replacer: None,
             replace_last: None,
+            mixer: None,
+            mixer_last: None,
+            focus: None,
+            smudge: None,
+            tone: None,
+            retouch_last: None,
+            clone: None,
             path: None,
             untitled_number: 1,
             dirty: false,
@@ -253,7 +310,9 @@ impl Document {
         Some(new_id)
     }
 
-    /// Delete a layer. Refuses to remove the last remaining one.
+    /// Delete a layer. Refuses to remove the last remaining one, or a fully
+    /// locked one — Photoshop will not throw away a layer you have locked
+    /// against being touched.
     pub fn delete_layer(&mut self, id: LayerId) -> bool {
         if self.stack.len() <= 1 {
             return false;
@@ -261,6 +320,9 @@ impl Document {
         let Some(index) = self.stack.index_of(id) else {
             return false;
         };
+        if self.stack.get(index).is_some_and(Layer::is_fully_locked) {
+            return false;
+        }
         self.stack.remove(index);
 
         if self.active_layer == id {
@@ -286,11 +348,18 @@ impl Document {
     }
 
     /// Merge a layer down into the one below it.
+    ///
+    /// Refused when either layer is fully locked: the upper one would be
+    /// destroyed and the lower one rewritten.
     pub fn merge_down(&mut self, id: LayerId) -> bool {
         let Some(index) = self.stack.index_of(id) else {
             return false;
         };
         if index == 0 {
+            return false;
+        }
+        let locked = |i: usize| self.stack.get(i).is_some_and(Layer::is_fully_locked);
+        if locked(index) || locked(index - 1) {
             return false;
         }
 
@@ -368,6 +437,28 @@ impl Document {
         if let Some(l) = self.stack.by_id_mut(id) {
             l.name = name.into();
             self.commit("Rename Layer");
+        }
+    }
+
+    /// Set the three locks on a layer in one step — the panel's Lock row.
+    pub fn set_layer_locks(
+        &mut self,
+        id: LayerId,
+        transparency: bool,
+        pixels: bool,
+        position: bool,
+    ) {
+        if let Some(l) = self.stack.by_id_mut(id) {
+            if l.lock_transparency == transparency
+                && l.lock_pixels == pixels
+                && l.lock_position == position
+            {
+                return;
+            }
+            l.lock_transparency = transparency;
+            l.lock_pixels = pixels;
+            l.lock_position = position;
+            self.commit("Lock Layer");
         }
     }
 
@@ -478,6 +569,48 @@ impl Document {
         true
     }
 
+    /// Begin a Clone Stamp stroke.
+    ///
+    /// `offset` is added to a destination pixel to find its source, in document
+    /// units — the delta between the Alt-clicked source point and where the
+    /// stroke starts. Everything else about the stroke is an ordinary brush
+    /// stroke, so this only adds the snapshot the dabs will copy from.
+    ///
+    /// Returns false when the active layer cannot be painted on.
+    pub fn begin_clone_stroke(
+        &mut self,
+        brush: &Brush,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        offset: (i32, i32),
+        sampling: CloneSampling,
+    ) -> bool {
+        if offset == (0, 0) {
+            // Sampling where it is painting would copy each pixel onto itself.
+            return false;
+        }
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        let source = stamp::snapshot(&self.stack, layer, self.width, self.height, sampling);
+        if !self.begin_stroke(brush, x, y, pressure) {
+            return false;
+        }
+        self.clone = Some(CloneStroke { source, offset });
+        true
+    }
+
+    /// Whether a Clone Stamp stroke is in progress, and so whether ending the
+    /// stroke should copy pixels rather than paint a colour.
+    pub fn is_cloning(&self) -> bool {
+        self.clone.is_some()
+    }
+
     /// Extend the active stroke. No-op if no stroke is in progress.
     pub fn extend_stroke(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) {
         if let Some(mask) = self.stroke.as_mut() {
@@ -505,14 +638,28 @@ impl Document {
         } else {
             Some(&self.selection)
         };
-        mask.composite_onto(
-            &mut target.pixels,
-            color,
-            opacity,
-            target.offset,
-            selection,
-            target.lock_transparency,
-        );
+        // A clone stroke previews the pixels it is copying, not the foreground
+        // colour. The shell asks for one preview whatever the tool, so the
+        // decision belongs here.
+        match self.clone.as_ref() {
+            Some(clone) => mask.composite_source_onto(
+                &mut target.pixels,
+                &clone.source,
+                clone.offset,
+                opacity,
+                target.offset,
+                selection,
+                target.lock_transparency,
+            ),
+            None => mask.composite_onto(
+                &mut target.pixels,
+                color,
+                opacity,
+                target.offset,
+                selection,
+                target.lock_transparency,
+            ),
+        };
 
         Some(compositor::composite(&preview_stack, self.width, self.height))
     }
@@ -555,6 +702,46 @@ impl Document {
         };
 
         self.commit("Brush Tool");
+        dirty
+    }
+
+    /// Finish a Clone Stamp stroke, copying the snapshot through the stroke's
+    /// coverage and recording one history state for the whole thing.
+    pub fn end_clone_stroke(&mut self, opacity: f32) -> Rect {
+        let (Some(mask), Some(clone)) = (self.stroke.take(), self.clone.take()) else {
+            self.stroke = None;
+            self.clone = None;
+            return Rect::default();
+        };
+        self.stroke_undo_base = None;
+        if mask.is_empty() {
+            return Rect::default();
+        }
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let id = self.active_layer;
+        let dirty = if let Some(layer) = self.stack.by_id_mut(id) {
+            let offset = layer.offset;
+            let lock = layer.lock_transparency;
+            mask.composite_source_onto(
+                &mut layer.pixels,
+                &clone.source,
+                clone.offset,
+                opacity,
+                offset,
+                selection.as_ref(),
+                lock,
+            )
+        } else {
+            Rect::default()
+        };
+
+        self.commit("Clone Stamp");
         dirty
     }
 
@@ -967,9 +1154,432 @@ impl Document {
         }
     }
 
+    /// Begin a Mixer Brush stroke.
+    ///
+    /// `reservoir` is the paint on the brush. Returns false if the layer cannot
+    /// be painted.
+    pub fn begin_mixer(
+        &mut self,
+        brush: &Brush,
+        options: MixerOptions,
+        reservoir: Rgba8,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        // The transparency lock is the layer's, not the tool's, so it is folded
+        // in here rather than being another thing the shell has to remember to
+        // send.
+        let options = MixerOptions { preserve_alpha: layer.lock_transparency, ..options };
+        self.stroke_undo_base = Some(self.stack.clone());
+        self.mixer = Some(MixerBrush::new(options, reservoir));
+        self.mixer_last = None;
+        self.extend_mixer(brush, x, y, pressure);
+        true
+    }
+
+    /// Continue a Mixer Brush stroke, laying dabs to `(x, y)`.
+    pub fn extend_mixer(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) -> Rect {
+        if self.mixer.is_none() {
+            return Rect::default();
+        }
+        let id = self.active_layer;
+        let offset = match self.stack.by_id(id) {
+            Some(layer) => layer.offset,
+            None => return Rect::default(),
+        };
+
+        // Dab positions along the segment, spaced as the brush asks.
+        let step = (brush.size * brush.spacing.max(0.01)).max(0.5);
+        let mut points = Vec::new();
+        match self.mixer_last {
+            None => points.push((x, y)),
+            Some((lx, ly)) => {
+                let (dx, dy) = (x - lx, y - ly);
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance < 1e-6 {
+                    return Rect::default();
+                }
+                let mut travelled = step;
+                while travelled <= distance {
+                    let t = travelled / distance;
+                    points.push((lx + dx * t, ly + dy * t));
+                    travelled += step;
+                }
+                if points.is_empty() {
+                    // Too short a move to warrant a dab; wait for the next one
+                    // rather than bunching dabs up at the start.
+                    return Rect::default();
+                }
+            }
+        }
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let sample_all = self
+            .mixer
+            .as_ref()
+            .is_some_and(|mixer| mixer.options().sample_all_layers);
+        let radius = brush.radius() * pressure.clamp(0.05, 1.0);
+        let mut dirty = Rect::default();
+
+        for (px, py) in points {
+            // Sample All Layers picks the colour up from the composite. Only the
+            // dab's own neighbourhood is composited, and it is recomposited per
+            // dab, so a wet brush picks up its own deposits as it travels — the
+            // same as when it reads the layer directly.
+            let sampled = if sample_all {
+                let area = Rect::new(
+                    (px - radius - 1.0).floor() as i32,
+                    (py - radius - 1.0).floor() as i32,
+                    (radius * 2.0 + 3.0) as u32,
+                    (radius * 2.0 + 3.0) as u32,
+                )
+                .intersect(&Rect::from_size(self.width, self.height));
+                if area.is_empty() {
+                    None
+                } else {
+                    Some((self.composite_region(area), area))
+                }
+            } else {
+                None
+            };
+
+            let (Some(mixer), Some(layer)) = (self.mixer.as_mut(), self.stack.by_id_mut(id)) else {
+                return dirty;
+            };
+            // The mixer works in the layer's own coordinates.
+            let touched = mixer.apply_dab(
+                &mut layer.pixels,
+                sampled.as_ref().map(|(pixels, area)| Sampled {
+                    pixels,
+                    origin: (area.x - offset.0, area.y - offset.1),
+                }),
+                brush,
+                px - offset.0 as f32,
+                py - offset.1 as f32,
+                pressure,
+            );
+            if !touched.is_empty() {
+                dirty = dirty.union(&Rect::new(
+                    touched.x + offset.0,
+                    touched.y + offset.1,
+                    touched.width,
+                    touched.height,
+                ));
+            }
+        }
+
+        // A marquee confines this exactly as it confines painting, and by the
+        // same after-the-fact restore the replacer uses.
+        if let Some(sel) = selection.as_ref() {
+            if let (Some(base), Some(layer)) =
+                (self.stroke_undo_base.as_ref(), self.stack.by_id_mut(id))
+            {
+                if let Some(original) = base.by_id(id) {
+                    for y in dirty.y..dirty.bottom() {
+                        for x in dirty.x..dirty.right() {
+                            if sel.coverage_at(x, y) <= 0.0 {
+                                let (lx, ly) = (x - offset.0, y - offset.1);
+                                layer.pixels.set(lx, ly, original.pixels.get(lx, ly));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.mixer_last = Some((x, y));
+        dirty
+    }
+
+    /// Begin a Blur or Sharpen stroke.
+    ///
+    /// Returns false if the active layer cannot be painted on.
+    pub fn begin_focus(
+        &mut self,
+        brush: &Brush,
+        options: FocusOptions,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        // The transparency lock belongs to the layer, not the options bar.
+        let options = FocusOptions { preserve_alpha: layer.lock_transparency, ..options };
+        self.stroke_undo_base = Some(self.stack.clone());
+        self.focus = Some(options);
+        self.retouch_last = None;
+        self.extend_retouch(brush, x, y, pressure);
+        true
+    }
+
+    /// Begin a Smudge stroke. `paint` is the foreground colour, used only when
+    /// Finger Painting is on.
+    pub fn begin_smudge(
+        &mut self,
+        brush: &Brush,
+        options: SmudgeOptions,
+        paint: Rgba8,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        let options = SmudgeOptions { preserve_alpha: layer.lock_transparency, ..options };
+        self.stroke_undo_base = Some(self.stack.clone());
+        self.smudge = Some(Smudge::new(options, paint));
+        self.retouch_last = None;
+        self.extend_retouch(brush, x, y, pressure);
+        true
+    }
+
+    /// Begin a Dodge, Burn or Sponge stroke.
+    ///
+    /// Returns false if the active layer cannot be painted on.
+    pub fn begin_tone(
+        &mut self,
+        brush: &Brush,
+        options: ToneOptions,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        let options = ToneOptions { preserve_alpha: layer.lock_transparency, ..options };
+        let (w, h) = (layer.pixels.width(), layer.pixels.height());
+        self.stroke_undo_base = Some(self.stack.clone());
+        self.tone = Some(ToneStroke::new(options, w, h));
+        self.retouch_last = None;
+        self.extend_retouch(brush, x, y, pressure);
+        true
+    }
+
+    /// Continue a retouch stroke, laying dabs to `(x, y)`.
+    ///
+    /// The six tools that work on what is already under the brush — Blur,
+    /// Sharpen, Smudge, Dodge, Burn and Sponge — share this: the same spacing,
+    /// the same per-dab application to the layer, the same marquee restore. Only
+    /// what a dab *does* differs, and that is the one branch inside the loop.
+    pub fn extend_retouch(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) -> Rect {
+        let sample_all = match (&self.focus, &self.smudge, &self.tone) {
+            (Some(options), ..) => options.sample_all_layers,
+            (_, Some(smudge), _) => smudge.options().sample_all_layers,
+            // The toning tools have no Sample All Layers in CS6: they read one
+            // pixel's own tone, and there is nothing a lower layer could add.
+            (.., Some(_)) => false,
+            _ => return Rect::default(),
+        };
+        let id = self.active_layer;
+        let offset = match self.stack.by_id(id) {
+            Some(layer) => layer.offset,
+            None => return Rect::default(),
+        };
+
+        // Dab positions along the segment, spaced as the brush asks — except for
+        // the toning tools, which take their effect from the *maximum* coverage a
+        // pixel reaches rather than from each dab in turn. For them spacing
+        // decides only how finely that envelope is sampled, not how strong the
+        // result is, and a quarter of a brush width samples it coarsely enough to
+        // leave a visible ripple between dab centres. Sampling finer costs a
+        // little time and removes it.
+        let spacing = match self.tone {
+            Some(_) => brush.spacing.min(0.08),
+            None => brush.spacing,
+        };
+        let step = (brush.size * spacing.max(0.01)).max(0.5);
+        let mut points = Vec::new();
+        match self.retouch_last {
+            None => points.push((x, y)),
+            Some((lx, ly)) => {
+                let (dx, dy) = (x - lx, y - ly);
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance < 1e-6 {
+                    return Rect::default();
+                }
+                let mut travelled = step;
+                while travelled <= distance {
+                    let t = travelled / distance;
+                    points.push((lx + dx * t, ly + dy * t));
+                    travelled += step;
+                }
+                if points.is_empty() {
+                    // Too short a move to warrant a dab; wait for the next one
+                    // rather than bunching dabs up at the start.
+                    return Rect::default();
+                }
+            }
+        }
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+        let radius = brush.radius() * pressure.clamp(0.05, 1.0);
+        let mut dirty = Rect::default();
+
+        for (px, py) in points {
+            // Sample All Layers reads the neighbourhood from the composite, and
+            // recomposites per dab so a stroke sees its own softening as it goes
+            // — the same as when it reads the layer directly.
+            let sampled = if sample_all {
+                let area = Rect::new(
+                    (px - radius - 2.0).floor() as i32,
+                    (py - radius - 2.0).floor() as i32,
+                    (radius * 2.0 + 5.0) as u32,
+                    (radius * 2.0 + 5.0) as u32,
+                )
+                .intersect(&Rect::from_size(self.width, self.height));
+                if area.is_empty() {
+                    None
+                } else {
+                    Some((self.composite_region(area), area))
+                }
+            } else {
+                None
+            };
+
+            let Some(layer) = self.stack.by_id_mut(id) else {
+                return dirty;
+            };
+            let source = sampled
+                .as_ref()
+                .map(|(pixels, area)| (pixels, (area.x - offset.0, area.y - offset.1)));
+            let (lx, ly) = (px - offset.0 as f32, py - offset.1 as f32);
+
+            let touched = match (self.focus.as_ref(), self.smudge.as_mut(), self.tone.as_mut())
+            {
+                (Some(options), ..) => {
+                    focus::apply_dab(&mut layer.pixels, source, brush, lx, ly, pressure, options)
+                }
+                (_, Some(smudge), _) => {
+                    smudge.apply_dab(&mut layer.pixels, source, brush, lx, ly, pressure)
+                }
+                (.., Some(tone)) => tone.apply_dab(&mut layer.pixels, brush, lx, ly, pressure),
+                _ => Rect::default(),
+            };
+            if !touched.is_empty() {
+                dirty = dirty.union(&Rect::new(
+                    touched.x + offset.0,
+                    touched.y + offset.1,
+                    touched.width,
+                    touched.height,
+                ));
+            }
+        }
+
+        // A marquee confines this as it confines painting, by the same
+        // after-the-fact restore the replacer and the mixer use.
+        if let Some(sel) = selection.as_ref() {
+            if let (Some(base), Some(layer)) =
+                (self.stroke_undo_base.as_ref(), self.stack.by_id_mut(id))
+            {
+                if let Some(original) = base.by_id(id) {
+                    for y in dirty.y..dirty.bottom() {
+                        for x in dirty.x..dirty.right() {
+                            if sel.coverage_at(x, y) <= 0.0 {
+                                let (lx, ly) = (x - offset.0, y - offset.1);
+                                layer.pixels.set(lx, ly, original.pixels.get(lx, ly));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.retouch_last = Some((x, y));
+        dirty
+    }
+
+    /// Finish a retouch stroke, recording it as one undo step under the name of
+    /// the tool that made it.
+    pub fn end_retouch(&mut self) -> bool {
+        let name = match (self.focus.take(), self.smudge.take(), self.tone.take()) {
+            (Some(options), ..) => match options.focus {
+                crate::focus::FocusMode::Blur => "Blur Tool",
+                crate::focus::FocusMode::Sharpen => "Sharpen Tool",
+            },
+            (_, Some(_), _) => "Smudge Tool",
+            (.., Some(tone)) => match tone.options().tool {
+                crate::tone::ToneTool::Dodge => "Dodge Tool",
+                crate::tone::ToneTool::Burn => "Burn Tool",
+                crate::tone::ToneTool::Sponge => "Sponge Tool",
+            },
+            _ => return false,
+        };
+        self.retouch_last = None;
+        self.stroke_undo_base = None;
+        self.commit(name);
+        true
+    }
+
+    /// Abandon one, restoring what it changed.
+    pub fn cancel_retouch(&mut self) {
+        self.focus = None;
+        self.smudge = None;
+        self.tone = None;
+        self.retouch_last = None;
+        if let Some(base) = self.stroke_undo_base.take() {
+            self.stack = base;
+        }
+    }
+
+    /// Finish a Mixer Brush stroke, recording it as one undo step.
+    ///
+    /// Returns the paint left on the brush, which the next stroke starts from
+    /// unless the shell cleans or reloads it — the reservoir outlives the stroke
+    /// in Photoshop too.
+    pub fn end_mixer(&mut self) -> Option<Rgba8> {
+        let mixer = self.mixer.take()?;
+        self.mixer_last = None;
+        self.stroke_undo_base = None;
+        self.commit("Mixer Brush Tool");
+        Some(mixer.reservoir())
+    }
+
+    /// Abandon a Mixer Brush stroke, restoring what it changed.
+    pub fn cancel_mixer(&mut self) {
+        self.mixer = None;
+        self.mixer_last = None;
+        if let Some(base) = self.stroke_undo_base.take() {
+            self.stack = base;
+        }
+    }
+
     /// Abandon the in-progress stroke without applying it.
     pub fn cancel_stroke(&mut self) {
         self.stroke = None;
+        self.clone = None;
         if let Some(base) = self.stroke_undo_base.take() {
             self.stack = base;
         }
@@ -1016,6 +1626,146 @@ impl Document {
             }
         }
         self.commit("Fill");
+    }
+
+    /// Draw a gradient over the active layer — the Gradient tool.
+    ///
+    /// `start` and `end` are the drag, in document space. The gradient covers
+    /// the whole layer (or the whole selection): the ends of the ramp extend
+    /// beyond the drag rather than stopping at it, which is what Photoshop does.
+    pub fn draw_gradient(
+        &mut self,
+        ramp: &Gradient,
+        options: &GradientOptions,
+        start: (f32, f32),
+        end: (f32, f32),
+    ) -> Rect {
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let id = self.active_layer;
+        let dirty = {
+            let Some(layer) = self.stack.by_id_mut(id) else {
+                return Rect::default();
+            };
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return Rect::default();
+            }
+            let offset = layer.offset;
+            // The transparency lock is the layer's business, not the options
+            // bar's, so it is folded in here.
+            let options = GradientOptions { preserve_alpha: layer.lock_transparency, ..*options };
+            // The ramp is described in document space, so shift the drag into the
+            // layer's own frame rather than asking the renderer to know about
+            // offsets.
+            let local_start = (start.0 - offset.0 as f32, start.1 - offset.1 as f32);
+            let local_end = (end.0 - offset.0 as f32, end.1 - offset.1 as f32);
+
+            let touched = gradient::draw(
+                &mut layer.pixels,
+                ramp,
+                &options,
+                local_start,
+                local_end,
+                offset,
+                selection.as_ref(),
+            );
+            if touched.is_empty() {
+                return Rect::default();
+            }
+            Rect::new(touched.x + offset.0, touched.y + offset.1, touched.width, touched.height)
+        };
+
+        self.commit("Gradient");
+        dirty
+    }
+
+    /// Flood-fill from a clicked point — the Paint Bucket.
+    ///
+    /// `seed` is in document space. What matches is decided by the Magic Wand's
+    /// own flood, so Tolerance, Contiguous and Anti-alias mean exactly what they
+    /// mean for the wand. With **All Layers** the matching reads the composite;
+    /// the fill lands on the active layer either way.
+    pub fn fill_bucket(
+        &mut self,
+        seed: (i32, i32),
+        options: &BucketOptions,
+        color: Rgba8,
+    ) -> Rect {
+        let Some(layer) = self.active_layer() else {
+            return Rect::default();
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return Rect::default();
+        }
+        let offset = layer.offset;
+
+        // The mask is built in whichever frame it is sampled from, and carries
+        // its origin in the layer's coordinates so the fill needs to know nothing
+        // about which mode was used.
+        let (coverage, mask_size, mask_origin) = if options.all_layers {
+            let composite = self.composite();
+            let (w, h) = (composite.width(), composite.height());
+            let mask = wand::magic_wand(
+                &composite,
+                seed,
+                options.tolerance,
+                options.contiguous,
+                options.antialias,
+            );
+            (mask, (w, h), (-offset.0, -offset.1))
+        } else {
+            let local = (seed.0 - offset.0, seed.1 - offset.1);
+            let pixels = &self.active_layer().unwrap().pixels;
+            let (w, h) = (pixels.width(), pixels.height());
+            let mask = wand::magic_wand(
+                pixels,
+                local,
+                options.tolerance,
+                options.contiguous,
+                options.antialias,
+            );
+            (mask, (w, h), (0, 0))
+        };
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let id = self.active_layer;
+        let dirty = {
+            let Some(layer) = self.stack.by_id_mut(id) else {
+                return Rect::default();
+            };
+            // The transparency lock is the layer's, not the options bar's.
+            let options = BucketOptions { preserve_alpha: layer.lock_transparency, ..*options };
+            let mask = FloodMask {
+                coverage: &coverage,
+                width: mask_size.0,
+                height: mask_size.1,
+                origin: mask_origin,
+            };
+            let touched = bucket::fill(
+                &mut layer.pixels,
+                &mask,
+                color,
+                &options,
+                offset,
+                selection.as_ref(),
+            );
+            if touched.is_empty() {
+                return Rect::default();
+            }
+            Rect::new(touched.x + offset.0, touched.y + offset.1, touched.width, touched.height)
+        };
+
+        self.commit("Paint Bucket");
+        dirty
     }
 
     /// Erase within the selection (or the whole layer).
@@ -1226,6 +1976,180 @@ impl Document {
         &mut self.slices
     }
 
+    // -- paths ------------------------------------------------------------
+
+    pub fn paths(&self) -> &PathSet {
+        &self.paths
+    }
+
+    pub fn paths_mut(&mut self) -> &mut PathSet {
+        &mut self.paths
+    }
+
+    /// How finely a path is flattened before it becomes pixels — fine enough
+    /// that no curve visibly facets at any zoom level a selection or a fill
+    /// edge is actually inspected at.
+    const PATH_FLATTEN_TOLERANCE: f32 = 0.35;
+
+    /// Turn the active path into a selection — the Paths panel's "Make
+    /// Selection". An open subpath is closed for this purpose, the same way
+    /// Photoshop treats one: a selection has to enclose an area, so where the
+    /// pen was lifted is implicitly joined back to where it started.
+    ///
+    /// Several subpaths combine under nonzero winding, so one wound the
+    /// opposite way from the rest cuts a hole rather than adding a second
+    /// region — see [`crate::selection::Selection::apply_polygons_feathered`].
+    pub fn select_from_active_path(&mut self, op: SelectionOp, feather: u32) -> bool {
+        let Some(path) = self.paths.active() else { return false };
+        let contours: Vec<Vec<(f32, f32)>> = path
+            .flatten(Self::PATH_FLATTEN_TOLERANCE)
+            .into_iter()
+            .map(|(points, _closed)| points)
+            .collect();
+        if contours.iter().all(|c| c.len() < 3) {
+            return false;
+        }
+        self.selection.apply_polygons_feathered(&contours, op, feather);
+        true
+    }
+
+    /// Add a subpath fitted to a freehand drag — the Freeform Pen tool.
+    /// `points` is the raw mouse trail in document space; it is simplified to a
+    /// handful of corner anchors before being appended (see
+    /// [`crate::path::simplify_freehand`]). Creates the Work Path if none is
+    /// active yet, the same as drawing with the ordinary Pen tool would.
+    pub fn add_freeform_subpath(&mut self, points: &[(f32, f32)], tolerance: f32, close: bool) -> bool {
+        let simplified = crate::path::simplify_freehand(points, tolerance);
+        if simplified.len() < 2 {
+            return false;
+        }
+        let path = self.paths.ensure_active();
+        for &(x, y) in &simplified {
+            path.append_corner(x, y);
+        }
+        if close {
+            path.close_active_subpath();
+        } else {
+            path.finish_editing();
+        }
+        true
+    }
+
+    /// Fill the active path with a colour — the Paths panel's "Fill Path".
+    /// Unlike [`Document::fill`] this ignores the current selection entirely:
+    /// the path *is* the region, exactly as Photoshop's own command works.
+    pub fn fill_active_path(&mut self, color: Rgba8, opacity: f32) -> Rect {
+        let Some(path) = self.paths.active() else { return Rect::default() };
+        let contours: Vec<Vec<(f32, f32)>> = path
+            .flatten(Self::PATH_FLATTEN_TOLERANCE)
+            .into_iter()
+            .map(|(points, _closed)| points)
+            .collect();
+        if contours.iter().all(|c| c.len() < 3) {
+            return Rect::default();
+        }
+
+        let mut coverage = Selection::new(self.width, self.height);
+        coverage.apply_polygons_feathered(&contours, SelectionOp::Replace, 0);
+
+        let id = self.active_layer;
+        let dirty = if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return Rect::default();
+            }
+            let offset = layer.offset;
+            let lock_alpha = layer.lock_transparency;
+            let (w, h) = (layer.pixels.width(), layer.pixels.height());
+            let mut touched = Rect::default();
+
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let mut alpha = coverage.coverage_at(x + offset.0, y + offset.1) * opacity;
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    let dst = layer.pixels.get(x, y);
+                    if lock_alpha {
+                        if dst.a == 0 {
+                            continue;
+                        }
+                        alpha *= dst.a as f32 / 255.0;
+                    }
+                    let out = crate::brush::source_over(dst, color, alpha);
+                    if out != dst {
+                        layer.pixels.set(x, y, out);
+                        touched = touched.union(&Rect::new(x, y, 1, 1));
+                    }
+                }
+            }
+            // Document space, matching every other pixel-editing call here —
+            // `touched` was accumulated in the layer's own coordinates.
+            Rect::new(touched.x + offset.0, touched.y + offset.1, touched.width, touched.height)
+        } else {
+            Rect::default()
+        };
+
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+        self.commit("Fill Path");
+        dirty
+    }
+
+    /// Stroke the active path with a brush — the Paths panel's "Stroke Path".
+    /// Each subpath is stroked independently (the pen lifts between them, so
+    /// two separate loops do not get joined by a straight line), and a closed
+    /// subpath's stroke returns all the way to its start.
+    pub fn stroke_active_path(&mut self, brush: &Brush, color: Rgba8, opacity: f32) -> Rect {
+        let Some(path) = self.paths.active() else { return Rect::default() };
+        let flat = path.flatten(Self::PATH_FLATTEN_TOLERANCE);
+        if flat.iter().all(|(points, _)| points.len() < 2) {
+            return Rect::default();
+        }
+
+        let id = self.active_layer;
+        let (offset, ..) = match self.stack.by_id(id) {
+            Some(layer) if !layer.lock_pixels && matches!(layer.kind, LayerKind::Raster) => {
+                (layer.offset, layer.pixels.width(), layer.pixels.height())
+            }
+            _ => return Rect::default(),
+        };
+
+        // The stroke mask works in document space, exactly as an interactive
+        // brush stroke does (`begin_stroke` passes the cursor's document
+        // coordinates straight through) — `composite_onto` below is what
+        // converts into the layer's own frame.
+        let mut mask = StrokeMask::new(self.width, self.height);
+        for (points, closed) in &flat {
+            if points.len() < 2 {
+                continue;
+            }
+            let (x0, y0) = points[0];
+            mask.begin(brush, x0, y0, 1.0);
+            for &(x, y) in &points[1..] {
+                mask.extend(brush, x, y, 1.0);
+            }
+            if *closed {
+                mask.extend(brush, x0, y0, 1.0);
+            }
+        }
+
+        let selection_empty = self.selection.is_empty();
+        let selection = if selection_empty { None } else { Some(self.selection.clone()) };
+        let dirty = if let Some(layer) = self.stack.by_id_mut(id) {
+            let lock = layer.lock_transparency;
+            mask.composite_onto(&mut layer.pixels, color, opacity, offset, selection.as_ref(), lock)
+        } else {
+            Rect::default()
+        };
+
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+        self.commit("Stroke Path");
+        dirty
+    }
+
     /// The full slice list — user slices plus the auto slices filling the rest
     /// of the canvas — numbered in reading order.
     pub fn resolved_slices(&self) -> Vec<Slice> {
@@ -1352,6 +2276,171 @@ mod tests {
 
     fn doc() -> Document {
         Document::new(16, 16, Rgba8::WHITE)
+    }
+
+    #[test]
+    fn make_selection_from_a_square_path() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(30.0, 10.0);
+            path.append_corner(30.0, 30.0);
+            path.append_corner(10.0, 30.0);
+            path.close_active_subpath();
+        }
+        assert!(d.select_from_active_path(SelectionOp::Replace, 0));
+        assert!(d.selection().coverage_at(20, 20) > 0.9, "the inside was not selected");
+        assert_eq!(d.selection().coverage_at(2, 2), 0.0, "the outside was selected");
+    }
+
+    #[test]
+    fn make_selection_closes_an_open_subpath() {
+        // A selection has to enclose an area, so an unclosed subpath is treated
+        // as if it had been closed back to its start.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(30.0, 10.0);
+            path.append_corner(30.0, 30.0);
+            path.append_corner(10.0, 30.0);
+            path.finish_editing(); // left open, not closed
+        }
+        assert!(d.select_from_active_path(SelectionOp::Replace, 0));
+        assert!(d.selection().coverage_at(20, 20) > 0.9, "an open path did not enclose its area");
+    }
+
+    #[test]
+    fn make_selection_with_no_active_path_does_nothing() {
+        let mut d = doc();
+        assert!(!d.select_from_active_path(SelectionOp::Replace, 0));
+        assert!(d.selection().is_empty());
+    }
+
+    #[test]
+    fn freeform_subpath_creates_a_work_path_and_simplifies() {
+        let mut d = doc();
+        let points: Vec<(f32, f32)> = (0..=40).map(|i| (i as f32, 0.0)).collect();
+        assert!(d.add_freeform_subpath(&points, 1.0, false));
+        assert_eq!(d.paths().len(), 1);
+        assert_eq!(d.paths().entries()[0].name, "Work Path");
+        let subpath = &d.paths().active().unwrap().subpaths[0];
+        assert!(subpath.points.len() < points.len(), "the drag was not simplified");
+        assert_eq!(subpath.points.first().unwrap().anchor, (0.0, 0.0));
+        assert_eq!(subpath.points.last().unwrap().anchor, (40.0, 0.0));
+    }
+
+    #[test]
+    fn fill_path_paints_only_the_enclosed_area() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(30.0, 10.0);
+            path.append_corner(30.0, 30.0);
+            path.append_corner(10.0, 30.0);
+            path.close_active_subpath();
+        }
+        let dirty = d.fill_active_path(Rgba8::BLACK, 1.0);
+        assert!(!dirty.is_empty());
+        assert_eq!(d.composite().get(20, 20), Rgba8::BLACK);
+        assert_eq!(d.composite().get(2, 2), Rgba8::WHITE, "the fill leaked outside the path");
+    }
+
+    #[test]
+    fn fill_path_ignores_the_current_selection() {
+        // Fill Path fills the path's own area; unlike Edit > Fill it does not
+        // stop at whatever the marquee happens to be doing.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.select_rect(Rect::new(0, 0, 5, 5), SelectionOp::Replace, 0);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(30.0, 10.0);
+            path.append_corner(30.0, 30.0);
+            path.append_corner(10.0, 30.0);
+            path.close_active_subpath();
+        }
+        d.fill_active_path(Rgba8::BLACK, 1.0);
+        assert_eq!(d.composite().get(20, 20), Rgba8::BLACK, "the fill was clipped to the marquee");
+    }
+
+    #[test]
+    fn fill_path_is_one_undo_step() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(30.0, 10.0);
+            path.append_corner(30.0, 30.0);
+            path.append_corner(10.0, 30.0);
+            path.close_active_subpath();
+        }
+        d.fill_active_path(Rgba8::BLACK, 1.0);
+        assert_eq!(d.composite().get(20, 20), Rgba8::BLACK);
+        assert!(d.undo());
+        assert_eq!(d.composite().get(20, 20), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_hole_wound_the_other_way_is_not_filled() {
+        let mut d = Document::new(60, 60, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 10.0);
+            path.append_corner(50.0, 10.0);
+            path.append_corner(50.0, 50.0);
+            path.append_corner(10.0, 50.0);
+            path.close_active_subpath();
+            // Wound the opposite way, so it cuts a hole instead of adding a
+            // second filled region.
+            path.append_corner(20.0, 20.0);
+            path.append_corner(20.0, 40.0);
+            path.append_corner(40.0, 40.0);
+            path.append_corner(40.0, 20.0);
+            path.close_active_subpath();
+        }
+        d.fill_active_path(Rgba8::BLACK, 1.0);
+        assert_eq!(d.composite().get(15, 15), Rgba8::BLACK, "the ring was not filled");
+        assert_eq!(d.composite().get(30, 30), Rgba8::WHITE, "the hole was filled in");
+    }
+
+    #[test]
+    fn stroke_path_paints_along_the_outline_and_nowhere_else() {
+        let mut d = Document::new(60, 60, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(10.0, 30.0);
+            path.append_corner(50.0, 30.0);
+            path.finish_editing();
+        }
+        let brush = Brush { size: 6.0, hardness: 1.0, ..Brush::default() };
+        let dirty = d.stroke_active_path(&brush, Rgba8::BLACK, 1.0);
+        assert!(!dirty.is_empty());
+        assert_eq!(d.composite().get(30, 30), Rgba8::BLACK, "the stroke missed the path");
+        assert_eq!(d.composite().get(30, 3), Rgba8::WHITE, "the stroke painted off the path");
+    }
+
+    #[test]
+    fn stroke_path_closes_a_closed_subpath() {
+        // The stroke has to reach every edge of a closed shape, including the
+        // one that only exists because it is closed — the segment back to the
+        // start.
+        let mut d = Document::new(60, 60, Rgba8::WHITE);
+        {
+            let path = d.paths_mut().ensure_active();
+            path.append_corner(15.0, 15.0);
+            path.append_corner(45.0, 15.0);
+            path.append_corner(45.0, 45.0);
+            path.append_corner(15.0, 45.0);
+            path.close_active_subpath();
+        }
+        let brush = Brush { size: 6.0, hardness: 1.0, ..Brush::default() };
+        d.stroke_active_path(&brush, Rgba8::BLACK, 1.0);
+        // The left edge, from (15,45) back to (15,15) — only present because
+        // the subpath is closed.
+        assert_eq!(d.composite().get(15, 30), Rgba8::BLACK, "the closing edge was not stroked");
     }
 
     #[test]
@@ -1804,6 +2893,382 @@ mod tests {
 
         d.cancel_replace();
         assert_eq!(d.composite().get(20, 20), before, "cancel left the change behind");
+    }
+
+    #[test]
+    fn the_paint_bucket_fills_the_region_it_was_clicked_in() {
+        let mut d = Document::new(40, 20, Rgba8::WHITE);
+        if let Some(l) = d.active_layer_mut() {
+            l.pixels.fill_rect(Rect::new(19, 0, 2, 20), Rgba8::BLACK);
+        }
+        d.commit("Setup");
+
+        let options = crate::bucket::BucketOptions {
+            antialias: false,
+            ..crate::bucket::BucketOptions::default()
+        };
+        let red = Rgba8::opaque(220, 0, 0);
+        assert!(!d.fill_bucket((5, 10), &options, red).is_empty());
+        assert_eq!(d.composite().get(5, 10), red);
+        assert_eq!(d.composite().get(30, 10), Rgba8::WHITE, "the fill crossed the wall");
+
+        assert!(d.undo(), "the fill was not one undo step");
+        assert_eq!(d.composite().get(5, 10), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn the_paint_bucket_can_match_on_every_layer_at_once() {
+        // All Layers decides what matches from the composite — so a boundary that
+        // only exists on the layer below still stops the fill — while the paint
+        // lands on the active layer.
+        let mut d = Document::new(40, 20, Rgba8::WHITE);
+        if let Some(background) = d.active_layer_mut() {
+            background.pixels.fill_rect(Rect::new(19, 0, 2, 20), Rgba8::BLACK);
+        }
+        let upper = d.add_layer(None);
+        d.set_active_layer(upper);
+        d.commit("Setup");
+
+        let options = crate::bucket::BucketOptions {
+            antialias: false,
+            all_layers: true,
+            ..crate::bucket::BucketOptions::default()
+        };
+        let red = Rgba8::opaque(220, 0, 0);
+        assert!(!d.fill_bucket((5, 10), &options, red).is_empty());
+
+        let painted = &d.active_layer().unwrap().pixels;
+        assert_eq!(painted.get(5, 10), red, "nothing was filled on the active layer");
+        assert_eq!(painted.get(30, 10).a, 0, "the fill crossed a wall it could see");
+        // The layer it matched against is untouched.
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(5, 10), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn the_paint_bucket_is_refused_on_a_locked_layer() {
+        let mut d = Document::new(20, 20, Rgba8::WHITE);
+        d.active_layer_mut().unwrap().lock_pixels = true;
+        let options = crate::bucket::BucketOptions::default();
+        assert!(d.fill_bucket((10, 10), &options, Rgba8::BLACK).is_empty());
+        assert_eq!(d.composite().get(10, 10), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_clone_stroke_copies_the_source_verbatim() {
+        // The Clone Stamp's defining property, and what separates it from the
+        // Healing Brush: the pixels land exactly as they were sampled.
+        let mut d = Document::new(80, 40, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 20, 40), Rgba8::opaque(20, 40, 200));
+        }
+        d.commit("Setup");
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        // Sample 50px to the left of where the stroke paints.
+        assert!(d.begin_clone_stroke(&brush, 60.0, 20.0, 1.0, (-50, 0),
+                                     CloneSampling::CurrentLayer));
+        d.end_clone_stroke(1.0);
+
+        assert_eq!(d.composite().get(60, 20), Rgba8::opaque(20, 40, 200),
+                   "the source colour was not copied exactly");
+    }
+
+    #[test]
+    fn a_clone_stroke_is_one_undo_step() {
+        let mut d = Document::new(80, 40, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 20, 40), Rgba8::BLACK);
+        }
+        d.commit("Setup");
+        // Sampling 40px left of the stroke, so the paint here comes from inside
+        // the black bar at x=10.
+        let before = d.composite().get(50, 20);
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 50.0, 20.0, 1.0, (-40, 0), CloneSampling::CurrentLayer);
+        d.extend_stroke(&brush, 55.0, 20.0, 1.0);
+        d.extend_stroke(&brush, 60.0, 20.0, 1.0);
+        d.end_clone_stroke(1.0);
+        assert_ne!(d.composite().get(50, 20), before);
+
+        assert!(d.undo(), "nothing to undo");
+        assert_eq!(d.composite().get(50, 20), before, "one undo did not restore the stroke");
+    }
+
+    #[test]
+    fn a_clone_stroke_samples_the_state_it_began_in() {
+        // With the source close behind the cursor, reading the layer live would
+        // feed each dab the previous dab's output and smear the source along the
+        // whole stroke. Sampling a snapshot copies it once, as Photoshop does.
+        let mut d = Document::new(120, 20, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 10, 20), Rgba8::BLACK);
+        }
+        d.commit("Setup");
+
+        let brush = Brush { size: 8.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 14.0, 10.0, 1.0, (-10, 0), CloneSampling::CurrentLayer);
+        for x in 15..100 {
+            d.extend_stroke(&brush, x as f32, 10.0, 1.0);
+        }
+        d.end_clone_stroke(1.0);
+
+        // The black bar is 10px wide, so cloning it 10px right reaches x≈19 and
+        // no further. Anything past that must still be white.
+        assert_eq!(d.composite().get(15, 10), Rgba8::BLACK, "the source was not cloned at all");
+        assert_eq!(d.composite().get(60, 10), Rgba8::WHITE,
+                   "the stroke smeared: it was reading its own output");
+    }
+
+    #[test]
+    fn cloning_an_empty_layer_copies_nothing_but_all_layers_copies_what_is_visible() {
+        // The confusing case, and CS6 behaves the same way: the material is on
+        // one layer, the active layer is another, and Sample defaults to the
+        // current layer — so there is genuinely nothing under the source point.
+        let mut d = Document::new(80, 40, Rgba8::WHITE);
+        if let Some(background) = d.active_layer_mut() {
+            background.pixels.fill_rect(Rect::new(0, 0, 20, 40), Rgba8::BLACK);
+        }
+        let upper = d.add_layer(None);
+        d.set_active_layer(upper);
+        d.commit("Setup");
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 50.0, 20.0, 1.0, (-40, 0), CloneSampling::CurrentLayer);
+        d.end_clone_stroke(1.0);
+        assert_eq!(d.active_layer().unwrap().pixels.get(50, 20).a, 0,
+                   "an empty layer had something to clone from");
+
+        d.begin_clone_stroke(&brush, 50.0, 20.0, 1.0, (-40, 0), CloneSampling::AllLayers);
+        d.end_clone_stroke(1.0);
+        assert_eq!(d.active_layer().unwrap().pixels.get(50, 20), Rgba8::BLACK,
+                   "All Layers did not clone the black bar from the layer below");
+        // The paint lands on the active layer, never on the one it sampled.
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(50, 20), Rgba8::WHITE,
+                   "the sampled layer was written to");
+    }
+
+    #[test]
+    fn a_clone_stroke_with_no_offset_is_refused() {
+        // Sampling where it paints would copy every pixel onto itself, which is
+        // the state before a source has been Alt-clicked.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let brush = Brush::default();
+        assert!(!d.begin_clone_stroke(&brush, 20.0, 20.0, 1.0, (0, 0),
+                                      CloneSampling::CurrentLayer));
+        assert!(!d.is_cloning());
+    }
+
+    #[test]
+    fn cloning_from_off_canvas_leaves_the_layer_alone() {
+        // Nothing to copy from out there, and painting transparency instead
+        // would punch a hole in the layer.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.commit("Setup");
+        let brush = Brush { size: 10.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 5.0, 20.0, 1.0, (-100, 0), CloneSampling::CurrentLayer);
+        d.end_clone_stroke(1.0);
+        assert_eq!(d.composite().get(5, 20), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_clone_stroke_on_a_locked_layer_is_refused() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.active_layer_mut().unwrap().lock_pixels = true;
+        let brush = Brush::default();
+        assert!(!d.begin_clone_stroke(&brush, 20.0, 20.0, 1.0, (-10, 0),
+                                      CloneSampling::CurrentLayer));
+    }
+
+    #[test]
+    fn a_clone_stroke_previews_the_pixels_it_will_copy() {
+        // The live preview must show the cloned source, not the foreground
+        // colour — the shell asks for one preview whatever the tool.
+        let mut d = Document::new(80, 40, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 20, 40), Rgba8::opaque(10, 200, 10));
+        }
+        d.commit("Setup");
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 60.0, 20.0, 1.0, (-50, 0), CloneSampling::CurrentLayer);
+        let preview = d.preview_stroke(Rgba8::opaque(255, 0, 0), 1.0).expect("no preview");
+        assert_eq!(preview.get(60, 20), Rgba8::opaque(10, 200, 10),
+                   "the preview painted the foreground colour instead of the source");
+    }
+
+    #[test]
+    fn cancelling_a_clone_stroke_drops_its_source() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let brush = Brush { size: 10.0, hardness: 1.0, ..Brush::default() };
+        d.begin_clone_stroke(&brush, 20.0, 20.0, 1.0, (-10, 0), CloneSampling::CurrentLayer);
+        assert!(d.is_cloning());
+        d.cancel_stroke();
+        assert!(!d.is_cloning(), "the snapshot outlived the stroke it belonged to");
+    }
+
+    #[test]
+    fn a_fully_locked_layer_cannot_be_deleted_or_merged() {
+        let mut d = Document::new(16, 16, Rgba8::WHITE);
+        let upper = d.add_layer(None);
+        if let Some(l) = d.stack.by_id_mut(upper) {
+            l.lock_transparency = true;
+            l.lock_pixels = true;
+            l.lock_position = true;
+        }
+        assert!(!d.delete_layer(upper), "a fully locked layer was deleted");
+        assert!(!d.merge_down(upper), "a fully locked layer was merged away");
+        assert_eq!(d.layer_count(), 2);
+
+        // One lock short of Lock All is not enough to protect it: Photoshop only
+        // refuses on the full lock.
+        if let Some(l) = d.stack.by_id_mut(upper) {
+            l.lock_position = false;
+        }
+        assert!(d.delete_layer(upper), "a partly locked layer refused deletion");
+    }
+
+    #[test]
+    fn merging_onto_a_fully_locked_layer_is_refused() {
+        // The lower layer is the one rewritten by a merge, so locking it has to
+        // stop the merge as surely as locking the upper one does.
+        let mut d = Document::new(16, 16, Rgba8::WHITE);
+        let lower = d.active_layer_id();
+        if let Some(l) = d.stack.by_id_mut(lower) {
+            l.lock_transparency = true;
+            l.lock_pixels = true;
+            l.lock_position = true;
+        }
+        let upper = d.add_layer(None);
+        assert!(!d.merge_down(upper), "the merge overwrote a locked layer");
+        assert_eq!(d.layer_count(), 2);
+    }
+
+    #[test]
+    fn setting_the_locks_is_one_undo_step() {
+        let mut d = Document::new(16, 16, Rgba8::WHITE);
+        let id = d.active_layer_id();
+        d.set_layer_locks(id, true, true, false);
+        assert!(d.active_layer().unwrap().is_locked());
+        assert!(!d.active_layer().unwrap().is_fully_locked());
+
+        assert!(d.undo(), "locking left nothing to undo");
+        assert!(!d.active_layer().unwrap().is_locked(), "undo did not unlock the layer");
+    }
+
+    #[test]
+    fn a_mixer_stroke_respects_the_transparency_lock() {
+        // Lock Transparent Pixels: the mixer may recolour what is there but must
+        // not give an empty pixel any coverage.
+        let mut d = Document::new(40, 40, Rgba8::TRANSPARENT);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 40, 20), Rgba8::opaque(200, 200, 200));
+            layer.lock_transparency = true;
+        }
+        d.commit("Setup");
+
+        let brush = Brush { size: 30.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions { load: 1.0, ..MixerOptions::default() };
+        d.begin_mixer(&brush, options, Rgba8::BLACK, 20.0, 20.0, 1.0);
+        d.end_mixer();
+
+        let px = &d.active_layer().unwrap().pixels;
+        assert_eq!(px.get(20, 30).a, 0, "paint reached a transparent pixel");
+        assert!(px.get(20, 10).r < 200, "the opaque half was not painted");
+        assert_eq!(px.get(20, 10).a, 255, "the opaque half lost its alpha");
+    }
+
+    #[test]
+    fn a_mixer_stroke_is_one_undo_step() {
+        let mut d = Document::new(60, 40, Rgba8::WHITE);
+        d.commit("Setup");
+        let before = d.composite().get(30, 20);
+
+        let brush = Brush { size: 24.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions { wet: 0.0, load: 1.0, mix: 0.0, ..MixerOptions::default() };
+        assert!(d.begin_mixer(&brush, options, Rgba8::opaque(20, 20, 220), 20.0, 20.0, 1.0));
+        d.extend_mixer(&brush, 30.0, 20.0, 1.0);
+        d.extend_mixer(&brush, 40.0, 20.0, 1.0);
+        assert!(d.end_mixer().is_some(), "the stroke reported no paint left on the brush");
+        assert_ne!(d.composite().get(30, 20), before);
+
+        assert!(d.undo(), "nothing to undo");
+        assert_eq!(d.composite().get(30, 20), before, "one undo did not restore the stroke");
+    }
+
+    #[test]
+    fn cancelling_a_mixer_stroke_restores_the_layer() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.commit("Setup");
+        let before = d.composite().get(20, 20);
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions { load: 1.0, ..MixerOptions::default() };
+        d.begin_mixer(&brush, options, Rgba8::BLACK, 20.0, 20.0, 1.0);
+        assert_ne!(d.composite().get(20, 20), before, "the stroke did nothing to cancel");
+
+        d.cancel_mixer();
+        assert_eq!(d.composite().get(20, 20), before, "cancel left the change behind");
+    }
+
+    #[test]
+    fn a_mixer_stroke_carries_paint_over_to_the_next_one() {
+        // The reservoir outlives the stroke, so a second stroke starting on
+        // white still lays down what the first one picked up.
+        let mut d = Document::new(64, 32, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 16, 32), Rgba8::opaque(20, 20, 220));
+        }
+        d.commit("Setup");
+
+        let brush = Brush { size: 16.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions { wet: 0.8, load: 1.0, mix: 1.0, flow: 1.0, ..MixerOptions::default() };
+        d.begin_mixer(&brush, options, Rgba8::WHITE, 8.0, 16.0, 1.0);
+        for x in 9..20 {
+            d.extend_mixer(&brush, x as f32, 16.0, 1.0);
+        }
+        let carried = d.end_mixer().expect("the stroke returned no reservoir");
+        assert!(carried.b > carried.r + 10, "the brush did not pick the blue up: {carried:?}");
+    }
+
+    #[test]
+    fn a_mixer_stroke_honours_the_selection() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.commit("Setup");
+        d.select_rect(Rect::new(0, 0, 20, 40), SelectionOp::Replace, 0);
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions { load: 1.0, ..MixerOptions::default() };
+        d.begin_mixer(&brush, options, Rgba8::BLACK, 20.0, 20.0, 1.0);
+        d.end_mixer();
+
+        assert!(d.composite().get(15, 20).r < 200, "nothing was painted inside the selection");
+        assert_eq!(d.composite().get(25, 20), Rgba8::WHITE, "paint escaped the selection");
+    }
+
+    #[test]
+    fn a_mixer_stroke_can_pick_colour_up_from_every_layer() {
+        // Sample All Layers reads the composite, so a colour that lives on a
+        // lower layer is picked up even though the paint lands above it.
+        let mut d = Document::new(40, 40, Rgba8::opaque(20, 200, 20));
+        d.commit("Setup");
+        let upper = d.add_layer(Some("Layer 1".to_string()));
+        d.set_active_layer(upper);
+
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        let options = MixerOptions {
+            wet: 1.0,
+            load: 1.0,
+            mix: 1.0,
+            flow: 1.0,
+            sample_all_layers: true,
+            preserve_alpha: false,
+        };
+        d.begin_mixer(&brush, options, Rgba8::TRANSPARENT, 20.0, 20.0, 1.0);
+        d.end_mixer();
+
+        let painted = d.active_layer().unwrap().pixels.get(20, 20);
+        assert!(painted.g > painted.r + 20, "the green below was not picked up: {painted:?}");
     }
 
     #[test]

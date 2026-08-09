@@ -2,6 +2,7 @@
 
 #include <QColor>
 #include <QIcon>
+#include <QPixmap>
 #include <QString>
 
 #include "ToolId.h"
@@ -34,6 +35,11 @@ QIcon icon(ToolId id, const QColor &color);
 /// Occurrences of the literal `COLOR` in `svgBody` are replaced with `color`.
 QIcon fromSvgBody(const QString &svgBody, const QColor &color);
 
+/// The same, at an explicit logical size and as a pixmap — the Layers panel
+/// draws its own rows, so it needs the artwork rather than an icon, and it
+/// needs it at several sizes (an eye is smaller than a footer button).
+QPixmap pixmapFromSvgBody(const QString &svgBody, const QColor &color, int size);
+
 /// SVG body for the Quick Mask toggle at the foot of the strip.
 QString quickMaskSvg(bool active);
 
@@ -53,6 +59,13 @@ QString columnToggleSvg(bool pointsLeft);
 /// CS6 draws these as two overlapping squares with the resulting region
 /// shaded, so the four read as a set at a glance.
 QString selectionModeSvg(SelectionMode mode);
+
+/// SVG body for one of the Gradient tool's five type buttons.
+///
+/// CS6 draws each as a small square filled with that shape's own ramp, so the
+/// five read as a set — a horizontal fade, concentric rings, a sweep, a mirrored
+/// fade and a diamond.
+QString gradientTypeSvg(GradientType type);
 
 /// SVG body for the Info panel's cursor-position glyph: CS6's small crosshair
 /// with an origin corner.

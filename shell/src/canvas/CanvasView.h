@@ -80,6 +80,42 @@ public:
     /// layer per dab instead of compositing a stroke at the end.
     void setReplaceMode(bool active);
 
+    /// Route strokes through the Mixer Brush path, which mixes the brush's paint
+    /// with what is already on the layer, dab by dab.
+    void setMixerMode(bool active);
+
+    /// Route strokes through the retouch path, which works on what is under the
+    /// brush instead of painting on it. True for the Blur button's three tools
+    /// and the Dodge button's three; which of the six strokes is the engine's
+    /// business, so the canvas has one path for all of them.
+    void setRetouchMode(bool active);
+
+    /// Which of the two tools the Gradient button currently holds. The Paint
+    /// Bucket fills on a click; the Gradient tool drags out an axis.
+    void setGradientTool(GradientTool tool);
+    GradientTool gradientTool() const { return m_gradientTool; }
+
+    /// Which of the five tools the Pen button currently holds.
+    void setPenTool(PenTool tool);
+    PenTool penTool() const { return m_penTool; }
+
+    /// Which of the two tools the Path Selection button currently holds.
+    void setPathSelectTool(PathSelectTool tool);
+    PathSelectTool pathSelectTool() const { return m_pathSelectTool; }
+
+    /// The Pen tool's options: Auto Add/Delete lets hovering the finished part
+    /// of the active path add or remove an anchor without switching tools;
+    /// Rubber Band previews the next segment before it is placed.
+    void setPenOptions(bool autoAddDelete, bool rubberBand);
+
+    /// How coarsely the Freeform Pen simplifies a drag into corner anchors, in
+    /// document pixels.
+    void setFreeformPenTolerance(double tolerance) { m_freeformTolerance = tolerance; }
+
+    /// The Clone Stamp's options: Aligned keeps the sample point travelling
+    /// with the cursor across strokes, and Sample picks which layers it reads.
+    void setCloneOptions(bool aligned, CloneSampling sampling);
+
     /// Which healing-group variant is active.
     void setHealingType(HealingType type);
     HealingType healingType() const { return m_healingType; }
@@ -148,6 +184,13 @@ public:
     /// Re-fetch the composited image from the engine and repaint.
     void refresh();
 
+    /// Drop the Clone Stamp's and Healing Brush's sampled source points.
+    ///
+    /// Called when the document changes. Photoshop holds a clone source per
+    /// document; ours is one per engine, so carrying it into another image would
+    /// mean cloning from coordinates that mean nothing there.
+    void forgetSampleSources();
+
     /// Re-trace the selection outline from the engine and repaint.
     ///
     /// Deliberately *not* called by `refresh()`. Tracing the contour walks the
@@ -184,6 +227,15 @@ signals:
     /// The Healing Brush was used before a source was set. `MainWindow` puts up
     /// the warning; the canvas does not own dialogs.
     void healingSourceRequired();
+    /// The Clone Stamp was used before a source was Alt-clicked.
+    void cloneSourceRequired();
+    /// A tool was used on a layer whose pixels or position are locked.
+    /// `MainWindow` names the tool and puts the dialog up — it holds the active
+    /// variant, and the canvas does not own dialogs.
+    void lockedLayerRefused();
+    /// A mixer stroke ended, so the paint on the brush has changed. The options
+    /// bar's load swatch reads it back from the engine.
+    void mixerLoadChanged();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -208,6 +260,22 @@ private:
     void clampPan();
     /// Cursor appropriate to the active tool and modifier state.
     void updateCursor();
+    /// Draw the Gradient tool's drag line.
+    void paintGradientDrag(QPainter &painter);
+    /// The drag's end point, snapped to 45° steps while `Shift` is held — the
+    /// same constraint CS6 puts on a gradient drag.
+    QPointF constrainedGradientEnd(const QPointF &doc, Qt::KeyboardModifiers modifiers) const;
+
+    /// Handle a press with the Clone Stamp. Returns true when the press was
+    /// consumed — an Alt-click that sets the source, or a stroke refused for
+    /// want of one — and false to fall through to the ordinary stroke path.
+    bool clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    /// Draw the Clone Stamp's sampled source point.
+    void paintCloneSource(QPainter &painter);
+
+    /// Emit `lockedLayerRefused` if the engine turned an edit down because the
+    /// layer's pixels are locked. Silent when it refused for any other reason.
+    void reportIfLocked();
     /// Marching-ants outline of the current selection.
     void paintSelection(QPainter &painter);
     /// The combine operation for a gesture made with `modifiers` held: the
@@ -239,6 +307,26 @@ private:
     bool lassoIsClicked() const { return toolIsLasso() && !lassoIsDragged(); }
     /// Whether `doc` is close enough to the first anchor to close the shape.
     bool nearLassoStart(const QPointF &doc) const;
+
+    /// A fixed screen-pixel hit radius, converted to document units at the
+    /// current zoom — the same idea as `nearLassoStart`'s, generalised for
+    /// anchor/handle/segment hit-testing.
+    float pathHitRadius() const;
+    /// Handle a press with one of the Pen button's five tools. Alt at press
+    /// time is not consulted — unlike real Photoshop, this Pen tool does not
+    /// temporarily borrow Convert Point's press behaviour under Alt; that
+    /// functionality is still fully available through the dedicated Convert
+    /// Point tool in the flyout.
+    void penPress(const QPointF &doc);
+    void penMove(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    void penRelease(const QPointF &doc);
+    /// Handle a press with one of the Path Selection button's two tools.
+    void pathSelectPress(const QPointF &doc);
+    void pathSelectMove(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    void pathSelectRelease();
+    /// Draw the active path: its curve, anchors and handles, and the Rubber
+    /// Band preview of the segment about to be placed.
+    void paintPathOverlay(QPainter &painter);
     /// True when the Quick Selection button is holding the drag-a-brush tool
     /// rather than the click-once wand.
     bool toolIsQuickBrush() const
@@ -457,6 +545,11 @@ private:
     /// CS6's default healing type.
     HealType m_healType = HealType::ContentAware;
     HealingType m_healingType = HealingType::SpotHealing;
+    /// True while the Mixer Brush is the active tool, and while one of its
+    /// strokes is in progress.
+    bool m_mixerMode = false;
+    bool m_mixing = false;
+
     /// True while the Color Replacement Brush is the active tool, and while one
     /// of its strokes is in progress.
     bool m_replaceMode = false;
@@ -464,6 +557,62 @@ private:
     /// The Healing Brush's Alt-clicked source, in document coordinates.
     QPointF m_healSource;
     bool m_healSourceValid = false;
+
+    /// True while one of the six retouch tools is active, and while one of their
+    /// strokes is in progress.
+    bool m_retouchMode = false;
+    bool m_retouching = false;
+
+    // -- Gradient --
+    GradientTool m_gradientTool = GradientTool::Gradient;
+    /// The drag that defines the ramp's axis, live only while dragging.
+    bool m_gradientDragging = false;
+    QPointF m_gradientStart;
+    QPointF m_gradientEnd;
+
+    // -- Pen / Path Selection --
+    PenTool m_penTool = PenTool::Pen;
+    PathSelectTool m_pathSelectTool = PathSelectTool::PathSelection;
+    bool m_penAutoAddDelete = PenDefaults::kAutoAddDelete;
+    bool m_penRubberBand = PenDefaults::kRubberBand;
+    double m_freeformTolerance = PenDefaults::kFreeformTolerance;
+    /// The cursor's last known document position while the Pen tool is
+    /// active, for the Rubber Band preview — tracked on every hover, not only
+    /// while dragging.
+    QPointF m_penHoverDoc;
+
+    /// What a Pen-tool press is in the middle of, so the matching move/release
+    /// know what to do. `PlacingHandle` covers the ordinary case: a fresh
+    /// corner was just appended, and a drag before release turns it smooth.
+    enum class PenGesture { None, PlacingHandle, ConvertHandle, ConvertNewHandles, Freeform };
+    PenGesture m_penGesture = PenGesture::None;
+    int m_penSubpath = -1;
+    int m_penPoint = -1;
+    int m_penHandleSide = -1;
+    /// Where the current Pen-tool press started, to tell a Convert Point click
+    /// from a Convert Point drag.
+    QPointF m_penPressDoc;
+    /// The raw drag trail for the Freeform Pen, simplified into anchors on
+    /// release.
+    QPolygonF m_freeformPoints;
+
+    /// What a Path Selection / Direct Selection press grabbed.
+    enum class PathSelectGesture { None, Subpath, Anchor, Handle };
+    PathSelectGesture m_pathSelectGesture = PathSelectGesture::None;
+    int m_pathSelectSubpath = -1;
+    int m_pathSelectPoint = -1;
+    int m_pathSelectHandleSide = -1;
+    /// The subpath drag's last position, since `pathMoveSubpath` takes a delta
+    /// rather than an absolute position.
+    QPointF m_pathSelectLastDoc;
+
+    // -- Clone Stamp --
+    /// The Alt-clicked source point, and whether one has been set. Held here as
+    /// well as in the engine so the overlay can draw it.
+    QPointF m_cloneSource;
+    bool m_cloneSourceValid = false;
+    bool m_cloneAligned = CloneDefaults::kAligned;
+    CloneSampling m_cloneSampling = CloneDefaults::kSampling;
     /// True while one of the region healing tools is tracing its outline; it
     /// borrows the lasso's freehand path.
     bool m_healingTracing = false;

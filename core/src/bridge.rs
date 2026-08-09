@@ -20,8 +20,15 @@ use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::document::{Document, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
-use crate::layer::LayerId;
+use crate::layer::{LayerId, LayerKind};
+use crate::mixer::MixerOptions;
 use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
+use crate::focus::{FocusMode, FocusOptions};
+use crate::smudge::SmudgeOptions;
+use crate::tone::{SpongeMode, ToneOptions, ToneRange, ToneTool};
+use crate::bucket::BucketOptions;
+use crate::gradient::{self, GradientOptions, GradientType};
+use crate::stamp::CloneSampling;
 use crate::magnetic::EdgeMap;
 use crate::selection::{Selection, SelectionOp};
 use crate::wand::{self, QuickSelector};
@@ -332,6 +339,220 @@ pub mod ffi {
         fn slices_changed(self: Pin<&mut Engine>);
     }
 
+    // -- paths -----------------------------------------------------------
+    //
+    // The Pen tool and the Paths panel both act on whichever path is
+    // *active*; there is no per-call path handle, only an index into this
+    // list, mirroring how the Layers panel addresses layers by panel index.
+    // Geometry edits are not undoable (see `path.rs`'s module comment) — only
+    // Fill Path, Stroke Path and the pixels a Make Selection goes on to affect
+    // are, and those already go through the ordinary commit machinery.
+    unsafe extern "RustQt" {
+        /// Number of paths in the panel.
+        #[qinvokable]
+        #[cxx_name = "pathCount"]
+        fn path_count(self: &Engine) -> i32;
+
+        /// A path's display name, or empty for an out-of-range index.
+        #[qinvokable]
+        #[cxx_name = "pathName"]
+        fn path_name(self: &Engine, index: i32) -> QString;
+
+        /// The active path's panel index, or -1 if none is active.
+        #[qinvokable]
+        #[cxx_name = "activePathIndex"]
+        fn active_path_index(self: &Engine) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "setActivePathIndex"]
+        fn set_active_path_index(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Create an empty path named "Path N" and make it active — the
+        /// panel's "New Path". Returns its index.
+        #[qinvokable]
+        #[cxx_name = "addPath"]
+        fn add_path(self: Pin<&mut Engine>) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "duplicatePath"]
+        fn duplicate_path(self: Pin<&mut Engine>, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "deletePath"]
+        fn delete_path(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "renamePath"]
+        fn rename_path(self: Pin<&mut Engine>, index: i32, name: &QString) -> bool;
+
+        /// Whether a subpath is currently being extended by the Pen tool —
+        /// what decides whether Enter/Escape/a tool switch has anything to
+        /// finish.
+        #[qinvokable]
+        #[cxx_name = "pathIsEditing"]
+        fn path_is_editing(self: &Engine) -> bool;
+
+        /// Append a corner anchor to the active path, starting the Work Path
+        /// if none is active yet and starting a new subpath within it if the
+        /// last one was finished or closed.
+        #[qinvokable]
+        #[cxx_name = "pathAppendCorner"]
+        fn path_append_corner(self: Pin<&mut Engine>, x: f32, y: f32);
+
+        /// Live-update the handle of the point last appended, as a Pen tool
+        /// drag moves away from where it clicked. `independent` is CS6's
+        /// Alt-drag-while-placing: it curves only the segment about to be
+        /// drawn, leaving the one already drawn into this point untouched.
+        #[qinvokable]
+        #[cxx_name = "pathUpdateLastHandle"]
+        fn path_update_last_handle(self: Pin<&mut Engine>, x: f32, y: f32, independent: bool) -> bool;
+
+        /// Close the subpath being drawn back to its first anchor. Refused
+        /// with fewer than two points.
+        #[qinvokable]
+        #[cxx_name = "pathCloseActiveSubpath"]
+        fn path_close_active_subpath(self: Pin<&mut Engine>) -> bool;
+
+        /// Stop extending the current subpath without closing it — Enter,
+        /// double-click, Escape, or switching away from the Pen tool.
+        #[qinvokable]
+        #[cxx_name = "pathFinishEditing"]
+        fn path_finish_editing(self: Pin<&mut Engine>);
+
+        /// The nearest anchor on the active path within `radius` document
+        /// units, as `[subpath, point]`, or empty if none is that close.
+        #[qinvokable]
+        #[cxx_name = "pathHitAnchor"]
+        fn path_hit_anchor(self: &Engine, x: f32, y: f32, radius: f32) -> Vec<i32>;
+
+        /// The nearest handle within `radius`, as `[subpath, point, side]`
+        /// (`side` 0 = in, 1 = out), or empty.
+        #[qinvokable]
+        #[cxx_name = "pathHitHandle"]
+        fn path_hit_handle(self: &Engine, x: f32, y: f32, radius: f32) -> Vec<i32>;
+
+        /// The nearest point on any segment within `radius`, as `[subpath,
+        /// segment, t]` — `t` packed as a float alongside the two integers, or
+        /// empty if nothing is that close. What Auto Add and the Add Anchor
+        /// Point tool hit-test against.
+        #[qinvokable]
+        #[cxx_name = "pathHitSegment"]
+        fn path_hit_segment(self: &Engine, x: f32, y: f32, radius: f32) -> Vec<f32>;
+
+        /// The subpath nearest `(x, y)` — on one of its segments, or anywhere
+        /// inside it if closed — or -1. What the Path Selection tool picks.
+        #[qinvokable]
+        #[cxx_name = "pathHitSubpath"]
+        fn path_hit_subpath(self: &Engine, x: f32, y: f32, radius: f32) -> i32;
+
+        /// Move an anchor to an absolute position, carrying its handles with
+        /// it — Direct Selection dragging a point.
+        #[qinvokable]
+        #[cxx_name = "pathMoveAnchor"]
+        fn path_move_anchor(self: Pin<&mut Engine>, sp: i32, pt: i32, x: f32, y: f32) -> bool;
+
+        /// Drag one handle to an absolute position. `side` 0 = in, 1 = out.
+        /// `independent` (Alt) moves just that handle and permanently breaks
+        /// the point's smoothness; otherwise a smooth point's opposite handle
+        /// follows the angle, keeping its own length.
+        #[qinvokable]
+        #[cxx_name = "pathMoveHandle"]
+        fn path_move_handle(
+            self: Pin<&mut Engine>,
+            sp: i32,
+            pt: i32,
+            side: i32,
+            x: f32,
+            y: f32,
+            independent: bool,
+        ) -> bool;
+
+        /// Convert Point's click: strip both handles, leaving a plain corner.
+        #[qinvokable]
+        #[cxx_name = "pathSetCorner"]
+        fn path_set_corner(self: Pin<&mut Engine>, sp: i32, pt: i32) -> bool;
+
+        /// Convert Point's drag from a corner: pull out a fresh symmetric pair
+        /// of handles, turning the point smooth.
+        #[qinvokable]
+        #[cxx_name = "pathDragNewHandles"]
+        fn path_drag_new_handles(self: Pin<&mut Engine>, sp: i32, pt: i32, x: f32, y: f32) -> bool;
+
+        /// Split a segment at `t`, inserting a new anchor exactly on the
+        /// curve — the Add Anchor Point tool, and Auto Add hovering a segment.
+        #[qinvokable]
+        #[cxx_name = "pathInsertAnchor"]
+        fn path_insert_anchor(self: Pin<&mut Engine>, sp: i32, seg: i32, t: f32) -> bool;
+
+        /// Remove an anchor, deleting its subpath too if that empties it — the
+        /// Delete Anchor Point tool, and Auto Add hovering an anchor.
+        #[qinvokable]
+        #[cxx_name = "pathDeleteAnchor"]
+        fn path_delete_anchor(self: Pin<&mut Engine>, sp: i32, pt: i32) -> bool;
+
+        /// Move a whole subpath by a delta — the Path Selection tool.
+        #[qinvokable]
+        #[cxx_name = "pathMoveSubpath"]
+        fn path_move_subpath(self: Pin<&mut Engine>, sp: i32, dx: f32, dy: f32) -> bool;
+
+        /// Number of subpaths in the active path.
+        #[qinvokable]
+        #[cxx_name = "pathSubpathCount"]
+        fn path_subpath_count(self: &Engine) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "pathIsClosed"]
+        fn path_is_closed(self: &Engine, sp: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "pathAnchorCount"]
+        fn path_anchor_count(self: &Engine, sp: i32) -> i32;
+
+        /// One anchor's full geometry, packed as `[x, y, smooth, hasIn, inX,
+        /// inY, hasOut, outX, outY]` (`smooth`/`hasIn`/`hasOut` are 0 or 1) —
+        /// everything the canvas needs to draw it and build a `QPainterPath`
+        /// segment either side of it. Empty for an out-of-range index.
+        #[qinvokable]
+        #[cxx_name = "pathAnchorAt"]
+        fn path_anchor_at(self: &Engine, sp: i32, pt: i32) -> Vec<f32>;
+
+        /// Reduce a freehand drag to a handful of corner anchors and append it
+        /// as a new subpath — the Freeform Pen tool. `points` is the raw mouse
+        /// trail in document coordinates, interleaved x, y.
+        #[qinvokable]
+        #[cxx_name = "pathAddFreeformSubpath"]
+        fn path_add_freeform_subpath(
+            self: Pin<&mut Engine>,
+            points: &QVector_f32,
+            tolerance: f32,
+            close: bool,
+        ) -> bool;
+
+        /// Turn the active path into a selection — the Paths panel's "Make
+        /// Selection". `op` is a `SelectionOp` discriminant.
+        #[qinvokable]
+        #[cxx_name = "pathMakeSelection"]
+        fn path_make_selection(self: Pin<&mut Engine>, op: i32, feather: i32) -> bool;
+
+        /// Fill the active path with the foreground colour — "Fill Path".
+        #[qinvokable]
+        #[cxx_name = "pathFill"]
+        fn path_fill(self: Pin<&mut Engine>) -> bool;
+
+        /// Stroke the active path with the current brush and foreground
+        /// colour — "Stroke Path". Photoshop lets Stroke Path use any tool's
+        /// settings; this always uses the Brush's, the overwhelmingly common
+        /// choice.
+        #[qinvokable]
+        #[cxx_name = "pathStroke"]
+        fn path_stroke(self: Pin<&mut Engine>) -> bool;
+
+        /// The paths changed and the canvas/panel should repaint.
+        #[qsignal]
+        #[cxx_name = "pathsChanged"]
+        fn paths_changed(self: Pin<&mut Engine>);
+    }
+
     // -- layers ------------------------------------------------------------
     unsafe extern "RustQt" {
         /// Name of the layer at a panel index (0 = topmost).
@@ -365,6 +586,47 @@ pub mod ffi {
         #[cxx_name = "layerHasMask"]
         fn layer_has_mask(self: &Engine, index: i32) -> bool;
 
+        /// What the layer is: 0 = raster (pixels), 1 = adjustment. The panel
+        /// draws these differently and filters on them, as CS6's Kind row does.
+        #[qinvokable]
+        #[cxx_name = "layerKind"]
+        fn layer_kind(self: &Engine, index: i32) -> i32;
+
+        /// The layer's Lock Transparent Pixels flag.
+        #[qinvokable]
+        #[cxx_name = "layerLockTransparency"]
+        fn layer_lock_transparency(self: &Engine, index: i32) -> bool;
+
+        /// Its Lock Image Pixels flag — the one that makes a layer untouchable.
+        #[qinvokable]
+        #[cxx_name = "layerLockPixels"]
+        fn layer_lock_pixels(self: &Engine, index: i32) -> bool;
+
+        /// Its Lock Position flag.
+        #[qinvokable]
+        #[cxx_name = "layerLockPosition"]
+        fn layer_lock_position(self: &Engine, index: i32) -> bool;
+
+        /// Whether any lock is on, which is what puts a padlock on the row.
+        #[qinvokable]
+        #[cxx_name = "layerIsLocked"]
+        fn layer_is_locked(self: &Engine, index: i32) -> bool;
+
+        /// Whether every lock is on — Lock All. Such a layer cannot be deleted
+        /// or merged either.
+        #[qinvokable]
+        #[cxx_name = "layerIsFullyLocked"]
+        fn layer_is_fully_locked(self: &Engine, index: i32) -> bool;
+
+        /// Whether the layer the tools would act on has its pixels locked.
+        ///
+        /// This is exactly the condition every painting entry point refuses on,
+        /// so the shell can tell a refusal caused by the lock from one caused by
+        /// the layer having no pixels to paint (an adjustment layer).
+        #[qinvokable]
+        #[cxx_name = "activeLayerIsLocked"]
+        fn active_layer_is_locked(self: &Engine) -> bool;
+
         /// A square thumbnail of the layer's content, for the panel.
         #[qinvokable]
         #[cxx_name = "layerThumbnail"]
@@ -393,6 +655,17 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "setLayerName"]
         fn set_layer_name(self: Pin<&mut Engine>, index: i32, name: &QString);
+
+        /// Set all three locks on a layer at once — the panel's Lock row.
+        #[qinvokable]
+        #[cxx_name = "setLayerLocks"]
+        fn set_layer_locks(
+            self: Pin<&mut Engine>,
+            index: i32,
+            transparency: bool,
+            pixels: bool,
+            position: bool,
+        );
 
         #[qinvokable]
         #[cxx_name = "setLayerClipping"]
@@ -589,6 +862,230 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "cancelReplace"]
         fn cancel_replace(self: Pin<&mut Engine>);
+
+        /// The Mixer Brush's options bar. `wet`, `load`, `mix` and `flow` are
+        /// percentages, 0-100.
+        #[qinvokable]
+        #[cxx_name = "setMixerOptions"]
+        fn set_mixer_options(
+            self: Pin<&mut Engine>,
+            wet: i32,
+            load: i32,
+            mix: i32,
+            flow: i32,
+            sample_all_layers: bool,
+            load_after_stroke: bool,
+            clean_after_stroke: bool,
+        );
+
+        /// Fill the brush's reservoir with the foreground colour — CS6's "Load
+        /// Brush".
+        #[qinvokable]
+        #[cxx_name = "loadMixerBrush"]
+        fn load_mixer_brush(self: Pin<&mut Engine>);
+
+        /// Load the reservoir from the image at `(x, y)` — CS6's Alt-click,
+        /// which is how paint is picked up to mix with.
+        #[qinvokable]
+        #[cxx_name = "loadMixerBrushFrom"]
+        fn load_mixer_brush_from(self: Pin<&mut Engine>, x: i32, y: i32);
+
+        /// Empty the reservoir — CS6's "Clean Brush". A clean wet brush smears
+        /// without adding colour of its own.
+        #[qinvokable]
+        #[cxx_name = "cleanMixerBrush"]
+        fn clean_mixer_brush(self: Pin<&mut Engine>);
+
+        /// The paint currently on the brush, for the options bar's load swatch.
+        /// Fully transparent means clean.
+        #[qinvokable]
+        #[cxx_name = "mixerLoadColor"]
+        fn mixer_load_color(self: &Engine) -> QColor;
+
+        /// Begin a Mixer Brush stroke. Returns false if the active layer cannot
+        /// be painted.
+        #[qinvokable]
+        #[cxx_name = "beginMixer"]
+        fn begin_mixer(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// Continue one.
+        #[qinvokable]
+        #[cxx_name = "extendMixer"]
+        fn extend_mixer(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32);
+
+        /// Finish one, recording a single undo step. The reservoir carries over
+        /// to the next stroke unless Clean or Load after each stroke is on.
+        #[qinvokable]
+        #[cxx_name = "endMixer"]
+        fn end_mixer(self: Pin<&mut Engine>);
+
+        /// Abandon one, restoring what it changed.
+        #[qinvokable]
+        #[cxx_name = "cancelMixer"]
+        fn cancel_mixer(self: Pin<&mut Engine>);
+
+        /// The Clone Stamp's options bar: Aligned, and Sample (0 = current
+        /// layer, 1 = current and below, 2 = all layers).
+        #[qinvokable]
+        #[cxx_name = "setCloneOptions"]
+        fn set_clone_options(self: Pin<&mut Engine>, aligned: bool, sampling: i32);
+
+        /// Set the point the Clone Stamp copies from — CS6's Alt-click. Also
+        /// forgets the offset an aligned stroke had established, so the next
+        /// stroke measures afresh from the new point.
+        ///
+        /// Returns whether there is anything to copy there *under the current
+        /// Sample mode*. Sampling the current layer alone — CS6's default — finds
+        /// nothing if the material is on another layer, and a stroke that copies
+        /// transparency looks to the user like a tool that does not work.
+        #[qinvokable]
+        #[cxx_name = "setCloneSource"]
+        fn set_clone_source(self: Pin<&mut Engine>, x: i32, y: i32) -> bool;
+
+        /// Forget the source, so the tool asks for one again.
+        #[qinvokable]
+        #[cxx_name = "clearCloneSource"]
+        fn clear_clone_source(self: Pin<&mut Engine>);
+
+        /// Whether a source has been set. Without one the Clone Stamp has
+        /// nothing to copy and refuses to paint, as Photoshop's does.
+        #[qinvokable]
+        #[cxx_name = "hasCloneSource"]
+        fn has_clone_source(self: &Engine) -> bool;
+
+        /// Begin a Clone Stamp stroke. Returns false if there is no source or
+        /// the active layer cannot be painted on. The stroke is then extended
+        /// and ended through `extendStroke` / `endStroke` like any other.
+        #[qinvokable]
+        #[cxx_name = "beginCloneStroke"]
+        fn begin_clone_stroke(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// The gradient presets, newline-separated and in CS6's order. The engine
+        /// owns the list so the options bar cannot offer a name it cannot draw.
+        #[qinvokable]
+        #[cxx_name = "gradientPresetNames"]
+        fn gradient_preset_names(self: &Engine) -> QString;
+
+        /// A preview strip of a preset, for the options bar's swatch and the
+        /// preset menu. Rendered by the engine, so a preview cannot drift from
+        /// what the tool paints. An unknown name gives an empty image.
+        #[qinvokable]
+        #[cxx_name = "gradientPreview"]
+        fn gradient_preview(self: &Engine, name: &QString, width: i32, height: i32) -> QImage;
+
+        /// The Gradient tool's options bar. `kind` 0-4 (Linear, Radial, Angle,
+        /// Reflected, Diamond), `mode` a blend-mode discriminant, `opacity` a
+        /// percentage.
+        #[qinvokable]
+        #[cxx_name = "setGradientOptions"]
+        fn set_gradient_options(
+            self: Pin<&mut Engine>,
+            preset: &QString,
+            kind: i32,
+            mode: i32,
+            opacity: i32,
+            reverse: bool,
+            dither: bool,
+            transparency: bool,
+        );
+
+        /// Draw the current gradient along a drag, in document coordinates.
+        /// Returns false if the active layer cannot be painted on, or the drag
+        /// was too short to have a direction.
+        #[qinvokable]
+        #[cxx_name = "drawGradient"]
+        fn draw_gradient(self: Pin<&mut Engine>, x0: f32, y0: f32, x1: f32, y1: f32) -> bool;
+
+        /// Which of the Blur button's three tools strokes: 0 = Blur,
+        /// 1 = Sharpen, 2 = Smudge.
+        #[qinvokable]
+        #[cxx_name = "setFocusTool"]
+        fn set_focus_tool(self: Pin<&mut Engine>, tool: i32);
+
+        /// Which of the Dodge button's three tools strokes: 0 = Dodge, 1 = Burn,
+        /// 2 = Sponge. Picking one switches the retouch stroke to the toning
+        /// family, as `setFocusTool` switches it back.
+        #[qinvokable]
+        #[cxx_name = "setToneTool"]
+        fn set_tone_tool(self: Pin<&mut Engine>, tool: i32);
+
+        /// The toning tools' options bar. `range` 0-2 (Shadows, Midtones,
+        /// Highlights) and `protect_tones` belong to Dodge and Burn; `sponge`
+        /// 0-1 (Desaturate, Saturate) and `vibrance` to the Sponge; `amount` is
+        /// CS6's Exposure on the first two and Flow on the third.
+        #[qinvokable]
+        #[cxx_name = "setToneOptions"]
+        fn set_tone_options(
+            self: Pin<&mut Engine>,
+            amount: i32,
+            range: i32,
+            sponge: i32,
+            protect_tones: bool,
+            vibrance: bool,
+        );
+
+        /// The options bar for whichever of the three is active. They share
+        /// Strength, Mode and Sample All Layers; `protect_detail` is Sharpen's
+        /// alone and `finger_painting` is Smudge's, and each is ignored by the
+        /// tools it does not belong to. One call rather than three keeps the
+        /// bridge surface small, which matters more here than tidiness on the
+        /// C++ side (CLAUDE.md §3).
+        #[qinvokable]
+        #[cxx_name = "setFocusOptions"]
+        fn set_focus_options(
+            self: Pin<&mut Engine>,
+            strength: i32,
+            mode: i32,
+            sample_all_layers: bool,
+            protect_detail: bool,
+            finger_painting: bool,
+        );
+
+        /// Begin a stroke with whichever retouch tool was last selected — the
+        /// three behind the Blur button or the three behind Dodge. Returns false
+        /// if the active layer cannot be painted on.
+        ///
+        /// One set of entry points for six tools: they differ in what a dab does
+        /// and in nothing else the shell can see, and a thin bridge is worth more
+        /// than a symmetrical one (CLAUDE.md §3).
+        #[qinvokable]
+        #[cxx_name = "beginRetouchStroke"]
+        fn begin_retouch_stroke(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// Continue one.
+        #[qinvokable]
+        #[cxx_name = "extendRetouchStroke"]
+        fn extend_retouch_stroke(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32);
+
+        /// Finish one, recording a single undo step.
+        #[qinvokable]
+        #[cxx_name = "endRetouchStroke"]
+        fn end_retouch_stroke(self: Pin<&mut Engine>);
+
+        /// Abandon one, restoring what it changed.
+        #[qinvokable]
+        #[cxx_name = "cancelRetouchStroke"]
+        fn cancel_retouch_stroke(self: Pin<&mut Engine>);
+
+        /// The Paint Bucket's options bar. `mode` is a blend-mode discriminant,
+        /// `opacity` a percentage, `tolerance` 0-255 as the Magic Wand's is.
+        #[qinvokable]
+        #[cxx_name = "setBucketOptions"]
+        fn set_bucket_options(
+            self: Pin<&mut Engine>,
+            mode: i32,
+            opacity: i32,
+            tolerance: i32,
+            antialias: bool,
+            contiguous: bool,
+            all_layers: bool,
+        );
+
+        /// Flood-fill from a click, in document coordinates. Returns false if the
+        /// active layer cannot be painted on, or nothing matched.
+        #[qinvokable]
+        #[cxx_name = "fillBucket"]
+        fn fill_bucket(self: Pin<&mut Engine>, x: i32, y: i32) -> bool;
 
         #[qinvokable]
         #[cxx_name = "setHealMode"]
@@ -938,12 +1435,49 @@ pub struct EngineRust {
     auto_erase_active: bool,
     /// The Color Replacement Brush's options, held between strokes.
     replace_options: ReplaceOptions,
+    /// The Mixer Brush's options, held between strokes.
+    mixer_options: MixerOptions,
+    /// The paint on the Mixer Brush. It survives strokes — and tool switches, as
+    /// in Photoshop, where the brush stays loaded until it is cleaned.
+    mixer_reservoir: Rgba8,
+    /// CS6's two toggles beside the load swatch: reload from the foreground, or
+    /// clean off, once each stroke ends.
+    mixer_load_after_stroke: bool,
+    mixer_clean_after_stroke: bool,
     /// Set while the Spot Healing Brush is active. `None` for every other tool,
     /// which is what makes `end_stroke` paint normally.
     heal_mode: Option<HealMode>,
     /// Source offset for the Healing Brush, which samples an explicit point
     /// rather than inpainting from the stroke's own surroundings.
     heal_source: Option<(i32, i32)>,
+
+    /// The Clone Stamp's Alt-clicked source point, in document space.
+    clone_source: Option<(i32, i32)>,
+    /// The offset the last clone stroke used, kept so an **aligned** stroke
+    /// carries on from where the previous one left off instead of jumping back
+    /// to the source point. Cleared whenever a new source is set.
+    clone_offset: Option<(i32, i32)>,
+    clone_aligned: bool,
+    clone_sampling: CloneSampling,
+
+    /// The Gradient tool's options. The preset is held by *name*: the ramps for
+    /// the first few depend on the current foreground and background, so they
+    /// are built at the moment of drawing rather than cached here.
+    gradient_preset: String,
+    gradient_options: GradientOptions,
+    /// The Paint Bucket's options, held between clicks.
+    bucket_options: BucketOptions,
+    /// Which of the Blur button's three tools is active, and the options each
+    /// keeps between strokes. Smudge carries different state mid-stroke, so it
+    /// gets its own settings rather than sharing a struct.
+    focus_tool: i32,
+    focus_options: FocusOptions,
+    smudge_options: SmudgeOptions,
+    /// The toning tools' settings, and whether one of them is the retouch tool
+    /// in hand. The two families are picked from different strip buttons, so the
+    /// last `setFocusTool` or `setToneTool` decides which strokes.
+    tone_active: bool,
+    tone_options: ToneOptions,
     /// Edge field for the Magnetic Lasso, live only for the duration of one
     /// gesture. `None` the rest of the time so a large document is not paying
     /// for a float per pixel it is not using.
@@ -980,8 +1514,27 @@ impl Default for EngineRust {
             auto_erase: false,
             auto_erase_active: false,
             replace_options: ReplaceOptions::default(),
+            mixer_options: MixerOptions::default(),
+            // An unloaded brush would make the tool do nothing on first use, so
+            // it starts loaded with the default foreground, as CS6's does.
+            mixer_reservoir: Rgba8::BLACK,
+            mixer_load_after_stroke: false,
+            mixer_clean_after_stroke: false,
             heal_mode: None,
             heal_source: None,
+            clone_source: None,
+            clone_offset: None,
+            // CS6 ships with Aligned on and Sample set to the current layer.
+            clone_aligned: true,
+            clone_sampling: CloneSampling::CurrentLayer,
+            gradient_preset: gradient::PRESET_NAMES[0].to_string(),
+            gradient_options: GradientOptions::default(),
+            bucket_options: BucketOptions::default(),
+            focus_tool: 0,
+            focus_options: FocusOptions::default(),
+            smudge_options: SmudgeOptions::default(),
+            tone_active: false,
+            tone_options: ToneOptions::default(),
             edge_map: None,
             quick_select: None,
             quick_base: None,
@@ -1495,6 +2048,394 @@ impl ffi::Engine {
         pixmap_to_qimage(self.doc.composite().crop(slice.rect))
     }
 
+    // -- paths ----------------------------------------------------------------
+
+    fn path_count(&self) -> i32 {
+        self.doc.paths().len() as i32
+    }
+
+    fn path_name(&self, index: i32) -> QString {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.doc.paths().entries().get(i))
+            .map_or_else(QString::default, |e| QString::from(e.name.as_str()))
+    }
+
+    fn active_path_index(&self) -> i32 {
+        self.doc.paths().active_index().map_or(-1, |i| i as i32)
+    }
+
+    fn set_active_path_index(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        if !self.as_mut().rust_mut().doc.paths_mut().set_active(index) {
+            return false;
+        }
+        self.as_mut().paths_changed();
+        true
+    }
+
+    fn add_path(mut self: core::pin::Pin<&mut Self>) -> i32 {
+        let index = self.as_mut().rust_mut().doc.paths_mut().add_named() as i32;
+        self.as_mut().paths_changed();
+        index
+    }
+
+    fn duplicate_path(mut self: core::pin::Pin<&mut Self>, index: i32) -> i32 {
+        let Ok(index) = usize::try_from(index) else {
+            return -1;
+        };
+        let result = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .paths_mut()
+            .duplicate(index)
+            .map_or(-1, |i| i as i32);
+        if result >= 0 {
+            self.as_mut().paths_changed();
+        }
+        result
+    }
+
+    fn delete_path(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        if !self.as_mut().rust_mut().doc.paths_mut().remove(index) {
+            return false;
+        }
+        self.as_mut().paths_changed();
+        true
+    }
+
+    fn rename_path(mut self: core::pin::Pin<&mut Self>, index: i32, name: &QString) -> bool {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        let name = name.to_string();
+        if name.is_empty() {
+            return false;
+        }
+        if !self.as_mut().rust_mut().doc.paths_mut().rename(index, name) {
+            return false;
+        }
+        self.as_mut().paths_changed();
+        true
+    }
+
+    fn path_is_editing(&self) -> bool {
+        self.doc.paths().active().is_some_and(|p| p.is_editing())
+    }
+
+    fn path_append_corner(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32) {
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .paths_mut()
+            .ensure_active()
+            .append_corner(x, y);
+        self.as_mut().paths_changed();
+    }
+
+    fn path_update_last_handle(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        independent: bool,
+    ) -> bool {
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let changed = path.update_last_handle(x, y, independent);
+        if changed {
+            self.as_mut().paths_changed();
+        }
+        changed
+    }
+
+    fn path_close_active_subpath(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let closed = path.close_active_subpath();
+        if closed {
+            self.as_mut().paths_changed();
+        }
+        closed
+    }
+
+    fn path_finish_editing(mut self: core::pin::Pin<&mut Self>) {
+        if let Some(path) = self.as_mut().rust_mut().doc.paths_mut().active_mut() {
+            path.finish_editing();
+        }
+        self.as_mut().paths_changed();
+    }
+
+    fn path_hit_anchor(&self, x: f32, y: f32, radius: f32) -> Vec<i32> {
+        self.doc
+            .paths()
+            .active()
+            .and_then(|p| p.hit_anchor(x, y, radius))
+            .map_or_else(Vec::new, |(sp, pt)| vec![sp as i32, pt as i32])
+    }
+
+    fn path_hit_handle(&self, x: f32, y: f32, radius: f32) -> Vec<i32> {
+        self.doc
+            .paths()
+            .active()
+            .and_then(|p| p.hit_handle(x, y, radius))
+            .map_or_else(Vec::new, |(sp, pt, side)| {
+                let side = if side == crate::path::HandleSide::In { 0 } else { 1 };
+                vec![sp as i32, pt as i32, side]
+            })
+    }
+
+    fn path_hit_segment(&self, x: f32, y: f32, radius: f32) -> Vec<f32> {
+        self.doc
+            .paths()
+            .active()
+            .and_then(|p| p.hit_segment(x, y, radius))
+            .map_or_else(Vec::new, |(sp, seg, t)| vec![sp as f32, seg as f32, t])
+    }
+
+    fn path_hit_subpath(&self, x: f32, y: f32, radius: f32) -> i32 {
+        self.doc
+            .paths()
+            .active()
+            .and_then(|p| p.hit_subpath(x, y, radius))
+            .map_or(-1, |i| i as i32)
+    }
+
+    fn path_move_anchor(mut self: core::pin::Pin<&mut Self>, sp: i32, pt: i32, x: f32, y: f32) -> bool {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let moved = path.move_anchor(sp, pt, x, y);
+        if moved {
+            self.as_mut().paths_changed();
+        }
+        moved
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn path_move_handle(
+        mut self: core::pin::Pin<&mut Self>,
+        sp: i32,
+        pt: i32,
+        side: i32,
+        x: f32,
+        y: f32,
+        independent: bool,
+    ) -> bool {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return false;
+        };
+        let side = if side == 0 { crate::path::HandleSide::In } else { crate::path::HandleSide::Out };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let moved = path.move_handle(sp, pt, side, x, y, independent);
+        if moved {
+            self.as_mut().paths_changed();
+        }
+        moved
+    }
+
+    fn path_set_corner(mut self: core::pin::Pin<&mut Self>, sp: i32, pt: i32) -> bool {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let changed = path.set_corner(sp, pt);
+        if changed {
+            self.as_mut().paths_changed();
+        }
+        changed
+    }
+
+    fn path_drag_new_handles(mut self: core::pin::Pin<&mut Self>, sp: i32, pt: i32, x: f32, y: f32) -> bool {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let changed = path.drag_new_handles(sp, pt, x, y);
+        if changed {
+            self.as_mut().paths_changed();
+        }
+        changed
+    }
+
+    fn path_insert_anchor(mut self: core::pin::Pin<&mut Self>, sp: i32, seg: i32, t: f32) -> bool {
+        let (Ok(sp), Ok(seg)) = (usize::try_from(sp), usize::try_from(seg)) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let changed = path.insert_anchor(sp, seg, t);
+        if changed {
+            self.as_mut().paths_changed();
+        }
+        changed
+    }
+
+    fn path_delete_anchor(mut self: core::pin::Pin<&mut Self>, sp: i32, pt: i32) -> bool {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let changed = path.delete_anchor(sp, pt);
+        if changed {
+            self.as_mut().paths_changed();
+        }
+        changed
+    }
+
+    fn path_move_subpath(mut self: core::pin::Pin<&mut Self>, sp: i32, dx: f32, dy: f32) -> bool {
+        let Ok(sp) = usize::try_from(sp) else {
+            return false;
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(path) = rust.doc.paths_mut().active_mut() else {
+            return false;
+        };
+        let moved = path.move_subpath(sp, dx, dy);
+        if moved {
+            self.as_mut().paths_changed();
+        }
+        moved
+    }
+
+    fn path_subpath_count(&self) -> i32 {
+        self.doc.paths().active().map_or(0, |p| p.subpaths.len() as i32)
+    }
+
+    fn path_is_closed(&self, sp: i32) -> bool {
+        usize::try_from(sp)
+            .ok()
+            .and_then(|sp| self.doc.paths().active()?.subpaths.get(sp))
+            .is_some_and(|s| s.closed)
+    }
+
+    fn path_anchor_count(&self, sp: i32) -> i32 {
+        usize::try_from(sp)
+            .ok()
+            .and_then(|sp| self.doc.paths().active()?.subpaths.get(sp))
+            .map_or(0, |s| s.points.len() as i32)
+    }
+
+    fn path_anchor_at(&self, sp: i32, pt: i32) -> Vec<f32> {
+        let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
+            return Vec::new();
+        };
+        let Some(point) = self
+            .doc
+            .paths()
+            .active()
+            .and_then(|p| p.subpaths.get(sp))
+            .and_then(|s| s.points.get(pt))
+        else {
+            return Vec::new();
+        };
+        let (in_flag, in_x, in_y) = point.in_handle.map_or((0.0, 0.0, 0.0), |h| (1.0, h.0, h.1));
+        let (out_flag, out_x, out_y) =
+            point.out_handle.map_or((0.0, 0.0, 0.0), |h| (1.0, h.0, h.1));
+        vec![
+            point.anchor.0,
+            point.anchor.1,
+            if point.smooth { 1.0 } else { 0.0 },
+            in_flag,
+            in_x,
+            in_y,
+            out_flag,
+            out_x,
+            out_y,
+        ]
+    }
+
+    fn path_add_freeform_subpath(
+        mut self: core::pin::Pin<&mut Self>,
+        points: &ffi::QVector_f32,
+        tolerance: f32,
+        close: bool,
+    ) -> bool {
+        let pairs: Vec<(f32, f32)> = points
+            .iter()
+            .copied()
+            .collect::<Vec<f32>>()
+            .chunks_exact(2)
+            .map(|p| (p[0], p[1]))
+            .collect();
+        let added = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .add_freeform_subpath(&pairs, tolerance.max(0.1), close);
+        if added {
+            self.as_mut().paths_changed();
+        }
+        added
+    }
+
+    fn path_make_selection(mut self: core::pin::Pin<&mut Self>, op: i32, feather: i32) -> bool {
+        let op = SelectionOp::from_i32(op);
+        let feather = feather.clamp(0, 1000) as u32;
+        let made = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .select_from_active_path(op, feather);
+        if made {
+            self.as_mut().selection_changed();
+            self.as_mut().canvas_changed();
+        }
+        made
+    }
+
+    fn path_fill(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let color = self.foreground;
+        let dirty = self.as_mut().rust_mut().doc.fill_active_path(color, 1.0);
+        if dirty.is_empty() {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
+    fn path_stroke(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let brush = self.brush;
+        let color = self.paint_color();
+        let dirty = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .stroke_active_path(&brush, color, brush.opacity);
+        if dirty.is_empty() {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
     /// Open `doc` in a new tab, at the end, and make it active.
     fn add_document(mut self: core::pin::Pin<&mut Self>, doc: Document) {
         {
@@ -1677,6 +2618,51 @@ impl ffi::Engine {
             .is_some_and(|l| l.mask.is_some())
     }
 
+    fn layer_kind(&self, index: i32) -> i32 {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .map_or(0, |l| match l.kind {
+                LayerKind::Adjustment(_) => 1,
+                _ => 0,
+            })
+    }
+
+    fn layer_lock_transparency(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|l| l.lock_transparency)
+    }
+
+    fn layer_lock_pixels(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|l| l.lock_pixels)
+    }
+
+    fn layer_lock_position(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|l| l.lock_position)
+    }
+
+    fn layer_is_locked(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|l| l.is_locked())
+    }
+
+    fn layer_is_fully_locked(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|l| l.is_fully_locked())
+    }
+
+    fn active_layer_is_locked(&self) -> bool {
+        // Lock Position does not stop a brush, and Lock Transparency only
+        // constrains one — neither refuses a stroke, so neither belongs here.
+        self.doc.active_layer().is_some_and(|l| l.lock_pixels)
+    }
+
     fn layer_thumbnail(&self, index: i32, size: i32) -> QImage {
         let size = size.clamp(1, 512);
         let Some(layer) = self
@@ -1751,6 +2737,22 @@ impl ffi::Engine {
         if let Some(id) = self.layer_id_at(index) {
             let name = name.to_string();
             self.as_mut().rust_mut().doc.set_layer_name(id, name);
+            self.sync();
+        }
+    }
+
+    fn set_layer_locks(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        transparency: bool,
+        pixels: bool,
+        position: bool,
+    ) {
+        if let Some(id) = self.layer_id_at(index) {
+            self.as_mut()
+                .rust_mut()
+                .doc
+                .set_layer_locks(id, transparency, pixels, position);
             self.sync();
         }
     }
@@ -1980,8 +2982,16 @@ impl ffi::Engine {
             self.sync();
             return;
         }
-        let color = self.paint_color();
         let opacity = self.brush.opacity;
+        // A clone stroke copies the snapshot it took when it began instead of
+        // filling with a colour. Everything up to here — dabs, spacing, flow —
+        // was the same stroke machinery.
+        if self.doc.is_cloning() {
+            self.as_mut().rust_mut().doc.end_clone_stroke(opacity);
+            self.sync();
+            return;
+        }
+        let color = self.paint_color();
         self.as_mut().rust_mut().doc.end_stroke(color, opacity);
         self.sync();
     }
@@ -2066,6 +3076,401 @@ impl ffi::Engine {
     fn cancel_replace(mut self: core::pin::Pin<&mut Self>) {
         self.as_mut().rust_mut().doc.cancel_replace();
         self.sync();
+    }
+
+    fn set_mixer_options(
+        mut self: core::pin::Pin<&mut Self>,
+        wet: i32,
+        load: i32,
+        mix: i32,
+        flow: i32,
+        sample_all_layers: bool,
+        load_after_stroke: bool,
+        clean_after_stroke: bool,
+    ) {
+        let percent = |v: i32| v.clamp(0, 100) as f32 / 100.0;
+        let mut rust = self.as_mut().rust_mut();
+        rust.mixer_options = MixerOptions {
+            wet: percent(wet),
+            load: percent(load),
+            mix: percent(mix),
+            flow: percent(flow),
+            sample_all_layers,
+            // Set from the layer when the stroke begins: the transparency lock
+            // belongs to the layer, not to the options bar.
+            preserve_alpha: false,
+        };
+        rust.mixer_load_after_stroke = load_after_stroke;
+        rust.mixer_clean_after_stroke = clean_after_stroke;
+    }
+
+    fn load_mixer_brush(mut self: core::pin::Pin<&mut Self>) {
+        let colour = self.foreground;
+        self.as_mut().rust_mut().mixer_reservoir = colour;
+    }
+
+    fn load_mixer_brush_from(mut self: core::pin::Pin<&mut Self>, x: i32, y: i32) {
+        // The composite, not the active layer: what the user is aiming at is
+        // what they see.
+        let colour = self.doc.composite().get(x, y);
+        self.as_mut().rust_mut().mixer_reservoir = colour;
+    }
+
+    fn clean_mixer_brush(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().mixer_reservoir = Rgba8::TRANSPARENT;
+    }
+
+    fn mixer_load_color(&self) -> QColor {
+        rgba_to_qcolor(self.mixer_reservoir)
+    }
+
+    fn begin_mixer(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) -> bool {
+        let brush = self.brush;
+        let options = self.mixer_options;
+        let reservoir = self.mixer_reservoir;
+        let started = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .begin_mixer(&brush, options, reservoir, x, y, pressure);
+        if started {
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn extend_mixer(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) {
+        let brush = self.brush;
+        let dirty = self.as_mut().rust_mut().doc.extend_mixer(&brush, x, y, pressure);
+        if !dirty.is_empty() {
+            self.as_mut().canvas_changed();
+        }
+    }
+
+    fn end_mixer(mut self: core::pin::Pin<&mut Self>) {
+        let Some(carried) = self.as_mut().rust_mut().doc.end_mixer() else {
+            return;
+        };
+        // What the brush ends the stroke holding, unless a toggle says
+        // otherwise. Clean wins over Load when both are on, which is what CS6
+        // does — a cleaned brush is not then reloaded.
+        let foreground = self.foreground;
+        let (clean, reload) = (self.mixer_clean_after_stroke, self.mixer_load_after_stroke);
+        self.as_mut().rust_mut().mixer_reservoir = if clean {
+            Rgba8::TRANSPARENT
+        } else if reload {
+            foreground
+        } else {
+            carried
+        };
+        self.sync();
+    }
+
+    fn cancel_mixer(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.cancel_mixer();
+        self.sync();
+    }
+
+    fn set_clone_options(mut self: core::pin::Pin<&mut Self>, aligned: bool, sampling: i32) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.clone_aligned = aligned;
+        rust.clone_sampling = CloneSampling::from_i32(sampling);
+    }
+
+    fn set_clone_source(mut self: core::pin::Pin<&mut Self>, x: i32, y: i32) -> bool {
+        let sampling = self.clone_sampling;
+        let has_content = match sampling {
+            CloneSampling::CurrentLayer => self.doc.active_layer().is_some_and(|layer| {
+                layer
+                    .pixels
+                    .get(x - layer.offset.0, y - layer.offset.1)
+                    .a
+                    > 0
+            }),
+            // Both the wider modes read the composite; one pixel of it is enough
+            // to answer the question.
+            _ => {
+                let px = self.doc.composite_region(Rect::new(x, y, 1, 1));
+                px.get(0, 0).a > 0
+            }
+        };
+
+        let mut rust = self.as_mut().rust_mut();
+        rust.clone_source = Some((x, y));
+        // A fresh source means the aligned offset has to be measured again from
+        // the next stroke, or the tool would go on cloning from the old place.
+        rust.clone_offset = None;
+        has_content
+    }
+
+    fn clear_clone_source(mut self: core::pin::Pin<&mut Self>) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.clone_source = None;
+        rust.clone_offset = None;
+    }
+
+    fn has_clone_source(&self) -> bool {
+        self.clone_source.is_some()
+    }
+
+    fn begin_clone_stroke(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(source) = self.clone_source else {
+            return false;
+        };
+        let brush = self.brush;
+        let sampling = self.clone_sampling;
+
+        // Aligned keeps the offset the previous stroke established, so the sample
+        // point travels with the cursor across strokes. Unaligned measures
+        // afresh, so every stroke starts copying from the source point again.
+        let offset = match (self.clone_aligned, self.clone_offset) {
+            (true, Some(offset)) => offset,
+            _ => (source.0 - x.round() as i32, source.1 - y.round() as i32),
+        };
+
+        let started = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .begin_clone_stroke(&brush, x, y, pressure, offset, sampling);
+        if started {
+            self.as_mut().rust_mut().clone_offset = Some(offset);
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn gradient_preset_names(&self) -> QString {
+        QString::from(gradient::PRESET_NAMES.join("\n").as_str())
+    }
+
+    fn gradient_preview(&self, name: &QString, width: i32, height: i32) -> QImage {
+        let Some(ramp) = gradient::preset(&name.to_string(), self.foreground, self.background)
+        else {
+            return QImage::default();
+        };
+        pixmap_to_qimage(ramp.preview(
+            width.clamp(1, 4096) as u32,
+            height.clamp(1, 4096) as u32,
+        ))
+    }
+
+    fn set_gradient_options(
+        mut self: core::pin::Pin<&mut Self>,
+        preset: &QString,
+        kind: i32,
+        mode: i32,
+        opacity: i32,
+        reverse: bool,
+        dither: bool,
+        transparency: bool,
+    ) {
+        let name = preset.to_string();
+        let mut rust = self.as_mut().rust_mut();
+        // An unknown name would leave the tool with nothing to draw, so keep the
+        // one that is already set.
+        if gradient::preset(&name, Rgba8::BLACK, Rgba8::WHITE).is_some() {
+            rust.gradient_preset = name;
+        }
+        rust.gradient_options = GradientOptions {
+            kind: GradientType::from_i32(kind),
+            mode: BlendMode::from_i32(mode),
+            opacity: opacity.clamp(0, 100) as f32 / 100.0,
+            reverse,
+            dither,
+            transparency,
+            // Set from the layer when the gradient is drawn.
+            preserve_alpha: false,
+        };
+    }
+
+    fn draw_gradient(mut self: core::pin::Pin<&mut Self>, x0: f32, y0: f32, x1: f32, y1: f32)
+        -> bool
+    {
+        // Built here rather than held: "Foreground to Background" has to mean the
+        // colours as they are now, not as they were when the preset was picked.
+        let Some(ramp) =
+            gradient::preset(&self.gradient_preset, self.foreground, self.background)
+        else {
+            return false;
+        };
+        let options = self.gradient_options;
+        let dirty = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .draw_gradient(&ramp, &options, (x0, y0), (x1, y1));
+        if dirty.is_empty() {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
+    fn set_focus_tool(mut self: core::pin::Pin<&mut Self>, tool: i32) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.focus_tool = tool.clamp(0, 2);
+        rust.tone_active = false;
+    }
+
+    fn set_tone_tool(mut self: core::pin::Pin<&mut Self>, tool: i32) {
+        let mut rust = self.as_mut().rust_mut();
+        rust.tone_options.tool = ToneTool::from_i32(tool);
+        rust.tone_active = true;
+    }
+
+    fn set_tone_options(
+        mut self: core::pin::Pin<&mut Self>,
+        amount: i32,
+        range: i32,
+        sponge: i32,
+        protect_tones: bool,
+        vibrance: bool,
+    ) {
+        let tool = self.tone_options.tool;
+        self.as_mut().rust_mut().tone_options = ToneOptions {
+            tool,
+            range: ToneRange::from_i32(range),
+            sponge: SpongeMode::from_i32(sponge),
+            amount: amount.clamp(0, 100) as f32 / 100.0,
+            protect_tones,
+            vibrance,
+            // Set from the layer when the stroke begins.
+            preserve_alpha: false,
+        };
+    }
+
+    fn set_focus_options(
+        mut self: core::pin::Pin<&mut Self>,
+        strength: i32,
+        mode: i32,
+        sample_all_layers: bool,
+        protect_detail: bool,
+        finger_painting: bool,
+    ) {
+        let strength = strength.clamp(0, 100) as f32 / 100.0;
+        let mode = BlendMode::from_i32(mode);
+        let focus = FocusMode::from_i32(self.focus_tool);
+        let mut rust = self.as_mut().rust_mut();
+        rust.focus_options = FocusOptions {
+            focus,
+            strength,
+            mode,
+            sample_all_layers,
+            protect_detail,
+            // Set from the layer when the stroke begins.
+            preserve_alpha: false,
+        };
+        rust.smudge_options = SmudgeOptions {
+            strength,
+            mode,
+            sample_all_layers,
+            finger_painting,
+            preserve_alpha: false,
+        };
+    }
+
+    fn begin_retouch_stroke(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let brush = self.brush;
+        // Three shapes of stroke behind one entry point: toning reads a pixel's
+        // own tone, smudge carries pixels along, and the focus pair reads a
+        // neighbourhood.
+        let started = if self.tone_active {
+            let options = self.tone_options;
+            self.as_mut()
+                .rust_mut()
+                .doc
+                .begin_tone(&brush, options, x, y, pressure)
+        } else if self.focus_tool == 2 {
+            let options = self.smudge_options;
+            let paint = self.foreground;
+            self.as_mut()
+                .rust_mut()
+                .doc
+                .begin_smudge(&brush, options, paint, x, y, pressure)
+        } else {
+            let options = self.focus_options;
+            self.as_mut()
+                .rust_mut()
+                .doc
+                .begin_focus(&brush, options, x, y, pressure)
+        };
+        if started {
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn extend_retouch_stroke(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) {
+        let brush = self.brush;
+        let dirty = self.as_mut().rust_mut().doc.extend_retouch(&brush, x, y, pressure);
+        if !dirty.is_empty() {
+            self.as_mut().canvas_changed();
+        }
+    }
+
+    fn end_retouch_stroke(mut self: core::pin::Pin<&mut Self>) {
+        if self.as_mut().rust_mut().doc.end_retouch() {
+            self.sync();
+        }
+    }
+
+    fn cancel_retouch_stroke(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.cancel_retouch();
+        self.sync();
+    }
+
+    fn set_bucket_options(
+        mut self: core::pin::Pin<&mut Self>,
+        mode: i32,
+        opacity: i32,
+        tolerance: i32,
+        antialias: bool,
+        contiguous: bool,
+        all_layers: bool,
+    ) {
+        self.as_mut().rust_mut().bucket_options = BucketOptions {
+            mode: BlendMode::from_i32(mode),
+            opacity: opacity.clamp(0, 100) as f32 / 100.0,
+            tolerance: tolerance.clamp(0, 255) as u32,
+            antialias,
+            contiguous,
+            all_layers,
+            // Set from the layer when the fill happens.
+            preserve_alpha: false,
+        };
+    }
+
+    fn fill_bucket(mut self: core::pin::Pin<&mut Self>, x: i32, y: i32) -> bool {
+        let options = self.bucket_options;
+        // The Paint Bucket fills with the foreground colour, but honours erase
+        // mode the same way a stroke does.
+        let colour = self.paint_color();
+        let dirty = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .fill_bucket((x, y), &options, colour);
+        if dirty.is_empty() {
+            return false;
+        }
+        self.sync();
+        true
     }
 
     fn set_heal_mode(mut self: core::pin::Pin<&mut Self>, mode: i32) {

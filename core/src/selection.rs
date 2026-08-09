@@ -251,21 +251,41 @@ impl Selection {
         op: SelectionOp,
         feather: u32,
     ) {
-        let mut incoming = Selection::new(self.width, self.height);
-        // Fewer than three vertices encloses no area at all. Combining the
-        // empty mask still does the right thing for every op, so there is no
-        // early return: an intersect against nothing must clear the selection.
-        let bounds = if points.len() >= 3 {
-            incoming.rasterize_polygon(points)
+        if points.len() < 3 {
+            self.apply_polygons_feathered(&[], op, feather);
         } else {
+            self.apply_polygons_feathered(std::slice::from_ref(&points.to_vec()), op, feather);
+        }
+    }
+
+    /// Combine several closed contours at once, rasterised together under a
+    /// single nonzero-winding fill — what a path with more than one subpath
+    /// needs, since a subpath wound the opposite way from the one around it
+    /// cuts a hole rather than adding a second, separate region. Each contour
+    /// is implicitly closed from its last vertex back to its first.
+    pub fn apply_polygons_feathered(
+        &mut self,
+        contours: &[Vec<(f32, f32)>],
+        op: SelectionOp,
+        feather: u32,
+    ) {
+        let mut incoming = Selection::new(self.width, self.height);
+        let usable: Vec<&[(f32, f32)]> = contours
+            .iter()
+            .map(|c| c.as_slice())
+            .filter(|c| c.len() >= 3)
+            .collect();
+        let bounds = if usable.is_empty() {
             Rect::default()
+        } else {
+            incoming.rasterize_polygons(&usable)
         };
         // The antialiased edge can spill one pixel past the exact bounds.
         incoming.feather_region(feather, bounds.inflate(feather + 1));
         self.combine(&incoming, op);
     }
 
-    /// Scan-convert `points` into this (assumed empty) mask, returning the
+    /// Scan-convert `contours` into this (assumed empty) mask, returning the
     /// pixel bounds actually touched.
     ///
     /// Coverage comes from `POLY_SUBSAMPLES` sub-scanlines per pixel row, each
@@ -273,16 +293,18 @@ impl Selection {
     /// and horizontal antialiasing respectively, for the cost of one pass over
     /// the edge list per sub-scanline — far cheaper than point-sampling every
     /// pixel against every edge.
-    fn rasterize_polygon(&mut self, points: &[(f32, f32)]) -> Rect {
+    fn rasterize_polygons(&mut self, contours: &[&[(f32, f32)]]) -> Rect {
         let canvas = Rect::from_size(self.width, self.height);
 
         let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
         let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
-        for &(x, y) in points {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
+        for contour in contours {
+            for &(x, y) in *contour {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
         }
 
         let region = Rect::new(
@@ -299,7 +321,9 @@ impl Selection {
         // One row of accumulated coverage, reused down the region.
         let mut row = vec![0.0f32; region.width as usize];
         // x position of each edge crossing, paired with its winding direction.
-        let mut crossings: Vec<(f32, i32)> = Vec::with_capacity(points.len());
+        // Shared across every contour, which is what makes an oppositely-wound
+        // subpath subtract from the ones around it instead of unioning.
+        let mut crossings: Vec<(f32, i32)> = Vec::new();
         let weight = 1.0 / POLY_SUBSAMPLES as f32;
 
         for y in region.y..region.bottom() {
@@ -309,17 +333,19 @@ impl Selection {
                 let sy = y as f32 + (s as f32 + 0.5) / POLY_SUBSAMPLES as f32;
 
                 crossings.clear();
-                for i in 0..points.len() {
-                    let (x0, y0) = points[i];
-                    let (x1, y1) = points[(i + 1) % points.len()];
-                    // Half-open in y so a vertex exactly on the sub-scanline
-                    // is counted once, not twice or zero times.
-                    if (y0 <= sy) == (y1 <= sy) {
-                        continue;
+                for points in contours {
+                    for i in 0..points.len() {
+                        let (x0, y0) = points[i];
+                        let (x1, y1) = points[(i + 1) % points.len()];
+                        // Half-open in y so a vertex exactly on the sub-scanline
+                        // is counted once, not twice or zero times.
+                        if (y0 <= sy) == (y1 <= sy) {
+                            continue;
+                        }
+                        let t = (sy - y0) / (y1 - y0);
+                        let direction = if y0 <= sy { 1 } else { -1 };
+                        crossings.push((x0 + t * (x1 - x0), direction));
                     }
-                    let t = (sy - y0) / (y1 - y0);
-                    let direction = if y0 <= sy { 1 } else { -1 };
-                    crossings.push((x0 + t * (x1 - x0), direction));
                 }
                 if crossings.len() < 2 {
                     continue;
@@ -328,7 +354,9 @@ impl Selection {
 
                 // Nonzero winding, which is what a freehand loop wants: a
                 // stroke that crosses back over itself stays solid instead of
-                // punching an even-odd hole where the user's hand wobbled.
+                // punching an even-odd hole where the user's hand wobbled. Fed
+                // by every contour together, the same rule is what turns an
+                // oppositely-wound subpath into a hole.
                 let mut winding = 0;
                 for pair in crossings.windows(2) {
                     winding += pair[0].1;
@@ -1054,6 +1082,35 @@ mod tests {
         );
         assert_eq!(s.coverage_at(30, 16), 1.0, "the overlapped region got a hole");
         assert_eq!(s.coverage_at(50, 16), 1.0, "the outer region was dropped");
+    }
+
+    #[test]
+    fn multiple_contours_union_when_wound_the_same_way() {
+        // Two separate closed subpaths, as a path with two disconnected loops
+        // produces — both should be selected.
+        let mut s = Selection::new(64, 64);
+        let a = vec![(4.0, 4.0), (20.0, 4.0), (20.0, 20.0), (4.0, 20.0)];
+        let b = vec![(40.0, 40.0), (56.0, 40.0), (56.0, 56.0), (40.0, 56.0)];
+        s.apply_polygons_feathered(&[a, b], SelectionOp::Replace, 0);
+        assert_eq!(s.coverage_at(12, 12), 1.0, "the first loop was not selected");
+        assert_eq!(s.coverage_at(48, 48), 1.0, "the second loop was not selected");
+        assert_eq!(s.coverage_at(30, 30), 0.0, "the gap between them got selected");
+    }
+
+    #[test]
+    fn an_oppositely_wound_contour_cuts_a_hole() {
+        // What a path's subpaths do to each other under nonzero winding: an
+        // inner loop wound the opposite way from the outer one is a hole, not
+        // a second region — this is how a compound shape like a letter "O" is
+        // built from two circles in Photoshop's own path model.
+        let mut s = Selection::new(64, 64);
+        // Outer, clockwise in screen coordinates (y grows downward).
+        let outer = vec![(8.0, 8.0), (56.0, 8.0), (56.0, 56.0), (8.0, 56.0)];
+        // Inner, wound the other way.
+        let inner = vec![(24.0, 24.0), (24.0, 40.0), (40.0, 40.0), (40.0, 24.0)];
+        s.apply_polygons_feathered(&[outer, inner], SelectionOp::Replace, 0);
+        assert_eq!(s.coverage_at(16, 16), 1.0, "the ring was not selected");
+        assert_eq!(s.coverage_at(32, 32), 0.0, "the hole was filled in");
     }
 
     #[test]

@@ -191,6 +191,30 @@ fn blend_over(
     *back_a = ar;
 }
 
+/// Composite one straight-alpha pixel over another through a blend mode.
+///
+/// The same operator the stack itself uses, exposed for the tools that paint a
+/// colour through a coverage mask — the Gradient tool and the Paint Bucket, both
+/// of which offer CS6's **Mode** menu. `alpha` scales the source's own opacity.
+pub fn blend_pixel(dst: Rgba8, src: Rgba8, alpha: f32, mode: BlendMode) -> Rgba8 {
+    let src_a = (src.a as f32 / 255.0) * alpha.clamp(0.0, 1.0);
+    if src_a <= 0.0 {
+        return dst;
+    }
+    let mut back_rgb = [dst.r as f32 / 255.0, dst.g as f32 / 255.0, dst.b as f32 / 255.0];
+    let mut back_a = dst.a as f32 / 255.0;
+    let src_rgb = [src.r as f32 / 255.0, src.g as f32 / 255.0, src.b as f32 / 255.0];
+
+    blend_over(&mut back_rgb, &mut back_a, src_rgb, src_a, mode);
+
+    Rgba8::new(
+        to_u8(back_rgb[0]),
+        to_u8(back_rgb[1]),
+        to_u8(back_rgb[2]),
+        to_u8(back_a),
+    )
+}
+
 /// Alpha of the clipping base for the layer at `index`.
 ///
 /// Scans downward past any other clipping layers to the first ordinary layer,

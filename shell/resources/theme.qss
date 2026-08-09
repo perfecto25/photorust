@@ -252,6 +252,18 @@ QToolButton#brushTipButton:hover {
     background-color: #4e4e4e;
 }
 
+/* The Gradient tool's options-bar swatch: a sunken frame around the ramp, the
+   same treatment as the brush tip button beside it. */
+QToolButton#gradientSwatch {
+    background-color: #3c3c3c;
+    border: 1px solid #2a2a2a;
+    padding: 2px 4px 2px 2px;
+}
+
+QToolButton#gradientSwatch:hover {
+    background-color: #4e4e4e;
+}
+
 /* The editable zoom field in the status bar. Sunk like any other input, but
    compact enough not to look out of place among the read-only readouts. */
 QLineEdit#statusZoom {

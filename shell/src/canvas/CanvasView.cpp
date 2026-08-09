@@ -194,6 +194,7 @@ void CanvasView::setActiveTool(ToolId tool)
     if (m_tool == tool) {
         return;
     }
+    const ToolId previous = m_tool;
     m_tool = tool;
 
     // Switching tools mid-gesture would leave the engine holding a half-built
@@ -202,10 +203,29 @@ void CanvasView::setActiveTool(ToolId tool)
         m_engine->cancelReplace();
         m_replacing = false;
     }
+    if (m_mixing && m_engine) {
+        m_engine->cancelMixer();
+        m_mixing = false;
+    }
+    m_gradientDragging = false;
+    if (m_retouching && m_engine) {
+        m_engine->cancelRetouchStroke();
+        m_retouching = false;
+    }
     if (m_dragging && m_engine) {
         m_engine->cancelStroke();
     }
     m_dragging = false;
+    // Leaving the Pen tool finishes whatever subpath was open rather than
+    // discarding it — switching tools is not a way to lose your place, only
+    // Esc is. Path Selection's drag, having no pending data of its own, just
+    // needs its gesture state cleared.
+    if (m_engine && previous == ToolId::Pen) {
+        m_engine->pathFinishEditing();
+    }
+    m_penGesture = PenGesture::None;
+    m_pathSelectGesture = PathSelectGesture::None;
+    m_freeformPoints.clear();
     // An outline left open on the old tool is discarded, not committed —
     // switching tools is not a way to close a shape.
     cancelLasso();
@@ -300,6 +320,594 @@ void CanvasView::setReplaceMode(bool active)
         m_replacing = false;
     }
     m_replaceMode = active;
+}
+
+void CanvasView::setMixerMode(bool active)
+{
+    if (m_mixerMode == active) {
+        return;
+    }
+    if (m_mixing && m_engine) {
+        m_engine->cancelMixer();
+        m_mixing = false;
+    }
+    m_mixerMode = active;
+}
+
+QPointF CanvasView::constrainedGradientEnd(const QPointF &doc,
+                                           Qt::KeyboardModifiers modifiers) const
+{
+    if (!modifiers.testFlag(Qt::ShiftModifier)) {
+        return doc;
+    }
+    // Shift snaps the axis to 45° steps, as it does for every other drag in
+    // Photoshop. The length is kept; only the direction is rounded.
+    const QPointF delta = doc - m_gradientStart;
+    const double length = std::hypot(delta.x(), delta.y());
+    if (length < 1e-6) {
+        return doc;
+    }
+    const double step = M_PI / 4.0;
+    const double angle = std::round(std::atan2(delta.y(), delta.x()) / step) * step;
+    return m_gradientStart + QPointF(std::cos(angle) * length, std::sin(angle) * length);
+}
+
+void CanvasView::paintGradientDrag(QPainter &painter)
+{
+    if (!m_gradientDragging) {
+        return;
+    }
+    // CS6 shows the axis as a plain line with a marker at each end while you
+    // drag, and draws nothing on the layer until the mouse is released.
+    const QPointF a = documentToWidget(m_gradientStart);
+    const QPointF b = documentToWidget(m_gradientEnd);
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setBrush(Qt::NoBrush);
+    // White under black, so the line reads on any image.
+    painter.setPen(QPen(Qt::white, 3.0));
+    painter.drawLine(a, b);
+    painter.setPen(QPen(Qt::black, 1.2));
+    painter.drawLine(a, b);
+    painter.drawEllipse(a, 3.0, 3.0);
+    painter.drawEllipse(b, 3.0, 3.0);
+    painter.restore();
+}
+
+void CanvasView::paintPathOverlay(QPainter &painter)
+{
+    if (!m_engine || !toolEditsPaths(m_tool)) {
+        return;
+    }
+    const int subpathCount = m_engine->pathSubpathCount();
+    if (subpathCount == 0) {
+        return;
+    }
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    // The curve itself: white under blue, the same two-pass trick the other
+    // overlays use so it reads against any part of the image beneath it.
+    QPainterPath curve;
+    // Anchors and handles, collected while building the curve so both walk the
+    // point data exactly once.
+    QVector<QPointF> anchors;
+    QVector<QPair<QPointF, QPointF>> handleLines; // anchor -> handle
+
+    for (int sp = 0; sp < subpathCount; ++sp) {
+        const int count = m_engine->pathAnchorCount(sp);
+        if (count == 0) {
+            continue;
+        }
+        const bool closed = m_engine->pathIsClosed(sp);
+
+        struct Anchor {
+            QPointF pos;
+            bool hasIn = false, hasOut = false;
+            QPointF in, out;
+        };
+        QVector<Anchor> points;
+        points.reserve(count);
+        for (int pt = 0; pt < count; ++pt) {
+            const rust::Vec<float> a = m_engine->pathAnchorAt(sp, pt);
+            if (a.size() != 9) {
+                continue;
+            }
+            Anchor entry;
+            entry.pos = documentToWidget(QPointF(a[0], a[1]));
+            entry.hasIn = a[3] > 0.5f;
+            entry.in = documentToWidget(QPointF(a[4], a[5]));
+            entry.hasOut = a[6] > 0.5f;
+            entry.out = documentToWidget(QPointF(a[7], a[8]));
+            points.append(entry);
+            anchors.append(entry.pos);
+            if (entry.hasIn) {
+                handleLines.append({entry.pos, entry.in});
+            }
+            if (entry.hasOut) {
+                handleLines.append({entry.pos, entry.out});
+            }
+        }
+        if (points.isEmpty()) {
+            continue;
+        }
+
+        curve.moveTo(points[0].pos);
+        const int segments = closed ? points.size() : points.size() - 1;
+        for (int i = 0; i < segments; ++i) {
+            const Anchor &a = points[i];
+            const Anchor &b = points[(i + 1) % points.size()];
+            const QPointF c1 = a.hasOut ? a.out : a.pos;
+            const QPointF c2 = b.hasIn ? b.in : b.pos;
+            curve.cubicTo(c1, c2, b.pos);
+        }
+    }
+
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(Qt::white, 2.6));
+    painter.drawPath(curve);
+    painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.1));
+    painter.drawPath(curve);
+
+    // Handles: thin lines from anchor to handle, then a small hollow circle.
+    painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.0));
+    for (const auto &line : handleLines) {
+        painter.drawLine(line.first, line.second);
+    }
+    painter.setBrush(Qt::white);
+    for (const auto &line : handleLines) {
+        painter.drawEllipse(line.second, 2.6, 2.6);
+    }
+
+    // Anchors: small hollow squares, matching CS6's own anchor glyph.
+    painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.2));
+    painter.setBrush(Qt::white);
+    for (const QPointF &p : anchors) {
+        painter.drawRect(QRectF(p.x() - 2.5, p.y() - 2.5, 5.0, 5.0));
+    }
+
+    // Rubber Band: the segment about to be drawn, previewed live from the last
+    // anchor to the cursor. Only the ordinary Pen tool has this, and only
+    // while a subpath is actually open — the editing subpath is always the
+    // last one, since a new one is only ever appended at the end.
+    if (m_penTool == PenTool::Pen && m_penRubberBand && m_engine->pathIsEditing()
+        && m_penGesture != PenGesture::Freeform) {
+        const int lastSubpath = subpathCount - 1;
+        const int count = m_engine->pathAnchorCount(lastSubpath);
+        if (count > 0) {
+            const rust::Vec<float> last = m_engine->pathAnchorAt(lastSubpath, count - 1);
+            if (last.size() == 9) {
+                const QPointF anchor(last[0], last[1]);
+                const QPointF start = last[6] > 0.5f ? QPointF(last[7], last[8]) : anchor;
+                QPainterPath preview(documentToWidget(anchor));
+                preview.cubicTo(documentToWidget(start), documentToWidget(m_penHoverDoc),
+                                documentToWidget(m_penHoverDoc));
+                painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.0, Qt::DashLine));
+                painter.drawPath(preview);
+            }
+        }
+    }
+
+    // Freeform Pen's own live trail.
+    if (m_penGesture == PenGesture::Freeform && m_freeformPoints.size() > 1) {
+        QPainterPath trail(documentToWidget(m_freeformPoints.first()));
+        for (int i = 1; i < m_freeformPoints.size(); ++i) {
+            trail.lineTo(documentToWidget(m_freeformPoints.at(i)));
+        }
+        painter.setPen(QPen(Qt::white, 2.6));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawPath(trail);
+        painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.1));
+        painter.drawPath(trail);
+    }
+
+    painter.restore();
+}
+
+void CanvasView::forgetSampleSources()
+{
+    m_cloneSourceValid = false;
+    m_healSourceValid = false;
+    if (m_engine) {
+        m_engine->clearCloneSource();
+        m_engine->setHealSource(false, 0, 0);
+    }
+    update();
+}
+
+void CanvasView::setRetouchMode(bool active)
+{
+    if (m_retouchMode == active) {
+        return;
+    }
+    if (m_retouching && m_engine) {
+        m_engine->cancelRetouchStroke();
+        m_retouching = false;
+    }
+    m_retouchMode = active;
+}
+
+void CanvasView::setGradientTool(GradientTool tool)
+{
+    if (m_gradientTool == tool) {
+        return;
+    }
+    // Switching away mid-drag would leave an axis on screen that nothing will
+    // ever draw.
+    m_gradientDragging = false;
+    m_gradientTool = tool;
+    update();
+}
+
+void CanvasView::setPenTool(PenTool tool)
+{
+    m_penTool = tool;
+    m_penGesture = PenGesture::None;
+    m_freeformPoints.clear();
+}
+
+void CanvasView::setPathSelectTool(PathSelectTool tool)
+{
+    m_pathSelectTool = tool;
+    m_pathSelectGesture = PathSelectGesture::None;
+}
+
+void CanvasView::setPenOptions(bool autoAddDelete, bool rubberBand)
+{
+    m_penAutoAddDelete = autoAddDelete;
+    m_penRubberBand = rubberBand;
+}
+
+float CanvasView::pathHitRadius() const
+{
+    // The same fixed-screen-size idea as `nearLassoStart`: reachable at any
+    // zoom, rather than shrinking to nothing zoomed out or ballooning zoomed
+    // in.
+    return float(8.0 / std::max(m_zoom, 0.01));
+}
+
+void CanvasView::penPress(const QPointF &doc)
+{
+    if (!m_engine) {
+        return;
+    }
+    const float radius = pathHitRadius();
+
+    switch (m_penTool) {
+    case PenTool::Pen: {
+        // Auto Add/Delete: hovering the already-finished part of the active
+        // path adds or removes an anchor instead of starting a new one. Only
+        // while nothing is currently being drawn — mid-subpath, a click always
+        // extends it (or closes it, just below).
+        if (m_penAutoAddDelete && !m_engine->pathIsEditing()) {
+            const rust::Vec<::std::int32_t> anchor = m_engine->pathHitAnchor(doc.x(), doc.y(), radius);
+            if (anchor.size() == 2) {
+                m_engine->pathDeleteAnchor(anchor[0], anchor[1]);
+                update();
+                return;
+            }
+            const rust::Vec<float> segment = m_engine->pathHitSegment(doc.x(), doc.y(), radius);
+            if (segment.size() == 3) {
+                m_engine->pathInsertAnchor(int(segment[0]), int(segment[1]), segment[2]);
+                update();
+                return;
+            }
+        }
+
+        // Closing: click back on the subpath's own first anchor.
+        if (m_engine->pathIsEditing()) {
+            const rust::Vec<::std::int32_t> anchor = m_engine->pathHitAnchor(doc.x(), doc.y(), radius);
+            if (anchor.size() == 2 && anchor[1] == 0) {
+                m_engine->pathCloseActiveSubpath();
+                update();
+                return;
+            }
+        }
+
+        // Otherwise: a fresh anchor. Whether it ends up a corner or a smooth
+        // point is decided by whether the next mouseMove drags it before
+        // release — see `penMove`.
+        m_engine->pathAppendCorner(float(doc.x()), float(doc.y()));
+        m_penGesture = PenGesture::PlacingHandle;
+        update();
+        return;
+    }
+
+    case PenTool::FreeformPen:
+        m_freeformPoints.clear();
+        m_freeformPoints.append(doc);
+        m_penGesture = PenGesture::Freeform;
+        return;
+
+    case PenTool::AddAnchor: {
+        const rust::Vec<float> segment = m_engine->pathHitSegment(doc.x(), doc.y(), radius);
+        if (segment.size() == 3) {
+            m_engine->pathInsertAnchor(int(segment[0]), int(segment[1]), segment[2]);
+            update();
+        }
+        return;
+    }
+
+    case PenTool::DeleteAnchor: {
+        const rust::Vec<::std::int32_t> anchor = m_engine->pathHitAnchor(doc.x(), doc.y(), radius);
+        if (anchor.size() == 2) {
+            m_engine->pathDeleteAnchor(anchor[0], anchor[1]);
+            update();
+        }
+        return;
+    }
+
+    case PenTool::ConvertPoint: {
+        // A handle takes priority — it is the smaller, more specific target,
+        // and dragging one always means "break this handle free" regardless
+        // of what the anchor underneath it would have done.
+        const rust::Vec<::std::int32_t> handle = m_engine->pathHitHandle(doc.x(), doc.y(), radius);
+        if (handle.size() == 3) {
+            m_penSubpath = handle[0];
+            m_penPoint = handle[1];
+            m_penHandleSide = handle[2];
+            m_penGesture = PenGesture::ConvertHandle;
+            m_penPressDoc = doc;
+            return;
+        }
+        const rust::Vec<::std::int32_t> anchor = m_engine->pathHitAnchor(doc.x(), doc.y(), radius);
+        if (anchor.size() == 2) {
+            m_penSubpath = anchor[0];
+            m_penPoint = anchor[1];
+            m_penGesture = PenGesture::ConvertNewHandles;
+            m_penPressDoc = doc;
+        }
+        return;
+    }
+    }
+}
+
+void CanvasView::penMove(const QPointF &doc, Qt::KeyboardModifiers modifiers)
+{
+    m_penHoverDoc = doc;
+    if (!m_engine) {
+        return;
+    }
+    const bool independent = modifiers.testFlag(Qt::AltModifier);
+
+    switch (m_penGesture) {
+    case PenGesture::PlacingHandle:
+        m_engine->pathUpdateLastHandle(float(doc.x()), float(doc.y()), independent);
+        update();
+        return;
+    case PenGesture::ConvertHandle:
+        // Convert Point's handle-drag always breaks it independent, which is
+        // what makes it useful for un-mirroring one side of a smooth point
+        // without hunting for the Alt key.
+        m_engine->pathMoveHandle(m_penSubpath, m_penPoint, m_penHandleSide, float(doc.x()),
+                                 float(doc.y()), true);
+        update();
+        return;
+    case PenGesture::ConvertNewHandles:
+        m_engine->pathDragNewHandles(m_penSubpath, m_penPoint, float(doc.x()), float(doc.y()));
+        update();
+        return;
+    case PenGesture::Freeform:
+        // Throttled the same way the freehand lasso is: one vertex per
+        // document pixel of travel keeps the trail small enough to simplify
+        // instantly on release.
+        if (m_freeformPoints.isEmpty()
+            || (doc - m_freeformPoints.last()).manhattanLength() >= 1.0) {
+            m_freeformPoints.append(doc);
+            update();
+        }
+        return;
+    case PenGesture::None:
+        if (m_tool == ToolId::Pen && m_penRubberBand) {
+            update();
+        }
+        return;
+    }
+}
+
+void CanvasView::penRelease(const QPointF &doc)
+{
+    if (!m_engine) {
+        m_penGesture = PenGesture::None;
+        return;
+    }
+
+    switch (m_penGesture) {
+    case PenGesture::ConvertNewHandles: {
+        // A click rather than a drag: Convert Point strips the handles back
+        // off instead of leaving the sliver a near-zero drag would have
+        // pulled out.
+        const QPointF delta = doc - m_penPressDoc;
+        if (QPointF::dotProduct(delta, delta) < 4.0) {
+            m_engine->pathSetCorner(m_penSubpath, m_penPoint);
+            update();
+        }
+        break;
+    }
+    case PenGesture::Freeform: {
+        // Interleaved x,y, matching every other point-list call to the bridge.
+        QVector<float> flat;
+        flat.reserve(m_freeformPoints.size() * 2);
+        for (const QPointF &p : m_freeformPoints) {
+            flat.append(float(p.x()));
+            flat.append(float(p.y()));
+        }
+        // Dragging back near the start closes the loop, the same gesture the
+        // ordinary Pen tool uses.
+        const QPointF toStart = documentToWidget(doc) - documentToWidget(m_freeformPoints.first());
+        const bool close = m_freeformPoints.size() > 2
+            && QPointF::dotProduct(toStart, toStart) <= 8.0 * 8.0;
+        if (m_engine->pathAddFreeformSubpath(flat, float(m_freeformTolerance), close)) {
+            update();
+        }
+        m_freeformPoints.clear();
+        break;
+    }
+    default:
+        break;
+    }
+    m_penGesture = PenGesture::None;
+}
+
+void CanvasView::pathSelectPress(const QPointF &doc)
+{
+    if (!m_engine) {
+        return;
+    }
+    const float radius = pathHitRadius();
+
+    if (m_pathSelectTool == PathSelectTool::DirectSelection) {
+        const rust::Vec<::std::int32_t> handle = m_engine->pathHitHandle(doc.x(), doc.y(), radius);
+        if (handle.size() == 3) {
+            m_pathSelectSubpath = handle[0];
+            m_pathSelectPoint = handle[1];
+            m_pathSelectHandleSide = handle[2];
+            m_pathSelectGesture = PathSelectGesture::Handle;
+            return;
+        }
+        const rust::Vec<::std::int32_t> anchor = m_engine->pathHitAnchor(doc.x(), doc.y(), radius);
+        if (anchor.size() == 2) {
+            m_pathSelectSubpath = anchor[0];
+            m_pathSelectPoint = anchor[1];
+            m_pathSelectGesture = PathSelectGesture::Anchor;
+        }
+        return;
+    }
+
+    // Path Selection: grabs the whole subpath.
+    const int sp = m_engine->pathHitSubpath(doc.x(), doc.y(), radius);
+    if (sp >= 0) {
+        m_pathSelectSubpath = sp;
+        m_pathSelectGesture = PathSelectGesture::Subpath;
+        m_pathSelectLastDoc = doc;
+    }
+}
+
+void CanvasView::pathSelectMove(const QPointF &doc, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_engine) {
+        return;
+    }
+    switch (m_pathSelectGesture) {
+    case PathSelectGesture::Anchor:
+        m_engine->pathMoveAnchor(m_pathSelectSubpath, m_pathSelectPoint, float(doc.x()),
+                                 float(doc.y()));
+        update();
+        break;
+    case PathSelectGesture::Handle:
+        m_engine->pathMoveHandle(m_pathSelectSubpath, m_pathSelectPoint, m_pathSelectHandleSide,
+                                 float(doc.x()), float(doc.y()),
+                                 modifiers.testFlag(Qt::AltModifier));
+        update();
+        break;
+    case PathSelectGesture::Subpath: {
+        const QPointF delta = doc - m_pathSelectLastDoc;
+        m_engine->pathMoveSubpath(m_pathSelectSubpath, float(delta.x()), float(delta.y()));
+        m_pathSelectLastDoc = doc;
+        update();
+        break;
+    }
+    case PathSelectGesture::None:
+        break;
+    }
+}
+
+void CanvasView::pathSelectRelease()
+{
+    m_pathSelectGesture = PathSelectGesture::None;
+}
+
+void CanvasView::setCloneOptions(bool aligned, CloneSampling sampling)
+{
+    m_cloneAligned = aligned;
+    m_cloneSampling = sampling;
+    if (m_engine) {
+        m_engine->setCloneOptions(aligned, int(sampling));
+    }
+}
+
+bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_engine) {
+        return false;
+    }
+
+    // Alt-click sets what to copy from, exactly as CS6 does. A one-off action,
+    // not the start of a stroke.
+    if (modifiers.testFlag(Qt::AltModifier)) {
+        m_cloneSource = QPointF(std::round(doc.x()), std::round(doc.y()));
+        m_cloneSourceValid = true;
+        const bool hasContent =
+            m_engine->setCloneSource(int(m_cloneSource.x()), int(m_cloneSource.y()));
+        // Sampling the current layer alone is CS6's default, and it finds
+        // nothing if what the user is pointing at lives on another layer. The
+        // stroke would then copy transparency and look like a broken tool, so say
+        // so here instead.
+        if (hasContent) {
+            emit statusMessage(tr("Clone source set to %1, %2")
+                                   .arg(int(m_cloneSource.x()))
+                                   .arg(int(m_cloneSource.y())));
+        } else {
+            emit statusMessage(tr("Clone source set to %1, %2 — but this layer is empty "
+                                  "there. Set Sample to All Layers to clone what you can "
+                                  "see.")
+                                   .arg(int(m_cloneSource.x()))
+                                   .arg(int(m_cloneSource.y())));
+        }
+        update();
+        return true;
+    }
+
+    // Without a source there is nothing to copy, and Photoshop refuses the
+    // stroke rather than painting the foreground colour. Consuming the press
+    // means no stroke begins and no undo state is created.
+    if (!m_engine->hasCloneSource()) {
+        emit cloneSourceRequired();
+        return true;
+    }
+
+    if (m_engine->beginCloneStroke(float(doc.x()), float(doc.y()), 1.0f)) {
+        m_dragging = true;
+        m_image = m_engine->previewImage();
+        update();
+    } else {
+        reportIfLocked();
+    }
+    return true;
+}
+
+void CanvasView::paintCloneSource(QPainter &painter)
+{
+    if (m_tool != ToolId::CloneStamp || !m_cloneSourceValid) {
+        return;
+    }
+    // The same crosshair the Healing Brush marks its source with, so the two
+    // read as the same idea.
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QPointF p = documentToWidget(m_cloneSource);
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(Qt::white, 2.5));
+    painter.drawLine(QPointF(p.x() - 7, p.y()), QPointF(p.x() + 7, p.y()));
+    painter.drawLine(QPointF(p.x(), p.y() - 7), QPointF(p.x(), p.y() + 7));
+    painter.setPen(QPen(QColor(0x2c, 0x6f, 0xd6), 1.2));
+    painter.drawLine(QPointF(p.x() - 7, p.y()), QPointF(p.x() + 7, p.y()));
+    painter.drawLine(QPointF(p.x(), p.y() - 7), QPointF(p.x(), p.y() + 7));
+    painter.drawEllipse(p, 4.0, 4.0);
+    painter.restore();
+}
+
+void CanvasView::reportIfLocked()
+{
+    // Every painting entry point refuses on the same condition, so asking the
+    // engine once here keeps four call sites from each having to work out why
+    // they were turned down. A refusal for any other reason — an adjustment
+    // layer, say — is silent, as it is in Photoshop.
+    if (m_engine && m_engine->activeLayerIsLocked()) {
+        emit lockedLayerRefused();
+    }
 }
 
 void CanvasView::setHealingType(HealingType type)
@@ -1548,6 +2156,9 @@ void CanvasView::paintEvent(QPaintEvent *event)
         paintAnnotations(painter);
     }
     paintHealing(painter);
+    paintCloneSource(painter);
+    paintGradientDrag(painter);
+    paintPathOverlay(painter);
 
     // Live marquee while the user is dragging one out. Drawn as the shape the
     // active variant will actually produce, so an elliptical drag previews an
@@ -1853,9 +2464,44 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         return;
     }
 
+    case ToolId::Gradient:
+        // The Paint Bucket fills where it is clicked; the Gradient tool drags out
+        // the ramp's axis instead.
+        if (m_gradientTool == GradientTool::PaintBucket) {
+            if (m_engine && !m_engine->fillBucket(int(std::floor(doc.x())),
+                                                  int(std::floor(doc.y())))) {
+                // Refused: a locked layer, or nothing under the click matched
+                // within Tolerance — Photoshop is silent about the latter.
+                reportIfLocked();
+            }
+            refresh();
+            return;
+        }
+        // Nothing is drawn until the drag is released, which is how CS6 behaves:
+        // only the axis line follows the cursor.
+        m_gradientDragging = true;
+        m_gradientStart = doc;
+        m_gradientEnd = doc;
+        update();
+        return;
+
     case ToolId::Move:
+        // A position-locked layer cannot be dragged, so say so rather than
+        // letting the user push at a layer that will not budge.
+        if (m_engine && m_engine->layerLockPosition(m_engine->getActiveLayerIndex())) {
+            emit lockedLayerRefused();
+            return;
+        }
         m_dragging = true;
         m_dragStartDoc = doc;
+        return;
+
+    case ToolId::Pen:
+        penPress(doc);
+        return;
+
+    case ToolId::PathSelect:
+        pathSelectPress(doc);
         return;
 
     default:
@@ -1868,6 +2514,45 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         return;
     }
 
+    // The six retouch tools — Blur, Sharpen and Smudge, Dodge, Burn and Sponge —
+    // all work on what they pass over, dab by dab: each dab has to act on what
+    // the last one left, which is what makes dwelling deepen the effect and what
+    // lets a smudge drag colour along.
+    if (m_retouchMode && m_engine) {
+        if (m_engine->beginRetouchStroke(float(doc.x()), float(doc.y()), 1.0f)) {
+            m_retouching = true;
+            m_dragging = true;
+            refresh();
+        } else {
+            reportIfLocked();
+        }
+        return;
+    }
+
+    // The Mixer Brush mixes with what is already there, so like colour
+    // replacement it edits the layer per dab rather than accumulating a stroke.
+    if (m_mixerMode && m_engine) {
+        // Alt-click loads the brush from the image, as CS6 does — picking paint
+        // up off the canvas is how the tool is meant to be filled. A one-off
+        // action, not the start of a stroke.
+        if (event->modifiers() & Qt::AltModifier) {
+            m_engine->loadMixerBrushFrom(int(doc.x()), int(doc.y()));
+            emit mixerLoadChanged();
+            emit statusMessage(tr("Brush loaded from %1, %2")
+                                   .arg(int(doc.x()))
+                                   .arg(int(doc.y())));
+            return;
+        }
+        if (m_engine->beginMixer(float(doc.x()), float(doc.y()), 1.0f)) {
+            m_mixing = true;
+            m_dragging = true;
+            refresh();
+        } else {
+            reportIfLocked();
+        }
+        return;
+    }
+
     // The Color Replacement Brush recolours what is already there, so it edits
     // the layer per dab rather than accumulating a stroke to composite.
     if (m_replaceMode && m_engine) {
@@ -1875,7 +2560,16 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
             m_replacing = true;
             m_dragging = true;
             refresh();
+        } else {
+            reportIfLocked();
         }
+        return;
+    }
+
+    // The Clone Stamp copies pixels rather than painting a colour, and needs a
+    // source Alt-clicked first. Its stroke is otherwise an ordinary one, so this
+    // only replaces the *beginning* of it.
+    if (m_tool == ToolId::CloneStamp && clonePress(doc, event->modifiers())) {
         return;
     }
 
@@ -1885,6 +2579,8 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
             m_dragging = true;
             m_image = m_engine->previewImage();
             update();
+        } else {
+            reportIfLocked();
         }
     }
 }
@@ -1949,6 +2645,18 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
             setCursor(Qt::CrossCursor);
         }
         update();
+        m_lastMousePos = pos;
+        return;
+    }
+
+    if (m_tool == ToolId::Pen) {
+        penMove(doc, event->modifiers());
+        m_lastMousePos = pos;
+        return;
+    }
+
+    if (m_tool == ToolId::PathSelect) {
+        pathSelectMove(doc, event->modifiers());
         m_lastMousePos = pos;
         return;
     }
@@ -2032,6 +2740,25 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_gradientDragging) {
+        m_gradientEnd = constrainedGradientEnd(doc, event->modifiers());
+        m_lastMousePos = pos;
+        update();
+        return;
+    }
+
+    if (m_retouching && m_engine) {
+        m_engine->extendRetouchStroke(float(doc.x()), float(doc.y()), 1.0f);
+        m_lastMousePos = pos;
+        return;
+    }
+
+    if (m_mixing && m_engine) {
+        m_engine->extendMixer(float(doc.x()), float(doc.y()), 1.0f);
+        m_lastMousePos = pos;
+        return;
+    }
+
     if (m_replacing && m_engine) {
         m_engine->extendReplace(float(doc.x()), float(doc.y()), 1.0f);
         m_lastMousePos = pos;
@@ -2066,6 +2793,17 @@ void CanvasView::mouseDoubleClickEvent(QMouseEvent *event)
     // cursor is, joining back to the first anchor — CS6's own gesture.
     if (m_marqueeActive && lassoIsClicked()) {
         closeLasso();
+        event->accept();
+        return;
+    }
+
+    // Double-clicking finishes an open path the same way Enter does. The
+    // click that started this double-click already placed its anchor through
+    // the ordinary press/release pair just before it; there is nothing left
+    // to do here but stop extending it.
+    if (m_tool == ToolId::Pen && m_engine && m_engine->pathIsEditing()) {
+        m_engine->pathFinishEditing();
+        update();
         event->accept();
         return;
     }
@@ -2120,6 +2858,17 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         }
         m_sliceGrip = CropGrip::None;
         update();
+        return;
+    }
+
+    if (m_tool == ToolId::Pen) {
+        penRelease(doc);
+        update();
+        return;
+    }
+
+    if (m_tool == ToolId::PathSelect) {
+        pathSelectRelease();
         return;
     }
 
@@ -2224,6 +2973,39 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_gradientDragging) {
+        m_gradientDragging = false;
+        m_gradientEnd = constrainedGradientEnd(doc, event->modifiers());
+        if (m_engine
+            && !m_engine->drawGradient(float(m_gradientStart.x()), float(m_gradientStart.y()),
+                                       float(m_gradientEnd.x()), float(m_gradientEnd.y()))) {
+            // Refused: either the layer is locked, or the drag was too short to
+            // have a direction — a click alone draws nothing, as in Photoshop.
+            reportIfLocked();
+        }
+        refresh();
+        return;
+    }
+
+    if (m_retouching && m_engine) {
+        m_engine->endRetouchStroke();
+        m_retouching = false;
+        m_dragging = false;
+        refresh();
+        return;
+    }
+
+    if (m_mixing && m_engine) {
+        m_engine->endMixer();
+        m_mixing = false;
+        m_dragging = false;
+        refresh();
+        // The stroke leaves the brush carrying different paint, unless it was
+        // cleaned or reloaded — either way the load swatch needs re-reading.
+        emit mixerLoadChanged();
+        return;
+    }
+
     if (m_replacing && m_engine) {
         m_engine->endReplace();
         m_replacing = false;
@@ -2317,6 +3099,16 @@ void CanvasView::keyPressEvent(QKeyEvent *event)
             event->accept();
             return;
         }
+    } else if (m_tool == ToolId::Pen && m_engine && m_engine->pathIsEditing()) {
+        // Enter and Esc both stop extending the open subpath without closing
+        // it — Esc does not throw the points away, matching Photoshop.
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter
+            || event->key() == Qt::Key_Escape) {
+            m_engine->pathFinishEditing();
+            update();
+            event->accept();
+            return;
+        }
     }
 
     // An open polygonal or magnetic outline takes the keys CS6 gives it:
@@ -2352,11 +3144,28 @@ void CanvasView::keyPressEvent(QKeyEvent *event)
             m_dragging = false;
             refresh();
         }
+        if (m_gradientDragging) {
+            m_gradientDragging = false;
+            update();
+        }
+        if (m_retouching && m_engine) {
+            m_engine->cancelRetouchStroke();
+            m_retouching = false;
+            m_dragging = false;
+            refresh();
+        }
+        if (m_mixing && m_engine) {
+            m_engine->cancelMixer();
+            m_mixing = false;
+            m_dragging = false;
+            refresh();
+        }
         if (m_dragging && m_engine) {
             m_engine->cancelStroke();
             m_dragging = false;
             refresh();
         }
+        m_pathSelectGesture = PathSelectGesture::None;
         cancelLasso();
         finishQuickSelect();
         update();
