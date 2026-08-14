@@ -7,6 +7,9 @@
 #include <QGuiApplication>
 #include <algorithm>
 #include <QEnterEvent>
+#include <QEvent>
+#include <QFontDatabase>
+#include <QFontMetrics>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -2101,6 +2104,23 @@ void CanvasView::updateCursor()
     }
 }
 
+bool CanvasView::event(QEvent *event)
+{
+    // Every registered tool shortcut is a QAction on the main window with the
+    // default Qt::WindowShortcut context, so it fires for a key press anywhere
+    // in the window unless the focused widget claims the ShortcutOverride
+    // event first. CanvasView never did, so a letter typed into the Type tool
+    // — "e", say — matched the Eraser's shortcut and switched tools instead of
+    // reaching keyPressEvent as a character. Accepting the override while
+    // text is being composed is what real Photoshop does too: its own
+    // single-letter shortcuts go quiet the moment there is a text cursor.
+    if (event->type() == QEvent::ShortcutOverride && m_tool == ToolId::Type && m_typing) {
+        event->accept();
+        return true;
+    }
+    return QWidget::event(event);
+}
+
 // ----------------------------------------------------------------- painting --
 
 void CanvasView::paintEvent(QPaintEvent *event)
@@ -2159,6 +2179,7 @@ void CanvasView::paintEvent(QPaintEvent *event)
     paintCloneSource(painter);
     paintGradientDrag(painter);
     paintPathOverlay(painter);
+    paintTypeOverlay(painter);
 
     // Live marquee while the user is dragging one out. Drawn as the shape the
     // active variant will actually produce, so an elliptical drag previews an
@@ -2504,6 +2525,10 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         pathSelectPress(doc);
         return;
 
+    case ToolId::Type:
+        typePress(doc, event->modifiers());
+        return;
+
     default:
         break;
     }
@@ -2596,6 +2621,13 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
         m_lastMousePos = pos;
         clampPan();
         update();
+        return;
+    }
+
+    // Dragging within text being composed sweeps out a selection.
+    if (m_typeSelecting) {
+        typeMoveCaret(typeIndexAt(pos), true);
+        m_lastMousePos = pos;
         return;
     }
 
@@ -2789,6 +2821,17 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
 
 void CanvasView::mouseDoubleClickEvent(QMouseEvent *event)
 {
+    // Double-clicking a word in text being composed selects it, as it does in
+    // any text field. The press that opened this double-click has already put
+    // the caret there, so the word to take is the one around it.
+    if (m_typing && typeBounds().adjusted(-2, -2, 2, 2)
+                        .contains(widgetToDocument(event->position()))) {
+        m_typeSelecting = false;
+        typeSelectWord(typeIndexAt(event->position()));
+        event->accept();
+        return;
+    }
+
     // Double-clicking closes a polygonal or magnetic outline wherever the
     // cursor is, joining back to the first anchor — CS6's own gesture.
     if (m_marqueeActive && lassoIsClicked()) {
@@ -2838,6 +2881,13 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
     if (m_panning) {
         m_panning = false;
         updateCursor();
+        return;
+    }
+
+    // The end of a drag-selection through text. The caret and its anchor stay
+    // where the drag left them.
+    if (m_typeSelecting) {
+        m_typeSelecting = false;
         return;
     }
 
@@ -3044,6 +3094,13 @@ void CanvasView::wheelEvent(QWheelEvent *event)
 
 void CanvasView::keyPressEvent(QKeyEvent *event)
 {
+    // While composing text, every key is the Type tool's — including Space,
+    // which the branch below would otherwise steal for a pan override.
+    if (m_tool == ToolId::Type && m_typing) {
+        typeKeyPress(event);
+        return;
+    }
+
     // Holding space temporarily swaps in the Hand tool.
     if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
         m_spacePanOverride = true;
@@ -3225,4 +3282,1098 @@ void CanvasView::leaveEvent(QEvent *event)
     QWidget::leaveEvent(event);
     unsetCursor();
     emit cursorLeft();
+}
+
+// -------------------------------------------------------------------- Type --
+
+namespace {
+
+/// Photoshop's rubylith: the half-transparent red a masked area wears, which
+/// mask type spreads over the document while the letters are being cut out
+/// of it.
+const QColor kQuickMaskVeil(255, 0, 0, 128);
+
+/// The type record's alignment code, 0-2, as the engine stores it.
+int typeAlignCode(Qt::Alignment alignment)
+{
+    if (alignment & Qt::AlignHCenter) {
+        return 1;
+    }
+    if (alignment & Qt::AlignRight) {
+        return 2;
+    }
+    return 0;
+}
+
+Qt::Alignment typeAlignFromCode(int code)
+{
+    switch (code) {
+    case 1:
+        return Qt::AlignHCenter;
+    case 2:
+        return Qt::AlignRight;
+    default:
+        return Qt::AlignLeft;
+    }
+}
+
+/// Whether a character counts as part of a word, for double-click and for
+/// Ctrl+arrow. Underscores go with letters and digits, as they do in every
+/// other text field.
+bool isWordChar(QChar c)
+{
+    return c.isLetterOrNumber() || c == QLatin1Char('_');
+}
+
+} // namespace
+
+void CanvasView::typePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
+{
+    // A click within the text being composed works it the way any text field
+    // does: it places the caret, and holding the button sweeps out a selection.
+    // Only a click that lands elsewhere ends the edit.
+    if (m_typing && typeBounds().adjusted(-2, -2, 2, 2).contains(doc)) {
+        typeMoveCaret(typeIndexAt(documentToWidget(doc)), modifiers & Qt::ShiftModifier);
+        m_typeSelecting = true;
+        setFocus(Qt::MouseFocusReason);
+        return;
+    }
+
+    // Finish the previous edit first, so the hit test below sees a document
+    // that already includes whatever was just typed — clicking straight from
+    // one piece of text into another works, and lands on the right one.
+    if (m_typing) {
+        commitTypeEdit();
+    }
+
+    // Mask type has nothing to reopen — it leaves a selection, not a layer —
+    // and clicking a type layer with it should start a new mask over that text
+    // rather than take the layer over.
+    const int existing = m_engine && !m_typeMask
+        ? m_engine->textLayerAt(qRound(doc.x()), qRound(doc.y()))
+        : -1;
+    if (existing >= 0) {
+        beginTypeEdit(existing, doc);
+        return;
+    }
+
+    m_typing = true;
+    m_typeLayer = -1;
+    m_typeOrigin = doc;
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeCaret = 0;
+    m_typeAnchor = 0;
+    setFocus(Qt::MouseFocusReason);
+    update();
+}
+
+void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
+{
+    if (!m_engine) {
+        return;
+    }
+
+    // Read the text back run by run, which is how its character formatting
+    // survives: a word set at 72pt in the middle of 12pt text is its own run.
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeFontCache.clear();
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        run.family = m_engine->layerTextRunFamily(layerIndex, i);
+        run.style = m_engine->layerTextRunStyle(layerIndex, i);
+        run.size = m_engine->layerTextRunSize(layerIndex, i);
+        run.color = m_engine->layerTextRunColor(layerIndex, i);
+        m_typeRuns.append(run);
+        m_typeText += text;
+    }
+
+    m_typeOrigin = QPointF(m_engine->layerTextOriginX(layerIndex),
+                           m_engine->layerTextOriginY(layerIndex));
+    m_typeAlignment = typeAlignFromCode(m_engine->layerTextAlign(layerIndex));
+    m_typeAntialias = m_engine->layerTextAntialias(layerIndex);
+    // Orientation belongs to the text, not to the tool in hand: clicking into
+    // vertical type edits it vertically whichever of the two tools opened it.
+    m_typeVertical = m_engine->layerTextVertical(layerIndex);
+
+    // The reopened text is edited in its own type, not in whatever the options
+    // bar happened to be left set to, so the bar takes on the formatting the
+    // caret lands in — `typeSyncStyleToCaret` below, once the caret is placed.
+    const TypeRun first = m_typeRuns.isEmpty() ? typePendingRun() : m_typeRuns.first();
+    m_typeStyleName = first.style;
+    m_typeFont = typeRunFont(first, 1.0);
+    m_typeColor = first.color;
+
+    // Hold the layer's own pixels back for the duration, or the live overlay
+    // would be drawn over the rendering it is replacing — deleting a word would
+    // leave it still showing underneath.
+    m_engine->beginTextEdit(layerIndex);
+
+    m_typing = true;
+    m_typeLayer = layerIndex;
+    // The caret goes where the click fell, now that there is a layout to
+    // measure it against — clicking mid-word puts it mid-word.
+    m_typeCaret = typeIndexAt(documentToWidget(doc));
+    m_typeAnchor = m_typeCaret;
+    setFocus(Qt::MouseFocusReason);
+    // Tell the options bar what it is now editing. The caret's own run may
+    // differ from the first, so this goes through the same path a caret move
+    // does rather than announcing the first run.
+    emit typeStyleAdopted(first.family, first.style, first.size, first.color, m_typeAlignment,
+                          m_typeAntialias, m_typeVertical);
+    typeSyncStyleToCaret();
+    update();
+}
+
+QFont CanvasView::typeRunFont(const TypeRun &run, qreal scale) const
+{
+    const qreal size = qMax(1.0, run.size * scale);
+    const QString key = QStringLiteral("%1|%2|%3").arg(run.family, run.style)
+                            .arg(size, 0, 'f', 3);
+    const auto hit = m_typeFontCache.constFind(key);
+    if (hit != m_typeFontCache.constEnd()) {
+        return *hit;
+    }
+
+    // Resolved by style *name* rather than by setting bold/italic bits, so a
+    // family's own styles ("Semibold", "Condensed Light") come out right.
+    QFont font = QFontDatabase::font(run.family, run.style, int(size));
+    font.setPointSizeF(size);
+    m_typeFontCache.insert(key, font);
+    return font;
+}
+
+CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
+{
+    TypeLayout layout;
+    layout.scale = scale;
+    layout.vertical = m_typeVertical;
+
+    // Walk the text once, cutting it at newlines and again wherever the
+    // formatting changes. Horizontal type draws a whole same-formatted stretch
+    // in one go; vertical type stacks characters, so each gets its own segment.
+    int runIndex = 0;
+    int runStart = 0;
+    int at = 0;
+
+    while (true) {
+        const int newline = m_typeText.indexOf(QLatin1Char('\n'), at);
+        const int lineEnd = newline < 0 ? m_typeText.size() : newline;
+
+        TypeLineBox line;
+        line.start = at;
+        line.length = lineEnd - at;
+
+        int cursor = at;
+        while (true) {
+            // Which run covers `cursor`, and how far it reaches.
+            while (runIndex < m_typeRuns.size()
+                   && cursor >= runStart + m_typeRuns.at(runIndex).length) {
+                runStart += m_typeRuns.at(runIndex).length;
+                ++runIndex;
+            }
+            const TypeRun run = runIndex < m_typeRuns.size() ? m_typeRuns.at(runIndex)
+                                                            : typePendingRun();
+            const QFont font = typeRunFont(run, scale);
+            const QFontMetricsF metrics(font);
+
+            const int runEnd = runIndex < m_typeRuns.size()
+                ? runStart + m_typeRuns.at(runIndex).length
+                : lineEnd;
+            const int segmentEnd = qMin(lineEnd, qMax(runEnd, cursor));
+
+            TypeSegment segment;
+            segment.start = cursor;
+            segment.length = segmentEnd - cursor;
+            segment.font = font;
+            segment.color = run.color;
+            segment.ascent = metrics.ascent();
+            segment.height = metrics.lineSpacing();
+
+            if (!m_typeVertical) {
+                segment.x = line.width;
+                segment.width = segment.length > 0
+                    ? metrics.horizontalAdvance(m_typeText.mid(cursor, segment.length))
+                    : 0.0;
+                line.width += segment.width;
+                // Every segment of a line shares one baseline, set by the
+                // tallest run in it, so a large word does not sit low.
+                line.height = qMax(line.height, segment.height);
+                line.segments.append(segment);
+            } else if (segment.length == 0) {
+                // An empty line still has to know how tall its caret is.
+                segment.y = line.height;
+                segment.width = metrics.horizontalAdvance(QLatin1Char('W'));
+                line.height += segment.height;
+                line.width = qMax(line.width, segment.width);
+                line.segments.append(segment);
+            } else {
+                for (int i = cursor; i < segmentEnd; ++i) {
+                    TypeSegment glyph = segment;
+                    glyph.start = i;
+                    glyph.length = 1;
+                    glyph.width = metrics.horizontalAdvance(m_typeText.at(i));
+                    glyph.y = line.height;
+                    line.height += glyph.height;
+                    line.width = qMax(line.width, glyph.width);
+                    line.segments.append(glyph);
+                }
+            }
+
+            cursor = segmentEnd;
+            if (cursor >= lineEnd) {
+                break;
+            }
+        }
+
+        // A line with no segments would have nowhere to put a caret; only an
+        // empty horizontal line reaches this, since the vertical branch above
+        // always appends one.
+        if (line.segments.isEmpty()) {
+            TypeSegment empty;
+            empty.start = line.start;
+            const QFontMetricsF metrics(typeRunFont(typePendingRun(), scale));
+            empty.font = typeRunFont(typePendingRun(), scale);
+            empty.ascent = metrics.ascent();
+            empty.height = metrics.lineSpacing();
+            line.height = qMax(line.height, empty.height);
+            line.segments.append(empty);
+        }
+
+        layout.lines.append(line);
+
+        if (newline < 0) {
+            break;
+        }
+        at = newline + 1;
+        // Step the run walk over the newline itself, which belongs to whichever
+        // run holds it.
+        while (runIndex < m_typeRuns.size()
+               && at >= runStart + m_typeRuns.at(runIndex).length) {
+            runStart += m_typeRuns.at(runIndex).length;
+            ++runIndex;
+        }
+    }
+
+    // Place the lines against the origin. Horizontal type stacks them
+    // downward and the alignment slides each one sideways; vertical type lays
+    // them out as columns leading away to the left, with the alignment sliding
+    // each column up or down instead.
+    qreal cross = 0.0;
+    for (TypeLineBox &line : layout.lines) {
+        if (!m_typeVertical) {
+            line.top = cross;
+            cross += line.height;
+            line.x = typeAlignOffset(line.width);
+        } else {
+            cross += line.width;
+            line.x = -cross;
+            line.top = typeAlignOffset(line.height);
+            // Stacked characters are centred in their column, so a narrow
+            // letter still reads as part of the same line as a wide one.
+            for (TypeSegment &segment : line.segments) {
+                segment.x = (line.width - segment.width) / 2.0;
+            }
+        }
+        const QRectF box(line.x, line.top, qMax(line.width, 1.0), qMax(line.height, 1.0));
+        layout.box = layout.box.isNull() ? box : layout.box.united(box);
+    }
+
+    return layout;
+}
+
+qreal CanvasView::typeAlignOffset(qreal extent) const
+{
+    // The same three settings, read against whichever axis the text runs
+    // across: left/centre/right for horizontal type, top/centre/bottom for
+    // vertical.
+    if (m_typeAlignment & Qt::AlignHCenter) {
+        return -extent / 2.0;
+    }
+    if (m_typeAlignment & Qt::AlignRight) {
+        return -extent;
+    }
+    return 0.0;
+}
+
+int CanvasView::typeLineOf(const TypeLayout &layout, int index) const
+{
+    for (int i = layout.lines.size() - 1; i >= 0; --i) {
+        if (index >= layout.lines.at(i).start) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+qreal CanvasView::typeFlowOffset(const TypeLayout &layout, int lineIndex, int index) const
+{
+    const TypeLineBox &line = layout.lines.at(lineIndex);
+    const int at = qBound(line.start, index, line.start + line.length);
+
+    for (const TypeSegment &segment : line.segments) {
+        if (at > segment.start + segment.length) {
+            continue;
+        }
+        if (layout.vertical) {
+            // Stacked characters are one segment each, so the gap is either
+            // above this character or below it.
+            return at > segment.start ? segment.y + segment.height : segment.y;
+        }
+        return segment.x
+            + QFontMetricsF(segment.font)
+                  .horizontalAdvance(m_typeText.mid(segment.start, at - segment.start));
+    }
+    return layout.vertical ? line.height : line.width;
+}
+
+QRectF CanvasView::typeCaretRect(const TypeLayout &layout, int index) const
+{
+    const int lineIndex = typeLineOf(layout, index);
+    const TypeLineBox &line = layout.lines.at(lineIndex);
+    const qreal flow = typeFlowOffset(layout, lineIndex, index);
+
+    // The caret lies across the direction the text runs: upright between
+    // letters, flat between stacked characters.
+    if (layout.vertical) {
+        return QRectF(line.x, line.top + flow, qMax(line.width, 1.0), 1.0);
+    }
+    return QRectF(line.x + flow, line.top, 1.0, qMax(line.height, 1.0));
+}
+
+QRectF CanvasView::typeRangeRect(const TypeLayout &layout, int lineIndex, int from, int to) const
+{
+    const TypeLineBox &line = layout.lines.at(lineIndex);
+    const qreal a = typeFlowOffset(layout, lineIndex, from);
+    const qreal b = typeFlowOffset(layout, lineIndex, to);
+    if (layout.vertical) {
+        return QRectF(line.x, line.top + a, line.width, b - a);
+    }
+    return QRectF(line.x + a, line.top, b - a, line.height);
+}
+
+int CanvasView::typeIndexAt(const QPointF &widgetPos) const
+{
+    const TypeLayout layout = typeLayout(m_zoom);
+    if (layout.lines.isEmpty()) {
+        return 0;
+    }
+
+    // Both are offsets from the origin, which is what the layout is measured
+    // from and where it is drawn.
+    const QPointF offset = widgetPos - documentToWidget(m_typeOrigin);
+
+    // Which line the point is on. Vertical columns run right to left, so the
+    // match is the last one whose right edge the point has passed.
+    int lineIndex = 0;
+    for (int i = 0; i < layout.lines.size(); ++i) {
+        const TypeLineBox &line = layout.lines.at(i);
+        const bool hit = layout.vertical ? offset.x() <= line.x + line.width
+                                         : offset.y() >= line.top;
+        if (hit) {
+            lineIndex = i;
+        }
+    }
+    const TypeLineBox &line = layout.lines.at(lineIndex);
+
+    // Then whichever gap between characters the click fell nearest to, so
+    // clicking the near half of a letter puts the caret before it and the far
+    // half after it.
+    const qreal target = layout.vertical ? offset.y() - line.top : offset.x() - line.x;
+    int nearest = line.start;
+    qreal shortest = qAbs(target - typeFlowOffset(layout, lineIndex, line.start));
+    for (int i = line.start + 1; i <= line.start + line.length; ++i) {
+        const qreal distance = qAbs(target - typeFlowOffset(layout, lineIndex, i));
+        if (distance < shortest) {
+            shortest = distance;
+            nearest = i;
+        }
+    }
+    return nearest;
+}
+
+int CanvasView::typeRunIndexAt(int index) const
+{
+    int start = 0;
+    for (int i = 0; i < m_typeRuns.size(); ++i) {
+        start += m_typeRuns.at(i).length;
+        if (index < start) {
+            return i;
+        }
+    }
+    return m_typeRuns.size() - 1;
+}
+
+CanvasView::TypeRun CanvasView::typeRunAt(int index) const
+{
+    const int run = typeRunIndexAt(index);
+    return run >= 0 ? m_typeRuns.at(run) : typePendingRun();
+}
+
+CanvasView::TypeRun CanvasView::typePendingRun() const
+{
+    TypeRun run;
+    run.family = m_typeFont.family();
+    run.style = m_typeStyleName;
+    run.size = m_typeFont.pointSizeF();
+    run.color = m_typeColor;
+    return run;
+}
+
+void CanvasView::typeApplyStyle(int from, int to)
+{
+    if (from >= to || m_typeRuns.isEmpty()) {
+        return;
+    }
+
+    const TypeRun style = typePendingRun();
+    QList<TypeRun> rebuilt;
+    int at = 0;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        const int runStart = at;
+        const int runEnd = at + run.length;
+        at = runEnd;
+
+        // Three pieces at most: what falls before the range keeps its old
+        // style, what falls inside takes the new one, what falls after keeps
+        // the old. Runs clear of the range come through untouched.
+        const int inFrom = qMax(runStart, from);
+        const int inTo = qMin(runEnd, to);
+        if (inFrom >= inTo) {
+            rebuilt.append(run);
+            continue;
+        }
+        if (inFrom > runStart) {
+            TypeRun before = run;
+            before.length = inFrom - runStart;
+            rebuilt.append(before);
+        }
+        TypeRun inside = style;
+        inside.length = inTo - inFrom;
+        rebuilt.append(inside);
+        if (inTo < runEnd) {
+            TypeRun after = run;
+            after.length = runEnd - inTo;
+            rebuilt.append(after);
+        }
+    }
+
+    m_typeRuns = rebuilt;
+    typeNormalizeRuns();
+}
+
+void CanvasView::typeNormalizeRuns()
+{
+    QList<TypeRun> merged;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        if (run.length <= 0) {
+            continue;
+        }
+        if (!merged.isEmpty() && merged.last().sameStyle(run)) {
+            merged.last().length += run.length;
+        } else {
+            merged.append(run);
+        }
+    }
+
+    // The runs describe the text, so their lengths have to add up to it. Any
+    // shortfall goes to the last run and any excess comes off it, which is
+    // where an edit that ran past the end of the runs would have landed.
+    int total = 0;
+    for (const TypeRun &run : std::as_const(merged)) {
+        total += run.length;
+    }
+    if (merged.isEmpty()) {
+        TypeRun whole = typePendingRun();
+        whole.length = m_typeText.size();
+        if (whole.length > 0) {
+            merged.append(whole);
+        }
+    } else if (total != m_typeText.size()) {
+        merged.last().length += m_typeText.size() - total;
+        if (merged.last().length <= 0) {
+            merged.removeLast();
+        }
+    }
+
+    m_typeRuns = merged;
+}
+
+void CanvasView::typeSyncStyleToCaret()
+{
+    if (m_typeRuns.isEmpty()) {
+        return;
+    }
+
+    // The style at the caret is the one the character *before* it is set in —
+    // typing continues what you just typed rather than what is ahead.
+    const int at = typeHasSelection() ? typeSelectionStart()
+                                      : qMax(0, m_typeCaret - 1);
+    // A selection spanning more than one style has no single style to show, so
+    // the options bar is left alone rather than made to pick one — picking one
+    // would then be pushed back over the selection and flatten it.
+    if (typeHasSelection()
+        && typeRunIndexAt(typeSelectionStart()) != typeRunIndexAt(typeSelectionEnd() - 1)) {
+        return;
+    }
+
+    const TypeRun run = typeRunAt(at);
+    if (run.sameStyle(typePendingRun())) {
+        return;
+    }
+
+    m_typeFont.setFamily(run.family);
+    m_typeFont.setPointSizeF(run.size);
+    m_typeStyleName = run.style;
+    m_typeColor = run.color;
+    emit typeStyleAdopted(run.family, run.style, run.size, run.color, m_typeAlignment,
+                          m_typeAntialias, m_typeVertical);
+}
+
+void CanvasView::typeMoveCaret(int index, bool extend)
+{
+    m_typeCaret = qBound(0, index, m_typeText.size());
+    if (!extend) {
+        m_typeAnchor = m_typeCaret;
+    }
+    typeSyncStyleToCaret();
+    update();
+}
+
+bool CanvasView::typeDeleteSelection()
+{
+    if (!typeHasSelection()) {
+        return false;
+    }
+    const int from = typeSelectionStart();
+    typeRemove(from, typeSelectionEnd() - from);
+    m_typeCaret = from;
+    m_typeAnchor = from;
+    return true;
+}
+
+void CanvasView::typeRemove(int at, int length)
+{
+    // Take the deleted characters off whichever runs held them, in order.
+    int remaining = length;
+    int runStart = 0;
+    for (int i = 0; i < m_typeRuns.size() && remaining > 0; ++i) {
+        TypeRun &run = m_typeRuns[i];
+        const int runEnd = runStart + run.length;
+        const int from = qMax(runStart, at);
+        const int to = qMin(runEnd, at + length);
+        if (from < to) {
+            run.length -= to - from;
+            remaining -= to - from;
+        }
+        runStart = runEnd;
+    }
+
+    m_typeText.remove(at, length);
+    typeNormalizeRuns();
+}
+
+void CanvasView::typeInsert(const QString &text)
+{
+    typeDeleteSelection();
+
+    // Typed characters take the options bar's current style, which is what
+    // makes setting a size with nothing selected apply to what you type next.
+    const TypeRun style = typePendingRun();
+    QList<TypeRun> rebuilt;
+    TypeRun inserted = style;
+    inserted.length = text.size();
+
+    int at = 0;
+    bool placed = false;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        const int runStart = at;
+        at += run.length;
+        if (placed || m_typeCaret > at) {
+            rebuilt.append(run);
+            continue;
+        }
+        // Split the run the caret sits inside; a caret on a boundary lands
+        // between two runs and splits neither.
+        const int before = m_typeCaret - runStart;
+        if (before > 0) {
+            TypeRun head = run;
+            head.length = before;
+            rebuilt.append(head);
+        }
+        rebuilt.append(inserted);
+        if (run.length - before > 0) {
+            TypeRun tail = run;
+            tail.length = run.length - before;
+            rebuilt.append(tail);
+        }
+        placed = true;
+    }
+    if (!placed) {
+        rebuilt.append(inserted);
+    }
+    m_typeRuns = rebuilt;
+
+    m_typeText.insert(m_typeCaret, text);
+    m_typeCaret += text.size();
+    m_typeAnchor = m_typeCaret;
+    typeNormalizeRuns();
+}
+
+void CanvasView::typeKeyPress(QKeyEvent *event)
+{
+    const bool extend = event->modifiers() & Qt::ShiftModifier;
+    const bool byWord = event->modifiers() & Qt::ControlModifier;
+    const TypeLayout layout = typeLayout(m_zoom);
+
+    // Step over a word rather than a character, for Ctrl+arrow: past any run of
+    // separators, then past the word itself, the way every text field moves.
+    auto wordStep = [this](int from, int direction) {
+        int at = from;
+        while (at + qMin(direction, 0) >= 0 && at + qMax(direction, 0) < m_typeText.size()
+               && !isWordChar(m_typeText.at(at + qMin(direction, 0)))) {
+            at += direction;
+        }
+        while (at + qMin(direction, 0) >= 0 && at + qMax(direction, 0) < m_typeText.size()
+               && isWordChar(m_typeText.at(at + qMin(direction, 0)))) {
+            at += direction;
+        }
+        return at;
+    };
+
+    // Up and down keep the caret's distance along the line, so running down a
+    // block of text does not drag it to the start.
+    auto verticalStep = [this, &layout](int direction) -> int {
+        const int line = typeLineOf(layout, m_typeCaret);
+        const int target = line + direction;
+        if (target < 0 || target >= layout.lines.size()) {
+            return direction < 0 ? 0 : m_typeText.size();
+        }
+        const int column = m_typeCaret - layout.lines.at(line).start;
+        return int(layout.lines.at(target).start
+                   + qMin(column, layout.lines.at(target).length));
+    };
+
+    switch (event->key()) {
+    case Qt::Key_Escape:
+        cancelTypeEdit();
+        event->accept();
+        return;
+
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        // Plain Enter inserts a newline, as it does in real Photoshop;
+        // Ctrl+Enter (its numpad Enter, which Qt does not distinguish from a
+        // modifier-free press here) commits instead.
+        if (event->modifiers() & Qt::ControlModifier) {
+            commitTypeEdit();
+        } else {
+            typeInsert(QStringLiteral("\n"));
+            update();
+        }
+        event->accept();
+        return;
+
+    case Qt::Key_Backspace:
+        // With a selection, Backspace deletes it rather than a character.
+        if (!typeDeleteSelection() && m_typeCaret > 0) {
+            m_typeText.remove(m_typeCaret - 1, 1);
+            --m_typeCaret;
+            m_typeAnchor = m_typeCaret;
+        }
+        update();
+        event->accept();
+        return;
+
+    case Qt::Key_Delete:
+        if (!typeDeleteSelection() && m_typeCaret < m_typeText.size()) {
+            m_typeText.remove(m_typeCaret, 1);
+        }
+        update();
+        event->accept();
+        return;
+
+    case Qt::Key_Left:
+    case Qt::Key_Right:
+    case Qt::Key_Up:
+    case Qt::Key_Down: {
+        // The arrows follow the text rather than the screen: along the line for
+        // horizontal type, down the column for vertical, with the crosswise
+        // pair stepping between lines. Vertical columns run right to left, so
+        // Left is the *next* one.
+        const bool alongTheText = m_typeVertical
+            ? (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down)
+            : (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right);
+        int direction = (event->key() == Qt::Key_Right || event->key() == Qt::Key_Down) ? 1 : -1;
+        if (m_typeVertical && !alongTheText) {
+            direction = -direction;
+        }
+
+        if (!alongTheText) {
+            typeMoveCaret(verticalStep(direction), extend);
+        } else if (!extend && typeHasSelection()) {
+            // Without Shift, an arrow key collapses a selection to its near
+            // edge instead of stepping on from the caret.
+            typeMoveCaret(direction < 0 ? typeSelectionStart() : typeSelectionEnd(), false);
+        } else {
+            typeMoveCaret(byWord ? wordStep(m_typeCaret, direction) : m_typeCaret + direction,
+                          extend);
+        }
+        event->accept();
+        return;
+    }
+
+    case Qt::Key_Home:
+        typeMoveCaret(byWord ? 0 : layout.lines.at(typeLineOf(layout, m_typeCaret)).start, extend);
+        event->accept();
+        return;
+
+    case Qt::Key_End: {
+        const TypeLineBox &line = layout.lines.at(typeLineOf(layout, m_typeCaret));
+        typeMoveCaret(byWord ? m_typeText.size() : line.start + line.length, extend);
+        event->accept();
+        return;
+    }
+
+    default:
+        break;
+    }
+
+    // Ctrl+A selects all the text being composed, as it does while editing type
+    // in Photoshop — it is not the canvas-wide Select All while the Type tool
+    // has an edit open.
+    if (event->key() == Qt::Key_A && (event->modifiers() & Qt::ControlModifier)) {
+        m_typeAnchor = 0;
+        m_typeCaret = m_typeText.size();
+        typeSyncStyleToCaret();
+        update();
+        event->accept();
+        return;
+    }
+
+    const QString text = event->text();
+    if (!text.isEmpty() && text.at(0).isPrint() && !(event->modifiers() & Qt::ControlModifier)) {
+        typeInsert(text);
+        update();
+    }
+    event->accept();
+}
+
+void CanvasView::typeSelectWord(int index)
+{
+    const int at = qBound(0, index, m_typeText.size());
+    // A double-click between two words — on a space — selects the run of
+    // spaces, so the gesture always grabs something.
+    const bool word = at < m_typeText.size() && isWordChar(m_typeText.at(at));
+    auto matches = [word](QChar c) { return isWordChar(c) == word && c != QLatin1Char('\n'); };
+
+    int from = at;
+    while (from > 0 && matches(m_typeText.at(from - 1))) {
+        --from;
+    }
+    int to = at;
+    while (to < m_typeText.size() && matches(m_typeText.at(to))) {
+        ++to;
+    }
+
+    m_typeAnchor = from;
+    m_typeCaret = to;
+    typeSyncStyleToCaret();
+    update();
+}
+
+void CanvasView::setTypeVertical(bool vertical)
+{
+    if (m_typeVertical == vertical) {
+        return;
+    }
+    // Horizontal and Vertical Type are two tools, so switching between them
+    // finishes the text in progress rather than turning it on its side.
+    commitTypeEdit();
+    m_typeVertical = vertical;
+}
+
+void CanvasView::setTypeMask(bool mask)
+{
+    if (m_typeMask == mask) {
+        return;
+    }
+    // Type and Type Mask are separate tools, and what an edit commits to — a
+    // layer or a selection — is decided when it starts, so the one in progress
+    // finishes under the tool it was begun with.
+    commitTypeEdit();
+    m_typeMask = mask;
+}
+
+void CanvasView::setTypeOptions(const QFont &font, const QString &styleName, const QColor &color,
+                                Qt::Alignment alignment, bool antialias)
+{
+    m_typeFont = font;
+    m_typeStyleName = styleName;
+    m_typeColor = color;
+    m_typeAlignment = alignment;
+    m_typeAntialias = antialias;
+
+    if (!m_typing) {
+        return;
+    }
+    // Character formatting applies to the selection, the way it does in
+    // Photoshop: selecting two letters and setting 72pt changes those two and
+    // nothing else. With no selection there is nothing to restyle — the new
+    // setting is what the next characters typed will be set in.
+    if (typeHasSelection()) {
+        typeApplyStyle(typeSelectionStart(), typeSelectionEnd());
+    }
+    update();
+}
+
+QRectF CanvasView::typeBounds() const
+{
+    // Document space, so the layout is measured at scale 1 — the size the text
+    // will be rasterized at, whatever the view is zoomed to. The layout's box
+    // already carries the alignment and, for vertical type, the columns
+    // trailing away to the left of the origin.
+    const QRectF box = typeLayout(1.0).box;
+    return QRectF(m_typeOrigin + box.topLeft(),
+                  QSizeF(qMax(box.width(), 1.0), qMax(box.height(), 1.0)));
+}
+
+void CanvasView::commitTypeEdit()
+{
+    if (!m_typing) {
+        return;
+    }
+    m_typing = false;
+    m_typeSelecting = false;
+    m_typeCaret = 0;
+    m_typeAnchor = 0;
+    const int editedLayer = m_typeLayer;
+    m_typeLayer = -1;
+
+    if (!m_engine) {
+        m_typeText.clear();
+        m_typeRuns.clear();
+        update();
+        return;
+    }
+
+    if (m_typeText.trimmed().isEmpty()) {
+        // Text emptied out and committed is text deleted: Photoshop drops the
+        // type layer rather than leaving an empty one behind. A new edit that
+        // never got any text simply goes away, and mask type that was never
+        // typed into leaves the selection alone.
+        m_engine->endTextEdit();
+        if (editedLayer >= 0) {
+            m_engine->deleteLayer(editedLayer);
+        }
+        m_typeText.clear();
+        m_typeRuns.clear();
+        update();
+        return;
+    }
+
+    // A pixel of padding on every side keeps antialiased strokes from being
+    // clipped at the rasterized image's edge.
+    const int pad = 2;
+    const QRectF bounds = typeBounds();
+    const QRect pixelBounds = bounds.toAlignedRect().adjusted(-pad, -pad, pad, pad);
+
+    QImage image(qMax(1, pixelBounds.width()), qMax(1, pixelBounds.height()),
+                QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+
+    if (m_typeMask) {
+        // Mask type commits the letterforms as a selection and nothing else:
+        // no layer, no type record, so no reopening it later — exactly like
+        // Photoshop, where a committed type mask is only a selection. Drawn in
+        // flat opaque black because only the alpha is read.
+        renderTypeToImage(image, pixelBounds.topLeft(), Qt::black);
+        m_engine->selectFromAlpha(image, pixelBounds.left(), pixelBounds.top(),
+                                  int(SelectionMode::New));
+        m_typeText.clear();
+        m_typeRuns.clear();
+        update();
+        return;
+    }
+
+    renderTypeToImage(image, pixelBounds.topLeft());
+
+    // CS6 names a text layer after what it says, one line's worth — and
+    // renames it as the text changes, so this is recomputed on every commit.
+    QString name = m_typeText.section(QLatin1Char('\n'), 0, 0).trimmed();
+    if (name.isEmpty()) {
+        name = tr("Type Layer");
+    }
+
+    // The text crosses the bridge run by run — see `beginTextRuns` — so the
+    // engine keeps the character formatting rather than one font for the lot.
+    m_engine->beginTextRuns();
+    int at = 0;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        m_engine->addTextRun(m_typeText.mid(at, run.length), run.family, run.style,
+                             float(run.size), run.color);
+        at += run.length;
+    }
+
+    // Re-rendering an existing layer keeps everything else about it — its place
+    // in the stack, its blend mode, its mask. Only if that layer has gone (undo
+    // during the edit, say) does this fall back to adding a new one.
+    bool updated = false;
+    if (editedLayer >= 0) {
+        updated = m_engine->updateTextLayer(editedLayer, image, pixelBounds.left(),
+                                            pixelBounds.top(), name,
+                                            typeAlignCode(m_typeAlignment), m_typeAntialias,
+                                            m_typeVertical, float(m_typeOrigin.x()),
+                                            float(m_typeOrigin.y()));
+    }
+    if (!updated) {
+        m_engine->endTextEdit();
+        m_engine->addTextLayer(image, pixelBounds.left(), pixelBounds.top(), name,
+                               typeAlignCode(m_typeAlignment), m_typeAntialias, m_typeVertical,
+                               float(m_typeOrigin.x()), float(m_typeOrigin.y()));
+    }
+
+    m_typeRuns.clear();
+    m_typeText.clear();
+    update();
+}
+
+void CanvasView::cancelTypeEdit()
+{
+    m_typing = false;
+    m_typeSelecting = false;
+    m_typeCaret = 0;
+    m_typeAnchor = 0;
+    m_typeLayer = -1;
+    m_typeText.clear();
+    m_typeRuns.clear();
+    // Reopened text goes back to showing its committed rendering, untouched.
+    if (m_engine) {
+        m_engine->endTextEdit();
+    }
+    update();
+}
+
+void CanvasView::paintTypeRuns(QPainter &painter, const TypeLayout &layout,
+                               const QPointF &origin, const QColor &forcedColor) const
+{
+    for (const TypeLineBox &line : layout.lines) {
+        for (const TypeSegment &segment : line.segments) {
+            if (segment.length <= 0) {
+                continue;
+            }
+            painter.setFont(segment.font);
+            painter.setPen(forcedColor.isValid() ? forcedColor : segment.color);
+            painter.drawText(QPointF(origin.x() + line.x + segment.x,
+                                     origin.y() + line.top + segment.y + segment.ascent),
+                             m_typeText.mid(segment.start, segment.length));
+        }
+    }
+}
+
+void CanvasView::renderTypeToImage(QImage &image, const QPoint &imageOrigin,
+                                   const QColor &forcedColor) const
+{
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, m_typeAntialias);
+    painter.setRenderHint(QPainter::TextAntialiasing, m_typeAntialias);
+    // The same layout and the same routine the overlay draws from, at scale 1 —
+    // so what is committed is what was on screen, segment for segment.
+    paintTypeRuns(painter, typeLayout(1.0), m_typeOrigin - QPointF(imageOrigin), forcedColor);
+}
+
+void CanvasView::paintTypeMaskVeil(QPainter &painter, const TypeLayout &layout,
+                                   const QPointF &origin) const
+{
+    const QRect area = documentRect().toAlignedRect().intersected(rect());
+    if (area.isEmpty()) {
+        return;
+    }
+
+    // Built off-screen because the letters are knocked *out* of the veil: the
+    // widget's own backing store is opaque, so there is nothing to erase into.
+    // Only the part of the document actually on screen is covered, so zooming
+    // in does not size this by the whole canvas.
+    const qreal ratio = devicePixelRatioF();
+    QImage veil(area.size() * ratio, QImage::Format_ARGB32_Premultiplied);
+    veil.setDevicePixelRatio(ratio);
+    veil.fill(kQuickMaskVeil);
+
+    QPainter cut(&veil);
+    cut.setRenderHint(QPainter::TextAntialiasing, m_typeAntialias);
+    // DestinationOut subtracts what is drawn from what is there, so an
+    // antialiased glyph edge thins the veil by exactly its own coverage.
+    cut.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+    paintTypeRuns(cut, layout, origin - QPointF(area.topLeft()), Qt::black);
+    cut.end();
+
+    painter.drawImage(area.topLeft(), veil);
+}
+
+void CanvasView::paintTypeOverlay(QPainter &painter)
+{
+    if (!m_typing) {
+        return;
+    }
+
+    const TypeLayout layout = typeLayout(m_zoom);
+    const QPointF origin = documentToWidget(m_typeOrigin);
+
+    painter.save();
+    painter.setRenderHint(QPainter::TextAntialiasing, m_typeAntialias);
+    if (m_typeMask) {
+        paintTypeMaskVeil(painter, layout, origin);
+    } else {
+        paintTypeRuns(painter, layout, origin);
+    }
+
+    // Against the veil the text has no ink of its own to invert, so mask type
+    // marks the caret and the selection in white instead.
+    const QColor marker = m_typeMask ? QColor(Qt::white) : m_typeColor;
+
+    if (typeHasSelection()) {
+        // Selected text is drawn inverted, the way Photoshop shows it: the run
+        // is filled with the text's own colour and the glyphs over it in the
+        // opposite. The glyphs are redrawn by the *same* routine that drew them
+        // the first time, clipped to the highlight — measuring them a second
+        // way could not be relied on to land on the same pixels.
+        const QColor inverse = m_typeColor.lightnessF() > 0.5 ? Qt::black : Qt::white;
+        const int from = typeSelectionStart();
+        const int to = typeSelectionEnd();
+
+        for (int i = 0; i < layout.lines.size(); ++i) {
+            const TypeLineBox &line = layout.lines.at(i);
+            const int selFrom = qMax(from, line.start);
+            const int selTo = qMin(to, line.start + line.length);
+            if (selFrom >= selTo) {
+                continue;
+            }
+
+            const QRectF highlight =
+                typeRangeRect(layout, i, selFrom, selTo).translated(origin);
+            if (m_typeMask) {
+                // A wash rather than an inversion: the knocked-out letters have
+                // to stay readable through it.
+                painter.fillRect(highlight, QColor(255, 255, 255, 90));
+                continue;
+            }
+            painter.fillRect(highlight, m_typeColor);
+            painter.save();
+            painter.setClipRect(highlight);
+            paintTypeRuns(painter, layout, origin, inverse);
+            painter.restore();
+        }
+    } else {
+        // The caret: as tall as the line it sits on for horizontal type — so it
+        // grows beside a larger word — and as wide as the column for vertical.
+        // CS6's blinks; this does not, to avoid a timer for what is otherwise a
+        // static overlay.
+        painter.fillRect(typeCaretRect(layout, m_typeCaret).translated(origin), marker);
+    }
+
+    painter.restore();
 }

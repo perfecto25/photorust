@@ -20,7 +20,7 @@ use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::document::{Document, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
-use crate::layer::{LayerId, LayerKind};
+use crate::layer::{LayerId, LayerKind, TextAlign, TextContent, TextRun};
 use crate::mixer::MixerOptions;
 use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
 use crate::focus::{FocusMode, FocusOptions};
@@ -709,6 +709,166 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "offsetLayer"]
         fn offset_layer(self: Pin<&mut Engine>, index: i32, dx: i32, dy: i32);
+
+        /// Start describing a piece of text, run by run.
+        ///
+        /// Character formatting is per-character — two letters in the middle of
+        /// a word can be a different size — so the text crosses the bridge as a
+        /// list, not as a string plus one font. A list is awkward to pass here
+        /// as an argument, so the shell builds it up instead: `beginTextRuns`,
+        /// an `addTextRun` per run, then `addTextLayer` or `updateTextLayer`,
+        /// which consume what was built.
+        #[qinvokable]
+        #[cxx_name = "beginTextRuns"]
+        fn begin_text_runs(self: Pin<&mut Engine>);
+
+        /// Append one run of same-formatted text: its characters, the font they
+        /// are set in (family and style by name, `size` in document pixels) and
+        /// their colour.
+        #[qinvokable]
+        #[cxx_name = "addTextRun"]
+        fn add_text_run(
+            self: Pin<&mut Engine>,
+            text: &QString,
+            family: &QString,
+            style: &QString,
+            size: f32,
+            color: &QColor,
+        );
+
+        /// Add a layer from pixels the shell already rasterized — what the
+        /// Type tool commits. `x`/`y` place the image's top-left in document
+        /// space; the image may hang off the canvas, like any other layer.
+        ///
+        /// The type record stored alongside those pixels is the runs built up
+        /// since `beginTextRuns`, plus what belongs to the block rather than to
+        /// any run: `align` (0 left, 1 centre, 2 right — top, centre, bottom for
+        /// vertical type), whether it was antialiased, whether it is `vertical`,
+        /// and `origin_x`/`origin_y` — the document-space point the lines are
+        /// laid out from, which is where the user first clicked rather than the
+        /// image's corner. Fails if no runs were built.
+        #[qinvokable]
+        #[cxx_name = "addTextLayer"]
+        fn add_text_layer(
+            self: Pin<&mut Engine>,
+            image: &QImage,
+            x: i32,
+            y: i32,
+            name: &QString,
+            align: i32,
+            antialias: bool,
+            vertical: bool,
+            origin_x: f32,
+            origin_y: f32,
+        ) -> bool;
+
+        /// Re-render the type layer at a panel index from new pixels and the
+        /// runs built up since `beginTextRuns` — committing an edit of text that
+        /// already exists.
+        ///
+        /// Unlike adding, this keeps the layer itself: its place in the stack,
+        /// its blend mode, opacity, mask and locks all survive being retyped.
+        /// Returns false if that layer is gone, which means the edit should be
+        /// committed as a new layer instead.
+        #[qinvokable]
+        #[cxx_name = "updateTextLayer"]
+        fn update_text_layer(
+            self: Pin<&mut Engine>,
+            index: i32,
+            image: &QImage,
+            x: i32,
+            y: i32,
+            name: &QString,
+            align: i32,
+            antialias: bool,
+            vertical: bool,
+            origin_x: f32,
+            origin_y: f32,
+        ) -> bool;
+
+        /// Make a selection out of an image's alpha — what the Type Mask tools
+        /// commit. `x`/`y` place the image's top-left in document space, and
+        /// anything of it that falls off the canvas is ignored. `op` is a
+        /// [`SelectionOp`] code, as the other selection calls take.
+        ///
+        /// Mask type produces no layer at all: the letterforms become the
+        /// selection and the text itself is gone, which is the whole point of
+        /// the tool.
+        #[qinvokable]
+        #[cxx_name = "selectFromAlpha"]
+        fn select_from_alpha(self: Pin<&mut Engine>, image: &QImage, x: i32, y: i32, op: i32)
+            -> bool;
+
+        /// Panel index of the topmost visible type layer whose bounds contain a
+        /// document-space point, or -1. This is what makes clicking existing
+        /// text with the Type tool reopen it rather than start new text.
+        #[qinvokable]
+        #[cxx_name = "textLayerAt"]
+        fn text_layer_at(self: &Engine, x: i32, y: i32) -> i32;
+
+        /// The type record of the layer at a panel index, read back run by run
+        /// the way it was written. Each getter returns a default when the layer
+        /// is not a type layer or the run does not exist, so a caller that has
+        /// already hit-tested with `textLayerAt` needs no further checks.
+        #[qinvokable]
+        #[cxx_name = "layerTextRunCount"]
+        fn layer_text_run_count(self: &Engine, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunText"]
+        fn layer_text_run_text(self: &Engine, index: i32, run: i32) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunFamily"]
+        fn layer_text_run_family(self: &Engine, index: i32, run: i32) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunStyle"]
+        fn layer_text_run_style(self: &Engine, index: i32, run: i32) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunSize"]
+        fn layer_text_run_size(self: &Engine, index: i32, run: i32) -> f32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunColor"]
+        fn layer_text_run_color(self: &Engine, index: i32, run: i32) -> QColor;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextAlign"]
+        fn layer_text_align(self: &Engine, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextAntialias"]
+        fn layer_text_antialias(self: &Engine, index: i32) -> bool;
+
+        /// Whether the layer is vertical type — which the Type tool takes on
+        /// when it reopens it, since the orientation belongs to the text and
+        /// not to whichever of the two tools is in hand.
+        #[qinvokable]
+        #[cxx_name = "layerTextVertical"]
+        fn layer_text_vertical(self: &Engine, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextOriginX"]
+        fn layer_text_origin_x(self: &Engine, index: i32) -> f32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextOriginY"]
+        fn layer_text_origin_y(self: &Engine, index: i32) -> f32;
+
+        /// Hold a type layer's pixels back while the Type tool has it open, so
+        /// the user sees the live overlay instead of it over the old rendering.
+        /// Not an edit: it makes no history state and does not disturb what the
+        /// Layers panel reports about the layer.
+        #[qinvokable]
+        #[cxx_name = "beginTextEdit"]
+        fn begin_text_edit(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Give those pixels back — the end of the edit, committed or not.
+        #[qinvokable]
+        #[cxx_name = "endTextEdit"]
+        fn end_text_edit(self: Pin<&mut Engine>);
     }
 
     // -- painting ----------------------------------------------------------
@@ -1444,6 +1604,11 @@ pub struct EngineRust {
     /// clean off, once each stroke ends.
     mixer_load_after_stroke: bool,
     mixer_clean_after_stroke: bool,
+    /// Text runs the shell is describing right now, between `beginTextRuns`
+    /// and the `addTextLayer`/`updateTextLayer` that consumes them. Empty at
+    /// rest — this is a builder's scratch space, not document state.
+    pending_runs: Vec<TextRun>,
+
     /// Set while the Spot Healing Brush is active. `None` for every other tool,
     /// which is what makes `end_stroke` paint normally.
     heal_mode: Option<HealMode>,
@@ -1520,6 +1685,7 @@ impl Default for EngineRust {
             mixer_reservoir: Rgba8::BLACK,
             mixer_load_after_stroke: false,
             mixer_clean_after_stroke: false,
+            pending_runs: Vec::new(),
             heal_mode: None,
             heal_source: None,
             clone_source: None,
@@ -1638,6 +1804,50 @@ impl EngineRust {
         // The panel lists top-first; the stack is bottom-first.
         let stack_index = count - 1 - panel_index as usize;
         self.doc.layers().get(stack_index).map(|l| l.id)
+    }
+
+    /// The type record of the layer at a panel index, if it has one.
+    fn text_content_at(&self, panel_index: i32) -> Option<&TextContent> {
+        self.layer_id_at(panel_index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .and_then(|l| l.text.as_ref())
+    }
+
+    /// One run of that record.
+    fn text_run_at(&self, panel_index: i32, run: i32) -> Option<&TextRun> {
+        if run < 0 {
+            return None;
+        }
+        self.text_content_at(panel_index)
+            .and_then(|t| t.runs.get(run as usize))
+    }
+
+    /// Take the runs built up since `beginTextRuns` and make a type record of
+    /// them. `None` when nothing was built, which is the shell failing to
+    /// describe its text rather than an empty piece of text — that case never
+    /// reaches here, because committing empty text deletes the layer.
+    fn take_text_content(
+        &mut self,
+        align: i32,
+        antialias: bool,
+        vertical: bool,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> Option<TextContent> {
+        if self.pending_runs.is_empty() {
+            return None;
+        }
+        Some(TextContent {
+            runs: std::mem::take(&mut self.pending_runs),
+            align: match align {
+                1 => TextAlign::Center,
+                2 => TextAlign::Right,
+                _ => TextAlign::Left,
+            },
+            antialias,
+            vertical,
+            origin: (origin_x, origin_y),
+        })
     }
 
     /// The inverse of [`EngineRust::layer_id_at`].
@@ -2583,9 +2793,19 @@ impl ffi::Engine {
     }
 
     fn layer_visible(&self, index: i32) -> bool {
-        self.layer_id_at(index)
-            .and_then(|id| self.doc.layers().by_id(id))
-            .is_some_and(|l| l.visible)
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        // A type layer open in the Type tool has its pixels held back for the
+        // duration (see `beginTextEdit`), but that is the tool's business and
+        // not a change the user made: the panel goes on showing the eye the way
+        // they left it.
+        if let Some((editing, was_visible)) = self.doc.text_edit_layer() {
+            if editing == id {
+                return was_visible;
+            }
+        }
+        self.doc.layers().by_id(id).is_some_and(|l| l.visible)
     }
 
     fn layer_opacity(&self, index: i32) -> i32 {
@@ -2835,6 +3055,207 @@ impl ffi::Engine {
             self.as_mut().rust_mut().doc.offset_layer(id, dx, dy);
             self.sync();
         }
+    }
+
+    fn begin_text_runs(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().pending_runs.clear();
+    }
+
+    fn add_text_run(
+        mut self: core::pin::Pin<&mut Self>,
+        text: &QString,
+        family: &QString,
+        style: &QString,
+        size: f32,
+        color: &QColor,
+    ) {
+        let run = TextRun {
+            text: text.to_string(),
+            family: family.to_string(),
+            style: style.to_string(),
+            size,
+            color: qcolor_to_rgba(color),
+        };
+        self.as_mut().rust_mut().pending_runs.push(run);
+    }
+
+    fn add_text_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        image: &QImage,
+        x: i32,
+        y: i32,
+        name: &QString,
+        align: i32,
+        antialias: bool,
+        vertical: bool,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> bool {
+        let Some(content) = self
+            .as_mut()
+            .rust_mut()
+            .take_text_content(align, antialias, vertical, origin_x, origin_y)
+        else {
+            return false;
+        };
+        let Some(pixels) = qimage_to_pixmap(image) else {
+            return false;
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .add_text_layer(pixels, (x, y), name.to_string(), content);
+        self.sync();
+        true
+    }
+
+    fn update_text_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        image: &QImage,
+        x: i32,
+        y: i32,
+        name: &QString,
+        align: i32,
+        antialias: bool,
+        vertical: bool,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> bool {
+        let Some(content) = self
+            .as_mut()
+            .rust_mut()
+            .take_text_content(align, antialias, vertical, origin_x, origin_y)
+        else {
+            return false;
+        };
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let Some(pixels) = qimage_to_pixmap(image) else {
+            return false;
+        };
+        // The edit is over either way, so the layer gets its pixels back before
+        // they are replaced — otherwise a failed update would leave it hidden.
+        self.as_mut().rust_mut().doc.end_text_edit();
+        let updated = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .update_text_layer(id, pixels, (x, y), name.to_string(), content);
+        self.sync();
+        updated
+    }
+
+    fn select_from_alpha(
+        mut self: core::pin::Pin<&mut Self>,
+        image: &QImage,
+        x: i32,
+        y: i32,
+        op: i32,
+    ) -> bool {
+        let (width, height) = (self.doc.width(), self.doc.height());
+        let (image_width, image_height) = (image.width(), image.height());
+        if image_width <= 0 || image_height <= 0 {
+            return false;
+        }
+
+        // The selection is canvas-sized, so the image is stamped into a blank
+        // coverage map at its offset rather than combined where it lies.
+        let mut coverage = vec![0u8; (width * height) as usize];
+        for iy in 0..image_height {
+            let doc_y = y + iy;
+            if doc_y < 0 || doc_y >= height as i32 {
+                continue;
+            }
+            for ix in 0..image_width {
+                let doc_x = x + ix;
+                if doc_x < 0 || doc_x >= width as i32 {
+                    continue;
+                }
+                let alpha = image.pixel_color(ix, iy).alpha().clamp(0, 255) as u8;
+                coverage[doc_y as usize * width as usize + doc_x as usize] = alpha;
+            }
+        }
+
+        let op = SelectionOp::from_i32(op);
+        self.as_mut().rust_mut().doc.select_mask(&coverage, op, 0);
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
+        true
+    }
+
+    fn text_layer_at(&self, x: i32, y: i32) -> i32 {
+        self.doc
+            .text_layer_at(x, y)
+            .map_or(-1, |id| self.panel_index_of(id))
+    }
+
+    fn layer_text_run_count(&self, index: i32) -> i32 {
+        self.text_content_at(index)
+            .map_or(0, |t| t.runs.len() as i32)
+    }
+
+    fn layer_text_run_text(&self, index: i32, run: i32) -> QString {
+        self.text_run_at(index, run)
+            .map_or_else(QString::default, |r| QString::from(r.text.as_str()))
+    }
+
+    fn layer_text_run_family(&self, index: i32, run: i32) -> QString {
+        self.text_run_at(index, run)
+            .map_or_else(QString::default, |r| QString::from(r.family.as_str()))
+    }
+
+    fn layer_text_run_style(&self, index: i32, run: i32) -> QString {
+        self.text_run_at(index, run)
+            .map_or_else(QString::default, |r| QString::from(r.style.as_str()))
+    }
+
+    fn layer_text_run_size(&self, index: i32, run: i32) -> f32 {
+        self.text_run_at(index, run).map_or(0.0, |r| r.size)
+    }
+
+    fn layer_text_run_color(&self, index: i32, run: i32) -> QColor {
+        rgba_to_qcolor(self.text_run_at(index, run).map_or(Rgba8::BLACK, |r| r.color))
+    }
+
+    fn layer_text_align(&self, index: i32) -> i32 {
+        self.text_content_at(index)
+            .map_or(0, |t| match t.align {
+                TextAlign::Left => 0,
+                TextAlign::Center => 1,
+                TextAlign::Right => 2,
+            })
+    }
+
+    fn layer_text_antialias(&self, index: i32) -> bool {
+        self.text_content_at(index).is_some_and(|t| t.antialias)
+    }
+
+    fn layer_text_vertical(&self, index: i32) -> bool {
+        self.text_content_at(index).is_some_and(|t| t.vertical)
+    }
+
+    fn layer_text_origin_x(&self, index: i32) -> f32 {
+        self.text_content_at(index).map_or(0.0, |t| t.origin.0)
+    }
+
+    fn layer_text_origin_y(&self, index: i32) -> f32 {
+        self.text_content_at(index).map_or(0.0, |t| t.origin.1)
+    }
+
+    fn begin_text_edit(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let started = self.as_mut().rust_mut().doc.begin_text_edit(id);
+        self.sync();
+        started
+    }
+
+    fn end_text_edit(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.end_text_edit();
+        self.sync();
     }
 
     // -- painting -----------------------------------------------------------

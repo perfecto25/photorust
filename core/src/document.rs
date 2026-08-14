@@ -12,7 +12,7 @@ use crate::compositor;
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{self, HealMode, MoveOptions, Transfer};
 use crate::history::History;
-use crate::layer::{Layer, LayerId, LayerKind, LayerStack};
+use crate::layer::{Layer, LayerId, LayerKind, LayerStack, TextContent};
 use crate::perspective;
 use crate::mixer::{MixerBrush, MixerOptions, Sampled};
 use crate::replace::{ColorReplacer, ReplaceOptions, ReplaceSampling};
@@ -112,6 +112,10 @@ pub struct Document {
     pub untitled_number: u32,
     /// Set on every mutation, cleared on save.
     dirty: bool,
+
+    /// The type layer the Type tool currently has open, and the visibility it
+    /// had before the edit hid it. See [`Document::begin_text_edit`].
+    text_edit: Option<(LayerId, bool)>,
 }
 
 impl Document {
@@ -146,6 +150,7 @@ impl Document {
             path: None,
             untitled_number: 1,
             dirty: false,
+            text_edit: None,
         }
     }
 
@@ -193,6 +198,7 @@ impl Document {
             path: None,
             untitled_number: 1,
             dirty: false,
+            text_edit: None,
         }
     }
 
@@ -294,6 +300,114 @@ impl Document {
         self.active_layer = id;
         self.commit(adjustment.name());
         id
+    }
+
+    /// Add a layer of already-rasterized pixels above the active one and
+    /// select it — what the Type tool commits.
+    ///
+    /// Text shaping and rendering happen in the C++ shell (CLAUDE.md §2: Qt's
+    /// font engine is the natural tool for that, and re-implementing it here
+    /// would mean shipping a second one); this stores the result like any
+    /// other layer's pixels, plus the [`TextContent`] they came from so the
+    /// layer can be reopened and retyped.
+    pub fn add_text_layer(
+        &mut self,
+        pixels: Pixmap,
+        offset: (i32, i32),
+        name: String,
+        text: TextContent,
+    ) -> LayerId {
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.pixels = pixels;
+        layer.offset = offset;
+        layer.text = Some(text);
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("Type Tool");
+        id
+    }
+
+    /// Re-render an existing type layer in place — the second and later commits
+    /// of the same piece of text.
+    ///
+    /// The layer keeps its identity, and so its place in the stack, its blend
+    /// mode, opacity, mask and everything else the user set on it: only the
+    /// pixels, their offset, the name and the type record change. Returns false
+    /// if the layer has gone (undone away mid-edit, say), which the caller
+    /// treats as reason to add a fresh one instead.
+    pub fn update_text_layer(
+        &mut self,
+        id: LayerId,
+        pixels: Pixmap,
+        offset: (i32, i32),
+        name: String,
+        text: TextContent,
+    ) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        layer.pixels = pixels;
+        layer.offset = offset;
+        layer.name = name;
+        layer.text = Some(text);
+        self.active_layer = id;
+        self.commit("Edit Type Layer");
+        true
+    }
+
+    /// The topmost type layer whose bounds contain a document-space point.
+    ///
+    /// Photoshop reopens text when you click anywhere in its bounding box, not
+    /// only on an inked pixel, so this tests bounds. Hidden layers are skipped:
+    /// clicking where invisible text happens to sit should start new text, not
+    /// silently reopen something that is not on screen.
+    pub fn text_layer_at(&self, x: i32, y: i32) -> Option<LayerId> {
+        self.stack
+            .iter()
+            .rev()
+            .find(|l| {
+                l.text.is_some() && !l.is_invisible() && l.bounds().contains(x, y)
+            })
+            .map(|l| l.id)
+    }
+
+    /// Suppress a type layer's pixels while the Type tool has it open, so the
+    /// live overlay is what the user sees rather than the overlay drawn on top
+    /// of the previous rendering.
+    ///
+    /// Deliberately *not* a history step and not the Layers panel's eye: it is
+    /// a view state belonging to an edit in progress, and it ends when the edit
+    /// does. [`Document::text_edit_layer`] lets callers keep reporting the
+    /// layer's real visibility while it is held down.
+    pub fn begin_text_edit(&mut self, id: LayerId) -> bool {
+        self.end_text_edit();
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        let was_visible = layer.visible;
+        layer.visible = false;
+        self.text_edit = Some((id, was_visible));
+        self.dirty = true;
+        true
+    }
+
+    /// Restore the visibility [`Document::begin_text_edit`] took away.
+    pub fn end_text_edit(&mut self) {
+        if let Some((id, was_visible)) = self.text_edit.take() {
+            if let Some(layer) = self.stack.by_id_mut(id) {
+                layer.visible = was_visible;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The type layer currently open in the Type tool, and the visibility it
+    /// will get back when the edit finishes.
+    pub fn text_edit_layer(&self) -> Option<(LayerId, bool)> {
+        self.text_edit
     }
 
     /// Duplicate a layer, inserting the copy directly above the original.
@@ -477,6 +591,13 @@ impl Document {
             }
             l.offset.0 += dx;
             l.offset.1 += dy;
+            // A type layer's anchor travels with its pixels, so reopening it
+            // after a move resumes where the text now is rather than snapping
+            // back to where it was first clicked.
+            if let Some(text) = l.text.as_mut() {
+                text.origin.0 += dx as f32;
+                text.origin.1 += dy as f32;
+            }
             self.commit("Move Layer");
         }
     }
@@ -2191,6 +2312,9 @@ impl Document {
         // An in-progress stroke is discarded rather than half-applied.
         self.stroke = None;
         self.stroke_undo_base = None;
+        // The restored stack carries its own visibility flags, so the one an
+        // open type edit was holding on to no longer means anything.
+        self.text_edit = None;
 
         if let Some(state) = self.history.undo() {
             let (stack, size) = (state.stack.clone(), state.size);
@@ -2207,6 +2331,7 @@ impl Document {
     pub fn redo(&mut self) -> bool {
         self.stroke = None;
         self.stroke_undo_base = None;
+        self.text_edit = None;
 
         if let Some(state) = self.history.redo() {
             let (stack, size) = (state.stack.clone(), state.size);
@@ -2273,6 +2398,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::{TextAlign, TextRun};
 
     fn doc() -> Document {
         Document::new(16, 16, Rgba8::WHITE)
@@ -3636,5 +3762,157 @@ mod tests {
         assert!(!d.has_selection(), "inverting a full selection empties it");
         d.deselect();
         assert!(!d.has_selection());
+    }
+
+    /// A type layer, 8x4 pixels at (4, 4), saying `text` in one run.
+    fn type_layer(d: &mut Document, text: &str) -> LayerId {
+        let mut pixels = Pixmap::new(8, 4);
+        pixels.fill(Rgba8::BLACK);
+        d.add_text_layer(pixels, (4, 4), text.to_string(), type_content(text))
+    }
+
+    fn type_run(text: &str, size: f32) -> TextRun {
+        TextRun {
+            text: text.to_string(),
+            family: "Permanent Marker".to_string(),
+            style: "Regular".to_string(),
+            size,
+            color: Rgba8::BLACK,
+        }
+    }
+
+    fn type_content(text: &str) -> TextContent {
+        TextContent {
+            runs: vec![type_run(text, 12.0)],
+            align: TextAlign::Left,
+            antialias: true,
+            vertical: false,
+            origin: (4.0, 4.0),
+        }
+    }
+
+    #[test]
+    fn a_type_layer_remembers_what_it_was_typed_from() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        let text = d.layers().by_id(id).unwrap().text.as_ref().unwrap();
+        assert_eq!(text.text(), "hello");
+        assert_eq!(text.first_run().unwrap().family, "Permanent Marker");
+        assert_eq!(text.origin, (4.0, 4.0));
+    }
+
+    #[test]
+    fn runs_keep_their_own_formatting_and_join_back_into_one_string() {
+        let mut d = doc();
+        let mut pixels = Pixmap::new(8, 4);
+        pixels.fill(Rgba8::BLACK);
+        let content = TextContent {
+            // "das" at 12pt, "ds" at 72pt, "dasdsd" back at 12pt — the mixed
+            // sizes a selection-only size change leaves behind.
+            runs: vec![type_run("das", 12.0), type_run("ds", 72.0), type_run("dasdsd", 12.0)],
+            align: TextAlign::Left,
+            antialias: true,
+            vertical: false,
+            origin: (4.0, 4.0),
+        };
+        let id = d.add_text_layer(pixels, (4, 4), "das".to_string(), content);
+
+        let text = d.layers().by_id(id).unwrap().text.as_ref().unwrap();
+        assert_eq!(text.text(), "dasdsdasdsd");
+        assert_eq!(text.runs.len(), 3);
+        assert_eq!(text.runs[1].size, 72.0, "the middle run lost its size");
+        assert_eq!(text.runs[2].size, 12.0, "the size change spread past the selection");
+    }
+
+    #[test]
+    fn clicking_in_a_type_layer_finds_it_and_clicking_outside_does_not() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        assert_eq!(d.text_layer_at(5, 5), Some(id));
+        assert_eq!(d.text_layer_at(15, 15), None, "a click clear of the text found it anyway");
+        assert_eq!(d.text_layer_at(4, 4), Some(id), "the top-left corner is inside");
+        assert_eq!(d.text_layer_at(12, 8), None, "bounds are half-open");
+    }
+
+    #[test]
+    fn a_hidden_type_layer_is_not_reopened_by_a_click() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        d.set_layer_visible(id, false);
+        assert_eq!(d.text_layer_at(5, 5), None);
+    }
+
+    #[test]
+    fn retyping_updates_the_layer_in_place() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        let count = d.layer_count();
+
+        let mut wider = Pixmap::new(16, 4);
+        wider.fill(Rgba8::BLACK);
+        assert!(d.update_text_layer(
+            id,
+            wider,
+            (4, 4),
+            "hello there".to_string(),
+            type_content("hello there")
+        ));
+
+        assert_eq!(d.layer_count(), count, "retyping stacked a second layer");
+        let layer = d.layers().by_id(id).unwrap();
+        assert_eq!(layer.name, "hello there");
+        assert_eq!(layer.pixels.width(), 16);
+        assert_eq!(layer.text.as_ref().unwrap().text(), "hello there");
+    }
+
+    #[test]
+    fn retyping_a_layer_that_has_gone_reports_failure() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        d.delete_layer(id);
+        assert!(!d.update_text_layer(
+            id,
+            Pixmap::new(8, 4),
+            (4, 4),
+            "hello".to_string(),
+            type_content("hello")
+        ));
+    }
+
+    #[test]
+    fn moving_a_type_layer_carries_its_anchor_along() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        d.offset_layer(id, 3, -2);
+        let text = d.layers().by_id(id).unwrap().text.as_ref().unwrap();
+        assert_eq!(text.origin, (7.0, 2.0));
+        assert_eq!(d.text_layer_at(8, 3), Some(id), "the moved text is not where it is drawn");
+    }
+
+    #[test]
+    fn an_open_type_edit_hides_the_pixels_and_gives_them_back() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        let steps = d.history().len();
+
+        assert!(d.begin_text_edit(id));
+        assert!(!d.layers().by_id(id).unwrap().visible);
+        assert_eq!(d.text_edit_layer(), Some((id, true)));
+        assert_eq!(d.history().len(), steps, "opening an edit made a history state");
+
+        d.end_text_edit();
+        assert!(d.layers().by_id(id).unwrap().visible);
+        assert_eq!(d.text_edit_layer(), None);
+    }
+
+    #[test]
+    fn ending_an_edit_restores_a_layer_that_was_hidden_to_begin_with() {
+        let mut d = doc();
+        let id = type_layer(&mut d, "hello");
+        d.set_layer_visible(id, false);
+
+        assert!(d.begin_text_edit(id));
+        d.end_text_edit();
+        assert!(!d.layers().by_id(id).unwrap().visible, "the edit turned a hidden layer on");
     }
 }

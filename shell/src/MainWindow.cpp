@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "canvas/CanvasView.h"
+#include "dialogs/ColorPickerDialog.h"
 #include "panels/BrushPresetPicker.h"
 #include "panels/ColorPanel.h"
 #include "panels/HistoryPanel.h"
@@ -16,6 +17,7 @@
 
 #include <QApplication>
 #include <QButtonGroup>
+#include <QCache>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -25,23 +27,32 @@
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontDatabase>
 #include <QFormLayout>
 #include <QInputDialog>
+#include <QIntValidator>
 #include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
+#include <QListView>
 #include <QPushButton>
 #include <QMenu>
 #include <QMenuBar>
 #include <QPainter>
 #include <QMessageBox>
+#include <QPointer>
+#include <QSet>
 #include <QSpinBox>
 #include <QSignalBlocker>
 #include <QStatusBar>
+#include <QStyledItemDelegate>
 #include <QTabBar>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 namespace {
 
@@ -64,6 +75,208 @@ const char *const kSaveFilter =
 
 /// Line-art tint for options-bar icons, matching the tool strip.
 const QColor kOptionsIconColor(0xd4, 0xd4, 0xd4);
+
+/// Row height for the font-family list, and the point size each preview is
+/// drawn at. Fixed so the popup can lay itself out without measuring a single
+/// font (see `FontFamilyDelegate`).
+constexpr int kFontRowHeight = 22;
+constexpr int kFontPreviewPoints = 11;
+
+/// Renders the Type tool's font-family list the way CS6 does: each row
+/// previewed in its own typeface, with a small "T" marking it as a font.
+///
+/// Rasterizing a preview means loading and shaping a font file, which is far
+/// too slow to do from `paint()` — a hovered list repaints constantly, and
+/// doing it inline cost seconds to open, lag while scrolling, and blocked long
+/// enough that a stale mouse release could dismiss the popup. So `paint()`
+/// never rasterizes: it draws whatever is already cached, and otherwise falls
+/// back to the list's own font and queues the family up. A zero-interval timer
+/// then renders a few at a time between events, so the popup appears at once
+/// and the previews fill in behind it.
+///
+/// Requests are served newest-first because the queue is filled by painting:
+/// the most recent additions are the rows the user is looking at now, not the
+/// ones they scrolled past.
+class FontFamilyDelegate : public QStyledItemDelegate
+{
+public:
+    explicit FontFamilyDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+        m_timer.setInterval(0);
+        connect(&m_timer, &QTimer::timeout, &m_timer, [this] { renderBatch(); });
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        painter->save();
+
+        const QRect row = option.rect;
+        if (option.state & QStyle::State_Selected) {
+            painter->fillRect(row, option.palette.color(QPalette::Highlight));
+        } else if (option.state & QStyle::State_MouseOver) {
+            painter->fillRect(row, option.palette.color(QPalette::Base).lighter(130));
+        }
+
+        // A plain "T" marks the row as a font, the way CS6 marks each entry
+        // with its format (TrueType/OpenType/PostScript) — one glyph rather
+        // than three icons for a distinction this minor. Drawn in the list's
+        // own font, so it costs nothing to load.
+        painter->setPen(kOptionsIconColor);
+        painter->setFont(option.font);
+        painter->drawText(QRect(row.left() + 6, row.top(), 14, row.height()),
+                          Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("T"));
+
+        const QString family = index.data(Qt::DisplayRole).toString();
+        const qreal ratio = painter->device()->devicePixelRatioF();
+        painter->setClipRect(row);
+
+        if (const QPixmap *preview = m_cache.object(cacheKey(family, ratio))) {
+            if (preview->isNull()) {
+                // Rendered once and rejected — see renderPreview().
+                painter->drawText(QRect(row.left() + 24, row.top(), row.width() - 28, row.height()),
+                                  Qt::AlignVCenter | Qt::AlignLeft, family);
+            } else {
+                const int y = row.top() + (row.height() - int(preview->height()
+                                                              / preview->devicePixelRatio())) / 2;
+                painter->drawPixmap(row.left() + 24, y, *preview);
+            }
+        } else {
+            painter->drawText(QRect(row.left() + 24, row.top(), row.width() - 28, row.height()),
+                              Qt::AlignVCenter | Qt::AlignLeft, family);
+            request(family, ratio, option.widget);
+        }
+
+        painter->restore();
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        Q_UNUSED(option)
+        Q_UNUSED(index)
+        return QSize(220, kFontRowHeight);
+    }
+
+private:
+    static QString cacheKey(const QString &family, qreal ratio)
+    {
+        return QStringLiteral("%1|%2").arg(family, QString::number(ratio));
+    }
+
+    /// Queue a family for rendering the next time the event loop is free.
+    void request(const QString &family, qreal ratio, const QWidget *view) const
+    {
+        if (view) {
+            m_view = const_cast<QWidget *>(view);
+        }
+        const QString key = cacheKey(family, ratio);
+        if (m_queued.contains(key)) {
+            return;
+        }
+        m_queued.insert(key);
+        m_pending.append({family, ratio});
+        if (!m_timer.isActive()) {
+            m_timer.start();
+        }
+    }
+
+    /// Render a handful of queued previews, then repaint. Deliberately a small
+    /// slice per pass: the point is that the list keeps responding to scrolling
+    /// and hovering while the previews arrive.
+    void renderBatch() const
+    {
+        constexpr int kPerPass = 6;
+        for (int i = 0; i < kPerPass && !m_pending.isEmpty(); ++i) {
+            const Request req = m_pending.takeLast();
+            const QString key = cacheKey(req.family, req.ratio);
+            m_queued.remove(key);
+            m_cache.insert(key, new QPixmap(renderPreview(req.family, req.ratio)));
+        }
+        if (m_pending.isEmpty()) {
+            m_timer.stop();
+        }
+        if (m_view) {
+            m_view->update();
+        }
+    }
+
+    /// The family name drawn in its own typeface.
+    ///
+    /// Returns a null pixmap for fonts that cannot preview their own name
+    /// legibly, which the caller renders in the UI font instead. Colour fonts
+    /// (COLR/CBDT — Google's "Bitcount Ink" faces, for instance) are the case
+    /// that matters: they ignore the pen and paint their own multi-coloured
+    /// artwork, which at row height comes out as a smear of confetti rather
+    /// than a readable name. There is no Qt API that reports this, so it is
+    /// detected from the result — a preview that painted in colours of its own
+    /// choosing is one we cannot show.
+    QPixmap renderPreview(const QString &family, qreal ratio) const
+    {
+        // Pin the style so a variable font renders at its regular weight
+        // rather than whatever instance Qt would default to. Leaving it as a
+        // bare QFont(family) is what made entries like "Bitcount Cursive Semi"
+        // render at the wrong weight.
+        QFont font = QFontDatabase::font(family, QStringLiteral("Regular"), kFontPreviewPoints);
+        font.setPointSize(kFontPreviewPoints);
+
+        const QFontMetrics metrics(font);
+        const int width = qBound(1, metrics.horizontalAdvance(family) + 4, 400);
+
+        QPixmap pixmap(QSize(width, kFontRowHeight) * ratio);
+        pixmap.setDevicePixelRatio(ratio);
+        pixmap.fill(Qt::transparent);
+
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::TextAntialiasing, true);
+        painter.setFont(font);
+        painter.setPen(kOptionsIconColor);
+        painter.drawText(QRect(0, 0, width, kFontRowHeight),
+                         Qt::AlignVCenter | Qt::AlignLeft, family);
+        painter.end();
+
+        return isColored(pixmap.toImage()) ? QPixmap() : pixmap;
+    }
+
+    /// True if the glyphs painted in colours the pen never asked for.
+    ///
+    /// The pen is a neutral grey, so ordinary text is grey through and through;
+    /// only antialiasing fringes stray, and never far. A handful of clearly
+    /// saturated pixels therefore means the font supplied its own colour.
+    static bool isColored(const QImage &image)
+    {
+        constexpr int kSaturationThreshold = 60;
+        constexpr int kMinColoredPixels = 8;
+
+        int colored = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor pixel = image.pixelColor(x, y);
+                if (pixel.alpha() < 32) {
+                    continue;
+                }
+                const int spread = std::max({pixel.red(), pixel.green(), pixel.blue()})
+                                   - std::min({pixel.red(), pixel.green(), pixel.blue()});
+                if (spread > kSaturationThreshold && ++colored >= kMinColoredPixels) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    struct Request
+    {
+        QString family;
+        qreal ratio;
+    };
+
+    mutable QCache<QString, QPixmap> m_cache{1024};
+    mutable QList<Request> m_pending;
+    mutable QSet<QString> m_queued;
+    mutable QPointer<QWidget> m_view;
+    mutable QTimer m_timer;
+};
 
 /// Stop a dialog's buttons being squeezed narrower than their text.
 ///
@@ -153,6 +366,7 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         m_colorPanel->setForegroundColor(c);
         m_toolStrip->swatches()->setForeground(c);
     });
+    connect(m_canvas, &CanvasView::typeStyleAdopted, this, &MainWindow::adoptTypeStyle);
 
     // Keep the tool strip's swatch and the Color panel showing the same pair.
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged,
@@ -789,6 +1003,8 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     } else if (tool == ToolId::Eyedropper
                && static_cast<EyedropperType>(variant) != EyedropperType::Eyedropper) {
         addAnnotationOptions(static_cast<EyedropperType>(variant));
+    } else if (tool == ToolId::Type) {
+        addTypeOptions();
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(
             new QLabel(tr("Click to zoom in    Alt+click to zoom out"), m_optionsBar));
@@ -1994,6 +2210,269 @@ void MainWindow::pushPenOptions()
     m_canvas->setFreeformPenTolerance(m_freeformTolerance);
 }
 
+void MainWindow::addTypeOptions()
+{
+    // The first time this bar is built, start from the current foreground
+    // colour — CS6's own default — rather than the black this class is
+    // constructed with. After that the user's own choice persists like every
+    // other tool option here.
+    if (!m_typeColorInitialized && m_engine) {
+        m_typeColor = m_engine->foregroundColor();
+        m_typeColorInitialized = true;
+    }
+
+    // Font family. CS6's own combo previews each entry in its own typeface;
+    // FontFamilyDelegate above does the same, rendering the previews off the
+    // paint path so the popup opens immediately however many fonts are
+    // installed.
+    auto *family = new QComboBox(m_optionsBar);
+    family->setItemDelegate(new FontFamilyDelegate(family));
+    QStringList families;
+    for (const QString &name : QFontDatabase::families()) {
+        // A colour-emoji font renders its own name as oversized colour
+        // glyphs when previewed at text size rather than garbling like an
+        // ordinary font would — and CS6 predates system emoji fonts
+        // entirely, so leaving them out is truer to the target UI, not just
+        // a workaround.
+        if (!name.contains(QLatin1String("Emoji"), Qt::CaseInsensitive)) {
+            families << name;
+        }
+    }
+    family->addItems(families);
+    const int familyIdx = family->findText(m_typeFont.family());
+    family->setCurrentIndex(familyIdx >= 0 ? familyIdx : 0);
+    family->setFixedWidth(170);
+    family->setMaxVisibleItems(20);
+    family->setToolTip(tr("Set the font family"));
+    // Every row is the same fixed height, so let the view take that as given
+    // rather than asking the delegate about each of several hundred entries
+    // to work out how tall the popup should be.
+    if (auto *view = qobject_cast<QListView *>(family->view())) {
+        view->setUniformItemSizes(true);
+        view->setLayoutMode(QListView::Batched);
+    }
+    m_optionsBar->addWidget(family);
+
+    // Style — CS6 keeps this as a second combo beside the family rather than
+    // bold/italic toggle buttons. The list comes from what the chosen family
+    // actually has, so it never offers a style the font cannot render.
+    auto *style = new QComboBox(m_optionsBar);
+    style->setFixedWidth(110);
+    style->setToolTip(tr("Set the font style"));
+    m_optionsBar->addWidget(style);
+
+    auto refreshStyles = [this, style](const QString &familyName) {
+        const QSignalBlocker blocker(style);
+        style->clear();
+        QStringList styles = QFontDatabase::styles(familyName);
+        if (styles.isEmpty()) {
+            styles << tr("Regular");
+        }
+        style->addItems(styles);
+        const int idx = style->findText(m_typeStyle);
+        style->setCurrentIndex(idx >= 0 ? idx : 0);
+        m_typeStyle = style->currentText();
+    };
+    refreshStyles(m_typeFont.family());
+
+    connect(family, &QComboBox::currentTextChanged, this,
+            [this, refreshStyles](const QString &familyName) {
+                m_typeFont.setFamily(familyName);
+                refreshStyles(familyName);
+                pushTypeOptions();
+            });
+    connect(style, &QComboBox::currentTextChanged, this, [this](const QString &text) {
+        m_typeStyle = text;
+        pushTypeOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Size: CS6's common point sizes, plus room to type any value.
+    auto *size = new QComboBox(m_optionsBar);
+    size->setEditable(true);
+    size->setFixedWidth(64);
+    size->setValidator(new QIntValidator(1, 1296, size));
+    size->setToolTip(tr("Set the font size"));
+    for (int pt : {6, 7, 8, 9, 10, 11, 12, 14, 18, 24, 30, 36, 48, 60, 72, 96, 144, 192, 288}) {
+        size->addItem(QString::number(pt));
+    }
+    size->setCurrentText(QString::number(int(m_typeFont.pointSizeF())));
+    m_optionsBar->addWidget(size);
+    connect(size, &QComboBox::currentTextChanged, this, [this](const QString &text) {
+        bool ok = false;
+        const double pt = text.toDouble(&ok);
+        if (ok && pt > 0) {
+            m_typeFont.setPointSizeF(pt);
+            pushTypeOptions();
+        }
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Anti-aliasing method. CS6 offers five; only None turns Qt's own text
+    // antialiasing off — the other four are all a *way* of smoothing, which
+    // Qt's rasterizer does not expose a choice between.
+    auto *aa = new QComboBox(m_optionsBar);
+    aa->addItems({tr("None"), tr("Sharp"), tr("Crisp"), tr("Strong"), tr("Smooth")});
+    aa->setCurrentText(m_typeAntialias ? tr("Sharp") : tr("None"));
+    aa->setFixedWidth(90);
+    aa->setToolTip(tr("Set the anti-aliasing method"));
+    m_optionsBar->addWidget(aa);
+    connect(aa, &QComboBox::currentTextChanged, this, [this](const QString &text) {
+        m_typeAntialias = text != tr("None");
+        pushTypeOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Paragraph alignment: left, centre, right.
+    auto *alignGroup = new QButtonGroup(m_optionsBar);
+    alignGroup->setExclusive(true);
+    struct AlignEntry {
+        Qt::Alignment align;
+        QString tip;
+    };
+    // Vertical type runs down the page, so the same three buttons mean top,
+    // centre and bottom — CS6 turns their icons a quarter turn to say so.
+    const AlignEntry aligns[] = {
+        {Qt::AlignLeft, m_typeVertical ? tr("Top align text") : tr("Left align text")},
+        {Qt::AlignHCenter, tr("Center text")},
+        {Qt::AlignRight, m_typeVertical ? tr("Bottom align text") : tr("Right align text")},
+    };
+    for (const AlignEntry &entry : aligns) {
+        auto *button = new QToolButton(m_optionsBar);
+        button->setCheckable(true);
+        button->setAutoRaise(true);
+        button->setIcon(ToolIcons::fromSvgBody(
+            ToolIcons::textAlignSvg(entry.align, m_typeVertical), kOptionsIconColor));
+        button->setIconSize(QSize(20, 20));
+        button->setChecked(m_typeAlignment == entry.align);
+        button->setToolTip(entry.tip);
+        alignGroup->addButton(button, int(entry.align));
+        m_optionsBar->addWidget(button);
+    }
+    connect(alignGroup, &QButtonGroup::idClicked, this, [this](int id) {
+        m_typeAlignment = Qt::Alignment(id);
+        pushTypeOptions();
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Text colour swatch.
+    auto *colorSwatch = new QToolButton(m_optionsBar);
+    colorSwatch->setFixedSize(22, 22);
+    colorSwatch->setToolTip(tr("Set the text colour"));
+    auto refreshSwatch = [this, colorSwatch] {
+        QPixmap pm(16, 16);
+        pm.fill(m_typeColor);
+        QPainter p(&pm);
+        p.setPen(QColor(0, 0, 0, 160));
+        p.drawRect(pm.rect().adjusted(0, 0, -1, -1));
+        colorSwatch->setIcon(QIcon(pm));
+    };
+    refreshSwatch();
+    m_optionsBar->addWidget(colorSwatch);
+    connect(colorSwatch, &QToolButton::clicked, this, [this, refreshSwatch] {
+        const QColor picked = ColorPickerDialog::getColor(m_typeColor, this, tr("Text Color"));
+        if (picked.isValid()) {
+            m_typeColor = picked;
+            refreshSwatch();
+            pushTypeOptions();
+        }
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Warp Text and the Character/Paragraph panel toggle: listed for CS6's
+    // shape, neither is implemented — there is no text-warp geometry and no
+    // Character/Paragraph panel behind them yet.
+    auto *warp = new QToolButton(m_optionsBar);
+    warp->setAutoRaise(true);
+    warp->setIcon(ToolIcons::fromSvgBody(
+        QStringLiteral(R"SVG(<path d="M3 14c3-6 11-6 14 0" stroke-width="1.3"/>
+                  <path d="M10 4V11M7 4H13" stroke-width="1.3"/>)SVG"),
+        kOptionsIconColor));
+    warp->setIconSize(QSize(20, 20));
+    warp->setEnabled(false);
+    warp->setToolTip(tr("Warp Text — not implemented yet"));
+    m_optionsBar->addWidget(warp);
+
+    auto *panels = new QToolButton(m_optionsBar);
+    panels->setAutoRaise(true);
+    panels->setIcon(ToolIcons::fromSvgBody(
+        QStringLiteral(R"SVG(<rect x="3" y="3" width="14" height="14" rx="1" stroke-width="1.2"/>
+                  <path d="M3 9H17" stroke-width="1"/>
+                  <path d="M6 6H12M6 13H14" stroke-width="1"/>)SVG"),
+        kOptionsIconColor));
+    panels->setIconSize(QSize(20, 20));
+    panels->setEnabled(false);
+    panels->setToolTip(tr("Toggle the Character and Paragraph panels — not implemented yet"));
+    m_optionsBar->addWidget(panels);
+
+    m_optionsBar->addSeparator();
+
+    // Cancel and commit. CS6 disables these until there is an edit in
+    // progress; both of ours are harmless no-ops when there is not, which
+    // avoids rebuilding the bar on every keystroke just to toggle them.
+    auto *cancel = new QToolButton(m_optionsBar);
+    cancel->setAutoRaise(true);
+    cancel->setIcon(ToolIcons::fromSvgBody(ToolIcons::cancelSvg(), kOptionsIconColor));
+    cancel->setIconSize(QSize(18, 18));
+    cancel->setToolTip(tr("Cancel any current edits (Esc)"));
+    m_optionsBar->addWidget(cancel);
+    connect(cancel, &QToolButton::clicked, this, [this] { m_canvas->cancelTypeEdit(); });
+
+    auto *commit = new QToolButton(m_optionsBar);
+    commit->setAutoRaise(true);
+    commit->setIcon(ToolIcons::fromSvgBody(ToolIcons::commitSvg(), kOptionsIconColor));
+    commit->setIconSize(QSize(18, 18));
+    commit->setToolTip(tr("Commit any current edits (Enter)"));
+    m_optionsBar->addWidget(commit);
+    connect(commit, &QToolButton::clicked, this, [this] { m_canvas->commitTypeEdit(); });
+
+    pushTypeOptions();
+}
+
+void MainWindow::pushTypeOptions()
+{
+    // The style name (e.g. "Bold Italic") comes from the family's own style
+    // list rather than QFont's bold/italic bits, so look the concrete font up
+    // by name instead of setting those bits and hoping they match.
+    QFont resolved = QFontDatabase::font(m_typeFont.family(), m_typeStyle,
+                                         int(m_typeFont.pointSizeF()));
+    resolved.setPointSizeF(m_typeFont.pointSizeF());
+    m_canvas->setTypeOptions(resolved, m_typeStyle, m_typeColor, m_typeAlignment,
+                             m_typeAntialias);
+}
+
+void MainWindow::adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
+                                const QColor &color, Qt::Alignment alignment, bool antialias,
+                                bool vertical)
+{
+    // Orientation belongs to the text: reopening vertical type edits it
+    // vertically whichever Type tool was in hand, so the bar's alignment
+    // buttons have to describe the axis actually being edited.
+    m_typeVertical = vertical;
+    m_typeFont.setFamily(family);
+    m_typeFont.setPointSizeF(pointSize);
+    m_typeStyle = style;
+    m_typeColor = color;
+    // The reopened text's colour is a deliberate choice already made, so it
+    // must not be overwritten by the foreground colour the first time the bar
+    // is built.
+    m_typeColorInitialized = true;
+    m_typeAlignment = alignment;
+    m_typeAntialias = antialias;
+
+    // Rebuild the bar so its combos, swatch and alignment buttons show what is
+    // now being edited. It ends by pushing these same values back to the
+    // canvas, which is a no-op — they came from there.
+    if (m_activeTool == ToolId::Type) {
+        populateOptionsBar(ToolId::Type, m_activeVariant);
+    }
+}
+
 void MainWindow::addCloneOptions()
 {
     m_optionsBar->addSeparator();
@@ -3042,12 +3521,28 @@ void MainWindow::actualPixels()
 
 void MainWindow::onToolChanged(ToolId tool, int variant)
 {
+    // Leaving the Type tool commits whatever text is in progress, the way
+    // switching tools does in real Photoshop.
+    if (m_activeTool == ToolId::Type && tool != ToolId::Type && m_canvas) {
+        m_canvas->commitTypeEdit();
+    }
+
     m_activeTool = tool;
     m_activeVariant = variant;
 
     m_canvas->setActiveTool(tool);
     if (tool == ToolId::Healing) {
         m_canvas->setHealingType(static_cast<HealingType>(variant));
+    }
+    // Four tools behind one button: text or mask, each way up. This has to land
+    // before the options bar is built, which reads `m_typeVertical` for its
+    // alignment buttons.
+    if (tool == ToolId::Type) {
+        const auto kind = static_cast<TypeTool>(variant);
+        m_typeVertical = kind == TypeTool::Vertical || kind == TypeTool::VerticalMask;
+        m_canvas->setTypeVertical(m_typeVertical);
+        m_canvas->setTypeMask(kind == TypeTool::HorizontalMask
+                              || kind == TypeTool::VerticalMask);
     }
     // Aliasing follows the brush variant, and has to be set before the options
     // bar pushes the rest of the brush settings.

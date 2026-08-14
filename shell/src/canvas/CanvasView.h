@@ -1,6 +1,10 @@
 #pragma once
 
+#include <QColor>
+#include <QFont>
+#include <QHash>
 #include <QImage>
+#include <QList>
 #include <QPainterPath>
 #include <QPoint>
 #include <QPointF>
@@ -204,6 +208,35 @@ public:
     /// Convert a document point to widget space.
     QPointF documentToWidget(const QPointF &pos) const;
 
+    /// The Type options bar's settings: font, the style name it was chosen by
+    /// ("Bold Italic" and so on — kept alongside the resolved font because it
+    /// is what the type record stores), colour, paragraph alignment and whether
+    /// to antialias. Live — there is no notion of a partial text selection
+    /// here, so changing any of these while text is being composed restyles the
+    /// whole thing, not just what is typed from here on the way real Photoshop
+    /// would with nothing selected.
+    void setTypeOptions(const QFont &font, const QString &styleName, const QColor &color,
+                        Qt::Alignment alignment, bool antialias);
+    /// True while the Type tool has an edit in progress.
+    bool isTyping() const { return m_typing; }
+    /// Switch between the Horizontal and Vertical Type tools. Vertical type
+    /// stacks characters downward and starts each new line as a column to the
+    /// left of the last. Any edit in progress is committed first: the two are
+    /// separate tools in Photoshop, not a setting on one piece of text.
+    void setTypeVertical(bool vertical);
+    /// Switch between the Type tools and the Type Mask tools. Mask type is
+    /// composed the same way but commits as a *selection* cut to the shape of
+    /// the letters, leaving no layer behind — so while it is being typed the
+    /// canvas wears the rubylith veil Quick Mask uses, with the text knocked
+    /// out of it. Any edit in progress is committed first.
+    void setTypeMask(bool mask);
+    /// Rasterize the composed text into its layer: the one being re-edited, or
+    /// a new one. Does nothing if the Type tool is not mid-edit.
+    void commitTypeEdit();
+    /// Abandon the in-progress edit without adding a layer. Safe to call at
+    /// any time, typing or not.
+    void cancelTypeEdit();
+
 signals:
     /// Emitted as the cursor moves, for the status bar and Info panel.
     void cursorMoved(const QPointF &documentPos);
@@ -233,11 +266,24 @@ signals:
     /// `MainWindow` names the tool and puts the dialog up — it holds the active
     /// variant, and the canvas does not own dialogs.
     void lockedLayerRefused();
+    /// The Type tool reopened existing text, whose own font, colour, alignment
+    /// and antialiasing are now what is being edited. `MainWindow` adopts them
+    /// into the options bar, the way clicking into text in Photoshop makes the
+    /// bar describe *that* text rather than what was last set up.
+    void typeStyleAdopted(const QString &family, const QString &style, qreal pointSize,
+                          const QColor &color, Qt::Alignment alignment, bool antialias,
+                          bool vertical);
     /// A mixer stroke ended, so the paint on the brush has changed. The options
     /// bar's load swatch reads it back from the engine.
     void mixerLoadChanged();
 
 protected:
+    /// Steals `QEvent::ShortcutOverride` while text is being composed, so a
+    /// letter typed into the Type tool is not matched against the single-
+    /// letter tool shortcuts (registered as `QAction`s on the main window)
+    /// before `keyPressEvent` ever sees it. Without this, typing "e" would
+    /// switch to the Eraser instead of inserting the character.
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
@@ -434,6 +480,167 @@ private:
     /// Paint the slice overlay: cut lines and numbered badges.
     void paintSlices(QPainter &painter);
 
+    /// Handle a Type tool click. Inside the text being composed it places the
+    /// caret and begins a drag-selection; inside other text it reopens that
+    /// layer; anywhere else it commits what was being typed and starts new
+    /// text. `modifiers` carries Shift, which extends the selection.
+    void typePress(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    /// Reopen the type layer at a panel index: its text becomes the edit in
+    /// progress and its own font, colour and alignment become the Type tool's.
+    /// The caret lands where in the text `doc` fell.
+    void beginTypeEdit(int layerIndex, const QPointF &doc);
+    /// Draw the text composed so far, its selection and its insertion caret.
+    void paintTypeOverlay(QPainter &painter);
+    /// The bounding rectangle of the composed text in document coordinates,
+    /// anchored at `m_typeOrigin` per `m_typeAlignment`.
+    QRectF typeBounds() const;
+
+    /// A stretch of the text being composed that is set the same way — the
+    /// character run Photoshop formats in. Selecting two letters and changing
+    /// the size splits the run they were in and gives the middle piece its own.
+    struct TypeRun
+    {
+        int length = 0;
+        QString family;
+        QString style;
+        qreal size = 12.0;
+        QColor color = Qt::black;
+
+        bool sameStyle(const TypeRun &other) const
+        {
+            return family == other.family && style == other.style
+                && qFuzzyCompare(size, other.size) && color == other.color;
+        }
+    };
+
+    /// One stretch of one line, in one font: what a single `drawText` call
+    /// draws. `x` and `y` place it within its line, and `ascent` is the drop
+    /// from there to its baseline.
+    ///
+    /// Horizontal type puts a whole run in one segment; vertical type gives
+    /// each character its own, since they are stacked rather than shaped into a
+    /// row.
+    struct TypeSegment
+    {
+        int start = 0;
+        int length = 0;
+        QFont font;
+        QColor color;
+        qreal x = 0.0;
+        qreal y = 0.0;
+        qreal ascent = 0.0;
+        qreal width = 0.0;
+        qreal height = 0.0;
+    };
+
+    /// One line of the text — a column, for vertical type — with its segments
+    /// in order. `x` and `top` are offsets from the origin and already carry
+    /// the alignment.
+    struct TypeLineBox
+    {
+        int start = 0;
+        int length = 0;
+        qreal x = 0.0;
+        qreal top = 0.0;
+        qreal height = 0.0;
+        qreal width = 0.0;
+        QList<TypeSegment> segments;
+    };
+
+    /// Where every character of the text being composed sits, relative to
+    /// `m_typeOrigin`.
+    ///
+    /// The caret, the selection highlight, click-to-place-caret, the bounding
+    /// box and the committed rasterization all have to agree with the glyphs
+    /// and with each other, so they are all measured from this one description.
+    /// It is built at a scale: 1 for document space — the size the text is
+    /// rasterized at — and the zoom factor for what is drawn on screen.
+    struct TypeLayout
+    {
+        QList<TypeLineBox> lines;
+        /// Everything the text covers, relative to the origin.
+        QRectF box;
+        qreal scale = 1.0;
+        /// Which way the text runs, copied from `m_typeVertical` when it was
+        /// built so everything measured against it agrees.
+        bool vertical = false;
+    };
+    TypeLayout typeLayout(qreal scale) const;
+    /// How far a line or column is slid along by the alignment: nothing for
+    /// left/top, half its extent for centred, all of it for right/bottom.
+    qreal typeAlignOffset(qreal extent) const;
+    /// Which line a character index falls on.
+    int typeLineOf(const TypeLayout &layout, int index) const;
+    /// How far along its line the gap before `index` sits: rightwards for
+    /// horizontal type, downwards for vertical.
+    qreal typeFlowOffset(const TypeLayout &layout, int line, int index) const;
+    /// The caret at a character index, relative to the origin — a thin upright
+    /// bar between letters, or a flat one between stacked characters.
+    QRectF typeCaretRect(const TypeLayout &layout, int index) const;
+    /// The rectangle covering `[from, to)` of one line, for the selection
+    /// highlight. Both ends must already be clamped to that line.
+    QRectF typeRangeRect(const TypeLayout &layout, int line, int from, int to) const;
+    /// The character index nearest a point given as an offset from the origin —
+    /// where a click there should put the caret.
+    int typeIndexAt(const QPointF &widgetPos) const;
+    /// The font a run is set in, resolved through the font database and cached:
+    /// laying the text out asks for the same few fonts over and over.
+    QFont typeRunFont(const TypeRun &run, qreal scale) const;
+    /// Draw a laid-out block of text, segment by segment, with each run's own
+    /// font and colour — or all in `forcedColor` when one is given, which is how
+    /// the inverted selection is drawn. `origin` is where `m_typeOrigin` falls
+    /// in whatever the painter is drawing on: the widget for the overlay, the
+    /// image being rasterized for a commit.
+    void paintTypeRuns(QPainter &painter, const TypeLayout &layout, const QPointF &origin,
+                       const QColor &forcedColor = QColor()) const;
+    /// Draw mask type: the rubylith veil over the document with the letters
+    /// knocked out of it, which is how Photoshop previews the selection the
+    /// text is about to become.
+    void paintTypeMaskVeil(QPainter &painter, const TypeLayout &layout,
+                           const QPointF &origin) const;
+    /// Rasterize the text being composed into `image`, whose top-left is at
+    /// `imageOrigin` in document space. `forcedColor` overrides every run's own
+    /// colour, which is what the mask commit wants — there it is the alpha that
+    /// matters, not the ink.
+    void renderTypeToImage(QImage &image, const QPoint &imageOrigin,
+                           const QColor &forcedColor = QColor()) const;
+
+    /// The run covering a character index, and the run the next character typed
+    /// at the caret should join.
+    int typeRunIndexAt(int index) const;
+    TypeRun typeRunAt(int index) const;
+    /// The style the options bar currently holds, as a run.
+    TypeRun typePendingRun() const;
+    /// Give `[from, to)` the options bar's current style, splitting runs at the
+    /// edges of the range so nothing outside it changes.
+    void typeApplyStyle(int from, int to);
+    /// Keep the runs consistent with the text: no empty runs, no two adjacent
+    /// runs set the same way, and lengths that add up to the text's.
+    void typeNormalizeRuns();
+    /// Make the options bar describe the text at the caret, so moving into a
+    /// differently-set word updates it — but only when that is unambiguous:
+    /// with a mixed selection there is no one style to show.
+    void typeSyncStyleToCaret();
+
+    /// True when some of the text is selected rather than just a caret.
+    bool typeHasSelection() const { return m_typeCaret != m_typeAnchor; }
+    int typeSelectionStart() const { return qMin(m_typeCaret, m_typeAnchor); }
+    int typeSelectionEnd() const { return qMax(m_typeCaret, m_typeAnchor); }
+    /// Put the caret at `index`, keeping the selection's other end where it is
+    /// when `extend` is set (Shift) and collapsing the selection when it is not.
+    void typeMoveCaret(int index, bool extend);
+    /// Delete the selected characters. False if there was no selection.
+    bool typeDeleteSelection();
+    /// Delete `length` characters from `at`, taking them off the runs too.
+    void typeRemove(int at, int length);
+    /// Insert at the caret, replacing the selection if there is one.
+    void typeInsert(const QString &text);
+    /// Select the word around `index`, as a double-click does.
+    void typeSelectWord(int index);
+    /// Every key press while an edit is open belongs to the text: typing,
+    /// caret movement, selection and the two keys that end the edit.
+    void typeKeyPress(QKeyEvent *event);
+
     Engine *m_engine = nullptr;
 
     /// Cached composite. Refreshed from the engine, never edited here.
@@ -595,6 +802,47 @@ private:
     /// The raw drag trail for the Freeform Pen, simplified into anchors on
     /// release.
     QPolygonF m_freeformPoints;
+
+    // -- Type --
+    /// True while text is being composed on the canvas, between a click with
+    /// the Type tool and Enter/the checkmark committing it or Esc cancelling.
+    bool m_typing = false;
+    /// Where the click landed, in document coordinates — the anchor the text
+    /// grows from. Which edge of the text sits there depends on
+    /// `m_typeAlignment`.
+    QPointF m_typeOrigin;
+    /// The text composed so far. Lines are separated by '\n'.
+    QString m_typeText;
+    /// How that text is formatted, in order. The lengths add up to the text's
+    /// own — `typeNormalizeRuns` keeps that true after every edit.
+    QList<TypeRun> m_typeRuns;
+    /// Resolved fonts, keyed by family, style and size. Cleared with the edit.
+    mutable QHash<QString, QFont> m_typeFontCache;
+    /// Where the caret sits, as a character index into `m_typeText`, and where
+    /// the selection it may be dragging out started. Equal means no selection —
+    /// the two are the ends of the selected range, and which is which depends
+    /// on whether it was made forwards or backwards.
+    int m_typeCaret = 0;
+    int m_typeAnchor = 0;
+    /// True between pressing and releasing while sweeping out a selection.
+    bool m_typeSelecting = false;
+    QFont m_typeFont;
+    /// The style name `m_typeFont` was resolved from — see `setTypeOptions`.
+    QString m_typeStyleName = QStringLiteral("Regular");
+    QColor m_typeColor = Qt::black;
+    Qt::Alignment m_typeAlignment = Qt::AlignLeft;
+    bool m_typeAntialias = true;
+    /// Set by the Vertical Type tool, and taken on from a layer reopened with
+    /// either — the orientation belongs to the text, not to the tool in hand.
+    bool m_typeVertical = false;
+    /// Set by the two Type Mask tools: this edit becomes a selection, not a
+    /// layer.
+    bool m_typeMask = false;
+    /// Panel index of the type layer being re-edited, or -1 when the edit will
+    /// commit as a new layer. Clicking existing text with the Type tool reopens
+    /// it, and committing then re-renders that layer in place instead of
+    /// stacking a second copy of the text on top of it.
+    int m_typeLayer = -1;
 
     /// What a Path Selection / Direct Selection press grabbed.
     enum class PathSelectGesture { None, Subpath, Anchor, Handle };

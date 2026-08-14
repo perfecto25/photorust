@@ -35,6 +35,83 @@ pub enum LayerKind {
     SolidColor(Rgba8),
 }
 
+/// How a type layer's lines sit about its origin: left, centre or right for
+/// ordinary type, and top, centre or bottom for vertical type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// What a type layer was rasterized *from*.
+///
+/// A type layer is an ordinary raster layer as far as the compositor, the
+/// filters and the file writers are concerned — it carries real pixels. What
+/// makes it a type layer is that it also remembers the text and the settings
+/// those pixels came from, so the Type tool can reopen it, change a word and
+/// render it again, the way clicking into existing text does in Photoshop.
+///
+/// Shaping and rasterizing stay in the shell (CLAUDE.md §2 — Qt's font engine
+/// is the right tool and re-implementing one here would be a project of its
+/// own), so this records the *choices* made there rather than anything
+/// Qt-specific: a family and style by name, not a serialized `QFont`. That
+/// keeps it something `.psd` type records can eventually be mapped onto.
+///
+/// The text is held as a list of [`TextRun`]s rather than one string plus one
+/// font, because character formatting is per-character in Photoshop: select two
+/// letters in the middle of a word, set them to 72pt, and only those two change.
+/// A run carries its own text, so nothing here has to agree with anything else
+/// about how a string is indexed.
+#[derive(Clone, Debug)]
+pub struct TextContent {
+    /// The text in order, split wherever its formatting changes. Never empty
+    /// for a live type layer — text with nothing in it is not kept as a layer.
+    pub runs: Vec<TextRun>,
+    /// Alignment is a paragraph property, so it belongs to the whole block
+    /// rather than to a run, and so does antialiasing.
+    pub align: TextAlign,
+    pub antialias: bool,
+    /// Set by the Vertical Type tool: characters run top to bottom and each
+    /// new line starts a column to the left of the last, the way Photoshop's
+    /// vertical type reads. `align` then means top, centre or bottom of the
+    /// column rather than left, centre or right of the line.
+    pub vertical: bool,
+    /// The click that started the text, in document space. Lines are laid out
+    /// from here per `align`, so reopening the layer resumes from the same
+    /// anchor rather than having to work backwards from the pixel bounds.
+    pub origin: (f32, f32),
+}
+
+/// A stretch of text set the same way — Photoshop's character run.
+#[derive(Clone, Debug)]
+pub struct TextRun {
+    pub text: String,
+    /// Font family name, e.g. "Permanent Marker".
+    pub family: String,
+    /// Style name within the family, e.g. "Regular" or "Bold Italic". A name
+    /// rather than bold/italic bits, because that is what the family actually
+    /// offers.
+    pub style: String,
+    /// Size in document pixels — the Type tool's point size.
+    pub size: f32,
+    pub color: Rgba8,
+}
+
+impl TextContent {
+    /// The whole text, runs joined back together — what the layer says.
+    pub fn text(&self) -> String {
+        self.runs.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    /// The formatting the text starts with, which is what a caller that can
+    /// only deal with one font — a thumbnail, a future `.psd` writer's fallback
+    /// — should use.
+    pub fn first_run(&self) -> Option<&TextRun> {
+        self.runs.first()
+    }
+}
+
 /// A single layer.
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -74,6 +151,10 @@ pub struct Layer {
     pub lock_pixels: bool,
     /// The layer may not be moved — Lock Position.
     pub lock_position: bool,
+
+    /// Set on a type layer: what its pixels were rendered from. `None` on
+    /// every other layer.
+    pub text: Option<TextContent>,
 }
 
 impl Layer {
@@ -95,6 +176,7 @@ impl Layer {
             lock_transparency: false,
             lock_pixels: false,
             lock_position: false,
+            text: None,
         }
     }
 

@@ -269,9 +269,9 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Convert Point Tool", nullptr, true}};
     case ToolId::Type:
         return {{"Horizontal Type Tool", "T", true},
-                {"Vertical Type Tool", nullptr, false},
-                {"Horizontal Type Mask Tool", nullptr, false},
-                {"Vertical Type Mask Tool", nullptr, false}};
+                {"Vertical Type Tool", "T", true},
+                {"Horizontal Type Mask Tool", "T", true},
+                {"Vertical Type Mask Tool", "T", true}};
     case ToolId::PathSelect:
         return {{"Path Selection Tool", "A", true},
                 {"Direct Selection Tool", "A", true}};
@@ -682,6 +682,26 @@ enum class PathSelectTool {
     PathSelection = 0,
     DirectSelection = 1,
 };
+
+/// The variants behind the Type button.
+///
+/// The first two lay text down as a layer; the mask pair compose text the same
+/// way but commit it as a *selection* cut to the letterforms, leaving no layer
+/// behind. Either pair can be horizontal or vertical.
+enum class TypeTool {
+    Horizontal = 0,
+    Vertical = 1,
+    HorizontalMask = 2,
+    VerticalMask = 3,
+};
+
+/// CS6's defaults for the Type tool's options bar. The point size is treated
+/// as a pixel size directly — the document model has no DPI concept for it to
+/// scale against.
+namespace TypeDefaults {
+constexpr double kSize = 12.0;
+constexpr bool kAntialias = true;
+} // namespace TypeDefaults
 
 /// CS6's defaults for the Pen tool's options bar.
 namespace PenDefaults {

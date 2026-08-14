@@ -338,8 +338,8 @@ ToolTip floating bar
 - gradient tools - done
 - blur tools - done
 - dodge tools - done
-- pen tools - in progress
-- type tools - not started
+- pen tools - done
+- type tools - done
 - selection tools - not started
 - shape tools - not started
 - hand tools - not started

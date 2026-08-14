@@ -111,10 +111,14 @@ QString bodyFor(ToolId id)
         return R"SVG(<circle cx="7.4" cy="7.4" r="3.9" fill="none" stroke="COLOR" stroke-width="1.25"/>
                   <path d="M10.2 10.2 17.4 17.4" stroke-width="1.4"/>)SVG";
 
+    // The fountain-pen nib CS6 uses for the whole Pen group: an angular kite
+    // tapering to the tip that draws, with the slit and breather hole real
+    // nibs have. Angled tip-down-left like Brush and Eyedropper.
     case ToolId::Pen:
-        return R"SVG(<path d="M10 1.8 15.1 9.1 10 18.2 4.9 9.1z"/>
-                  <path d="M10 11.4V18.2"/>
-                  <circle cx="10" cy="9.1" r="1.5" fill="none" stroke="COLOR" stroke-width="1.25"/>)SVG";
+        return R"SVG(<g transform="rotate(-45 10 10)">
+                  <path d="M10 18.4 6.6 8.6 8.5 3.2 12.6 4.1 13.2 9.4Z"/>
+                  <path d="M10.1 10V17"/>
+                  <circle cx="9.9" cy="8.2" r="1.05" fill="COLOR" stroke="none"/></g>)SVG";
 
     case ToolId::Type:
         return R"SVG(<path d="M3.8 3.6H16.2M10 3.6V16.4M7.2 16.4H12.8"/>)SVG";
@@ -400,6 +404,100 @@ QString dodgeVariantBody(int variant)
     return bodyFor(ToolId::Dodge);
 }
 
+/// Per-variant artwork for the gradient group.
+///
+/// The button's default is the gradient swatch; the Paint Bucket gets CS6's own
+/// glyph, which the flyout was showing the swatch for.
+///
+/// That glyph is a bucket tipped past horizontal with its mouth to the lower
+/// left, its handle hanging away from the body, and a drop of paint falling
+/// from the low lip. It is drawn tilted outright rather than as an upright
+/// bucket inside a `rotate()`, so every point can be placed against the 20×20
+/// grid — at this size a few tenths decide whether the mouth reads as open.
+///
+/// The bucket's axis runs up-right at 45°: the mouth is centred at (8.3, 11.2)
+/// and the base at (14.7, 4.8), with the four corners of the body falling
+/// either side of those two points along the perpendicular.
+QString gradientVariantBody(int variant)
+{
+    if (static_cast<GradientTool>(variant) != GradientTool::PaintBucket) {
+        return bodyFor(ToolId::Gradient);
+    }
+
+    return R"SVG(<path d="M5.3 8.2 12.6 2.7Q15.6 4 16.8 6.9L11.3 14.2"/>
+                  <ellipse cx="8.3" cy="11.2" rx="4.2" ry="1.5"
+                  transform="rotate(45 8.3 11.2)"/>
+                  <path d="M5.3 8.2Q4.8 14.7 11.3 14.2" stroke-width="1.1"/>
+                  <path fill="COLOR" stroke="none" d="M10.6 13.6c1.05 1.6 1.55 2.5 1.55 3.2
+                  a1.55 1.55 0 0 1-3.1 0c0-.7.5-1.6 1.55-3.2z"/>)SVG";
+}
+
+/// The Type button's four variants.
+///
+/// CS6 turns the same "T" a quarter turn for the vertical tool, and outlines it
+/// for the two mask tools — the mask tools cut their letterforms out of a
+/// selection rather than laying down ink, and the hollow glyph says so.
+QString typeVariantBody(int variant)
+{
+    const QString upright = bodyFor(ToolId::Type);
+
+    switch (static_cast<TypeTool>(variant)) {
+    case TypeTool::Vertical:
+        return QStringLiteral(R"SVG(<g transform="rotate(90 10 10)">%1</g>)SVG").arg(upright);
+
+    case TypeTool::HorizontalMask:
+    case TypeTool::VerticalMask: {
+        const QString dashed =
+            QStringLiteral(R"SVG(<rect x="1.6" y="1.6" width="16.8" height="16.8" fill="none")SVG"
+                           R"SVG( stroke="COLOR" stroke-width="1" stroke-dasharray="2.2 1.6"/>)SVG");
+        if (static_cast<TypeTool>(variant) == TypeTool::VerticalMask) {
+            return dashed
+                + QStringLiteral(R"SVG(<g transform="rotate(90 10 10)">%1</g>)SVG").arg(upright);
+        }
+        return dashed + upright;
+    }
+
+    case TypeTool::Horizontal:
+        break;
+    }
+    return upright;
+}
+
+/// Per-variant artwork for the pen group.
+///
+/// The first four entries are the nib with a small mark added: none for Pen
+/// itself, a scribble tail for Freeform, a +/- badge for the two anchor-point
+/// tools. Convert Point drops the nib and draws CS6's corner-to-curve glyph
+/// instead — a straight arm meeting a curved one at a shared anchor.
+QString penVariantBody(int variant)
+{
+    const QString nib = bodyFor(ToolId::Pen);
+
+    switch (static_cast<PenTool>(variant)) {
+    case PenTool::FreeformPen:
+        return nib + R"SVG(<path d="M1.8 15.4c1.6 0.4 2.1-1.2 1-1.9-1-0.7-0.6-2.1 1-1.7"
+                  stroke-width="1.05"/>)SVG";
+
+    case PenTool::AddAnchor:
+        return nib + R"SVG(<g stroke-width="1.2"><path d="M15.4 1.8V5.8"/>
+                  <path d="M13.4 3.8H17.4"/></g>)SVG";
+
+    case PenTool::DeleteAnchor:
+        return nib + R"SVG(<path d="M13.4 3.8H17.4" stroke-width="1.2"/>)SVG";
+
+    case PenTool::ConvertPoint:
+        return R"SVG(<path d="M4 16.4 9.6 10.8"/>
+                  <path d="M9.6 10.8C12.2 8.2 12.8 5 16.6 4.2"/>
+                  <circle cx="4" cy="16.4" r="1.2" fill="COLOR" stroke="none"/>
+                  <circle cx="9.6" cy="10.8" r="1.3" fill="none" stroke="COLOR" stroke-width="1.15"/>
+                  <circle cx="16.6" cy="4.2" r="1.2" fill="COLOR" stroke="none"/>)SVG";
+
+    case PenTool::Pen:
+        break;
+    }
+    return nib;
+}
+
 /// Per-variant artwork, where a tool's flyout entries need distinct icons.
 ///
 /// Every group whose variants are implemented has these; the rest reuse their
@@ -429,6 +527,15 @@ QString variantBodyFor(ToolId id, int variant)
     }
     if (id == ToolId::Dodge) {
         return dodgeVariantBody(variant);
+    }
+    if (id == ToolId::Gradient) {
+        return gradientVariantBody(variant);
+    }
+    if (id == ToolId::Pen) {
+        return penVariantBody(variant);
+    }
+    if (id == ToolId::Type) {
+        return typeVariantBody(variant);
     }
     if (id != ToolId::Marquee) {
         return bodyFor(id);
@@ -658,6 +765,44 @@ QString ToolIcons::protractorSvg()
     // readout block.
     return QStringLiteral(R"SVG(<path stroke-width="1.3" d="M3 16.4 16.4 16.4 3 5.4z"/>
                   <path stroke-width="1" fill="none" d="M3 12.4a4 4 0 0 0 3.6 4"/>)SVG");
+}
+
+QString ToolIcons::textAlignSvg(Qt::Alignment align, bool vertical)
+{
+    // The vertical set is the horizontal one turned a quarter turn: ruled lines
+    // running down the icon, flush to the top, centred, or flush to the bottom
+    // — which is what the same three buttons mean for vertical type.
+    if (vertical) {
+        if (align & Qt::AlignHCenter) {
+            return QStringLiteral(
+                R"SVG(<path d="M5 3V17M10 5.5V14.5M15 4.2V15.8" stroke-width="1.6"/>)SVG");
+        }
+        if (align & Qt::AlignRight) {
+            return QStringLiteral(
+                R"SVG(<path d="M5 3V17M10 8V17M15 5V17" stroke-width="1.6"/>)SVG");
+        }
+        return QStringLiteral(R"SVG(<path d="M5 3V17M10 3V12M15 3V15" stroke-width="1.6"/>)SVG");
+    }
+
+    if (align & Qt::AlignHCenter) {
+        return QStringLiteral(
+            R"SVG(<path d="M3 5H17M5.5 10H14.5M4.2 15H15.8" stroke-width="1.6"/>)SVG");
+    }
+    if (align & Qt::AlignRight) {
+        return QStringLiteral(R"SVG(<path d="M3 5H17M8 10H17M5 15H17" stroke-width="1.6"/>)SVG");
+    }
+    return QStringLiteral(R"SVG(<path d="M3 5H17M3 10H12M3 15H15" stroke-width="1.6"/>)SVG");
+}
+
+QString ToolIcons::commitSvg()
+{
+    return QStringLiteral(R"SVG(<path d="M4 10.5 8.2 15 16.5 5.5" stroke-width="1.8"/>)SVG");
+}
+
+QString ToolIcons::cancelSvg()
+{
+    return QStringLiteral(R"SVG(<circle cx="10" cy="10" r="7" stroke-width="1.5"/>
+                  <path d="M5.2 14.8 14.8 5.2" stroke-width="1.5"/>)SVG");
 }
 
 QString ToolIcons::selectionModeSvg(SelectionMode mode)

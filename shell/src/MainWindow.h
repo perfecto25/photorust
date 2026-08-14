@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QColor>
+#include <QFont>
 #include <QLabel>
 #include <QMainWindow>
 
@@ -213,6 +215,17 @@ private:
     void pushCropOptions();
     /// Push the current brush settings into the engine.
     void pushBrushSettings();
+    /// Add the Type tool's options: font family and style, size, the
+    /// anti-aliasing method, paragraph alignment, text colour, and the
+    /// (unimplemented) warp and panel-toggle buttons CS6 has after them.
+    void addTypeOptions();
+    /// Push those into the canvas.
+    void pushTypeOptions();
+    /// Take on the type of text the Type tool just reopened, and rebuild the
+    /// options bar so it describes that text.
+    void adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
+                        const QColor &color, Qt::Alignment alignment, bool antialias,
+                        bool vertical);
     /// The brush preset picker, created on first use. It outlives the options
     /// bar because it holds the current tip.
     BrushPresetPicker *brushPicker();
@@ -299,6 +312,22 @@ private:
     bool m_penAutoAddDelete = PenDefaults::kAutoAddDelete;
     bool m_penRubberBand = PenDefaults::kRubberBand;
     double m_freeformTolerance = PenDefaults::kFreeformTolerance;
+    /// Type tool options, which persist across tool switches. The style name
+    /// (e.g. "Bold Italic") is kept separately from the font because it comes
+    /// from the family's own style list, not from QFont's bold/italic bits.
+    QFont m_typeFont{QStringLiteral("Myriad Pro"), int(TypeDefaults::kSize)};
+    QString m_typeStyle = QStringLiteral("Regular");
+    QColor m_typeColor = Qt::black;
+    Qt::Alignment m_typeAlignment = Qt::AlignLeft;
+    bool m_typeAntialias = TypeDefaults::kAntialias;
+    /// True while the Vertical Type tool is the one in hand, or while text that
+    /// is itself vertical is open for editing.
+    bool m_typeVertical = false;
+    /// True once `m_typeColor` has been seeded from the engine's foreground
+    /// colour, which happens the first time the Type tool's bar is built.
+    /// After that the user's own choice persists, the same as every other
+    /// tool option here.
+    bool m_typeColorInitialized = false;
     /// Paint Bucket options, which persist across tool switches.
     int m_bucketMode = 0;
     int m_bucketOpacity = BucketDefaults::kOpacity;

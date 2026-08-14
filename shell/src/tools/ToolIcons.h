@@ -21,8 +21,10 @@ namespace ToolIcons {
 
 /// The icon for a tool variant, tinted `color`.
 ///
-/// `variant` indexes the tool's `subTools()` list. Only the Marquee group has
-/// per-variant artwork; every other tool falls back to its default icon.
+/// `variant` indexes the tool's `subTools()` list. Groups whose flyout needs
+/// distinct icons (Crop, Lasso, Quick Selection, Eyedropper, Healing, Brush,
+/// Blur, Dodge, Pen, Marquee) have per-variant artwork; the rest fall back to
+/// their default icon.
 ///
 /// Results are cached per (tool, variant, colour, ratio), since the strip
 /// rebuilds its tooltips and repaints far more often than artwork changes.
@@ -78,5 +80,17 @@ QString boundsSvg();
 /// SVG body for the Info panel's angle glyph: the protractor CS6 shows beside
 /// the ruler's A and L readouts.
 QString protractorSvg();
+
+/// SVG body for one of the Type options bar's three paragraph-alignment
+/// buttons: three ruled lines, the trailing one shortest, flush to whichever
+/// edge (or centred) the button sets.
+QString textAlignSvg(Qt::Alignment align, bool vertical = false);
+
+/// SVG body for the Type options bar's commit button — a plain checkmark.
+QString commitSvg();
+
+/// SVG body for the Type options bar's cancel button — CS6's "no" circle
+/// with a diagonal slash through it.
+QString cancelSvg();
 
 } // namespace ToolIcons
