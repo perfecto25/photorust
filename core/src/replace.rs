@@ -15,6 +15,7 @@
 use crate::blend::{blend_rgb, BlendMode};
 use crate::brush::Brush;
 use crate::buffer::{Pixmap, Rect, Rgba8};
+use crate::sample;
 
 /// Which part of the pixel the replacement affects. CS6's Mode menu.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -49,56 +50,10 @@ impl ReplaceMode {
     }
 }
 
-/// Where the colour being replaced comes from. CS6's Sampling buttons.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[repr(i32)]
-pub enum ReplaceSampling {
-    /// Re-read under the brush as it moves, so dragging across a boundary
-    /// replaces whatever is currently beneath. CS6's default.
-    #[default]
-    Continuous = 0,
-    /// Read once, where the stroke began.
-    Once = 1,
-    /// Replace whatever matches the background swatch, sampling nothing.
-    BackgroundSwatch = 2,
-}
-
-impl ReplaceSampling {
-    pub fn from_i32(v: i32) -> ReplaceSampling {
-        match v {
-            1 => ReplaceSampling::Once,
-            2 => ReplaceSampling::BackgroundSwatch,
-            _ => ReplaceSampling::Continuous,
-        }
-    }
-}
-
-/// How far the replacement is allowed to spread within a dab. CS6's Limits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[repr(i32)]
-pub enum ReplaceLimits {
-    /// Every matching pixel under the brush, connected or not.
-    Discontiguous = 0,
-    /// Only pixels joined to the one under the brush centre. CS6's default.
-    #[default]
-    Contiguous = 1,
-    /// As contiguous, but stopping at strong edges — so painting along a
-    /// boundary does not leak across it.
-    FindEdges = 2,
-}
-
-impl ReplaceLimits {
-    pub fn from_i32(v: i32) -> ReplaceLimits {
-        match v {
-            0 => ReplaceLimits::Discontiguous,
-            2 => ReplaceLimits::FindEdges,
-            _ => ReplaceLimits::Contiguous,
-        }
-    }
-}
-
-/// Normalised gradient above which Find Edges refuses to spread.
-const EDGE_LIMIT: f32 = 0.35;
+/// Sampling and Limits are the same buttons the Background Eraser has, and the
+/// same code answers them for both — see [`crate::sample`]. They keep their
+/// tool-flavoured names here because that is what the bar calls them.
+pub use crate::sample::{Limits as ReplaceLimits, Sampling as ReplaceSampling};
 
 /// Settings for one colour-replacement stroke.
 #[derive(Clone, Copy, Debug, Default)]
@@ -190,7 +145,19 @@ impl ColorReplacer {
         // replacement cannot jump a boundary even if the far side matches.
         let reachable = match self.options.limits {
             ReplaceLimits::Discontiguous => None,
-            _ => Some(self.flood(pixels, region, centre, reference, brush, cx, cy, radius)),
+            limits => Some(sample::reachable(
+                pixels,
+                region,
+                centre,
+                reference,
+                brush,
+                cx,
+                cy,
+                radius,
+                limits,
+                self.options.tolerance,
+                self.options.antialias,
+            )),
         };
 
         let dab = Brush { size: radius * 2.0, ..*brush };
@@ -222,7 +189,12 @@ impl ColorReplacer {
                 }
 
                 let existing = pixels.get(x, y);
-                let match_strength = self.match_strength(existing, reference);
+                let match_strength = sample::match_strength(
+                    existing,
+                    reference,
+                    self.options.tolerance,
+                    self.options.antialias,
+                );
                 if match_strength <= 0.0 {
                     continue;
                 }
@@ -245,99 +217,6 @@ impl ColorReplacer {
         dirty
     }
 
-    /// How strongly a pixel counts as a match, `0.0..=1.0`.
-    ///
-    /// With antialiasing the strength tapers as the difference approaches the
-    /// tolerance, which softens the edge of the replaced region; without it the
-    /// test is a hard in-or-out.
-    fn match_strength(&self, pixel: Rgba8, reference: Rgba8) -> f32 {
-        let d = |a: u8, b: u8| (a as i32 - b as i32).unsigned_abs();
-        let distance = d(pixel.r, reference.r)
-            .max(d(pixel.g, reference.g))
-            .max(d(pixel.b, reference.b)) as f32;
-        let tolerance = self.options.tolerance.max(1) as f32;
-
-        if !self.options.antialias {
-            return if distance <= tolerance { 1.0 } else { 0.0 };
-        }
-        // Solid out to 70% of the tolerance, then fading to nothing at it.
-        let solid = tolerance * 0.7;
-        if distance <= solid {
-            1.0
-        } else if distance >= tolerance {
-            0.0
-        } else {
-            1.0 - (distance - solid) / (tolerance - solid)
-        }
-    }
-
-    /// Pixels within the dab reachable from its centre without leaving the
-    /// matching region — and, for Find Edges, without crossing a strong edge.
-    #[allow(clippy::too_many_arguments)]
-    fn flood(
-        &self,
-        pixels: &Pixmap,
-        region: Rect,
-        centre: (i32, i32),
-        reference: Rgba8,
-        brush: &Brush,
-        cx: f32,
-        cy: f32,
-        radius: f32,
-    ) -> Vec<bool> {
-        let w = region.width as usize;
-        let h = region.height as usize;
-        let mut reached = vec![false; w * h];
-        if !region.contains(centre.0, centre.1) {
-            return reached;
-        }
-
-        let luma = |c: Rgba8| 0.299 * c.r as f32 + 0.587 * c.g as f32 + 0.114 * c.b as f32;
-        let index = |x: i32, y: i32| ((y - region.y) as usize) * w + (x - region.x) as usize;
-
-        let mut queue = std::collections::VecDeque::new();
-        reached[index(centre.0, centre.1)] = true;
-        queue.push_back(centre);
-
-        let dab = Brush { size: radius * 2.0, ..*brush };
-        while let Some((x, y)) = queue.pop_front() {
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let (nx, ny) = (x + dx, y + dy);
-                if !region.contains(nx, ny) {
-                    continue;
-                }
-                let next = index(nx, ny);
-                if reached[next] {
-                    continue;
-                }
-                // Only spread within the dab's own footprint.
-                if dab.pixel_coverage(
-                    nx as f32 + 0.5 - cx,
-                    ny as f32 + 0.5 - cy,
-                    brush.angle,
-                    brush.roundness,
-                ) <= 0.0
-                {
-                    continue;
-                }
-                if self.match_strength(pixels.get(nx, ny), reference) <= 0.0 {
-                    continue;
-                }
-                if self.options.limits == ReplaceLimits::FindEdges {
-                    // A big jump in brightness between neighbours is a boundary;
-                    // stopping there is what keeps the replacement off the other
-                    // side of an edge.
-                    let step = (luma(pixels.get(nx, ny)) - luma(pixels.get(x, y))).abs() / 255.0;
-                    if step > EDGE_LIMIT {
-                        continue;
-                    }
-                }
-                reached[next] = true;
-                queue.push_back((nx, ny));
-            }
-        }
-        reached
-    }
 }
 
 /// Blend `replacement` into `base` under `mode`, at strength `weight`.

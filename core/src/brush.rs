@@ -6,8 +6,20 @@
 //!
 //! Stamping dabs directly onto the layer would compound alpha wherever they
 //! overlap, making a slow stroke darker than a fast one. Instead each stroke
-//! accumulates coverage into a scratch mask (taking the *maximum* at every
-//! pixel) and composites that onto the layer once at the end.
+//! accumulates coverage into a scratch mask and composites that onto the layer
+//! once at the end, scaled by the brush's opacity.
+//!
+//! Within that mask a dab lays its `flow` worth of paint *over* what is already
+//! there, exactly as Photoshop's does. Two things follow, and both matter:
+//! a low-flow brush builds up where its dabs overlap, and a soft brush at full
+//! flow saturates to a solid core — which is what stops a soft stroke reading
+//! as a row of beads. Taking the maximum instead leaves the dab's own falloff
+//! showing between one centre and the next: at Photoshop's default 25% spacing
+//! a soft dab has fallen to about 0.84 halfway to its neighbour, and that
+//! ripple runs visibly down the middle of the stroke.
+//!
+//! Speed still cannot darken a stroke, because dabs are placed by *distance*
+//! along the path — the spacing setting — not by how many mouse events arrived.
 
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::selection::Selection;
@@ -324,7 +336,7 @@ impl StrokeMask {
         }
     }
 
-    /// Stamp one dab, taking the maximum against existing coverage.
+    /// Stamp one dab over the coverage already there.
     #[allow(clippy::too_many_arguments)]
     fn stamp_dab(
         &mut self,
@@ -368,7 +380,7 @@ impl StrokeMask {
             let (px, py) = (cx.floor() as i32, cy.floor() as i32);
             if self.coverage.rect().contains(px, py) {
                 let existing = self.coverage.get(px, py).a as f32 / 255.0;
-                let v = (existing.max(flow) * 255.0 + 0.5) as u8;
+                let v = ((existing + flow * (1.0 - existing)) * 255.0 + 0.5) as u8;
                 self.coverage.set(px, py, Rgba8::new(v, v, v, v));
                 self.dirty = self.dirty.union(&Rect::new(px, py, 1, 1));
             }
@@ -390,9 +402,12 @@ impl StrokeMask {
                     continue;
                 }
                 let existing = self.coverage.get(x, y).a as f32 / 255.0;
-                // Max, not sum: overlapping dabs within one stroke must not
-                // darken the result.
-                let next = existing.max(cov);
+                // Over, not max: a dab covers what is under it in proportion to
+                // what it leaves uncovered, so overlapping dabs saturate toward
+                // full coverage rather than tracing each dab's own falloff (see
+                // the module comment). Never past full, so the stroke still
+                // tops out at the brush's opacity however slowly it is drawn.
+                let next = existing + cov * (1.0 - existing);
                 let v = (next * 255.0 + 0.5) as u8;
                 self.coverage.set(x, y, Rgba8::new(v, v, v, v));
             }
@@ -655,27 +670,80 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_dabs_do_not_compound() {
+    fn a_stroke_never_paints_past_full_coverage() {
+        // Dabs build on each other, so the guard against a slow stroke coming
+        // out darker is that coverage saturates: going over the same ground
+        // again and again reaches full and stops there, and the composite then
+        // scales it by the brush's opacity.
         let brush = Brush {
             size: 10.0,
             flow: 0.5,
             ..Default::default()
         };
         let mut mask = StrokeMask::new(64, 64);
-        mask.begin(&brush, 32.0, 32.0, 1.0);
-        let after_one = mask.coverage_at(32, 32);
-
-        // Stamping the same spot repeatedly must not darken it.
-        for _ in 0..10 {
-            mask.extend(&brush, 32.0, 32.0, 1.0);
+        mask.begin(&brush, 20.0, 32.0, 1.0);
+        for _ in 0..20 {
+            mask.extend(&brush, 44.0, 32.0, 1.0);
+            mask.extend(&brush, 20.0, 32.0, 1.0);
         }
-        let after_many = mask.coverage_at(32, 32);
+        let covered = mask.coverage_at(32, 32);
+        assert!(covered > 0.99, "repeated passes did not reach full coverage: {covered}");
+        assert!(covered <= 1.0, "coverage ran past full: {covered}");
+    }
+
+    #[test]
+    fn a_soft_stroke_does_not_bead_along_its_middle() {
+        // The regression behind "the eraser is choppy": with dabs combined by
+        // maximum, a soft dab's own falloff showed between one centre and the
+        // next — about 16% down at Photoshop's default 25% spacing, which reads
+        // as a string of beads. Laying each dab over the last leaves the middle
+        // of the stroke essentially flat.
+        let brush = Brush {
+            size: 38.0,
+            hardness: 0.0,
+            flow: 1.0,
+            spacing: 0.25,
+            ..Default::default()
+        };
+        let mut mask = StrokeMask::new(180, 64);
+        mask.begin(&brush, 20.0, 32.0, 1.0);
+        mask.extend(&brush, 160.0, 32.0, 1.0);
+
+        let mut lowest = 1.0f32;
+        let mut highest = 0.0f32;
+        for x in 40..140 {
+            let covered = mask.coverage_at(x, 32);
+            lowest = lowest.min(covered);
+            highest = highest.max(covered);
+        }
+        assert!(lowest > 0.95, "the middle of the stroke thinned to {lowest}");
         assert!(
-            (after_many - after_one).abs() < 1e-3,
-            "coverage compounded: {} -> {}",
-            after_one,
-            after_many
+            highest - lowest < 0.03,
+            "the stroke ripples from {lowest} to {highest} along its middle"
         );
+    }
+
+    #[test]
+    fn low_flow_builds_up_where_dabs_overlap() {
+        // Flow is how much paint one dab lays down, so a quarter-flow brush
+        // reaches much further than a quarter after a stroke's worth of
+        // overlapping dabs — Photoshop's airbrush-like build-up.
+        let brush = Brush {
+            size: 20.0,
+            hardness: 1.0,
+            flow: 0.25,
+            spacing: 0.25,
+            ..Default::default()
+        };
+        let mut mask = StrokeMask::new(64, 64);
+        mask.begin(&brush, 10.0, 32.0, 1.0);
+        let one_dab = mask.coverage_at(10, 32);
+        assert!((one_dab - 0.25).abs() < 0.02, "a single dab laid {one_dab}, not its flow");
+
+        mask.extend(&brush, 50.0, 32.0, 1.0);
+        let built_up = mask.coverage_at(30, 32);
+        assert!(built_up > 0.6, "overlapping dabs did not build up: {built_up}");
+        assert!(built_up <= 1.0);
     }
 
     #[test]

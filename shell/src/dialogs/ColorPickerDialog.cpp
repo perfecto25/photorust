@@ -1,5 +1,7 @@
 #include "ColorPickerDialog.h"
 
+#include "../tools/ToolIcons.h"
+
 #include <QCheckBox>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -11,10 +13,50 @@
 #include <QRadioButton>
 #include <QRegularExpressionValidator>
 #include <QResizeEvent>
+#include <QCursor>
+#include <QGuiApplication>
 #include <QSpinBox>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <cmath>
+
+namespace {
+
+/// Where the eyedropper reads from. One per application — see `setSampler`.
+ColorPickerDialog::Sampler g_sampler;
+
+/// The eyedropper cursor shown while the pointer is over the image.
+///
+/// The tool strip's own eyedropper artwork, drawn twice: a dark copy a pixel
+/// down-right and a white one over it, so the shape stays legible against both
+/// a white sky and a black horse. Built once and kept — a cursor is asked for
+/// on every pointer move.
+const QCursor &eyedropperCursor()
+{
+    static const QCursor cursor = [] {
+        const QPixmap pale = ToolIcons::icon(ToolId::Eyedropper, Qt::white).pixmap(22, 22);
+        const QPixmap dark =
+            ToolIcons::icon(ToolId::Eyedropper, QColor(0, 0, 0, 190)).pixmap(22, 22);
+
+        QPixmap art(pale.size());
+        art.setDevicePixelRatio(pale.devicePixelRatio());
+        art.fill(Qt::transparent);
+        QPainter painter(&art);
+        painter.drawPixmap(QPointF(1, 1), dark);
+        painter.drawPixmap(QPointF(0, 0), pale);
+        painter.end();
+
+        // The hotspot is the dropper's tip, which the artwork puts at the
+        // bottom-left — the pixel sampled has to be the one under the tip, not
+        // the one under the middle of the glyph.
+        return QCursor(art, 3, 19);
+    }();
+    return cursor;
+}
+
+} // namespace
+
 
 namespace {
 
@@ -628,6 +670,143 @@ ColorPickerDialog::ColorPickerDialog(const QColor &initial, QWidget *parent,
     syncControls();
 }
 
+void ColorPickerDialog::updateHoverSampling()
+{
+    if (!g_sampler) {
+        return;
+    }
+
+    const QPoint pos = QCursor::pos();
+    const bool outside = !frameGeometry().contains(pos);
+
+    if (outside == m_sampling) {
+        // Already in the right state; just keep reading while outside.
+        if (m_sampling) {
+            showCursorFor(sampleAt(pos));
+        }
+        return;
+    }
+
+    if (outside) {
+        // A drag that began inside the dialog — sliding out of the colour
+        // field's edge, say — belongs to the control it started on. Taking the
+        // mouse mid-drag would cut that gesture off, so sampling waits until
+        // the button comes up.
+        if (QGuiApplication::mouseButtons() != Qt::NoButton) {
+            return;
+        }
+        m_sampling = true;
+        // The dialog is modal, so the canvas cannot see the pointer at all:
+        // holding the mouse is what lets the dialog read where it is and catch
+        // a click on the image. The cursor is *not* taken with the grab,
+        // because it has to change as the pointer crosses on and off the
+        // canvas — see `showCursorFor`.
+        grabMouse();
+        QGuiApplication::setOverrideCursor(Qt::ArrowCursor);
+        m_cursorOverridden = true;
+        showCursorFor(sampleAt(pos));
+    } else {
+        m_sampling = false;
+        releaseMouse();
+        clearCursorOverride();
+    }
+}
+
+void ColorPickerDialog::showCursorFor(bool overImage)
+{
+    if (!m_cursorOverridden) {
+        return;
+    }
+    // The eyedropper belongs to the image and stops at its edge: over the
+    // panels, the toolbar or another window there is nothing to sample, and
+    // showing a dropper there would promise something the click cannot do.
+    QGuiApplication::changeOverrideCursor(overImage ? eyedropperCursor()
+                                                    : QCursor(Qt::ArrowCursor));
+}
+
+void ColorPickerDialog::clearCursorOverride()
+{
+    if (m_cursorOverridden) {
+        QGuiApplication::restoreOverrideCursor();
+        m_cursorOverridden = false;
+    }
+}
+
+bool ColorPickerDialog::sampleAt(const QPoint &globalPos)
+{
+    if (!g_sampler) {
+        return false;
+    }
+    const QColor sampled = g_sampler(globalPos);
+    if (!sampled.isValid()) {
+        // Off the image — over the tool strip or another window. Nothing to
+        // read there, so the colour stays as it was.
+        return false;
+    }
+
+    // Straight into the ordinary colour path, so the swatch, the field, the
+    // ramp and every number update together as the pointer moves.
+    setColor(sampled);
+    syncControls();
+    return true;
+}
+
+void ColorPickerDialog::mouseMoveEvent(QMouseEvent *event)
+{
+    // Moves arrive here whenever the mouse is held, which is exactly while
+    // sampling — following them is smoother than waiting for the next poll.
+    updateHoverSampling();
+    if (m_sampling) {
+        event->accept();
+        return;
+    }
+    QDialog::mouseMoveEvent(event);
+}
+
+void ColorPickerDialog::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (m_sampling) {
+        // A click on the image takes what is under it — the same thing hovering
+        // already did, so this only has to make sure the colour is the one the
+        // user clicked on rather than one poll behind.
+        showCursorFor(sampleAt(event->globalPosition().toPoint()));
+        event->accept();
+        return;
+    }
+    QDialog::mouseReleaseEvent(event);
+}
+
+void ColorPickerDialog::showEvent(QShowEvent *event)
+{
+    QDialog::showEvent(event);
+    if (!g_sampler) {
+        return;
+    }
+    if (!m_hoverTimer) {
+        m_hoverTimer = new QTimer(this);
+        // Often enough to feel continuous, cheap enough to be free: one cursor
+        // position read and, while outside, one pixel from the engine.
+        m_hoverTimer->setInterval(30);
+        connect(m_hoverTimer, &QTimer::timeout, this, &ColorPickerDialog::updateHoverSampling);
+    }
+    m_hoverTimer->start();
+}
+
+void ColorPickerDialog::hideEvent(QHideEvent *event)
+{
+    if (m_hoverTimer) {
+        m_hoverTimer->stop();
+    }
+    if (m_sampling) {
+        m_sampling = false;
+        // Neither the grab nor the cursor may outlive the dialog, or the
+        // application is left with a mouse it cannot use.
+        releaseMouse();
+    }
+    clearCursorOverride();
+    QDialog::hideEvent(event);
+}
+
 void ColorPickerDialog::buildUi(const QString &title)
 {
     setWindowTitle(title.isEmpty() ? tr("Color Picker")
@@ -986,6 +1165,11 @@ void ColorPickerDialog::revertToOriginal()
 {
     setColor(m_original);
     syncControls();
+}
+
+void ColorPickerDialog::setSampler(Sampler sampler)
+{
+    g_sampler = std::move(sampler);
 }
 
 QColor ColorPickerDialog::getColor(const QColor &initial, QWidget *parent,

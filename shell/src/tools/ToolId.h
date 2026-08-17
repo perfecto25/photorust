@@ -242,14 +242,14 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Mixer Brush Tool", "B", true}};
     case ToolId::CloneStamp:
         return {{"Clone Stamp Tool", "S", true},
-                {"Pattern Stamp Tool", nullptr, false}};
+                {"Pattern Stamp Tool", "S", true}};
     case ToolId::HistoryBrush:
         return {{"History Brush Tool", "Y", true},
                 {"Art History Brush Tool", nullptr, false}};
     case ToolId::Eraser:
         return {{"Eraser Tool", "E", true},
-                {"Background Eraser Tool", nullptr, false},
-                {"Magic Eraser Tool", nullptr, false}};
+                {"Background Eraser Tool", "E", true},
+                {"Magic Eraser Tool", "E", true}};
     case ToolId::Gradient:
         return {{"Gradient Tool", "G", true},
                 {"Paint Bucket Tool", "G", true}};
@@ -277,14 +277,14 @@ inline QList<SubTool> subTools(ToolId id)
                 {"Direct Selection Tool", "A", true}};
     case ToolId::Shape:
         return {{"Rectangle Tool", "U", true},
-                {"Rounded Rectangle Tool", nullptr, false},
-                {"Ellipse Tool", nullptr, false},
-                {"Polygon Tool", nullptr, false},
-                {"Line Tool", nullptr, false},
-                {"Custom Shape Tool", nullptr, false}};
+                {"Rounded Rectangle Tool", "U", true},
+                {"Ellipse Tool", "U", true},
+                {"Polygon Tool", "U", true},
+                {"Line Tool", "U", true},
+                {"Custom Shape Tool", "U", true}};
     case ToolId::Hand:
         return {{"Hand Tool", "H", true},
-                {"Rotate View Tool", nullptr, false}};
+                {"Rotate View Tool", "R", true}};
     // Move and Zoom stand alone in CS6 — no corner triangle.
     case ToolId::Move:
     case ToolId::Zoom:
@@ -560,6 +560,79 @@ constexpr bool kReverse = false;
 constexpr bool kDither = true;
 constexpr bool kTransparency = true;
 } // namespace GradientDefaults
+
+/// The variants behind the Hand button.
+///
+/// Both move the *view* and neither touches the image: the Hand slides it, the
+/// Rotate View tool turns it — for drawing along an awkward angle by bringing
+/// the angle to the hand rather than the hand to the angle.
+enum class HandTool {
+    Hand = 0,
+    RotateView = 1,
+};
+
+/// The variants behind the Shape button. They differ only in the points a drag
+/// produces — see `core/src/shape.rs`, where all six live.
+enum class ShapeTool {
+    Rectangle = 0,
+    RoundedRectangle = 1,
+    Ellipse = 2,
+    Polygon = 3,
+    Line = 4,
+    CustomShape = 5,
+};
+
+/// What a dragged shape becomes — CS6's Mode menu, mirroring `shape::ShapeMode`
+/// across the bridge.
+enum class ShapeMode {
+    Shape = 0,
+    Path = 1,
+    Pixels = 2,
+};
+
+/// CS6's defaults for the shape tools' options bar.
+namespace ShapeDefaults {
+constexpr ShapeMode kMode = ShapeMode::Shape;
+/// The Rounded Rectangle's corner Radius, in pixels.
+constexpr int kCornerRadius = 10;
+/// The Polygon's Sides.
+constexpr int kSides = 5;
+/// The Line's Weight, in pixels.
+constexpr int kLineWeight = 1;
+} // namespace ShapeDefaults
+
+/// The variants behind the Eraser button.
+///
+/// The plain Eraser rubs out whatever it is dragged over. The other two erase
+/// *by colour*: the Background Eraser samples under its crosshair and takes
+/// away only what matches, which is what makes it cut a subject out of its
+/// background; the Magic Eraser is one click, erasing the region the Magic Wand
+/// would have selected.
+enum class EraserType {
+    Eraser = 0,
+    BackgroundEraser = 1,
+    MagicEraser = 2,
+};
+
+/// CS6's defaults for the Background Eraser's options bar.
+namespace BackgroundEraseDefaults {
+/// Sampling: 0 Continuous, 1 Once, 2 Background Swatch.
+constexpr int kSampling = 0;
+/// Limits: 0 Discontiguous, 1 Contiguous, 2 Find Edges.
+constexpr int kLimits = 1;
+/// Tolerance as a percentage, as the bar shows it.
+constexpr int kTolerance = 50;
+constexpr bool kProtectForeground = false;
+} // namespace BackgroundEraseDefaults
+
+/// CS6's defaults for the Magic Eraser's options bar.
+namespace MagicEraseDefaults {
+constexpr int kTolerance = 32;
+constexpr bool kAntialias = true;
+constexpr bool kContiguous = true;
+constexpr bool kSampleAllLayers = false;
+constexpr int kOpacity = 100;
+} // namespace MagicEraseDefaults
 
 /// The variants behind the Clone Stamp button.
 enum class CloneType {

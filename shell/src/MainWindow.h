@@ -87,6 +87,8 @@ private:
     void createToolPanel();
     /// CS6's marquee right-click menu, opened by the canvas.
     void showSelectionContextMenu(const QPoint &globalPos);
+    /// CS6's Zoom tool right-click menu, likewise.
+    void showZoomContextMenu(const QPoint &globalPos);
     void createOptionsBar();
     void createDocks();
     /// Rebuild the document tab bar from the engine's open documents.
@@ -185,6 +187,34 @@ private:
     void addCloneOptions();
     /// Push those into the canvas, which owns the source point.
     void pushCloneOptions();
+    /// Add the Rotate View tool's angle field and Reset View button.
+    void addRotateViewOptions();
+    /// Add the shape tools' Mode menu and Fill swatch, plus whichever setting
+    /// this particular shape owns — Radius, Sides, Weight or the shape picker.
+    void addShapeOptions(ShapeTool tool);
+    /// The hint the bar ends with, which differs per tool because the
+    /// modifiers do.
+    QString shapeHintFor(ShapeTool tool) const;
+    /// Redraw the options-bar swatch from the chosen custom shape.
+    void refreshCustomShapeButton();
+    /// Push the shape settings into the engine, which owns the geometry.
+    void pushShapeOptions();
+    /// Add the Background Eraser's Sampling, Limits, Tolerance and Protect
+    /// Foreground Color.
+    void addBackgroundEraseOptions();
+    /// Push those into the canvas.
+    void pushBackgroundEraseOptions();
+    /// Add the Magic Eraser's Tolerance, Anti-alias, Contiguous, Sample All
+    /// Layers and Opacity.
+    void addMagicEraseOptions();
+    /// Push those into the canvas, which passes them with the click.
+    void pushMagicEraseOptions();
+    /// Add the Pattern Stamp's pattern picker, Aligned and Impressionist.
+    void addPatternStampOptions();
+    /// Redraw the options-bar swatch from the chosen pattern.
+    void refreshPatternSwatch();
+    /// Push the pattern choice into the engine.
+    void pushPatternOptions();
     /// Tell the user the Clone Stamp needs a source point first.
     void warnCloneSourceRequired();
     /// Add the Spot Healing Brush's Type radio set.
@@ -323,6 +353,34 @@ private:
     /// True while the Vertical Type tool is the one in hand, or while text that
     /// is itself vertical is open for editing.
     bool m_typeVertical = false;
+
+    /// The shape tools' options, which persist across tool switches like every
+    /// other tool's.
+    ShapeMode m_shapeMode = ShapeDefaults::kMode;
+    ShapeTool m_shapeTool = ShapeTool::Rectangle;
+    int m_shapeCornerRadius = ShapeDefaults::kCornerRadius;
+    int m_shapeSides = ShapeDefaults::kSides;
+    int m_shapeLineWeight = ShapeDefaults::kLineWeight;
+    int m_customShape = 0;
+    QToolButton *m_customShapeButton = nullptr;
+
+    /// The two colour erasers' options, which persist across tool switches like
+    /// every other tool's.
+    int m_bgEraseSampling = BackgroundEraseDefaults::kSampling;
+    int m_bgEraseLimits = BackgroundEraseDefaults::kLimits;
+    int m_bgEraseTolerance = BackgroundEraseDefaults::kTolerance;
+    bool m_bgEraseProtectForeground = BackgroundEraseDefaults::kProtectForeground;
+    int m_magicEraseTolerance = MagicEraseDefaults::kTolerance;
+    bool m_magicEraseAntialias = MagicEraseDefaults::kAntialias;
+    bool m_magicEraseContiguous = MagicEraseDefaults::kContiguous;
+    bool m_magicEraseSampleAll = MagicEraseDefaults::kSampleAllLayers;
+    int m_magicEraseOpacity = MagicEraseDefaults::kOpacity;
+
+    /// The Pattern Stamp's options, which persist across tool switches like
+    /// every other tool's. The index is into the engine's pattern list.
+    int m_patternIndex = 0;
+    bool m_patternAligned = true;
+    QToolButton *m_patternSwatch = nullptr;
     /// True once `m_typeColor` has been seeded from the engine's foreground
     /// colour, which happens the first time the Type tool's bar is built.
     /// After that the user's own choice persists, the same as every other

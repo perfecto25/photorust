@@ -23,18 +23,22 @@ use crate::healing::{HealMode, MoveOptions};
 use crate::layer::{LayerId, LayerKind, TextAlign, TextContent, TextRun};
 use crate::mixer::MixerOptions;
 use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
+use crate::erase::BackgroundEraseOptions;
+use crate::sample::{Limits, Sampling};
 use crate::focus::{FocusMode, FocusOptions};
 use crate::smudge::SmudgeOptions;
 use crate::tone::{SpongeMode, ToneOptions, ToneRange, ToneTool};
 use crate::bucket::BucketOptions;
 use crate::gradient::{self, GradientOptions, GradientType};
+use crate::pattern;
+use crate::shape::{self, ShapeKind, ShapeMode, ShapeOptions};
 use crate::stamp::CloneSampling;
 use crate::magnetic::EdgeMap;
 use crate::selection::{Selection, SelectionOp};
 use crate::wand::{self, QuickSelector};
 // `rust_mut()` on a generated QObject comes from this trait.
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QColor, QImage, QImageFormat, QString};
+use cxx_qt_lib::{QColor, QImage, QImageFormat, QPointF, QPolygonF, QString};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -47,6 +51,14 @@ pub mod ffi {
 
         include!("cxx-qt-lib/qcolor.h");
         type QColor = cxx_qt_lib::QColor;
+
+        include!("cxx-qt-lib/qpointf.h");
+        type QPointF = cxx_qt_lib::QPointF;
+
+        include!("cxx-qt-lib/qpolygonf.h");
+        /// Carries a shape's outline out — the points the canvas previews and
+        /// the engine commits, in one Qt container rather than a builder.
+        type QPolygonF = cxx_qt_lib::QPolygonF;
 
         include!("cxx-qt-lib/qvector.h");
         /// Carries lasso vertices in. Qt's own container, so the shell builds
@@ -1002,6 +1014,59 @@ pub mod ffi {
             antialias: bool,
         );
 
+        /// The Background Eraser's options bar. `sampling` 0-2 (Continuous,
+        /// Once, Background Swatch), `limits` 0-2 (Discontiguous, Contiguous,
+        /// Find Edges), `tolerance` as CS6 shows it — a percentage — and
+        /// Protect Foreground Color.
+        #[qinvokable]
+        #[cxx_name = "setBackgroundEraseOptions"]
+        fn set_background_erase_options(
+            self: Pin<&mut Engine>,
+            sampling: i32,
+            limits: i32,
+            tolerance_percent: i32,
+            protect_foreground: bool,
+        );
+
+        /// Begin a Background Eraser stroke. Returns false if the active layer
+        /// cannot be erased — including one with Lock Transparent Pixels on,
+        /// since erasing does nothing else.
+        #[qinvokable]
+        #[cxx_name = "beginBackgroundErase"]
+        fn begin_background_erase(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// Continue one.
+        #[qinvokable]
+        #[cxx_name = "extendBackgroundErase"]
+        fn extend_background_erase(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32);
+
+        /// Finish one, recording a single undo step.
+        #[qinvokable]
+        #[cxx_name = "endBackgroundErase"]
+        fn end_background_erase(self: Pin<&mut Engine>);
+
+        /// Abandon one, restoring what it changed.
+        #[qinvokable]
+        #[cxx_name = "cancelBackgroundErase"]
+        fn cancel_background_erase(self: Pin<&mut Engine>);
+
+        /// Erase the region a click lands in — the Magic Eraser. One undo step,
+        /// and no stroke: it is the Magic Wand's flood, erased.
+        ///
+        /// `tolerance` 0-255, `opacity` a percentage.
+        #[qinvokable]
+        #[cxx_name = "magicErase"]
+        fn magic_erase(
+            self: Pin<&mut Engine>,
+            x: i32,
+            y: i32,
+            tolerance: i32,
+            contiguous: bool,
+            antialias: bool,
+            sample_all: bool,
+            opacity: i32,
+        ) -> bool;
+
         /// Begin a colour-replacement stroke. Returns false if the active layer
         /// cannot be painted.
         #[qinvokable]
@@ -1119,6 +1184,95 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "beginCloneStroke"]
         fn begin_clone_stroke(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// The built-in patterns, newline-separated and in picker order. The
+        /// engine owns the list, so the picker cannot offer one it cannot paint.
+        #[qinvokable]
+        #[cxx_name = "patternNames"]
+        fn pattern_names(self: &Engine) -> QString;
+
+        /// A pattern's tile as an image, for the picker's swatches. Rendered by
+        /// the engine, so a swatch cannot drift from what the tool paints.
+        #[qinvokable]
+        #[cxx_name = "patternPreview"]
+        fn pattern_preview(self: &Engine, index: i32, size: i32) -> QImage;
+
+        /// The Pattern Stamp's options bar: which pattern, and whether the tile
+        /// is pinned to the document (Aligned) or to each stroke's start.
+        #[qinvokable]
+        #[cxx_name = "setPatternOptions"]
+        fn set_pattern_options(self: Pin<&mut Engine>, index: i32, aligned: bool);
+
+        /// Begin a Pattern Stamp stroke. Returns false if the active layer
+        /// cannot be painted on. Extended and ended through `extendStroke` /
+        /// `endStroke` like any other stroke — unlike the Clone Stamp it needs
+        /// no source point, since the pattern is the source.
+        #[qinvokable]
+        #[cxx_name = "beginPatternStroke"]
+        fn begin_pattern_stroke(self: Pin<&mut Engine>, x: f32, y: f32, pressure: f32) -> bool;
+
+        /// The shape tools' options bar. `kind` 0-5 in flyout order
+        /// (Rectangle, Rounded Rectangle, Ellipse, Polygon, Line, Custom
+        /// Shape), then the setting each of them owns: the rounded
+        /// rectangle's Radius, the polygon's Sides, the line's Weight, and
+        /// which custom shape is chosen.
+        #[qinvokable]
+        #[cxx_name = "setShapeOptions"]
+        fn set_shape_options(
+            self: Pin<&mut Engine>,
+            kind: i32,
+            corner_radius: f32,
+            sides: i32,
+            line_weight: f32,
+            custom: i32,
+        );
+
+        /// The outline a drag from `x0, y0` to `x1, y1` marks out, for the
+        /// canvas to preview while the button is down.
+        ///
+        /// The same call `drawShape` commits from, so what is previewed and
+        /// what lands cannot disagree — and the shell needs no geometry of its
+        /// own to draw a rounded corner or an ellipse. `shift` and `alt` are
+        /// CS6's modifiers, which mean different things to different tools.
+        #[qinvokable]
+        #[cxx_name = "shapeOutline"]
+        fn shape_outline(
+            self: &Engine,
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
+            shift: bool,
+            alt: bool,
+        ) -> QPolygonF;
+
+        /// Commit a dragged shape. `mode` is CS6's Mode menu: 0 a shape layer
+        /// of its own, 1 a path on the work path, 2 pixels on the active layer.
+        /// Shape and Pixels use the foreground colour. Returns false if nothing
+        /// came of it — a drag that went nowhere, or a layer that refuses
+        /// pixels.
+        #[qinvokable]
+        #[cxx_name = "drawShape"]
+        fn draw_shape(
+            self: Pin<&mut Engine>,
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
+            shift: bool,
+            alt: bool,
+            mode: i32,
+        ) -> bool;
+
+        /// The custom shapes, newline-separated and in picker order.
+        #[qinvokable]
+        #[cxx_name = "customShapeNames"]
+        fn custom_shape_names(self: &Engine) -> QString;
+
+        /// One custom shape drawn on its own, for the picker's swatch.
+        #[qinvokable]
+        #[cxx_name = "customShapePreview"]
+        fn custom_shape_preview(self: &Engine, index: i32, size: i32) -> QImage;
 
         /// The gradient presets, newline-separated and in CS6's order. The engine
         /// owns the list so the options bar cannot offer a name it cannot draw.
@@ -1322,6 +1476,17 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "clearSelection"]
         fn clear_selection(self: Pin<&mut Engine>);
+
+        /// Whether the document is in Quick Mask mode.
+        #[qinvokable]
+        #[cxx_name = "quickMask"]
+        fn quick_mask(self: &Engine) -> bool;
+
+        /// Enter or leave Quick Mask mode, where painting edits the selection
+        /// instead of the image and what is *not* selected wears a red veil.
+        #[qinvokable]
+        #[cxx_name = "setQuickMask"]
+        fn set_quick_mask(self: Pin<&mut Engine>, on: bool);
 
         /// Sample the composited colour at a point, for the eyedropper.
         #[qinvokable]
@@ -1604,6 +1769,19 @@ pub struct EngineRust {
     /// clean off, once each stroke ends.
     mixer_load_after_stroke: bool,
     mixer_clean_after_stroke: bool,
+    /// The shape tools' options bar, held between drags like every other
+    /// tool's.
+    shape_options: ShapeOptions,
+
+    /// The Background Eraser's options, held between strokes like the brush.
+    bg_erase_options: BackgroundEraseOptions,
+
+    /// The Pattern Stamp's chosen pattern and its Aligned checkbox. Held here
+    /// rather than in the document: they are tool settings that outlive any one
+    /// stroke, like the brush itself.
+    pattern_index: usize,
+    pattern_aligned: bool,
+
     /// Text runs the shell is describing right now, between `beginTextRuns`
     /// and the `addTextLayer`/`updateTextLayer` that consumes them. Empty at
     /// rest — this is a builder's scratch space, not document state.
@@ -1685,6 +1863,17 @@ impl Default for EngineRust {
             mixer_reservoir: Rgba8::BLACK,
             mixer_load_after_stroke: false,
             mixer_clean_after_stroke: false,
+            shape_options: ShapeOptions::default(),
+            bg_erase_options: BackgroundEraseOptions {
+                // CS6's defaults: sample as you go, keep to what the crosshair
+                // is connected to, half tolerance.
+                sampling: Sampling::Continuous,
+                limits: Limits::Contiguous,
+                tolerance: 50 * 255 / 100,
+                protect_foreground: false,
+            },
+            pattern_index: 0,
+            pattern_aligned: true,
             pending_runs: Vec::new(),
             heal_mode: None,
             heal_source: None,
@@ -1725,6 +1914,35 @@ fn qcolor_to_rgba(c: &QColor) -> Rgba8 {
 
 fn rgba_to_qcolor(c: Rgba8) -> QColor {
     QColor::from_rgba(c.r as i32, c.g as i32, c.b as i32, c.a as u32 as i32)
+}
+
+/// Photoshop's rubylith, laid over what the selection does *not* cover.
+///
+/// Display only, and deliberately applied here rather than in the document's
+/// own compositing: the veil is a way of showing a selection, not part of the
+/// image. Saving, flattening and every filter go on seeing the picture without
+/// it.
+fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
+    // Nothing selected means nothing masked — entering Quick Mask selects all
+    // (see `Document::set_quick_mask`), so an empty mask here can only mean a
+    // document that has none, and covering it in red would be a lie.
+    if selection.is_empty() {
+        return;
+    }
+
+    const VEIL: Rgba8 = Rgba8 { r: 255, g: 0, b: 0, a: 255 };
+    const STRENGTH: f32 = 0.5;
+
+    for y in 0..composite.height() as i32 {
+        for x in 0..composite.width() as i32 {
+            let masked = 1.0 - selection.coverage_at(x, y);
+            if masked <= 0.0 {
+                continue;
+            }
+            let under = composite.get(x, y);
+            composite.set(x, y, crate::brush::source_over(under, VEIL, masked * STRENGTH));
+        }
+    }
 }
 
 /// Convert a [`Pixmap`] into a `QImage` that owns its pixels.
@@ -2010,7 +2228,11 @@ impl ffi::Engine {
     }
 
     fn composite_image(&self) -> QImage {
-        pixmap_to_qimage(self.doc.composite())
+        let mut composite = self.doc.composite();
+        if self.doc.quick_mask() {
+            apply_quick_mask_veil(&mut composite, self.doc.selection());
+        }
+        pixmap_to_qimage(composite)
     }
 
     fn preview_image(&self) -> QImage {
@@ -2023,6 +2245,17 @@ impl ffi::Engine {
         } else {
             (self.paint_color(), self.brush.opacity)
         };
+        // In Quick Mask the stroke is not paint, so the image underneath does
+        // not change as it is drawn — what changes is the mask over it.
+        if self.doc.quick_mask() {
+            let mut composite = self.doc.composite();
+            match self.doc.quick_mask_preview(color, opacity) {
+                Some(preview) => apply_quick_mask_veil(&mut composite, &preview),
+                None => apply_quick_mask_veil(&mut composite, self.doc.selection()),
+            }
+            return pixmap_to_qimage(composite);
+        }
+
         match self.doc.preview_stroke(color, opacity) {
             Some(pm) => pixmap_to_qimage(pm),
             None => self.composite_image(),
@@ -2892,7 +3125,20 @@ impl ffi::Engine {
             return QImage::default();
         };
 
-        let (sw, sh) = (layer.pixels.width(), layer.pixels.height());
+        // A fill layer — a shape layer is one — has no pixels of its own: it is
+        // a colour the compositor pours through the layer's mask. So the
+        // thumbnail is built the same way, or the panel would show a shape
+        // layer as an empty row.
+        let solid = match layer.kind {
+            LayerKind::SolidColor(color) => Some(color),
+            _ => None,
+        };
+
+        let (sw, sh) = match (solid, layer.mask.as_ref()) {
+            (Some(_), Some(mask)) => (mask.width(), mask.height()),
+            (Some(_), None) => (self.doc.width(), self.doc.height()),
+            _ => (layer.pixels.width(), layer.pixels.height()),
+        };
         if sw == 0 || sh == 0 {
             return QImage::default();
         }
@@ -2909,7 +3155,22 @@ impl ffi::Engine {
                 // allocating an intermediate mip chain on every panel repaint.
                 let sx = (x as f32 / scale) as i32;
                 let sy = (y as f32 / scale) as i32;
-                thumb.set(x as i32, y as i32, layer.pixels.get(sx, sy));
+                let px = match solid {
+                    Some(color) => {
+                        let coverage = layer
+                            .mask
+                            .as_ref()
+                            .map_or(255, |mask| mask.get(sx, sy).a);
+                        Rgba8::new(
+                            color.r,
+                            color.g,
+                            color.b,
+                            ((color.a as u32 * coverage as u32) / 255) as u8,
+                        )
+                    }
+                    None => layer.pixels.get(sx, sy),
+                };
+                thumb.set(x as i32, y as i32, px);
             }
         }
         pixmap_to_qimage(thumb)
@@ -3455,6 +3716,98 @@ impl ffi::Engine {
         };
     }
 
+    fn set_background_erase_options(
+        mut self: core::pin::Pin<&mut Self>,
+        sampling: i32,
+        limits: i32,
+        tolerance_percent: i32,
+        protect_foreground: bool,
+    ) {
+        self.as_mut().rust_mut().bg_erase_options = BackgroundEraseOptions {
+            sampling: Sampling::from_i32(sampling),
+            limits: Limits::from_i32(limits),
+            // CS6's bar is a percentage of the channel range.
+            tolerance: (tolerance_percent.clamp(0, 100) * 255 / 100) as u32,
+            protect_foreground,
+        };
+    }
+
+    fn begin_background_erase(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let brush = self.brush;
+        let options = self.bg_erase_options;
+        // Once reads the pixel the stroke starts on; Background Swatch uses the
+        // swatch itself and samples nothing.
+        let reference = match options.sampling {
+            Sampling::Once => Some(self.doc.composite().get(x as i32, y as i32)),
+            Sampling::BackgroundSwatch => Some(self.background),
+            Sampling::Continuous => None,
+        };
+        let foreground = self.foreground;
+        let started = self.as_mut().rust_mut().doc.begin_background_erase(
+            &brush, options, reference, foreground, x, y, pressure,
+        );
+        if started {
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn extend_background_erase(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) {
+        let brush = self.brush;
+        let foreground = self.foreground;
+        let dirty = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .extend_background_erase(&brush, x, y, pressure, foreground);
+        if !dirty.is_empty() {
+            self.as_mut().canvas_changed();
+        }
+    }
+
+    fn end_background_erase(mut self: core::pin::Pin<&mut Self>) {
+        if self.as_mut().rust_mut().doc.end_background_erase() {
+            self.sync();
+        }
+    }
+
+    fn cancel_background_erase(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.cancel_background_erase();
+        self.as_mut().canvas_changed();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn magic_erase(
+        mut self: core::pin::Pin<&mut Self>,
+        x: i32,
+        y: i32,
+        tolerance: i32,
+        contiguous: bool,
+        antialias: bool,
+        sample_all: bool,
+        opacity: i32,
+    ) -> bool {
+        let dirty = self.as_mut().rust_mut().doc.magic_erase(
+            x,
+            y,
+            tolerance.clamp(0, 255) as u32,
+            contiguous,
+            antialias,
+            sample_all,
+            (opacity.clamp(0, 100) as f32) / 100.0,
+        );
+        if dirty.is_empty() {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
     fn begin_replace(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) -> bool {
         let brush = self.brush;
         let options = self.replace_options;
@@ -3661,6 +4014,157 @@ impl ffi::Engine {
             .begin_clone_stroke(&brush, x, y, pressure, offset, sampling);
         if started {
             self.as_mut().rust_mut().clone_offset = Some(offset);
+            self.as_mut().canvas_changed();
+        }
+        started
+    }
+
+    fn set_shape_options(
+        mut self: core::pin::Pin<&mut Self>,
+        kind: i32,
+        corner_radius: f32,
+        sides: i32,
+        line_weight: f32,
+        custom: i32,
+    ) {
+        self.as_mut().rust_mut().shape_options = ShapeOptions {
+            kind: ShapeKind::from_i32(kind),
+            corner_radius: corner_radius.max(0.0),
+            sides: sides.clamp(3, 100) as u32,
+            line_weight: line_weight.max(1.0),
+            custom: custom.max(0) as usize,
+        };
+    }
+
+    fn shape_outline(&self, x0: f32, y0: f32, x1: f32, y1: f32, shift: bool, alt: bool)
+        -> QPolygonF
+    {
+        let points = shape::outline(self.shape_options, (x0, y0), (x1, y1), shift, alt);
+        let mut polygon = QPolygonF::default();
+        for (x, y) in points {
+            polygon.append(QPointF::new(x as f64, y as f64));
+        }
+        polygon
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_shape(
+        mut self: core::pin::Pin<&mut Self>,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        shift: bool,
+        alt: bool,
+        mode: i32,
+    ) -> bool {
+        let options = self.shape_options;
+        let points = shape::outline(options, (x0, y0), (x1, y1), shift, alt);
+        if points.len() < 3 {
+            return false;
+        }
+        let color = self.foreground;
+        let mode = ShapeMode::from_i32(mode);
+
+        let drawn = match mode {
+            ShapeMode::Shape => self
+                .as_mut()
+                .rust_mut()
+                .doc
+                .add_shape_layer(&points, color, options.kind.layer_name())
+                .is_some(),
+            ShapeMode::Path => self.as_mut().rust_mut().doc.append_shape_path(&points),
+            ShapeMode::Pixels => !self
+                .as_mut()
+                .rust_mut()
+                .doc
+                .fill_shape(&points, color, 1.0)
+                .is_empty(),
+        };
+
+        if drawn {
+            // A path is overlay geometry rather than pixels, so it repaints the
+            // canvas and the Paths panel without touching the layer stack.
+            if mode == ShapeMode::Path {
+                self.as_mut().paths_changed();
+                self.as_mut().canvas_changed();
+            } else {
+                self.sync();
+            }
+        }
+        drawn
+    }
+
+    fn custom_shape_names(&self) -> QString {
+        QString::from(shape::CUSTOM_SHAPE_NAMES.join("\n").as_str())
+    }
+
+    fn custom_shape_preview(&self, index: i32, size: i32) -> QImage {
+        if index < 0 {
+            return QImage::default();
+        }
+        let side = size.clamp(1, 512) as u32;
+        let points = shape::custom_shape_preview_points(index as usize, side);
+        if points.len() < 3 {
+            return QImage::default();
+        }
+
+        // Filled through the same polygon coverage the tool itself uses, so a
+        // swatch cannot drift from what gets drawn.
+        let mut coverage = Selection::new(side, side);
+        coverage.apply_polygons_feathered(&[points], SelectionOp::Replace, 0);
+
+        let mut preview = Pixmap::new(side, side);
+        for y in 0..side as i32 {
+            for x in 0..side as i32 {
+                let a = (coverage.coverage_at(x, y) * 255.0 + 0.5) as u8;
+                preview.set(x, y, Rgba8::new(0xd4, 0xd4, 0xd4, a));
+            }
+        }
+        pixmap_to_qimage(preview)
+    }
+
+    fn pattern_names(&self) -> QString {
+        QString::from(pattern::PATTERN_NAMES.join("\n").as_str())
+    }
+
+    fn pattern_preview(&self, index: i32, size: i32) -> QImage {
+        if index < 0 {
+            return QImage::default();
+        }
+        let Some(tile) = pattern::tile(index as usize) else {
+            return QImage::default();
+        };
+        // The tile repeated to fill the swatch, so a small swatch shows the
+        // repeat rather than one enlarged tile.
+        let side = size.clamp(1, 512) as u32;
+        let Some(filled) = pattern::tiled(index as usize, (side, side), (0, 0)) else {
+            return pixmap_to_qimage(tile);
+        };
+        pixmap_to_qimage(filled)
+    }
+
+    fn set_pattern_options(mut self: core::pin::Pin<&mut Self>, index: i32, aligned: bool) {
+        let mut engine = self.as_mut().rust_mut();
+        engine.pattern_index = index.max(0) as usize;
+        engine.pattern_aligned = aligned;
+    }
+
+    fn begin_pattern_stroke(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let brush = self.brush;
+        let index = self.pattern_index;
+        let aligned = self.pattern_aligned;
+        let started = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .begin_pattern_stroke(&brush, x, y, pressure, index, aligned);
+        if started {
             self.as_mut().canvas_changed();
         }
         started
@@ -3981,6 +4485,18 @@ impl ffi::Engine {
     fn clear_selection(mut self: core::pin::Pin<&mut Self>) {
         self.as_mut().rust_mut().doc.clear_selection_pixels();
         self.sync();
+    }
+
+    fn quick_mask(&self) -> bool {
+        self.doc.quick_mask()
+    }
+
+    fn set_quick_mask(mut self: core::pin::Pin<&mut Self>, on: bool) {
+        self.as_mut().rust_mut().doc.set_quick_mask(on);
+        // Both the canvas and the selection outline change: the veil goes on or
+        // off, and the marching ants give way to it.
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
     }
 
     fn pick_color(&self, x: i32, y: i32) -> QColor {

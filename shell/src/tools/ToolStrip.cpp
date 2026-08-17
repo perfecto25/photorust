@@ -330,6 +330,15 @@ bool ToolStrip::quickMaskEnabled() const
 void ToolStrip::onQuickMaskToggled(bool on)
 {
     m_quickMask->setIcon(ToolIcons::fromSvgBody(ToolIcons::quickMaskSvg(on), kIconColor));
+
+    // One button, two names: it says what pressing it would do next, which is
+    // how CS6 labels the pair.
+    const QString shortcut = m_registry
+        ? m_registry->shortcut(QStringLiteral("tool.quickMask")).toString(QKeySequence::NativeText)
+        : QString();
+    const QString name = on ? tr("Edit in Standard Mode") : tr("Edit in Quick Mask Mode");
+    m_quickMask->setToolTip(shortcut.isEmpty() ? name
+                                               : tr("%1  (%2)").arg(name, shortcut));
     emit quickMaskToggled(on);
 }
 

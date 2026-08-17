@@ -391,6 +391,19 @@ impl LayerStack {
         }
     }
 
+    /// The next free "<shape> N", for a shape layer. Photoshop names these
+    /// after the tool that drew them rather than "Layer N".
+    pub fn suggest_shape_name(&self, shape: &str) -> String {
+        let mut n = 0;
+        loop {
+            n += 1;
+            let candidate = format!("{} {}", shape, n);
+            if !self.layers.iter().any(|l| l.name == candidate) {
+                return candidate;
+            }
+        }
+    }
+
     pub fn byte_size(&self) -> usize {
         self.layers.iter().map(|l| l.byte_size()).sum()
     }

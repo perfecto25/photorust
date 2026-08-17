@@ -1,9 +1,11 @@
 #include "CanvasView.h"
 
+#include "../tools/ToolIcons.h"
 #include "cxx-qt-lib/qcolor.h"
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QGuiApplication>
 #include <algorithm>
 #include <QEnterEvent>
@@ -26,6 +28,11 @@ const double kZoomSteps[] = {0.0067, 0.01, 0.0167, 0.025, 0.0333, 0.05, 0.0667,
                              1.0,    2.0,   3.0,    4.0,  5.0,    6.0,  7.0,
                              8.0,    12.0,  16.0,   32.0};
 constexpr int kZoomStepCount = sizeof(kZoomSteps) / sizeof(kZoomSteps[0]);
+
+/// How far a Zoom drag has to run, in screen pixels, before it counts as a
+/// rectangle rather than a click. Below this a press-and-twitch would zoom to a
+/// few pixels instead of stepping in, which is never what was meant.
+constexpr double kZoomMarqueeMinimum = 8.0;
 
 constexpr double kMinZoom = 0.0067; //  0.67%
 constexpr double kMaxZoom = 32.0;   // 3200%
@@ -98,16 +105,130 @@ QRectF CanvasView::documentRect() const
     return QRectF(origin, QSizeF(m_image.width() * m_zoom, m_image.height() * m_zoom));
 }
 
+QColor CanvasView::colorAtGlobal(const QPoint &globalPos) const
+{
+    if (!m_engine || m_image.isNull()) {
+        return {};
+    }
+    const QPoint local = mapFromGlobal(globalPos);
+    if (!rect().contains(local)) {
+        return {};
+    }
+
+    const QPointF doc = widgetToDocument(QPointF(local));
+    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_image.width()
+        || doc.y() >= m_image.height()) {
+        return {};
+    }
+    return m_engine->pickColor(int(doc.x()), int(doc.y()));
+}
+
+void CanvasView::setHandTool(HandTool tool)
+{
+    if (m_handTool == tool) {
+        return;
+    }
+    m_handTool = tool;
+    m_rotatingView = false;
+    updateCursor();
+}
+
+QPointF CanvasView::uprightDelta(const QPointF &screenDelta) const
+{
+    // The pan is kept in the frame the document is laid out in, which the view
+    // rotation then turns. So a movement measured on screen — a hand drag, or
+    // the correction that keeps a pixel under the cursor while zooming — has to
+    // be turned back before it can be added to it. Without this both slide off
+    // at an angle to the hand once the canvas is turned.
+    if (qFuzzyIsNull(m_viewRotation)) {
+        return screenDelta;
+    }
+    QTransform unrotate;
+    unrotate.rotate(-m_viewRotation);
+    return unrotate.map(screenDelta);
+}
+
+double CanvasView::angleToPointer(const QPointF &widgetPos) const
+{
+    // Measured from the middle of the viewport, which is what the view turns
+    // about.
+    const QPointF centre(width() / 2.0, height() / 2.0);
+    const QPointF delta = widgetPos - centre;
+    return std::atan2(delta.y(), delta.x()) * 180.0 / M_PI;
+}
+
+QTransform CanvasView::viewTransform() const
+{
+    if (qFuzzyIsNull(m_viewRotation)) {
+        return {};
+    }
+    // About the middle of the viewport rather than the middle of the document:
+    // what the user is looking at stays where it is as the canvas turns, which
+    // is what makes rotating feel like turning a sheet of paper under your hand
+    // rather than watching it swing away.
+    const QPointF centre(width() / 2.0, height() / 2.0);
+    QTransform transform;
+    transform.translate(centre.x(), centre.y());
+    transform.rotate(m_viewRotation);
+    transform.translate(-centre.x(), -centre.y());
+    return transform;
+}
+
 QPointF CanvasView::widgetToDocument(const QPointF &pos) const
 {
+    // Undo the view rotation first: everything below it works in the upright
+    // frame the document is laid out in.
+    const QPointF upright = viewTransform().inverted().map(pos);
     const QPointF origin = documentOrigin();
-    return QPointF((pos.x() - origin.x()) / m_zoom, (pos.y() - origin.y()) / m_zoom);
+    return QPointF((upright.x() - origin.x()) / m_zoom, (upright.y() - origin.y()) / m_zoom);
 }
 
 QPointF CanvasView::documentToWidget(const QPointF &pos) const
 {
     const QPointF origin = documentOrigin();
-    return QPointF(pos.x() * m_zoom + origin.x(), pos.y() * m_zoom + origin.y());
+    // Rotation last, so every overlay that places itself through this function
+    // — marching ants, the crop box, a type caret — turns with the canvas
+    // without knowing the view can turn at all.
+    return viewTransform().map(
+        QPointF(pos.x() * m_zoom + origin.x(), pos.y() * m_zoom + origin.y()));
+}
+
+void CanvasView::zoomToRect(const QRectF &docRect)
+{
+    if (docRect.width() <= 0.0 || docRect.height() <= 0.0 || width() <= 0 || height() <= 0) {
+        return;
+    }
+
+    // Whichever axis runs out first decides the zoom, so the whole rectangle
+    // fits rather than being cropped to the wider one.
+    const double fit = qMin(width() / docRect.width(), height() / docRect.height());
+    m_zoom = qBound(kMinZoom, fit, kMaxZoom);
+
+    // Then put what was marked out in the middle of the viewport. Solving
+    // `documentToWidget(centre) == viewport centre` for the pan gives this;
+    // the view rotation turns about that same centre, so it drops out.
+    const QPointF centre = docRect.center();
+    m_pan = QPointF((m_image.width() * m_zoom) / 2.0 - centre.x() * m_zoom,
+                    (m_image.height() * m_zoom) / 2.0 - centre.y() * m_zoom);
+
+    clampPan();
+    emit zoomChanged(m_zoom);
+    update();
+}
+
+void CanvasView::setViewRotation(double degrees)
+{
+    // Kept in 0..360 so the options bar's field never shows -720°.
+    double wrapped = std::fmod(degrees, 360.0);
+    if (wrapped < 0.0) {
+        wrapped += 360.0;
+    }
+    if (qFuzzyCompare(m_viewRotation + 1.0, wrapped + 1.0)) {
+        return;
+    }
+    m_viewRotation = wrapped;
+    emit viewRotationChanged(m_viewRotation);
+    update();
 }
 
 void CanvasView::clampPan()
@@ -140,7 +261,7 @@ void CanvasView::setZoomAt(double zoom, const QPointF &focusWidgetPos)
     const QPointF docBefore = widgetToDocument(focusWidgetPos);
     m_zoom = next;
     const QPointF widgetAfter = documentToWidget(docBefore);
-    m_pan += focusWidgetPos - widgetAfter;
+    m_pan += uprightDelta(focusWidgetPos - widgetAfter);
 
     clampPan();
     emit zoomChanged(m_zoom);
@@ -206,6 +327,14 @@ void CanvasView::setActiveTool(ToolId tool)
         m_engine->cancelReplace();
         m_replacing = false;
     }
+    if (m_backgroundErasing && m_engine) {
+        m_engine->cancelBackgroundErase();
+        m_backgroundErasing = false;
+    }
+    m_shapeDragging = false;
+    m_shapeOutline.clear();
+    m_zoomDragging = false;
+    m_zoomRectDoc = QRectF();
     if (m_mixing && m_engine) {
         m_engine->cancelMixer();
         m_mixing = false;
@@ -260,7 +389,8 @@ void CanvasView::setActiveTool(ToolId tool)
     }
 
     if (m_engine) {
-        m_engine->setEraseMode(tool == ToolId::Eraser);
+        m_engine->setEraseMode(tool == ToolId::Eraser
+                               && m_eraserType == EraserType::Eraser);
         // Healing runs through the same stroke path as a brush; this is what
         // tells the engine to rebuild the region at the end instead of filling
         // it with the foreground colour.
@@ -311,6 +441,48 @@ void CanvasView::setCropOptions(double aspectRatio, bool deleteCropped)
         applyCropRatio(CropGrip::BottomRight);
         update();
     }
+}
+
+void CanvasView::setEraserType(EraserType type)
+{
+    if (m_eraserType == type) {
+        return;
+    }
+    if (m_backgroundErasing && m_engine) {
+        m_engine->cancelBackgroundErase();
+        m_backgroundErasing = false;
+    }
+    m_eraserType = type;
+    if (m_engine) {
+        // Only the plain Eraser rubs out through the ordinary stroke path; the
+        // other two have paths of their own.
+        m_engine->setEraseMode(m_tool == ToolId::Eraser && type == EraserType::Eraser);
+    }
+    updateCursor();
+}
+
+void CanvasView::setBackgroundEraseOptions(int sampling, int limits, int tolerance,
+                                           bool protectForeground)
+{
+    m_bgEraseSampling = sampling;
+    m_bgEraseLimits = limits;
+    m_bgEraseTolerance = tolerance;
+    m_bgEraseProtectForeground = protectForeground;
+    if (m_engine) {
+        m_engine->setBackgroundEraseOptions(sampling, limits, tolerance, protectForeground);
+    }
+}
+
+void CanvasView::setMagicEraseOptions(int tolerance, bool antialias, bool contiguous,
+                                      bool sampleAllLayers, int opacity)
+{
+    // The Magic Eraser has no stroke to configure, so its settings are held
+    // here and passed with the click.
+    m_magicEraseTolerance = tolerance;
+    m_magicEraseAntialias = antialias;
+    m_magicEraseContiguous = contiguous;
+    m_magicEraseSampleAll = sampleAllLayers;
+    m_magicEraseOpacity = opacity;
 }
 
 void CanvasView::setReplaceMode(bool active)
@@ -831,10 +1003,35 @@ void CanvasView::setCloneOptions(bool aligned, CloneSampling sampling)
     }
 }
 
+void CanvasView::setCloneTool(CloneType tool)
+{
+    if (m_cloneTool == tool) {
+        return;
+    }
+    m_cloneTool = tool;
+    updateCursor();
+    // The clone source crosshair belongs to the Clone Stamp; the Pattern Stamp
+    // has no source to mark.
+    update();
+}
+
 bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
 {
     if (!m_engine) {
         return false;
+    }
+
+    // The Pattern Stamp is the same stroke over a different source: no
+    // Alt-click, nothing to sample, so it starts painting straight away.
+    if (m_cloneTool == CloneType::PatternStamp) {
+        if (m_engine->beginPatternStroke(float(doc.x()), float(doc.y()), 1.0f)) {
+            m_dragging = true;
+            m_image = m_engine->previewImage();
+            update();
+        } else {
+            reportIfLocked();
+        }
+        return true;
     }
 
     // Alt-click sets what to copy from, exactly as CS6 does. A one-off action,
@@ -883,7 +1080,8 @@ bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
 
 void CanvasView::paintCloneSource(QPainter &painter)
 {
-    if (m_tool != ToolId::CloneStamp || !m_cloneSourceValid) {
+    if (m_tool != ToolId::CloneStamp || m_cloneTool != CloneType::CloneStamp
+        || !m_cloneSourceValid) {
         return;
     }
     // The same crosshair the Healing Brush marks its source with, so the two
@@ -2073,12 +2271,47 @@ void CanvasView::updateMagneticWire(const QPointF &doc)
     }
 }
 
+namespace {
+
+/// The Rotate View cursor: the tool's own icon, drawn dark-behind-pale so it
+/// reads over both the image and the surround. Built once — a cursor is asked
+/// for on every pointer move.
+const QCursor &rotateViewCursor()
+{
+    static const QCursor cursor = [] {
+        const QPixmap pale =
+            ToolIcons::icon(ToolId::Hand, int(HandTool::RotateView), Qt::white).pixmap(24, 24);
+        const QPixmap dark =
+            ToolIcons::icon(ToolId::Hand, int(HandTool::RotateView), QColor(0, 0, 0, 190))
+                .pixmap(24, 24);
+
+        QPixmap art(pale.size());
+        art.setDevicePixelRatio(pale.devicePixelRatio());
+        art.fill(Qt::transparent);
+        QPainter painter(&art);
+        painter.drawPixmap(QPointF(1, 1), dark);
+        painter.drawPixmap(QPointF(0, 0), pale);
+        painter.end();
+
+        return QCursor(art, 12, 12);
+    }();
+    return cursor;
+}
+
+} // namespace
+
 void CanvasView::updateCursor()
 {
     const ToolId effective = m_spacePanOverride ? ToolId::Hand : m_tool;
     switch (effective) {
     case ToolId::Hand:
-        setCursor(m_panning ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
+        if (m_handTool == HandTool::RotateView && !m_spacePanOverride) {
+            // No stock cursor says "turn this", so the tool's own icon does —
+            // the same artwork the flyout shows, which is how the user got here.
+            setCursor(rotateViewCursor());
+        } else {
+            setCursor(m_panning ? Qt::ClosedHandCursor : Qt::OpenHandCursor);
+        }
         break;
     case ToolId::Move:
         setCursor(Qt::SizeAllCursor);
@@ -2137,6 +2370,12 @@ void CanvasView::paintEvent(QPaintEvent *event)
 
     const QRectF target = documentRect();
 
+    // Everything from here to the document's border is laid out upright and
+    // then turned as a whole. The overlays below are not: they place themselves
+    // through `documentToWidget`, which already carries the rotation.
+    painter.save();
+    painter.setTransform(viewTransform(), true);
+
     // Transparency checkerboard, clipped to the document.
     painter.save();
     painter.setClipRect(target);
@@ -2162,13 +2401,17 @@ void CanvasView::paintEvent(QPaintEvent *event)
 
     // At 200% and above Photoshop switches to nearest-neighbour so individual
     // pixels stay crisp; below that it smooths.
-    painter.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 2.0);
+    // A turned canvas is resampled whatever the zoom, so nearest-neighbour
+    // would leave every edge in the image jagged.
+    painter.setRenderHint(QPainter::SmoothPixmapTransform,
+                          m_zoom < 2.0 || !qFuzzyIsNull(m_viewRotation));
     painter.drawImage(target, m_image);
 
     // A thin border so the document edge reads against the surround.
     painter.setPen(QPen(QColor(0x00, 0x00, 0x00, 160), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(target.adjusted(-0.5, -0.5, 0.5, 0.5));
+    painter.restore();
 
     paintSelection(painter);
     paintCrop(painter);
@@ -2180,6 +2423,8 @@ void CanvasView::paintEvent(QPaintEvent *event)
     paintGradientDrag(painter);
     paintPathOverlay(painter);
     paintTypeOverlay(painter);
+    paintShapeOverlay(painter);
+    paintZoomOverlay(painter);
 
     // Live marquee while the user is dragging one out. Drawn as the shape the
     // active variant will actually produce, so an elliptical drag previews an
@@ -2257,6 +2502,13 @@ void CanvasView::paintSelection(QPainter &painter)
         return;
     }
 
+    // In Quick Mask the red veil *is* the selection, drawn per pixel by the
+    // engine. Marching ants over it would say the same thing twice, and worse
+    // than the veil does — a soft-edged mask has no one outline.
+    if (m_engine && m_engine->quickMask()) {
+        return;
+    }
+
     // The cached path is in document coordinates; map it once rather than
     // transforming every point by hand.
     const QPointF origin = documentOrigin();
@@ -2292,9 +2544,23 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     m_lastMousePos = event->position();
     const QPointF doc = widgetToDocument(event->position());
 
-    // Middle-drag and space-drag pan from any tool, as in Photoshop.
+    // Rotate View turns the canvas by dragging it round, like a hand on a
+    // sheet of paper: the angle from the centre to the pointer is followed, so
+    // wherever the drag starts stays under the finger as it goes.
+    if (m_tool == ToolId::Hand && m_handTool == HandTool::RotateView
+        && !m_spacePanOverride && event->button() == Qt::LeftButton) {
+        m_rotatingView = true;
+        m_rotateStartAngle = angleToPointer(event->position());
+        m_rotateStartRotation = m_viewRotation;
+        updateCursor();
+        return;
+    }
+
+    // Middle-drag and space-drag pan from any tool, as in Photoshop. Space
+    // still pans while Rotate View is in hand, which is how CS6 gets around a
+    // turned canvas without switching tools.
     const bool wantsPan = m_spacePanOverride || event->button() == Qt::MiddleButton
-        || m_tool == ToolId::Hand;
+        || (m_tool == ToolId::Hand && m_handTool == HandTool::Hand);
     if (wantsPan) {
         m_panning = true;
         updateCursor();
@@ -2307,12 +2573,11 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
 
     switch (m_tool) {
     case ToolId::Zoom:
-        // Alt inverts the zoom direction, matching CS6.
-        if (event->modifiers() & Qt::AltModifier) {
-            zoomOut();
-        } else {
-            zoomIn();
-        }
+        // The zoom happens on *release*: a drag marks out a rectangle to zoom
+        // into, and only a press that never became one is a plain click.
+        m_zoomDragging = true;
+        m_zoomStartDoc = doc;
+        m_zoomRectDoc = QRectF();
         return;
 
     case ToolId::Eyedropper: {
@@ -2578,6 +2843,41 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         return;
     }
 
+    // The shape tools drag out a rectangle and commit it on release, so the
+    // press only records where the drag began.
+    if (m_tool == ToolId::Shape) {
+        m_shapeDragging = true;
+        m_dragStartDoc = doc;
+        m_shapeOutline.clear();
+        update();
+        return;
+    }
+
+    // The two colour erasers: one clicks, one drags, and neither goes through
+    // the ordinary stroke path.
+    if (m_tool == ToolId::Eraser && m_eraserType != EraserType::Eraser && m_engine) {
+        if (m_eraserType == EraserType::MagicEraser) {
+            if (!m_engine->magicErase(qRound(doc.x()), qRound(doc.y()), m_magicEraseTolerance,
+                                      m_magicEraseContiguous, m_magicEraseAntialias,
+                                      m_magicEraseSampleAll, m_magicEraseOpacity)) {
+                // Nothing came of it: either the layer refuses to be erased, or
+                // the click landed where there is already nothing.
+                reportIfLocked();
+            }
+            refresh();
+            return;
+        }
+
+        if (m_engine->beginBackgroundErase(float(doc.x()), float(doc.y()), 1.0f)) {
+            m_backgroundErasing = true;
+            m_dragging = true;
+            refresh();
+        } else {
+            reportIfLocked();
+        }
+        return;
+    }
+
     // The Color Replacement Brush recolours what is already there, so it edits
     // the layer per dab rather than accumulating a stroke to composite.
     if (m_replaceMode && m_engine) {
@@ -2617,10 +2917,19 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
     emit cursorMoved(doc);
 
     if (m_panning) {
-        m_pan += pos - m_lastMousePos;
+        // The pan is in the upright frame the document is laid out in, so a
+        // drag on a turned canvas has to be turned back the same way — without
+        // this the image would slide off at an angle to the hand.
+        m_pan += uprightDelta(pos - m_lastMousePos);
         m_lastMousePos = pos;
         clampPan();
         update();
+        return;
+    }
+
+    if (m_rotatingView) {
+        setViewRotation(m_rotateStartRotation + angleToPointer(pos) - m_rotateStartAngle);
+        m_lastMousePos = pos;
         return;
     }
 
@@ -2797,6 +3106,26 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_backgroundErasing && m_engine) {
+        m_engine->extendBackgroundErase(float(doc.x()), float(doc.y()), 1.0f);
+        m_lastMousePos = pos;
+        return;
+    }
+
+    if (m_shapeDragging) {
+        m_shapeOutline = shapeOutlineFor(doc, event->modifiers());
+        m_lastMousePos = pos;
+        update();
+        return;
+    }
+
+    if (m_zoomDragging) {
+        m_zoomRectDoc = QRectF(m_zoomStartDoc, doc).normalized();
+        m_lastMousePos = pos;
+        update();
+        return;
+    }
+
     if (m_dragging && m_engine) {
         if (m_tool == ToolId::Move) {
             // Nudge by whole pixels only; sub-pixel layer offsets would need
@@ -2880,6 +3209,12 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
 
     if (m_panning) {
         m_panning = false;
+        updateCursor();
+        return;
+    }
+
+    if (m_rotatingView) {
+        m_rotatingView = false;
         updateCursor();
         return;
     }
@@ -3064,6 +3399,61 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
+    if (m_backgroundErasing && m_engine) {
+        m_engine->endBackgroundErase();
+        m_backgroundErasing = false;
+        m_dragging = false;
+        refresh();
+        return;
+    }
+
+    if (m_zoomDragging) {
+        m_zoomDragging = false;
+        const QRectF marked = m_zoomRectDoc;
+        m_zoomRectDoc = QRectF();
+
+        // A rectangle only counts once it is big enough to have been meant:
+        // below that the press was a click, and a click zooms a step about
+        // where it landed.
+        const QRectF widgetRect(documentToWidget(marked.topLeft()),
+                                documentToWidget(marked.bottomRight()));
+        if (marked.isValid() && qAbs(widgetRect.width()) >= kZoomMarqueeMinimum
+            && qAbs(widgetRect.height()) >= kZoomMarqueeMinimum) {
+            zoomToRect(marked);
+        } else if (event->modifiers().testFlag(Qt::AltModifier)
+                   && event->modifiers().testFlag(Qt::ControlModifier)) {
+            // Ctrl+Alt inverts the direction. Alt alone is left free: it is the
+            // modifier half the other tools sample or subtract with, and a
+            // stray Alt should not quietly zoom the wrong way.
+            zoomOut();
+        } else {
+            zoomIn();
+        }
+        update();
+        return;
+    }
+
+    if (m_shapeDragging) {
+        m_shapeDragging = false;
+        m_shapeOutline.clear();
+        if (m_engine) {
+            const bool drawn = m_engine->drawShape(
+                float(m_dragStartDoc.x()), float(m_dragStartDoc.y()), float(doc.x()),
+                float(doc.y()), event->modifiers().testFlag(Qt::ShiftModifier),
+                event->modifiers().testFlag(Qt::AltModifier), int(m_shapeMode));
+            if (!drawn) {
+                // Either the drag went nowhere — a click rather than a drag,
+                // where CS6 opens a size dialog we do not have — or the layer
+                // refuses pixels.
+                reportIfLocked();
+            }
+            refresh();
+        } else {
+            update();
+        }
+        return;
+    }
+
     if (m_dragging && m_engine && toolPaints(m_tool)) {
         m_engine->endStroke();
         refresh();
@@ -3195,9 +3585,20 @@ void CanvasView::keyPressEvent(QKeyEvent *event)
 
     // Escape abandons an in-progress stroke or marquee.
     if (event->key() == Qt::Key_Escape) {
+        if (m_zoomDragging) {
+            m_zoomDragging = false;
+            m_zoomRectDoc = QRectF();
+            update();
+        }
         if (m_replacing && m_engine) {
             m_engine->cancelReplace();
             m_replacing = false;
+            m_dragging = false;
+            refresh();
+        }
+        if (m_backgroundErasing && m_engine) {
+            m_engine->cancelBackgroundErase();
+            m_backgroundErasing = false;
             m_dragging = false;
             refresh();
         }
@@ -3247,17 +3648,24 @@ void CanvasView::keyReleaseEvent(QKeyEvent *event)
 
 void CanvasView::contextMenuEvent(QContextMenuEvent *event)
 {
-    // CS6 gives every tool its own right-click menu; the selection tools are
-    // the ones that have one here so far.
-    if (!toolSelects(m_tool)) {
-        QWidget::contextMenuEvent(event);
+    // Mid-gesture a right-click is not a request for a menu — it would open on
+    // top of the marquee being dragged.
+    if (m_marqueeActive || m_dragging || m_panning) {
+        event->ignore();
         return;
     }
 
-    // Mid-gesture a right-click is not a request for a menu — it would open
-    // on top of the marquee being dragged.
-    if (m_marqueeActive || m_dragging || m_panning) {
-        event->ignore();
+    // CS6 gives every tool its own right-click menu; the selection tools and
+    // the Zoom tool are the ones that have one here so far. The canvas does not
+    // build either: the commands on them belong to the registry, which
+    // MainWindow owns.
+    if (m_tool == ToolId::Zoom) {
+        emit zoomContextMenuRequested(event->globalPos());
+        event->accept();
+        return;
+    }
+    if (!toolSelects(m_tool)) {
+        QWidget::contextMenuEvent(event);
         return;
     }
 
@@ -4289,7 +4697,10 @@ void CanvasView::renderTypeToImage(QImage &image, const QPoint &imageOrigin,
 void CanvasView::paintTypeMaskVeil(QPainter &painter, const TypeLayout &layout,
                                    const QPointF &origin) const
 {
-    const QRect area = documentRect().toAlignedRect().intersected(rect());
+    // The bounding box of the document *as seen*: with the view turned, the
+    // veil still has to cover every part of the canvas on screen.
+    const QRect area =
+        viewTransform().mapRect(documentRect()).toAlignedRect().intersected(rect());
     if (area.isEmpty()) {
         return;
     }
@@ -4312,6 +4723,68 @@ void CanvasView::paintTypeMaskVeil(QPainter &painter, const TypeLayout &layout,
     cut.end();
 
     painter.drawImage(area.topLeft(), veil);
+}
+
+QPolygonF CanvasView::shapeOutlineFor(const QPointF &doc,
+                                      Qt::KeyboardModifiers modifiers) const
+{
+    if (!m_engine) {
+        return QPolygonF();
+    }
+    // The engine owns every shape's geometry, including what Shift and Alt mean
+    // to each of them, and this is the same call the commit goes through — so
+    // the dashed preview is exactly the shape that will land.
+    return m_engine->shapeOutline(float(m_dragStartDoc.x()), float(m_dragStartDoc.y()),
+                                  float(doc.x()), float(doc.y()),
+                                  modifiers.testFlag(Qt::ShiftModifier),
+                                  modifiers.testFlag(Qt::AltModifier));
+}
+
+void CanvasView::paintPendingOutline(QPainter &painter, const QPolygonF &widgetOutline) const
+{
+    // The same two-tone dashed outline the marquee uses, so a gesture in
+    // progress reads as pending rather than as something already done —
+    // nothing is committed until the button comes up.
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(Qt::black, 1));
+    painter.drawPolygon(widgetOutline);
+    QPen dashed(Qt::white, 1, Qt::DashLine);
+    dashed.setDashPattern({4, 4});
+    painter.setPen(dashed);
+    painter.drawPolygon(widgetOutline);
+    painter.restore();
+}
+
+void CanvasView::paintShapeOverlay(QPainter &painter)
+{
+    if (!m_shapeDragging || m_shapeOutline.size() < 2) {
+        return;
+    }
+
+    QPolygonF widgetOutline;
+    widgetOutline.reserve(m_shapeOutline.size());
+    for (const QPointF &point : m_shapeOutline) {
+        widgetOutline.append(documentToWidget(point));
+    }
+    paintPendingOutline(painter, widgetOutline);
+}
+
+void CanvasView::paintZoomOverlay(QPainter &painter)
+{
+    if (!m_zoomDragging || !m_zoomRectDoc.isValid()) {
+        return;
+    }
+
+    // Through `documentToWidget`, so the rectangle sits on the image it marks
+    // out even when the view is turned.
+    QPolygonF outline;
+    outline.append(documentToWidget(m_zoomRectDoc.topLeft()));
+    outline.append(documentToWidget(m_zoomRectDoc.topRight()));
+    outline.append(documentToWidget(m_zoomRectDoc.bottomRight()));
+    outline.append(documentToWidget(m_zoomRectDoc.bottomLeft()));
+    paintPendingOutline(painter, outline);
 }
 
 void CanvasView::paintTypeOverlay(QPainter &painter)

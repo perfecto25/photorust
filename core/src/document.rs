@@ -16,6 +16,8 @@ use crate::layer::{Layer, LayerId, LayerKind, LayerStack, TextContent};
 use crate::perspective;
 use crate::mixer::{MixerBrush, MixerOptions, Sampled};
 use crate::replace::{ColorReplacer, ReplaceOptions, ReplaceSampling};
+use crate::erase::{self, BackgroundEraseOptions, BackgroundEraser};
+use crate::sample::Sampling;
 use crate::focus::{self, FocusOptions};
 use crate::smudge::{Smudge, SmudgeOptions};
 use crate::tone::{ToneOptions, ToneStroke};
@@ -25,6 +27,7 @@ use crate::gradient::{self, Gradient, GradientOptions};
 use crate::stamp::{self, CloneSampling, CloneStroke};
 use crate::selection::{Selection, SelectionOp};
 use crate::path::PathSet;
+use crate::pattern;
 use crate::slice::{Slice, SliceSet};
 
 /// What the Patch tool was asked to do — CS6's options bar, as one value.
@@ -79,6 +82,12 @@ pub struct Document {
     /// Where the replacement stroke last reached, for even dab spacing.
     replace_last: Option<(f32, f32)>,
 
+    /// State for a Background Eraser stroke. Direct-to-layer for the same
+    /// reason the replacer is: what a dab erases depends on what is under it.
+    bg_eraser: Option<BackgroundEraser>,
+    /// Where that stroke last reached, for even dab spacing.
+    bg_erase_last: Option<(f32, f32)>,
+
     /// State for a Mixer Brush stroke. Direct-to-layer for the same reason the
     /// replacer is: each dab mixes with what the last one left.
     mixer: Option<MixerBrush>,
@@ -113,9 +122,74 @@ pub struct Document {
     /// Set on every mutation, cleared on save.
     dirty: bool,
 
+    /// True while the document is in Quick Mask mode, where painting edits the
+    /// selection instead of the image. See [`Document::set_quick_mask`].
+    quick_mask: bool,
+
     /// The type layer the Type tool currently has open, and the visibility it
     /// had before the edit hid it. See [`Document::begin_text_edit`].
     text_edit: Option<(LayerId, bool)>,
+}
+
+/// Paint a finished stroke into a selection — Quick Mask's whole mechanism.
+///
+/// How light the paint is decides what the pixel becomes: black masks it out,
+/// white selects it, grey lands in between. That is Photoshop's rule, and it is
+/// why the same brushes, erasers and gradients that paint an image can build a
+/// selection.
+fn paint_stroke_into_selection(
+    selection: &mut Selection,
+    mask: &StrokeMask,
+    color: Rgba8,
+    opacity: f32,
+) {
+    // Rec. 601 luma, the same weighting the rest of the engine uses to judge
+    // brightness.
+    let target = (0.299 * color.r as f32 + 0.587 * color.g as f32 + 0.114 * color.b as f32)
+        / 255.0;
+    let opacity = opacity.clamp(0.0, 1.0);
+
+    let dirty = mask.dirty();
+    for y in dirty.y..dirty.bottom() {
+        for x in dirty.x..dirty.right() {
+            let coverage = mask.coverage_at(x, y) * opacity;
+            if coverage > 0.0 {
+                selection.paint_at(x, y, coverage, target);
+            }
+        }
+    }
+}
+
+/// Where the dabs of a direct-to-layer stroke fall between two mouse positions.
+///
+/// The tools that edit the layer as they go — the Color Replacement Brush and
+/// the Background Eraser — have to place their own dabs, since they never build
+/// a [`StrokeMask`]. `last` is where the previous dab landed, or `None` at the
+/// start of a stroke. `None` comes back when the pointer has not moved far
+/// enough yet: the dabs are then left for the next move rather than bunched up.
+fn dab_points(brush: &Brush, last: Option<(f32, f32)>, x: f32, y: f32) -> Option<Vec<(f32, f32)>> {
+    let Some((lx, ly)) = last else {
+        return Some(vec![(x, y)]);
+    };
+
+    let step = (brush.size * brush.spacing.max(0.01)).max(0.5);
+    let (dx, dy) = (x - lx, y - ly);
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance < 1e-6 {
+        return None;
+    }
+
+    let mut points = Vec::new();
+    let mut travelled = step;
+    while travelled <= distance {
+        let t = travelled / distance;
+        points.push((lx + dx * t, ly + dy * t));
+        travelled += step;
+    }
+    if points.is_empty() {
+        return None;
+    }
+    Some(points)
 }
 
 impl Document {
@@ -140,6 +214,8 @@ impl Document {
             stroke_undo_base: None,
             replacer: None,
             replace_last: None,
+            bg_eraser: None,
+            bg_erase_last: None,
             mixer: None,
             mixer_last: None,
             focus: None,
@@ -150,6 +226,7 @@ impl Document {
             path: None,
             untitled_number: 1,
             dirty: false,
+            quick_mask: false,
             text_edit: None,
         }
     }
@@ -188,6 +265,8 @@ impl Document {
             stroke_undo_base: None,
             replacer: None,
             replace_last: None,
+            bg_eraser: None,
+            bg_erase_last: None,
             mixer: None,
             mixer_last: None,
             focus: None,
@@ -198,6 +277,7 @@ impl Document {
             path: None,
             untitled_number: 1,
             dirty: false,
+            quick_mask: false,
             text_edit: None,
         }
     }
@@ -288,6 +368,85 @@ impl Document {
         self.active_layer = id;
         self.commit("New Layer");
         id
+    }
+
+    /// Add a shape layer above the active one — what the shape tools commit in
+    /// CS6's Shape mode.
+    ///
+    /// Photoshop builds one of these as a solid colour clipped by a vector
+    /// mask, and so does this: a [`LayerKind::SolidColor`] layer carrying a mask
+    /// cut to the shape. The compositor already honours a mask on a solid
+    /// colour, so nothing new is needed to draw it, and the layer stays a real
+    /// fill layer — its colour can be changed after the fact.
+    ///
+    /// What is *not* kept is the geometry as a live path: the shape is
+    /// rasterized into the mask, so it can be masked, moved and recoloured
+    /// afterwards but not reshaped by dragging its corners. That needs a vector
+    /// mask on the layer, which the layer model does not have yet.
+    pub fn add_shape_layer(
+        &mut self,
+        points: &[(f32, f32)],
+        color: Rgba8,
+        name: &str,
+    ) -> Option<LayerId> {
+        if points.len() < 3 {
+            return None;
+        }
+
+        let mut coverage = Selection::new(self.width, self.height);
+        coverage.apply_polygons_feathered(&[points.to_vec()], SelectionOp::Replace, 0);
+
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, self.stack.suggest_shape_name(name), 0, 0);
+        layer.kind = LayerKind::SolidColor(color);
+
+        // The mask is canvas-sized and starts at the origin, so the layer's own
+        // offset is zero and `mask_at` lines up with document space.
+        let mut mask = Pixmap::new(self.width, self.height);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                let a = (coverage.coverage_at(x, y) * 255.0 + 0.5) as u8;
+                mask.set(x, y, Rgba8::new(a, a, a, a));
+            }
+        }
+        layer.mask = Some(mask);
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("Shape Layer");
+        Some(id)
+    }
+
+    /// Add a shape to the work path — the shape tools' Path mode.
+    ///
+    /// The subpath is closed, since a dragged shape encloses an area, and left
+    /// not being edited: the Pen tool would otherwise carry on extending it
+    /// from the last corner.
+    pub fn append_shape_path(&mut self, points: &[(f32, f32)]) -> bool {
+        if points.len() < 3 {
+            return false;
+        }
+        let path = self.paths.ensure_active();
+        for (x, y) in points {
+            path.append_corner(*x, *y);
+        }
+        path.close_active_subpath();
+        path.finish_editing();
+        true
+    }
+
+    /// Paint a shape onto the active layer — the shape tools' Pixels mode.
+    pub fn fill_shape(&mut self, points: &[(f32, f32)], color: Rgba8, opacity: f32) -> Rect {
+        if points.len() < 3 {
+            return Rect::default();
+        }
+        let dirty = self.fill_polygons(&[points.to_vec()], color, opacity);
+        if dirty.is_empty() {
+            return Rect::default();
+        }
+        self.commit("Shape Tool");
+        dirty
     }
 
     /// Add an adjustment layer above the active one.
@@ -726,8 +885,59 @@ impl Document {
         true
     }
 
-    /// Whether a Clone Stamp stroke is in progress, and so whether ending the
-    /// stroke should copy pixels rather than paint a colour.
+    /// Begin a Pattern Stamp stroke — the Clone Stamp's other half.
+    ///
+    /// It is the same stroke with a different thing under it: instead of a
+    /// snapshot of the image offset by an Alt-click, the source is the chosen
+    /// pattern repeated across the layer, read straight through at the pixel
+    /// the brush is over. So this reuses [`CloneStroke`] with a zero offset,
+    /// and everything downstream — dabs, opacity, flow, the selection, the
+    /// transparency lock, the live preview, the single history state — is
+    /// already right.
+    ///
+    /// `aligned` is CS6's checkbox: the tile is pinned to the document, so
+    /// separate strokes join up as though uncovering one continuous sheet.
+    /// Unaligned pins it to wherever each stroke starts instead, so every
+    /// stroke begins mid-tile at the same place.
+    pub fn begin_pattern_stroke(
+        &mut self,
+        brush: &Brush,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        pattern: usize,
+        aligned: bool,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        // The source lives in the layer's frame, so a tile pinned to the
+        // document starts at wherever the document's origin falls in it.
+        let offset = layer.offset;
+        let size = (layer.pixels.width(), layer.pixels.height());
+        let origin = if aligned {
+            (-offset.0, -offset.1)
+        } else {
+            (x.round() as i32 - offset.0, y.round() as i32 - offset.1)
+        };
+
+        let Some(source) = pattern::tiled(pattern, size, origin) else {
+            return false;
+        };
+        if !self.begin_stroke(brush, x, y, pressure) {
+            return false;
+        }
+        self.clone = Some(CloneStroke { source, offset: (0, 0) });
+        true
+    }
+
+    /// Whether a stroke that copies *pixels* is in progress — the Clone Stamp
+    /// or the Pattern Stamp — and so whether ending it should composite those
+    /// pixels rather than paint a colour.
     pub fn is_cloning(&self) -> bool {
         self.clone.is_some()
     }
@@ -795,6 +1005,14 @@ impl Document {
 
         if mask.is_empty() {
             return Rect::default();
+        }
+
+        // In Quick Mask the stroke belongs to the selection, not to any layer,
+        // and so does its undo step: the pixels are untouched.
+        if self.quick_mask {
+            paint_stroke_into_selection(&mut self.selection, &mask, color, opacity);
+            self.dirty = true;
+            return mask.dirty();
         }
 
         let selection_empty = self.selection.is_empty();
@@ -1174,30 +1392,9 @@ impl Document {
             None => return Rect::default(),
         };
 
-        // Dab positions along the segment, spaced as the brush asks.
-        let step = (brush.size * brush.spacing.max(0.01)).max(0.5);
-        let mut points = Vec::new();
-        match self.replace_last {
-            None => points.push((x, y)),
-            Some((lx, ly)) => {
-                let (dx, dy) = (x - lx, y - ly);
-                let distance = (dx * dx + dy * dy).sqrt();
-                if distance < 1e-6 {
-                    return Rect::default();
-                }
-                let mut travelled = step;
-                while travelled <= distance {
-                    let t = travelled / distance;
-                    points.push((lx + dx * t, ly + dy * t));
-                    travelled += step;
-                }
-                if points.is_empty() {
-                    // Too short a move to warrant a dab; wait for the next one
-                    // rather than bunching dabs up at the start.
-                    return Rect::default();
-                }
-            }
-        }
+        let Some(points) = dab_points(brush, self.replace_last, x, y) else {
+            return Rect::default();
+        };
 
         let selection = if self.selection.is_empty() {
             None
@@ -1273,6 +1470,260 @@ impl Document {
         if let Some(base) = self.stroke_undo_base.take() {
             self.stack = base;
         }
+    }
+
+    // -- background eraser ---------------------------------------------------
+
+    /// Begin a Background Eraser stroke.
+    ///
+    /// Built exactly like the Color Replacement Brush's, and for the same
+    /// reason: what a dab erases depends on what the dabs before it left, so it
+    /// edits the layer as it goes rather than accumulating into a stroke mask.
+    /// The whole drag is still one history state.
+    ///
+    /// `reference` is the colour to erase for the Once and Background Swatch
+    /// sampling modes; Continuous ignores it and reads under the crosshair.
+    pub fn begin_background_erase(
+        &mut self,
+        brush: &Brush,
+        options: BackgroundEraseOptions,
+        reference: Option<Rgba8>,
+        foreground: Rgba8,
+        x: f32,
+        y: f32,
+        pressure: f32,
+    ) -> bool {
+        let Some(layer) = self.active_layer() else {
+            return false;
+        };
+        if layer.lock_pixels || layer.lock_transparency || !matches!(layer.kind, LayerKind::Raster)
+        {
+            // Erasing is exactly what Lock Transparent Pixels forbids: it can
+            // only ever change alpha.
+            return false;
+        }
+
+        self.stroke_undo_base = Some(self.stack.clone());
+        let reference = match options.sampling {
+            Sampling::Continuous => None,
+            _ => reference,
+        };
+        self.bg_eraser = Some(BackgroundEraser::new(options, reference));
+        self.bg_erase_last = None;
+        self.extend_background_erase(brush, x, y, pressure, foreground);
+        true
+    }
+
+    /// Continue a Background Eraser stroke, laying dabs to `(x, y)`.
+    pub fn extend_background_erase(
+        &mut self,
+        brush: &Brush,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        foreground: Rgba8,
+    ) -> Rect {
+        if self.bg_eraser.is_none() {
+            return Rect::default();
+        }
+        let id = self.active_layer;
+        let offset = match self.stack.by_id(id) {
+            Some(layer) => layer.offset,
+            None => return Rect::default(),
+        };
+
+        let Some(points) = dab_points(brush, self.bg_erase_last, x, y) else {
+            return Rect::default();
+        };
+
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+
+        let mut dirty = Rect::default();
+        let (Some(eraser), Some(layer)) = (self.bg_eraser.as_mut(), self.stack.by_id_mut(id))
+        else {
+            return Rect::default();
+        };
+
+        for (px, py) in points {
+            let touched = eraser.apply_dab(
+                &mut layer.pixels,
+                brush,
+                px - offset.0 as f32,
+                py - offset.1 as f32,
+                pressure,
+                foreground,
+            );
+            if !touched.is_empty() {
+                dirty = dirty.union(&Rect::new(
+                    touched.x + offset.0,
+                    touched.y + offset.1,
+                    touched.width,
+                    touched.height,
+                ));
+            }
+        }
+
+        // A marquee confines this exactly as it confines painting: what fell
+        // outside is put back, which keeps the eraser's own logic free of
+        // selection handling.
+        if let Some(sel) = selection.as_ref() {
+            if let (Some(base), Some(layer)) =
+                (self.stroke_undo_base.as_ref(), self.stack.by_id_mut(id))
+            {
+                if let Some(original) = base.by_id(id) {
+                    for y in dirty.y..dirty.bottom() {
+                        for x in dirty.x..dirty.right() {
+                            if sel.coverage_at(x, y) <= 0.0 {
+                                let (lx, ly) = (x - offset.0, y - offset.1);
+                                layer.pixels.set(lx, ly, original.pixels.get(lx, ly));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.bg_erase_last = Some((x, y));
+        dirty
+    }
+
+    /// Finish a Background Eraser stroke, recording it as one undo step.
+    pub fn end_background_erase(&mut self) -> bool {
+        if self.bg_eraser.take().is_none() {
+            return false;
+        }
+        self.bg_erase_last = None;
+        self.stroke_undo_base = None;
+        self.commit("Background Eraser");
+        true
+    }
+
+    /// Abandon a Background Eraser stroke, restoring what it changed.
+    pub fn cancel_background_erase(&mut self) {
+        self.bg_eraser = None;
+        self.bg_erase_last = None;
+        if let Some(base) = self.stroke_undo_base.take() {
+            self.stack = base;
+        }
+    }
+
+    // -- quick mask ----------------------------------------------------------
+
+    pub fn quick_mask(&self) -> bool {
+        self.quick_mask
+    }
+
+    /// Enter or leave Quick Mask mode.
+    ///
+    /// A selection and a greyscale mask are the same thing — coverage per pixel
+    /// — so there is nothing to convert on the way in or out. What changes is
+    /// where a brush stroke goes: in Quick Mask it paints the selection rather
+    /// than the layer, which is what lets a selection be built with a soft
+    /// brush, an eraser or a gradient.
+    ///
+    /// The two ends translate between the mask's world and the tools':
+    ///
+    /// - going in, "no marquee" becomes an explicit full selection, or the
+    ///   first black stroke would have nothing to subtract from;
+    /// - coming out, a mask that ended up covering everything becomes "no
+    ///   marquee" again, since every tool treats those the same and the
+    ///   marching ants round the whole canvas would be noise.
+    pub fn set_quick_mask(&mut self, on: bool) {
+        if self.quick_mask == on {
+            return;
+        }
+        self.quick_mask = on;
+
+        if on {
+            if self.selection.is_empty() {
+                self.selection.select_all();
+            }
+        } else if self.selection.is_full() {
+            self.selection.clear();
+        }
+        self.dirty = true;
+    }
+
+    /// Paint the stroke in progress into a copy of the selection — what the
+    /// Quick Mask overlay shows while a stroke is being drawn.
+    ///
+    /// Returns `None` when there is nothing in progress, so the caller can use
+    /// the live selection and skip the copy.
+    pub fn quick_mask_preview(&self, color: Rgba8, opacity: f32) -> Option<Selection> {
+        let mask = self.stroke.as_ref()?;
+        let mut preview = self.selection.clone();
+        paint_stroke_into_selection(&mut preview, mask, color, opacity);
+        Some(preview)
+    }
+
+    /// Erase the region a click lands in — the Magic Eraser.
+    ///
+    /// The same flood the Magic Wand selects, erased instead. `sample_all` reads
+    /// the composite to decide the region, which lets a click follow what the
+    /// user can see even though only the active layer is erased — Photoshop's
+    /// Sample All Layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn magic_erase(
+        &mut self,
+        x: i32,
+        y: i32,
+        tolerance: u32,
+        contiguous: bool,
+        antialias: bool,
+        sample_all: bool,
+        opacity: f32,
+    ) -> Rect {
+        let Some(layer) = self.active_layer() else {
+            return Rect::default();
+        };
+        if layer.lock_pixels || layer.lock_transparency || !matches!(layer.kind, LayerKind::Raster)
+        {
+            return Rect::default();
+        }
+        let (id, offset) = (layer.id, layer.offset);
+
+        // What the click means is read off the image, either the composite or
+        // the layer alone, placed in document space either way.
+        let source = if sample_all {
+            self.composite()
+        } else {
+            let mut placed = Pixmap::new(self.width, self.height);
+            for py in 0..layer.pixels.height() as i32 {
+                for px in 0..layer.pixels.width() as i32 {
+                    placed.set(px + offset.0, py + offset.1, layer.pixels.get(px, py));
+                }
+            }
+            placed
+        };
+
+        let mut mask =
+            wand::magic_wand(&source, (x, y), tolerance.min(255), contiguous, antialias);
+
+        // A marquee confines the erase the way it confines a fill. Applied to
+        // the mask rather than to the pixels afterwards, so a partly selected
+        // edge is partly erased.
+        if !self.selection.is_empty() {
+            for my in 0..self.height as i32 {
+                for mx in 0..self.width as i32 {
+                    let index = my as usize * self.width as usize + mx as usize;
+                    let coverage = self.selection.coverage_at(mx, my);
+                    mask[index] = (mask[index] as f32 * coverage) as u8;
+                }
+            }
+        }
+
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return Rect::default();
+        };
+        let dirty = erase::erase_through_mask(&mut layer.pixels, &mask, self.width, offset, opacity);
+        if !dirty.is_empty() {
+            self.commit("Magic Eraser");
+        }
+        dirty
     }
 
     /// Begin a Mixer Brush stroke.
@@ -2166,55 +2617,69 @@ impl Document {
             .into_iter()
             .map(|(points, _closed)| points)
             .collect();
-        if contours.iter().all(|c| c.len() < 3) {
-            return Rect::default();
-        }
 
-        let mut coverage = Selection::new(self.width, self.height);
-        coverage.apply_polygons_feathered(&contours, SelectionOp::Replace, 0);
-
-        let id = self.active_layer;
-        let dirty = if let Some(layer) = self.stack.by_id_mut(id) {
-            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
-                return Rect::default();
-            }
-            let offset = layer.offset;
-            let lock_alpha = layer.lock_transparency;
-            let (w, h) = (layer.pixels.width(), layer.pixels.height());
-            let mut touched = Rect::default();
-
-            for y in 0..h as i32 {
-                for x in 0..w as i32 {
-                    let mut alpha = coverage.coverage_at(x + offset.0, y + offset.1) * opacity;
-                    if alpha <= 0.0 {
-                        continue;
-                    }
-                    let dst = layer.pixels.get(x, y);
-                    if lock_alpha {
-                        if dst.a == 0 {
-                            continue;
-                        }
-                        alpha *= dst.a as f32 / 255.0;
-                    }
-                    let out = crate::brush::source_over(dst, color, alpha);
-                    if out != dst {
-                        layer.pixels.set(x, y, out);
-                        touched = touched.union(&Rect::new(x, y, 1, 1));
-                    }
-                }
-            }
-            // Document space, matching every other pixel-editing call here —
-            // `touched` was accumulated in the layer's own coordinates.
-            Rect::new(touched.x + offset.0, touched.y + offset.1, touched.width, touched.height)
-        } else {
-            Rect::default()
-        };
-
+        let dirty = self.fill_polygons(&contours, color, opacity);
         if dirty.is_empty() {
             return Rect::default();
         }
         self.commit("Fill Path");
         dirty
+    }
+
+    /// Paint closed polygons onto the active layer, antialiased at their edges.
+    ///
+    /// Shared by Fill Path and the shape tools' Pixels mode: both turn an
+    /// outline into coverage and lay one colour through it. Returns the region
+    /// changed, in document space, and records no history state — the caller
+    /// names the action.
+    fn fill_polygons(&mut self, contours: &[Vec<(f32, f32)>], color: Rgba8, opacity: f32) -> Rect {
+        if contours.iter().all(|c| c.len() < 3) {
+            return Rect::default();
+        }
+
+        let mut coverage = Selection::new(self.width, self.height);
+        coverage.apply_polygons_feathered(contours, SelectionOp::Replace, 0);
+
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return Rect::default();
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return Rect::default();
+        }
+
+        let offset = layer.offset;
+        let lock_alpha = layer.lock_transparency;
+        let (w, h) = (layer.pixels.width(), layer.pixels.height());
+        let mut touched = Rect::default();
+
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let mut alpha = coverage.coverage_at(x + offset.0, y + offset.1) * opacity;
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let dst = layer.pixels.get(x, y);
+                if lock_alpha {
+                    if dst.a == 0 {
+                        continue;
+                    }
+                    alpha *= dst.a as f32 / 255.0;
+                }
+                let out = crate::brush::source_over(dst, color, alpha);
+                if out != dst {
+                    layer.pixels.set(x, y, out);
+                    touched = touched.union(&Rect::new(x, y, 1, 1));
+                }
+            }
+        }
+
+        if touched.is_empty() {
+            return Rect::default();
+        }
+        // Document space, matching every other pixel-editing call here —
+        // `touched` was accumulated in the layer's own coordinates.
+        Rect::new(touched.x + offset.0, touched.y + offset.1, touched.width, touched.height)
     }
 
     /// Stroke the active path with a brush — the Paths panel's "Stroke Path".
@@ -2399,6 +2864,7 @@ impl Document {
 mod tests {
     use super::*;
     use crate::layer::{TextAlign, TextRun};
+    use crate::sample::Limits;
 
     fn doc() -> Document {
         Document::new(16, 16, Rgba8::WHITE)
@@ -3097,6 +3563,324 @@ mod tests {
 
         assert_eq!(d.composite().get(60, 20), Rgba8::opaque(20, 40, 200),
                    "the source colour was not copied exactly");
+    }
+
+    /// A document with a blue field and a yellow bar down the right — a
+    /// stand-in for a subject against a background.
+    fn erase_fixture() -> Document {
+        let mut d = Document::new(40, 20, Rgba8::opaque(30, 120, 220));
+        if let Some(layer) = d.active_layer_mut() {
+            layer
+                .pixels
+                .fill_rect(Rect::new(20, 0, 20, 20), Rgba8::opaque(220, 200, 40));
+        }
+        d.commit("Setup");
+        d
+    }
+
+    fn erase_options() -> BackgroundEraseOptions {
+        BackgroundEraseOptions {
+            sampling: Sampling::Continuous,
+            limits: Limits::Contiguous,
+            tolerance: 40,
+            protect_foreground: false,
+        }
+    }
+
+    #[test]
+    fn entering_quick_mask_with_no_marquee_selects_everything() {
+        // Otherwise the first black stroke would have nothing to subtract from.
+        let mut d = Document::new(16, 16, Rgba8::WHITE);
+        assert!(!d.has_selection());
+        d.set_quick_mask(true);
+        assert!(d.selection().is_full());
+    }
+
+    #[test]
+    fn leaving_quick_mask_with_everything_masked_in_drops_the_marquee() {
+        // A mask covering the whole canvas and no marquee at all mean the same
+        // thing to every tool, and the ants round the edge would be noise.
+        let mut d = Document::new(16, 16, Rgba8::WHITE);
+        d.set_quick_mask(true);
+        d.set_quick_mask(false);
+        assert!(!d.has_selection());
+    }
+
+    #[test]
+    fn painting_black_in_quick_mask_masks_and_leaves_the_pixels_alone() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.set_quick_mask(true);
+
+        let brush = Brush { size: 12.0, hardness: 1.0, ..Brush::default() };
+        d.begin_stroke(&brush, 20.0, 20.0, 1.0);
+        d.end_stroke(Rgba8::BLACK, 1.0);
+
+        assert_eq!(d.selection().coverage_at(20, 20), 0.0, "black did not mask");
+        assert_eq!(d.selection().coverage_at(2, 2), 1.0, "the mask spread beyond the brush");
+        assert_eq!(d.composite().get(20, 20), Rgba8::WHITE, "the image was painted on");
+    }
+
+    #[test]
+    fn painting_white_in_quick_mask_selects_again() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.set_quick_mask(true);
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+
+        d.begin_stroke(&brush, 20.0, 20.0, 1.0);
+        d.end_stroke(Rgba8::BLACK, 1.0);
+        assert_eq!(d.selection().coverage_at(20, 20), 0.0);
+
+        let small = Brush { size: 8.0, hardness: 1.0, ..Brush::default() };
+        d.begin_stroke(&small, 20.0, 20.0, 1.0);
+        d.end_stroke(Rgba8::WHITE, 1.0);
+        assert_eq!(d.selection().coverage_at(20, 20), 1.0, "white did not select");
+        // Well inside the black stroke and clear of both the white one and the
+        // antialiased edge either brush leaves.
+        assert_eq!(d.selection().coverage_at(20, 26), 0.0, "the smaller brush reached too far");
+    }
+
+    #[test]
+    fn a_soft_brush_in_quick_mask_gives_a_soft_selection() {
+        // The reason to build a selection this way rather than with the lasso.
+        let mut d = Document::new(80, 80, Rgba8::WHITE);
+        d.set_quick_mask(true);
+        let brush = Brush { size: 40.0, hardness: 0.0, ..Brush::default() };
+        d.begin_stroke(&brush, 40.0, 40.0, 1.0);
+        d.end_stroke(Rgba8::BLACK, 1.0);
+
+        // Half way out along the falloff of a 40px soft brush, where a hard
+        // brush would have left either fully masked or fully selected.
+        let edge = d.selection().coverage_at(40, 30);
+        assert!(edge > 0.1 && edge < 0.9, "the mask edge came out hard: {edge}");
+    }
+
+    #[test]
+    fn a_shape_layer_is_a_colour_poured_through_a_mask() {
+        let mut d = Document::new(60, 40, Rgba8::WHITE);
+        let points = crate::shape::rectangle_points((10.0, 10.0, 20.0, 20.0));
+        let red = Rgba8::opaque(220, 30, 30);
+        let id = d.add_shape_layer(&points, red, "Rectangle").expect("no shape layer was added");
+
+        let layer = d.layers().by_id(id).unwrap();
+        assert!(matches!(layer.kind, LayerKind::SolidColor(c) if c == red));
+        assert!(layer.mask.is_some(), "the shape was not cut into a mask");
+
+        // Inside the rectangle the colour shows; outside, the layer below does.
+        assert_eq!(d.composite().get(20, 20), red);
+        assert_eq!(d.composite().get(2, 2), Rgba8::WHITE, "the shape covered the whole canvas");
+        assert!(d.undo(), "the shape layer left no undo step");
+        assert_eq!(d.layer_count(), 1);
+    }
+
+    #[test]
+    fn a_shape_layers_colour_can_be_changed_after_the_fact() {
+        // The point of committing a fill layer rather than pixels: it stays a
+        // colour, so the Layers panel can recolour it.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let points = crate::shape::rectangle_points((5.0, 5.0, 20.0, 20.0));
+        let id = d.add_shape_layer(&points, Rgba8::opaque(10, 10, 200), "Rectangle").unwrap();
+
+        // The shape layer is the active one, having just been added.
+        assert_eq!(d.active_layer_id(), id);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.kind = LayerKind::SolidColor(Rgba8::opaque(10, 200, 10));
+        }
+        assert_eq!(d.composite().get(10, 10), Rgba8::opaque(10, 200, 10));
+    }
+
+    #[test]
+    fn a_shape_in_pixels_mode_paints_the_active_layer() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let points = crate::shape::rectangle_points((10.0, 10.0, 10.0, 10.0));
+        let blue = Rgba8::opaque(20, 40, 200);
+        assert!(!d.fill_shape(&points, blue, 1.0).is_empty());
+
+        assert_eq!(d.layer_count(), 1, "pixels mode added a layer");
+        assert_eq!(d.composite().get(15, 15), blue);
+        assert_eq!(d.composite().get(2, 2), Rgba8::WHITE);
+        assert!(d.undo());
+        assert_eq!(d.composite().get(15, 15), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn a_shape_in_path_mode_draws_nothing_and_leaves_a_closed_path() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let points = crate::shape::rectangle_points((10.0, 10.0, 10.0, 10.0));
+        assert!(d.append_shape_path(&points));
+
+        assert_eq!(d.composite().get(15, 15), Rgba8::WHITE, "path mode painted pixels");
+        let path = d.paths().active().expect("no work path was made");
+        assert!(!path.is_empty());
+        assert!(!path.is_editing(), "the path was left open for the Pen to extend");
+
+        // And it can then be filled, which is what Path mode is for.
+        assert!(!d.fill_active_path(Rgba8::BLACK, 1.0).is_empty());
+        assert_eq!(d.composite().get(15, 15), Rgba8::BLACK);
+    }
+
+    #[test]
+    fn a_shape_needs_more_than_a_line() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let degenerate = [(10.0, 10.0), (20.0, 10.0)];
+        assert!(d.add_shape_layer(&degenerate, Rgba8::BLACK, "Rectangle").is_none());
+        assert!(!d.append_shape_path(&degenerate));
+        assert!(d.fill_shape(&degenerate, Rgba8::BLACK, 1.0).is_empty());
+    }
+
+    #[test]
+    fn a_background_erase_stroke_is_one_undo_step() {
+        let mut d = erase_fixture();
+        let brush = Brush { size: 12.0, hardness: 1.0, ..Brush::default() };
+        assert!(d.begin_background_erase(&brush, erase_options(), None, Rgba8::BLACK, 6.0, 10.0,
+                                         1.0));
+        d.extend_background_erase(&brush, 10.0, 10.0, 1.0, Rgba8::BLACK);
+        d.extend_background_erase(&brush, 14.0, 10.0, 1.0, Rgba8::BLACK);
+        assert!(d.end_background_erase());
+
+        assert_eq!(d.layers().by_id(d.active_layer_id()).unwrap().pixels.get(10, 10).a, 0,
+                   "the background was not erased");
+        assert!(d.undo(), "nothing to undo");
+        assert_eq!(d.layers().by_id(d.active_layer_id()).unwrap().pixels.get(10, 10).a, 255,
+                   "one undo did not take the whole stroke back");
+    }
+
+    #[test]
+    fn a_background_erase_leaves_what_it_did_not_sample() {
+        // The point of the tool: the crosshair rides the background while the
+        // brush overlaps the subject, and the subject survives.
+        let mut d = erase_fixture();
+        let brush = Brush { size: 20.0, hardness: 1.0, ..Brush::default() };
+        d.begin_background_erase(&brush, erase_options(), None, Rgba8::BLACK, 16.0, 10.0, 1.0);
+        d.end_background_erase();
+
+        let pixels = &d.layers().by_id(d.active_layer_id()).unwrap().pixels;
+        assert_eq!(pixels.get(14, 10).a, 0, "the sampled background survived");
+        assert_eq!(pixels.get(24, 10).a, 255, "the subject was erased too");
+    }
+
+    #[test]
+    fn a_background_erase_refuses_a_layer_locked_against_it() {
+        let mut d = erase_fixture();
+        if let Some(layer) = d.active_layer_mut() {
+            // Erasing only ever changes alpha, which is exactly what this lock
+            // forbids.
+            layer.lock_transparency = true;
+        }
+        let brush = Brush { size: 10.0, ..Brush::default() };
+        assert!(!d.begin_background_erase(&brush, erase_options(), None, Rgba8::BLACK, 6.0, 10.0,
+                                          1.0));
+    }
+
+    #[test]
+    fn the_magic_eraser_clears_the_region_it_is_clicked_in() {
+        let mut d = erase_fixture();
+        let dirty = d.magic_erase(5, 10, 32, true, true, false, 1.0);
+        assert!(!dirty.is_empty());
+
+        let pixels = &d.layers().by_id(d.active_layer_id()).unwrap().pixels;
+        assert_eq!(pixels.get(5, 10).a, 0, "the clicked region was not erased");
+        assert_eq!(pixels.get(30, 10).a, 255, "the erase crossed into the subject");
+
+        assert!(d.undo(), "the magic eraser left no undo step");
+        assert_eq!(
+            d.layers().by_id(d.active_layer_id()).unwrap().pixels.get(5, 10).a,
+            255
+        );
+    }
+
+    #[test]
+    fn the_magic_eraser_at_half_opacity_leaves_the_region_half_there() {
+        let mut d = erase_fixture();
+        d.magic_erase(5, 10, 32, true, false, false, 0.5);
+        let alpha = d.layers().by_id(d.active_layer_id()).unwrap().pixels.get(5, 10).a;
+        assert!((alpha as i32 - 128).abs() <= 2, "half an erase left alpha {alpha}");
+    }
+
+    #[test]
+    fn the_magic_eraser_refuses_a_locked_layer() {
+        let mut d = erase_fixture();
+        if let Some(layer) = d.active_layer_mut() {
+            layer.lock_pixels = true;
+        }
+        assert!(d.magic_erase(5, 10, 32, true, true, false, 1.0).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_stroke_lays_down_the_pattern() {
+        // The Pattern Stamp paints the tile itself, so what lands under the
+        // brush is whatever the pattern has at that document pixel.
+        let mut d = Document::new(80, 80, Rgba8::WHITE);
+        let brush = Brush { size: 30.0, hardness: 1.0, ..Brush::default() };
+        assert!(d.begin_pattern_stroke(&brush, 40.0, 40.0, 1.0, 0, true));
+        d.end_clone_stroke(1.0);
+
+        let tile = pattern::tile(0).unwrap();
+        let painted = d.composite().get(40, 40);
+        let expected = tile.get(40 % pattern::TILE as i32, 40 % pattern::TILE as i32);
+        assert_eq!(painted, expected, "the pattern was not laid down as it is");
+        assert_ne!(d.composite().get(2, 2), painted, "the stroke painted outside the brush");
+    }
+
+    #[test]
+    fn an_aligned_pattern_joins_up_across_strokes() {
+        // Aligned pins the tile to the document, so two separate strokes over
+        // neighbouring ground continue one sheet rather than each starting the
+        // pattern afresh.
+        let brush = Brush { size: 24.0, hardness: 1.0, ..Brush::default() };
+
+        let mut aligned = Document::new(80, 80, Rgba8::WHITE);
+        aligned.begin_pattern_stroke(&brush, 20.0, 40.0, 1.0, 0, true);
+        aligned.end_clone_stroke(1.0);
+        aligned.begin_pattern_stroke(&brush, 44.0, 40.0, 1.0, 0, true);
+        aligned.end_clone_stroke(1.0);
+
+        let mut single = Document::new(80, 80, Rgba8::WHITE);
+        single.begin_pattern_stroke(&brush, 20.0, 40.0, 1.0, 0, true);
+        single.extend_stroke(&brush, 44.0, 40.0, 1.0);
+        single.end_clone_stroke(1.0);
+
+        assert_eq!(
+            aligned.composite().get(44, 40),
+            single.composite().get(44, 40),
+            "the second aligned stroke did not continue the same sheet"
+        );
+    }
+
+    #[test]
+    fn an_unaligned_pattern_restarts_at_each_stroke() {
+        // Unaligned pins the tile to where the stroke began, so the tile's own
+        // corner lands under the first dab and the same ground comes out
+        // shifted depending on where the user started.
+        let brush = Brush { size: 24.0, hardness: 1.0, ..Brush::default() };
+        let corner = pattern::tile(0).unwrap().get(0, 0);
+
+        let mut from_left = Document::new(96, 80, Rgba8::WHITE);
+        from_left.begin_pattern_stroke(&brush, 20.0, 40.0, 1.0, 0, false);
+        from_left.extend_stroke(&brush, 76.0, 40.0, 1.0);
+        from_left.end_clone_stroke(1.0);
+        assert_eq!(from_left.composite().get(20, 40), corner, "the tile did not start at the dab");
+
+        let mut from_the_middle = Document::new(96, 80, Rgba8::WHITE);
+        from_the_middle.begin_pattern_stroke(&brush, 44.0, 40.0, 1.0, 0, false);
+        from_the_middle.extend_stroke(&brush, 76.0, 40.0, 1.0);
+        from_the_middle.end_clone_stroke(1.0);
+        assert_eq!(from_the_middle.composite().get(44, 40), corner);
+
+        // Over the ground both strokes covered, the two must disagree
+        // somewhere: they are the same pattern laid 24 pixels apart.
+        let (left, middle) = (from_left.composite(), from_the_middle.composite());
+        let shifted = (48..72).any(|x| left.get(x, 40) != middle.get(x, 40));
+        assert!(shifted, "unaligned strokes started the pattern at the same place");
+    }
+
+    #[test]
+    fn a_pattern_stroke_refuses_a_locked_layer() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.lock_pixels = true;
+        }
+        let brush = Brush { size: 10.0, ..Brush::default() };
+        assert!(!d.begin_pattern_stroke(&brush, 20.0, 20.0, 1.0, 0, true));
     }
 
     #[test]

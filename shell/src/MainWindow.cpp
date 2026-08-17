@@ -350,6 +350,17 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_canvas, &CanvasView::zoomChanged, this, &MainWindow::onZoomChanged);
     connect(m_canvas, &CanvasView::contextMenuRequested, this,
             &MainWindow::showSelectionContextMenu);
+    connect(m_canvas, &CanvasView::zoomContextMenuRequested, this,
+            &MainWindow::showZoomContextMenu);
+    // Q, and the button at the foot of the tool strip, both come through here.
+    connect(m_toolStrip, &ToolStrip::quickMaskToggled, this, [this](bool on) {
+        if (m_engine) {
+            m_engine->setQuickMask(on);
+        }
+        statusBar()->showMessage(on ? tr("Edit in Quick Mask Mode")
+                                    : tr("Edit in Standard Mode"),
+                                 2000);
+    });
     connect(m_canvas, &CanvasView::noteEditRequested, this, &MainWindow::editNote);
     connect(m_canvas, &CanvasView::statusMessage, this, [this](const QString &text) {
         statusBar()->showMessage(text, 4000);
@@ -367,6 +378,14 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         m_toolStrip->swatches()->setForeground(c);
     });
     connect(m_canvas, &CanvasView::typeStyleAdopted, this, &MainWindow::adoptTypeStyle);
+
+    // Let every Color Picker in the application sample the image. A QPointer
+    // rather than `this`, because the sampler outlives nothing in particular
+    // and must not reach a canvas that has gone.
+    ColorPickerDialog::setSampler([canvas = QPointer<CanvasView>(m_canvas)](
+                                      const QPoint &globalPos) -> QColor {
+        return canvas ? canvas->colorAtGlobal(globalPos) : QColor();
+    });
 
     // Keep the tool strip's swatch and the Color panel showing the same pair.
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged,
@@ -649,6 +668,43 @@ void MainWindow::installShortcuts()
     }
 }
 
+void MainWindow::showZoomContextMenu(const QPoint &globalPos)
+{
+    // CS6's Zoom tool menu, in its order and grouping: the four sizes it can
+    // jump straight to, then the two steps.
+    QMenu menu(this);
+    menu.setObjectName(QStringLiteral("canvasContextMenu"));
+    menu.setToolTipsVisible(true);
+
+    // The registry's own actions, so these show the same shortcuts and run the
+    // same handlers as the View menu.
+    auto addCommand = [this, &menu](const char *id) {
+        if (QAction *action = m_registry->action(QLatin1String(id))) {
+            menu.addAction(action);
+        }
+    };
+
+    addCommand("view.fitOnScreen");
+    addCommand("view.actualPixels");
+
+    // 200% has no menu-bar command of its own — it exists only here, as in CS6.
+    QAction *twice = menu.addAction(tr("200%"));
+    connect(twice, &QAction::triggered, this, [this] { m_canvas->setZoom(2.0); });
+
+    // Print Size needs a resolution to work from, and the document has no DPI
+    // yet. Listed and disabled rather than omitted, like every other entry
+    // whose engine side is missing.
+    QAction *printSize = menu.addAction(tr("Print Size"));
+    printSize->setEnabled(false);
+    printSize->setToolTip(tr("The document has no print resolution yet"));
+
+    menu.addSeparator();
+    addCommand("view.zoomIn");
+    addCommand("view.zoomOut");
+
+    menu.exec(globalPos);
+}
+
 void MainWindow::showSelectionContextMenu(const QPoint &globalPos)
 {
     // CS6's marquee right-click menu, in its order and grouping. Entries the
@@ -765,6 +821,8 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     m_mixerLoadButton = nullptr;
     m_mixerPresetCombo = nullptr;
     m_gradientSwatch = nullptr;
+    m_patternSwatch = nullptr;
+    m_customShapeButton = nullptr;
 
     // Name the active variant, so switching to Elliptical says so.
     auto *label = new QLabel(QStringLiteral("  %1  ").arg(toolVariantName(tool, variant)),
@@ -778,7 +836,11 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
     // The healing group is mostly brush-driven, but Patch, Content-Aware Move
     // and Red Eye are not — they have no brush at all, so they must not take the
     // Size/Hardness/Opacity/Flow branch below.
-    const bool paintsWithBrush = toolPaints(tool)
+    // The Magic Eraser is the odd one in a brush-tipped group: it clicks once
+    // and erases a region, so the tip picker and Flow would configure nothing.
+    const bool magicErasing =
+        tool == ToolId::Eraser && static_cast<EraserType>(variant) == EraserType::MagicEraser;
+    const bool paintsWithBrush = toolPaints(tool) && !magicErasing
         && (!toolHeals(tool) || healingIsBrush(static_cast<HealingType>(variant)));
 
     if (paintsWithBrush) {
@@ -822,8 +884,16 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
             m_optionsBar->addWidget(m_brushOpacity);
         }
 
+        // The Background Eraser erases by colour, so it gets Sampling, Limits
+        // and Tolerance in place of Flow — the same shape as the Color
+        // Replacement Brush's bar, which is the same machinery underneath.
+        const bool backgroundErasing = tool == ToolId::Eraser
+            && static_cast<EraserType>(variant) == EraserType::BackgroundEraser;
+
         if (replacing) {
             addColorReplaceOptions();
+        } else if (backgroundErasing) {
+            addBackgroundEraseOptions();
         } else if (mixing) {
             addMixerOptions();
         } else if (!pencil) {
@@ -894,9 +964,14 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
 
         // The Clone Stamp adds CS6's Aligned and Sample after the brush
         // controls — the stroke is an ordinary one, so everything above applies
-        // to it unchanged.
+        // to it unchanged. The Pattern Stamp shares the brush controls and
+        // swaps the source options for a pattern picker.
         if (tool == ToolId::CloneStamp) {
-            addCloneOptions();
+            if (static_cast<CloneType>(variant) == CloneType::PatternStamp) {
+                addPatternStampOptions();
+            } else {
+                addCloneOptions();
+            }
         }
 
         // The Spot Healing Brush adds CS6's Type buttons after the brush
@@ -998,6 +1073,10 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
                 : tr("Drag an anchor or handle to reshape the path. Alt+drag a handle "
                      "breaks it free of its smooth point"),
             m_optionsBar));
+    } else if (tool == ToolId::Shape) {
+        addShapeOptions(static_cast<ShapeTool>(variant));
+    } else if (magicErasing) {
+        addMagicEraseOptions();
     } else if (tool == ToolId::Crop) {
         addCropOptions(static_cast<CropType>(variant));
     } else if (tool == ToolId::Eyedropper
@@ -1007,11 +1086,16 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
         addTypeOptions();
     } else if (tool == ToolId::Zoom) {
         m_optionsBar->addWidget(
-            new QLabel(tr("Click to zoom in    Alt+click to zoom out"), m_optionsBar));
+            new QLabel(tr("Click to zoom in    Drag to zoom into a rectangle    "
+                          "Ctrl+Alt+click to zoom out    Right-click for zoom levels"),
+                       m_optionsBar));
     } else if (tool == ToolId::Move) {
         m_optionsBar->addWidget(
             new QLabel(tr("Drag to move the active layer    Arrow keys nudge"),
                        m_optionsBar));
+    } else if (tool == ToolId::Hand
+               && static_cast<HandTool>(variant) == HandTool::RotateView) {
+        addRotateViewOptions();
     }
 
     m_optionsBar->addSeparator();
@@ -2533,6 +2617,471 @@ void MainWindow::pushCloneOptions()
     m_canvas->setCloneOptions(m_cloneAligned, static_cast<CloneSampling>(m_cloneSampling));
 }
 
+void MainWindow::addRotateViewOptions()
+{
+    // CS6's bar: the angle as a number, and a way back to upright.
+    m_optionsBar->addWidget(new QLabel(tr("Rotation Angle:"), m_optionsBar));
+    auto *angle = new QSpinBox(m_optionsBar);
+    angle->setRange(0, 359);
+    angle->setWrapping(true);
+    angle->setSuffix(QStringLiteral("°"));
+    angle->setFixedWidth(72);
+    angle->setValue(int(m_canvas->viewRotation()));
+    angle->setToolTip(tr("How far the canvas is turned on screen. The image itself is "
+                         "not rotated — nothing about it changes"));
+    m_optionsBar->addWidget(angle);
+    connect(angle, &QSpinBox::valueChanged, this,
+            [this](int value) { m_canvas->setViewRotation(value); });
+    // A drag on the canvas moves the field, and the field moves the canvas,
+    // without the two chasing each other: the canvas only reports angles it
+    // has actually taken on.
+    connect(m_canvas, &CanvasView::viewRotationChanged, angle, [angle](double degrees) {
+        const QSignalBlocker blocker(angle);
+        angle->setValue(int(std::lround(degrees)) % 360);
+    });
+
+    auto *reset = new QPushButton(tr("Reset View"), m_optionsBar);
+    reset->setToolTip(tr("Put the canvas back upright"));
+    m_optionsBar->addWidget(reset);
+    connect(reset, &QPushButton::clicked, this, [this] { m_canvas->setViewRotation(0.0); });
+
+    m_optionsBar->addSeparator();
+
+    // Present for CS6's shape: with one canvas there is nothing for it to do.
+    auto *allWindows = new QCheckBox(tr("Rotate All Windows"), m_optionsBar);
+    allWindows->setEnabled(false);
+    allWindows->setToolTip(tr("There is only one canvas to turn"));
+    m_optionsBar->addWidget(allWindows);
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(
+        tr("Drag to turn the canvas    Space+drag still pans"), m_optionsBar));
+}
+
+void MainWindow::addShapeOptions(ShapeTool tool)
+{
+    m_shapeTool = tool;
+
+    // CS6 leads its shape bar with the Mode menu, since it decides what the
+    // drag even produces.
+    m_optionsBar->addWidget(new QLabel(tr("Mode:"), m_optionsBar));
+    auto *mode = new QComboBox(m_optionsBar);
+    struct Choice {
+        QString label;
+        ShapeMode value;
+        QString tip;
+    };
+    const Choice choices[] = {
+        {tr("Shape"), ShapeMode::Shape,
+         tr("Add a layer of its own, filled with the foreground colour and cut to the "
+            "shape")},
+        {tr("Path"), ShapeMode::Path,
+         tr("Add the outline to the work path, drawing nothing until the Paths panel "
+            "fills or strokes it")},
+        {tr("Pixels"), ShapeMode::Pixels,
+         tr("Paint the shape straight onto the active layer in the foreground colour")},
+    };
+    for (const Choice &choice : choices) {
+        mode->addItem(choice.label, int(choice.value));
+        mode->setItemData(mode->count() - 1, choice.tip, Qt::ToolTipRole);
+        if (choice.value == m_shapeMode) {
+            mode->setCurrentIndex(mode->count() - 1);
+        }
+    }
+    m_optionsBar->addWidget(mode);
+    connect(mode, &QComboBox::currentIndexChanged, this, [this, mode](int index) {
+        m_shapeMode = static_cast<ShapeMode>(mode->itemData(index).toInt());
+        m_canvas->setShapeMode(m_shapeMode);
+    });
+
+    m_optionsBar->addSeparator();
+
+    // CS6's Fill swatch. The shape takes the foreground colour, so this is that
+    // swatch rather than a second colour of its own — picking here changes the
+    // foreground, exactly as the Type tool's colour button does.
+    m_optionsBar->addWidget(new QLabel(tr("Fill:"), m_optionsBar));
+    auto *fill = new QToolButton(m_optionsBar);
+    fill->setFixedSize(22, 22);
+    fill->setToolTip(tr("The foreground colour the shape is filled with"));
+    auto refreshFill = [this, fill] {
+        QPixmap pm(16, 16);
+        pm.fill(m_engine ? m_engine->foregroundColor() : QColor(Qt::black));
+        QPainter p(&pm);
+        p.setPen(QColor(0, 0, 0, 160));
+        p.drawRect(pm.rect().adjusted(0, 0, -1, -1));
+        fill->setIcon(QIcon(pm));
+    };
+    refreshFill();
+    m_optionsBar->addWidget(fill);
+    connect(fill, &QToolButton::clicked, this, [this, refreshFill] {
+        if (!m_engine) {
+            return;
+        }
+        const QColor picked =
+            ColorPickerDialog::getColor(m_engine->foregroundColor(), this, tr("Fill Color"));
+        if (picked.isValid()) {
+            m_engine->setForegroundColor(picked);
+            m_colorPanel->setForegroundColor(picked);
+            m_toolStrip->swatches()->setForeground(picked);
+            refreshFill();
+        }
+    });
+
+    m_optionsBar->addSeparator();
+
+    // Then whichever setting this particular shape owns. CS6 shows one field
+    // here and it changes with the tool, so only the relevant one is built.
+    switch (tool) {
+    case ShapeTool::RoundedRectangle: {
+        m_optionsBar->addWidget(new QLabel(tr("Radius:"), m_optionsBar));
+        auto *radius = new QSpinBox(m_optionsBar);
+        radius->setRange(0, 1000);
+        radius->setValue(m_shapeCornerRadius);
+        radius->setSuffix(tr(" px"));
+        radius->setFixedWidth(76);
+        radius->setToolTip(tr("How far the corners are rounded. Anything past half the "
+                              "shorter side gives the same fully rounded ends"));
+        m_optionsBar->addWidget(radius);
+        connect(radius, &QSpinBox::valueChanged, this, [this](int value) {
+            m_shapeCornerRadius = value;
+            pushShapeOptions();
+        });
+        break;
+    }
+
+    case ShapeTool::Polygon: {
+        m_optionsBar->addWidget(new QLabel(tr("Sides:"), m_optionsBar));
+        auto *sides = new QSpinBox(m_optionsBar);
+        sides->setRange(3, 100);
+        sides->setValue(m_shapeSides);
+        sides->setFixedWidth(64);
+        sides->setToolTip(tr("How many sides the polygon has"));
+        m_optionsBar->addWidget(sides);
+        connect(sides, &QSpinBox::valueChanged, this, [this](int value) {
+            m_shapeSides = value;
+            pushShapeOptions();
+        });
+        break;
+    }
+
+    case ShapeTool::Line: {
+        m_optionsBar->addWidget(new QLabel(tr("Weight:"), m_optionsBar));
+        auto *weight = new QSpinBox(m_optionsBar);
+        weight->setRange(1, 1000);
+        weight->setValue(m_shapeLineWeight);
+        weight->setSuffix(tr(" px"));
+        weight->setFixedWidth(76);
+        weight->setToolTip(tr("How thick the line is. The Line tool draws a filled "
+                              "shape, not a brush stroke, so this is its width rather "
+                              "than a brush size"));
+        m_optionsBar->addWidget(weight);
+        connect(weight, &QSpinBox::valueChanged, this, [this](int value) {
+            m_shapeLineWeight = value;
+            pushShapeOptions();
+        });
+        break;
+    }
+
+    case ShapeTool::CustomShape: {
+        m_optionsBar->addWidget(new QLabel(tr("Shape:"), m_optionsBar));
+        m_customShapeButton = new QToolButton(m_optionsBar);
+        m_customShapeButton->setPopupMode(QToolButton::InstantPopup);
+        m_customShapeButton->setIconSize(QSize(24, 24));
+        m_customShapeButton->setFixedSize(38, 26);
+
+        auto *menu = new QMenu(m_customShapeButton);
+        const QStringList names = m_engine
+            ? m_engine->customShapeNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts)
+            : QStringList();
+        for (int i = 0; i < names.size(); ++i) {
+            QAction *action = menu->addAction(names.at(i));
+            action->setIcon(QIcon(QPixmap::fromImage(m_engine->customShapePreview(i, 32))));
+            action->setCheckable(true);
+            action->setChecked(i == m_customShape);
+            connect(action, &QAction::triggered, this, [this, i] {
+                m_customShape = i;
+                refreshCustomShapeButton();
+                pushShapeOptions();
+            });
+        }
+        m_customShapeButton->setMenu(menu);
+        m_optionsBar->addWidget(m_customShapeButton);
+        refreshCustomShapeButton();
+        break;
+    }
+
+    case ShapeTool::Rectangle:
+    case ShapeTool::Ellipse:
+        break;
+    }
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(shapeHintFor(tool), m_optionsBar));
+
+    m_canvas->setShapeMode(m_shapeMode);
+    pushShapeOptions();
+}
+
+QString MainWindow::shapeHintFor(ShapeTool tool) const
+{
+    // The modifiers do different things per tool, so the hint says which.
+    switch (tool) {
+    case ShapeTool::Polygon:
+        return tr("Drag from the centre outward    Shift snaps the angle to 15°");
+    case ShapeTool::Line:
+        return tr("Drag end to end    Shift snaps the angle to 45°");
+    case ShapeTool::Ellipse:
+        return tr("Drag to draw    Shift constrains to a circle    Alt draws from the centre");
+    default:
+        return tr("Drag to draw    Shift constrains to a square    Alt draws from the centre");
+    }
+}
+
+void MainWindow::refreshCustomShapeButton()
+{
+    if (!m_customShapeButton || !m_engine) {
+        return;
+    }
+    m_customShapeButton->setIcon(
+        QIcon(QPixmap::fromImage(m_engine->customShapePreview(m_customShape, 24))));
+    const QStringList names =
+        m_engine->customShapeNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    m_customShapeButton->setToolTip(tr("Shape: %1").arg(names.value(m_customShape)));
+}
+
+void MainWindow::pushShapeOptions()
+{
+    if (m_engine) {
+        m_engine->setShapeOptions(int(m_shapeTool), float(m_shapeCornerRadius), m_shapeSides,
+                                  float(m_shapeLineWeight), m_customShape);
+    }
+}
+
+void MainWindow::addBackgroundEraseOptions()
+{
+    m_optionsBar->addSeparator();
+
+    // Sampling: three buttons in CS6, since it is the control the tool lives or
+    // dies by — where the colour to erase comes from.
+    m_optionsBar->addWidget(new QLabel(tr("Sampling:"), m_optionsBar));
+    auto *sampling = new QComboBox(m_optionsBar);
+    struct Mode {
+        QString label;
+        QString tip;
+    };
+    const Mode samplingModes[] = {
+        {tr("Continuous"), tr("Re-read the colour under the crosshair as it moves, so "
+                              "dragging along an edge erases whatever it is over")},
+        {tr("Once"), tr("Erase only the colour under the crosshair when the drag began")},
+        {tr("Background Swatch"), tr("Erase whatever matches the background colour, "
+                                     "sampling nothing from the image")},
+    };
+    for (const Mode &mode : samplingModes) {
+        sampling->addItem(mode.label);
+        sampling->setItemData(sampling->count() - 1, mode.tip, Qt::ToolTipRole);
+    }
+    sampling->setCurrentIndex(m_bgEraseSampling);
+    m_optionsBar->addWidget(sampling);
+    connect(sampling, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_bgEraseSampling = index;
+        pushBackgroundEraseOptions();
+    });
+
+    m_optionsBar->addWidget(new QLabel(tr("Limits:"), m_optionsBar));
+    auto *limits = new QComboBox(m_optionsBar);
+    const Mode limitModes[] = {
+        {tr("Discontiguous"), tr("Erase every matching pixel under the brush, connected "
+                                 "or not")},
+        {tr("Contiguous"), tr("Erase only what is joined to the pixel under the "
+                              "crosshair")},
+        {tr("Find Edges"), tr("As contiguous, but stopping at strong edges, which keeps "
+                              "the erase off the far side of a boundary")},
+    };
+    for (const Mode &mode : limitModes) {
+        limits->addItem(mode.label);
+        limits->setItemData(limits->count() - 1, mode.tip, Qt::ToolTipRole);
+    }
+    limits->setCurrentIndex(m_bgEraseLimits);
+    m_optionsBar->addWidget(limits);
+    connect(limits, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_bgEraseLimits = index;
+        pushBackgroundEraseOptions();
+    });
+
+    m_optionsBar->addWidget(new QLabel(tr("Tolerance:"), m_optionsBar));
+    auto *tolerance = new QSpinBox(m_optionsBar);
+    tolerance->setRange(0, 100);
+    tolerance->setValue(m_bgEraseTolerance);
+    tolerance->setSuffix(QStringLiteral("%"));
+    tolerance->setFixedWidth(64);
+    tolerance->setToolTip(tr("How far a colour may differ from the sampled one and still "
+                             "be erased"));
+    m_optionsBar->addWidget(tolerance);
+    connect(tolerance, &QSpinBox::valueChanged, this, [this](int value) {
+        m_bgEraseTolerance = value;
+        pushBackgroundEraseOptions();
+    });
+
+    auto *protect = new QCheckBox(tr("Protect Foreground Color"), m_optionsBar);
+    protect->setChecked(m_bgEraseProtectForeground);
+    protect->setToolTip(tr("Never erase what matches the foreground colour, for keeping a "
+                           "colour that also appears in the background"));
+    m_optionsBar->addWidget(protect);
+    connect(protect, &QCheckBox::toggled, this, [this](bool on) {
+        m_bgEraseProtectForeground = on;
+        pushBackgroundEraseOptions();
+    });
+
+    pushBackgroundEraseOptions();
+}
+
+void MainWindow::pushBackgroundEraseOptions()
+{
+    m_canvas->setBackgroundEraseOptions(m_bgEraseSampling, m_bgEraseLimits, m_bgEraseTolerance,
+                                        m_bgEraseProtectForeground);
+}
+
+void MainWindow::addMagicEraseOptions()
+{
+    m_optionsBar->addWidget(new QLabel(tr("Tolerance:"), m_optionsBar));
+    auto *tolerance = new QSpinBox(m_optionsBar);
+    tolerance->setRange(0, 255);
+    tolerance->setValue(m_magicEraseTolerance);
+    tolerance->setFixedWidth(64);
+    tolerance->setToolTip(tr("How far a colour may differ from the clicked one and still "
+                             "be erased"));
+    m_optionsBar->addWidget(tolerance);
+    connect(tolerance, &QSpinBox::valueChanged, this, [this](int value) {
+        m_magicEraseTolerance = value;
+        pushMagicEraseOptions();
+    });
+
+    auto *antialias = new QCheckBox(tr("Anti-alias"), m_optionsBar);
+    antialias->setChecked(m_magicEraseAntialias);
+    antialias->setToolTip(tr("Soften the edge of what is erased"));
+    m_optionsBar->addWidget(antialias);
+    connect(antialias, &QCheckBox::toggled, this, [this](bool on) {
+        m_magicEraseAntialias = on;
+        pushMagicEraseOptions();
+    });
+
+    auto *contiguous = new QCheckBox(tr("Contiguous"), m_optionsBar);
+    contiguous->setChecked(m_magicEraseContiguous);
+    contiguous->setToolTip(tr("Erase only the matching area joined to the click. Off, "
+                              "every matching pixel in the layer goes"));
+    m_optionsBar->addWidget(contiguous);
+    connect(contiguous, &QCheckBox::toggled, this, [this](bool on) {
+        m_magicEraseContiguous = on;
+        pushMagicEraseOptions();
+    });
+
+    auto *sampleAll = new QCheckBox(tr("Sample All Layers"), m_optionsBar);
+    sampleAll->setChecked(m_magicEraseSampleAll);
+    sampleAll->setToolTip(tr("Decide the region from the whole visible image rather than "
+                             "the active layer alone. Only the active layer is erased "
+                             "either way"));
+    m_optionsBar->addWidget(sampleAll);
+    connect(sampleAll, &QCheckBox::toggled, this, [this](bool on) {
+        m_magicEraseSampleAll = on;
+        pushMagicEraseOptions();
+    });
+
+    m_optionsBar->addSeparator();
+    m_optionsBar->addWidget(new QLabel(tr("Opacity:"), m_optionsBar));
+    auto *opacity = new QSpinBox(m_optionsBar);
+    opacity->setRange(1, 100);
+    opacity->setValue(m_magicEraseOpacity);
+    opacity->setSuffix(QStringLiteral("%"));
+    opacity->setFixedWidth(64);
+    opacity->setToolTip(tr("How much of the region to take away. Below 100% it is left "
+                           "partly there"));
+    m_optionsBar->addWidget(opacity);
+    connect(opacity, &QSpinBox::valueChanged, this, [this](int value) {
+        m_magicEraseOpacity = value;
+        pushMagicEraseOptions();
+    });
+
+    pushMagicEraseOptions();
+}
+
+void MainWindow::pushMagicEraseOptions()
+{
+    m_canvas->setMagicEraseOptions(m_magicEraseTolerance, m_magicEraseAntialias,
+                                   m_magicEraseContiguous, m_magicEraseSampleAll,
+                                   m_magicEraseOpacity);
+}
+
+void MainWindow::addPatternStampOptions()
+{
+    m_optionsBar->addSeparator();
+
+    // The pattern swatch and its picker, as CS6 has it: a button showing the
+    // current tile that drops down the list. The swatches come from the engine
+    // so what the picker shows is what the tool paints.
+    m_patternSwatch = new QToolButton(m_optionsBar);
+    m_patternSwatch->setPopupMode(QToolButton::InstantPopup);
+    m_patternSwatch->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    m_patternSwatch->setIconSize(QSize(24, 24));
+    m_patternSwatch->setFixedSize(38, 26);
+
+    auto *menu = new QMenu(m_patternSwatch);
+    const QStringList names = m_engine
+        ? m_engine->patternNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts)
+        : QStringList();
+    for (int i = 0; i < names.size(); ++i) {
+        QAction *action = menu->addAction(names.at(i));
+        action->setIcon(QIcon(QPixmap::fromImage(m_engine->patternPreview(i, 32))));
+        action->setCheckable(true);
+        action->setChecked(i == m_patternIndex);
+        connect(action, &QAction::triggered, this, [this, i] {
+            m_patternIndex = i;
+            refreshPatternSwatch();
+            pushPatternOptions();
+        });
+    }
+    m_patternSwatch->setMenu(menu);
+    m_optionsBar->addWidget(m_patternSwatch);
+    refreshPatternSwatch();
+
+    auto *aligned = new QCheckBox(tr("Aligned"), m_optionsBar);
+    aligned->setChecked(m_patternAligned);
+    aligned->setToolTip(tr("Pin the pattern to the document, so separate strokes uncover "
+                           "one continuous sheet. Off, every stroke starts the pattern "
+                           "again where it began"));
+    m_optionsBar->addWidget(aligned);
+    connect(aligned, &QCheckBox::toggled, this, [this](bool on) {
+        m_patternAligned = on;
+        pushPatternOptions();
+    });
+
+    // Listed for CS6's shape, disabled: Impressionist repaints the pattern as
+    // smeared dabs, which is a brush-dynamics feature of its own.
+    auto *impressionist = new QCheckBox(tr("Impressionist"), m_optionsBar);
+    impressionist->setEnabled(false);
+    impressionist->setToolTip(tr("Not implemented yet"));
+    m_optionsBar->addWidget(impressionist);
+
+    pushPatternOptions();
+}
+
+void MainWindow::refreshPatternSwatch()
+{
+    if (!m_patternSwatch || !m_engine) {
+        return;
+    }
+    m_patternSwatch->setIcon(QIcon(QPixmap::fromImage(m_engine->patternPreview(m_patternIndex, 24))));
+    const QStringList names =
+        m_engine->patternNames().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    m_patternSwatch->setToolTip(tr("Pattern: %1").arg(names.value(m_patternIndex)));
+}
+
+void MainWindow::pushPatternOptions()
+{
+    if (m_engine) {
+        m_engine->setPatternOptions(m_patternIndex, m_patternAligned);
+    }
+}
+
 void MainWindow::warnCloneSourceRequired()
 {
     // Photoshop's own wording, down to the parenthesis.
@@ -3573,6 +4122,12 @@ void MainWindow::onToolChanged(ToolId tool, int variant)
         m_canvas->setPenTool(static_cast<PenTool>(variant));
     } else if (tool == ToolId::PathSelect) {
         m_canvas->setPathSelectTool(static_cast<PathSelectTool>(variant));
+    } else if (tool == ToolId::Hand) {
+        m_canvas->setHandTool(static_cast<HandTool>(variant));
+    } else if (tool == ToolId::Eraser) {
+        m_canvas->setEraserType(static_cast<EraserType>(variant));
+    } else if (tool == ToolId::CloneStamp) {
+        m_canvas->setCloneTool(static_cast<CloneType>(variant));
     } else if (tool == ToolId::Crop) {
         m_canvas->setCropType(static_cast<CropType>(variant));
     } else if (tool == ToolId::Eyedropper) {

@@ -9,6 +9,7 @@
 #include <QPoint>
 #include <QPointF>
 #include <QPolygonF>
+#include <QTransform>
 #include <QWidget>
 
 #include "../tools/ToolId.h"
@@ -41,6 +42,12 @@ public:
     /// Set zoom, keeping `focusWidgetPos` pinned to the same document pixel.
     /// This is what makes scroll-wheel zoom feel anchored to the cursor.
     void setZoomAt(double zoom, const QPointF &focusWidgetPos);
+
+    /// Turn the whole view, the way the Rotate View tool does — the canvas is
+    /// rotated on screen and nothing about the image changes. Degrees
+    /// clockwise; 0 is upright.
+    void setViewRotation(double degrees);
+    double viewRotation() const { return m_viewRotation; }
 
     /// Scale so the whole document fits, then centre it (Ctrl+0).
     void fitToWindow();
@@ -80,6 +87,26 @@ public:
     void setHealType(HealType type);
     HealType healType() const { return m_healType; }
 
+    /// What a dragged shape commits as — CS6's Mode menu.
+    void setShapeMode(ShapeMode mode) { m_shapeMode = mode; }
+    ShapeMode shapeMode() const { return m_shapeMode; }
+
+    /// Which of the three tools the Eraser button currently holds. The plain
+    /// Eraser strokes like a brush; the Background Eraser erases by colour per
+    /// dab, and the Magic Eraser erases a region on one click.
+    void setEraserType(EraserType type);
+    EraserType eraserType() const { return m_eraserType; }
+
+    /// The Background Eraser's options bar: Sampling (0 Continuous, 1 Once,
+    /// 2 Background Swatch), Limits (0 Discontiguous, 1 Contiguous, 2 Find
+    /// Edges), Tolerance as a percentage, and Protect Foreground Color.
+    void setBackgroundEraseOptions(int sampling, int limits, int tolerance,
+                                   bool protectForeground);
+    /// The Magic Eraser's: Tolerance 0-255, Anti-alias, Contiguous, Sample All
+    /// Layers and Opacity as a percentage.
+    void setMagicEraseOptions(int tolerance, bool antialias, bool contiguous,
+                              bool sampleAllLayers, int opacity);
+
     /// Route strokes through the Color Replacement path, which recolours the
     /// layer per dab instead of compositing a stroke at the end.
     void setReplaceMode(bool active);
@@ -103,6 +130,11 @@ public:
     void setPenTool(PenTool tool);
     PenTool penTool() const { return m_penTool; }
 
+    /// Which of the two tools the Hand button currently holds. Rotate View
+    /// turns the canvas on screen instead of sliding it.
+    void setHandTool(HandTool tool);
+    HandTool handTool() const { return m_handTool; }
+
     /// Which of the two tools the Path Selection button currently holds.
     void setPathSelectTool(PathSelectTool tool);
     PathSelectTool pathSelectTool() const { return m_pathSelectTool; }
@@ -119,6 +151,12 @@ public:
     /// The Clone Stamp's options: Aligned keeps the sample point travelling
     /// with the cursor across strokes, and Sample picks which layers it reads.
     void setCloneOptions(bool aligned, CloneSampling sampling);
+
+    /// Which of the two tools the Clone Stamp button currently holds. The
+    /// Pattern Stamp paints a repeating pattern instead of sampled pixels, so
+    /// it needs no Alt-clicked source.
+    void setCloneTool(CloneType tool);
+    CloneType cloneTool() const { return m_cloneTool; }
 
     /// Which healing-group variant is active.
     void setHealingType(HealingType type);
@@ -203,8 +241,27 @@ public:
     /// signal is the trigger.
     void refreshSelection();
 
+    /// The composited colour under a point on *screen*, or an invalid colour
+    /// if that point is not over the image.
+    ///
+    /// For the Color Picker's eyedropper, which samples while a modal dialog
+    /// holds the mouse and so only has global coordinates to go on. It reads
+    /// the document rather than the screen, so what it picks is unaffected by
+    /// zoom, the transparency checkerboard or any overlay drawn on top.
+    QColor colorAtGlobal(const QPoint &globalPos) const;
+
     /// Convert a widget point to document space.
     QPointF widgetToDocument(const QPointF &pos) const;
+    /// A movement measured on screen, turned back into the frame the pan is
+    /// kept in. The identity while the view is upright.
+    QPointF uprightDelta(const QPointF &screenDelta) const;
+    /// The angle, in degrees, from the middle of the viewport to a point in
+    /// it — what a Rotate View drag follows.
+    double angleToPointer(const QPointF &widgetPos) const;
+    /// The view rotation as a transform about the widget's centre, which is
+    /// what everything drawn in unrotated widget space has to be drawn under.
+    /// The identity while the view is upright.
+    QTransform viewTransform() const;
     /// Convert a document point to widget space.
     QPointF documentToWidget(const QPointF &pos) const;
 
@@ -245,12 +302,18 @@ signals:
     void cursorLeft();
     /// Emitted whenever the zoom factor changes.
     void zoomChanged(double zoom);
+    /// Emitted whenever the view is turned, so the Rotate View tool's angle
+    /// field follows a drag.
+    void viewRotationChanged(double degrees);
     /// The user picked a colour with the eyedropper.
     void colorPicked(const QColor &color);
     /// Right-click with a selection tool active. `globalPos` is where the
     /// menu should open. The canvas does not build the menu itself: the
     /// commands on it belong to the registry, which `MainWindow` owns.
     void contextMenuRequested(const QPoint &globalPos);
+    /// Right-click with the Zoom tool active. Like `contextMenuRequested`, the
+    /// menu itself is MainWindow's to build.
+    void zoomContextMenuRequested(const QPoint &globalPos);
     /// A note needs its text edited. The canvas does not own dialogs, so
     /// `MainWindow` puts one up and writes the result back to the engine.
     void noteEditRequested(int index);
@@ -489,6 +552,22 @@ private:
     /// progress and its own font, colour and alignment become the Type tool's.
     /// The caret lands where in the text `doc` fell.
     void beginTypeEdit(int layerIndex, const QPointF &doc);
+    /// Draw the outline of the shape being dragged out, so the user sees what
+    /// they are about to commit.
+    void paintShapeOverlay(QPainter &painter);
+    /// Draw the rectangle a Zoom drag is marking out.
+    void paintZoomOverlay(QPainter &painter);
+    /// The two-tone dashed outline a pending gesture is drawn with — nothing
+    /// has been committed until the button comes up, and this is what says so.
+    void paintPendingOutline(QPainter &painter, const QPolygonF &widgetOutline) const;
+    /// Zoom so a document-space rectangle fills the viewport, and centre it.
+    void zoomToRect(const QRectF &docRect);
+    /// The outline a drag to `doc` marks out, asked of the engine. The
+    /// modifiers go with it: what Shift and Alt mean depends on the tool, and
+    /// the engine is where that is decided.
+    QPolygonF shapeOutlineFor(const QPointF &doc, Qt::KeyboardModifiers modifiers) const;
+
+
     /// Draw the text composed so far, its selection and its insertion caret.
     void paintTypeOverlay(QPainter &painter);
     /// The bounding rectangle of the composed text in document coordinates,
@@ -647,6 +726,23 @@ private:
     QImage m_image;
 
     double m_zoom = 1.0;
+    /// Degrees the view is turned by, clockwise. Purely a way of looking at
+    /// the document: no pixel, layer or coordinate in the engine knows about
+    /// it, and it is not saved with the file.
+    double m_viewRotation = 0.0;
+    /// The angle the Rotate View drag started from, and the pointer's angle at
+    /// that moment — the drag turns the view by the difference.
+    double m_rotateStartAngle = 0.0;
+    double m_rotateStartRotation = 0.0;
+    bool m_rotatingView = false;
+    HandTool m_handTool = HandTool::Hand;
+
+    /// The Zoom tool's marquee: where the drag began, and the rectangle it has
+    /// marked out so far, both in document space. Empty unless a drag is in
+    /// progress.
+    bool m_zoomDragging = false;
+    QPointF m_zoomStartDoc;
+    QRectF m_zoomRectDoc;
     /// Pan offset in widget pixels, from the centred position.
     QPointF m_pan{0.0, 0.0};
 
@@ -859,6 +955,28 @@ private:
     /// well as in the engine so the overlay can draw it.
     QPointF m_cloneSource;
     bool m_cloneSourceValid = false;
+    /// The Shape tools' Mode, and the outline being dragged out — empty unless
+    /// a drag is in progress. The outline comes from the engine rather than
+    /// being worked out here, so what is previewed is what will land.
+    ShapeMode m_shapeMode = ShapeDefaults::kMode;
+    QPolygonF m_shapeOutline;
+    bool m_shapeDragging = false;
+
+    /// Which eraser is in hand, and the two colour erasers' settings.
+    EraserType m_eraserType = EraserType::Eraser;
+    int m_bgEraseSampling = BackgroundEraseDefaults::kSampling;
+    int m_bgEraseLimits = BackgroundEraseDefaults::kLimits;
+    int m_bgEraseTolerance = BackgroundEraseDefaults::kTolerance;
+    bool m_bgEraseProtectForeground = BackgroundEraseDefaults::kProtectForeground;
+    int m_magicEraseTolerance = MagicEraseDefaults::kTolerance;
+    bool m_magicEraseAntialias = MagicEraseDefaults::kAntialias;
+    bool m_magicEraseContiguous = MagicEraseDefaults::kContiguous;
+    bool m_magicEraseSampleAll = MagicEraseDefaults::kSampleAllLayers;
+    int m_magicEraseOpacity = MagicEraseDefaults::kOpacity;
+    /// True while a Background Eraser drag is in progress.
+    bool m_backgroundErasing = false;
+
+    CloneType m_cloneTool = CloneType::CloneStamp;
     bool m_cloneAligned = CloneDefaults::kAligned;
     CloneSampling m_cloneSampling = CloneDefaults::kSampling;
     /// True while one of the region healing tools is tracing its outline; it

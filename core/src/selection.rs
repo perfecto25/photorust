@@ -413,6 +413,32 @@ impl Selection {
     }
 
     /// Select everything.
+    /// Paint a value into the mask through a brush's coverage — Quick Mask.
+    ///
+    /// `target` is where a fully covered pixel ends up, `0.0..=1.0`: painting
+    /// black in Quick Mask drives the selection to 0 (masked, and shown under
+    /// the red veil) and white drives it to 1. Partial brush coverage moves the
+    /// pixel part of the way, so a soft brush gives a soft-edged selection —
+    /// which is the whole reason to edit a selection as if it were paint.
+    pub fn paint_at(&mut self, x: i32, y: i32, coverage: f32, target: f32) {
+        let coverage = coverage.clamp(0.0, 1.0);
+        if coverage <= 0.0 {
+            return;
+        }
+        let existing = self.coverage_at(x, y);
+        let blended = existing + (target.clamp(0.0, 1.0) - existing) * coverage;
+        self.set_raw(x, y, (blended * 255.0 + 0.5) as u8);
+    }
+
+    /// Whether every pixel is fully selected.
+    ///
+    /// The counterpart to `is_empty`, and the question Quick Mask asks on the
+    /// way out: a mask that ends up covering everything is the same thing as no
+    /// marquee at all, and the tools are happier with the latter.
+    pub fn is_full(&self) -> bool {
+        self.coverage.iter().all(|c| *c == 255)
+    }
+
     pub fn select_all(&mut self) {
         self.coverage.fill(255);
         self.cached_bounds = Some(Rect::from_size(self.width, self.height));
@@ -753,6 +779,31 @@ fn collapse_runs(path: &[(i32, i32)]) -> Vec<(i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painting_moves_a_pixel_toward_the_target() {
+        let mut sel = Selection::all(4, 4);
+        // Black at full coverage masks it completely.
+        sel.paint_at(1, 1, 1.0, 0.0);
+        assert_eq!(sel.coverage_at(1, 1), 0.0);
+
+        // Half coverage moves it half way back.
+        sel.paint_at(1, 1, 0.5, 1.0);
+        assert!((sel.coverage_at(1, 1) - 0.5).abs() < 0.01);
+
+        // And a brush that does not reach a pixel leaves it alone.
+        sel.paint_at(2, 2, 0.0, 0.0);
+        assert_eq!(sel.coverage_at(2, 2), 1.0);
+    }
+
+    #[test]
+    fn a_mask_covering_everything_reads_as_full() {
+        let mut sel = Selection::all(4, 4);
+        assert!(sel.is_full());
+        sel.paint_at(0, 0, 1.0, 0.0);
+        assert!(!sel.is_full());
+        assert!(!Selection::new(4, 4).is_full(), "an empty mask is not a full one");
+    }
 
     #[test]
     fn new_selection_is_empty() {

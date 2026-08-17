@@ -332,23 +332,35 @@ ToolTip floating bar
 - eye dropper tools - done
 - healing tools - done
 - brush tools - done
-- stamp and clone tools - in progress
+- stamp and clone tools - done
 - history brush tool - not started
-- eraser tools - not started. 1/3 done
+- eraser tools - done
 - gradient tools - done
 - blur tools - done
 - dodge tools - done
 - pen tools - done
 - type tools - done
-- selection tools - not started
-- shape tools - not started
-- hand tools - not started
-- zoom tools - 80% done, need work
-- Color picker tool - basic functionality, need to add eye dropper picker
+- selection tools -  done
+- shape tools - done
+- hand tools - done
+- zoom tools - done
+- Color picker tool - done
+- Mask modes - quick mask and standard modes - done
 
 Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
 
 Auto recovery - save working project to temp file for auto recover - not started
 
 Layers - add ability to lock layer from modification - done
+
+File format support:
+
+- GIF - in progress
+- JPG
+- BMP
+- PSD - not started
+- RAW
+- PNG
+- TIFF
+
 ```

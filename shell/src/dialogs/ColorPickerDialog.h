@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <QColor>
 #include <QDialog>
 #include <QImage>
@@ -10,6 +12,7 @@ class QLabel;
 class QLineEdit;
 class QRadioButton;
 class QSpinBox;
+class QTimer;
 
 /// The component the vertical ramp controls.
 ///
@@ -176,6 +179,28 @@ public:
                            QWidget *parent = nullptr,
                            const QString &title = {});
 
+    /// How the eyedropper reads a colour off the image: given a point on
+    /// screen, return the colour there, or an invalid colour if the point is
+    /// not over the image.
+    using Sampler = std::function<QColor(const QPoint &globalPos)>;
+
+    /// Install that function for every picker in the application.
+    ///
+    /// Deliberately application-wide rather than passed in per call: where the
+    /// picker samples from is a property of the app — there is one canvas —
+    /// and threading it through would mean teaching the Color panel and the
+    /// tool strip's swatches about the canvas, which is not their business.
+    /// Without one installed the eyedropper simply does not appear.
+    static void setSampler(Sampler sampler);
+
+protected:
+    // While the pointer is off the dialog it holds the mouse, so these arrive
+    // wherever it is — including over the canvas behind the dialog.
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+
 private slots:
     void onAxisChanged();
     void onPlanePicked(int hue, int sat, int val);
@@ -188,6 +213,19 @@ private slots:
 
 private:
     void buildUi(const QString &title);
+    /// Follow the pointer: take the mouse while it is off the dialog, give it
+    /// back when it returns, and sample whatever it is over in between.
+    ///
+    /// Called from a timer and from every mouse move, so it is the one place
+    /// that decides whether sampling is happening.
+    void updateHoverSampling();
+    /// Read the colour at a screen point and show it. False if there is
+    /// nothing to sample there.
+    bool sampleAt(const QPoint &globalPos);
+    /// Show the eyedropper over the image and an ordinary arrow anywhere else.
+    void showCursorFor(bool overImage);
+    /// Put the application's cursor back, exactly once.
+    void clearCursorOverride();
     /// Push the current colour into every control except `except`, which is
     /// the one the user is typing into.
     void syncControls(QWidget *except = nullptr);
@@ -214,6 +252,18 @@ private:
 
     QColor m_original{Qt::black};
     bool m_updating = false;
+
+    /// True while the pointer is off the dialog and the mouse is held, which
+    /// is when sampling happens.
+    bool m_sampling = false;
+    /// Polls where the pointer is. The dialog is modal, so nothing else in the
+    /// application sees the pointer to tell it — and without the mouse held
+    /// there are no move events to go on either.
+    QTimer *m_hoverTimer = nullptr;
+    /// Whether this dialog has an override cursor pushed. Kept so the push and
+    /// the pop stay in step — an unbalanced restore would strip a cursor some
+    /// other part of the application had set.
+    bool m_cursorOverridden = false;
 
     ColorPlane *m_plane = nullptr;
     ColorRamp *m_ramp = nullptr;

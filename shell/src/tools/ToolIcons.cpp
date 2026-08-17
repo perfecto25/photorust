@@ -19,6 +19,11 @@ const char *const kStrokeAttrs =
     R"SVG(fill="none" stroke="COLOR" stroke-width="1.25" )SVG"
     R"SVG(stroke-linecap="round" stroke-linejoin="round")SVG";
 
+/// The cursor arrow both path selection tools are drawn from — filled for one,
+/// hollow for the other (see `pathSelectVariantBody`). Kept in one place so the
+/// pair cannot drift apart.
+const char *const kPathArrow = "M5 1.8 5 16.2 8.5 12.7 10.9 17.8 13.4 16.6 11 11.6 15.8 11.6z";
+
 /// SVG body for each tool, on a 20×20 viewBox.
 ///
 /// `COLOR` is substituted at render time. Elements that want a solid
@@ -124,8 +129,8 @@ QString bodyFor(ToolId id)
         return R"SVG(<path d="M3.8 3.6H16.2M10 3.6V16.4M7.2 16.4H12.8"/>)SVG";
 
     case ToolId::PathSelect:
-        return R"SVG(<path fill="COLOR" stroke="none" d="M5 1.8 5 16.2 8.5 12.7 10.9 17.8 13.4 16.6
-                  11 11.6 15.8 11.6z"/>)SVG";
+        return QStringLiteral(R"SVG(<path fill="COLOR" stroke="none" d="%1"/>)SVG")
+            .arg(QLatin1String(kPathArrow));
 
     case ToolId::Shape:
         return R"SVG(<rect x="2.8" y="5.4" width="14.4" height="9.2" fill="COLOR" stroke="none"/>)SVG";
@@ -404,6 +409,130 @@ QString dodgeVariantBody(int variant)
     return bodyFor(ToolId::Dodge);
 }
 
+/// Per-variant artwork for the hand group.
+///
+/// CS6 draws Rotate View as a hand with a curved arrow turning about it. At
+/// 20px the hand plus an arrow is mud, so this is the arrow alone — a circle
+/// open at one end with a head on it, which is what the eye picks out anyway.
+QString handVariantBody(int variant)
+{
+    if (static_cast<HandTool>(variant) != HandTool::RotateView) {
+        return bodyFor(ToolId::Hand);
+    }
+    return R"SVG(<path d="M15.6 6.4a7 7 0 1 0 1.7 5" stroke-width="1.4"/>
+                  <path fill="COLOR" stroke="none" d="M10.4 2.2 16.8 4.2 15 10.6z"/>)SVG";
+}
+
+/// Per-variant artwork for the shape group.
+///
+/// Each is the shape itself as a solid silhouette, which is how CS6 draws them
+/// — the tool and its icon are the same thing here, so there is nothing to
+/// badge.
+QString shapeVariantBody(int variant)
+{
+    switch (static_cast<ShapeTool>(variant)) {
+    case ShapeTool::RoundedRectangle:
+        return R"SVG(<rect x="2.8" y="5.4" width="14.4" height="9.2" rx="2.6" fill="COLOR"
+                  stroke="none"/>)SVG";
+
+    case ShapeTool::Ellipse:
+        return R"SVG(<ellipse cx="10" cy="10" rx="7.6" ry="5.6" fill="COLOR" stroke="none"/>)SVG";
+
+    case ShapeTool::Polygon:
+        // A pentagon, point up, matching the five sides the tool defaults to.
+        return R"SVG(<path fill="COLOR" stroke="none" d="M10 2.2 17.4 7.6 14.6 16.4 5.4 16.4
+                  2.6 7.6z"/>)SVG";
+
+    case ShapeTool::Line:
+        return R"SVG(<path d="M2.6 15.6 17.4 4.4" stroke-width="2.2"/>)SVG";
+
+    case ShapeTool::CustomShape:
+        // CS6 uses a shape from the library itself; the star reads at 20px and
+        // is the first entry of ours.
+        return R"SVG(<path fill="COLOR" stroke="none" d="M10 1.8 12.3 7.4 18.3 7.8 13.7 11.7
+                  15.2 17.6 10 14.3 4.8 17.6 6.3 11.7 1.7 7.8 7.7 7.4z"/>)SVG";
+
+    case ShapeTool::Rectangle:
+        break;
+    }
+    return bodyFor(ToolId::Shape);
+}
+
+/// Per-variant artwork for the eraser group.
+///
+/// CS6 keeps the eraser block for all three and marks what each one erases *by*:
+/// scissors-like shears on the Background Eraser, which cuts a subject away from
+/// its background, and the wand's sparkle on the Magic Eraser, the tool being
+/// the Magic Wand's flood erased rather than selected.
+QString eraserVariantBody(int variant)
+{
+    const QString block = bodyFor(ToolId::Eraser);
+
+    switch (static_cast<EraserType>(variant)) {
+    case EraserType::BackgroundEraser:
+        // The crosshair the tool aims with, on the corner it erases from — the
+        // one thing a user has to understand about this tool.
+        return block
+            + R"SVG(<g stroke-width="1.1"><path d="M2 5.2H8.4M5.2 2V8.4"/>
+                  <circle cx="5.2" cy="5.2" r="2.4" fill="none" stroke="COLOR"/></g>)SVG";
+
+    case EraserType::MagicEraser:
+        return block
+            + R"SVG(<path fill="COLOR" stroke="none" d="M4.6 1.2 5.5 3.5 7.8 4.4 5.5 5.3
+                  4.6 7.6 3.7 5.3 1.4 4.4 3.7 3.5z"/>)SVG";
+
+    case EraserType::Eraser:
+        break;
+    }
+    return block;
+}
+
+/// Per-variant artwork for the path selection group.
+///
+/// Photoshop's two arrows, and the pair is how everyone tells the tools apart:
+/// the Path Selection tool is the **black arrow**, which takes a whole subpath,
+/// and Direct Selection is the **white arrow**, which takes one anchor or
+/// handle. Here "black" is a filled silhouette and "white" a hollow outline,
+/// both in the strip's own colour — the strip is dark, so a literally black
+/// arrow would be invisible and a literally white one would not match the rest.
+///
+/// Both are the same outline at the same size, so the two read as one tool with
+/// two modes rather than two unrelated glyphs.
+QString pathSelectVariantBody(int variant)
+{
+    if (static_cast<PathSelectTool>(variant) == PathSelectTool::DirectSelection) {
+        // Mitred rather than the group's round join, so the point of the arrow
+        // stays a point instead of being rounded off at this size.
+        return QStringLiteral(R"SVG(<path fill="none" stroke="COLOR" stroke-width="1.2")SVG"
+                              R"SVG( stroke-linejoin="miter" d="%1"/>)SVG")
+            .arg(QLatin1String(kPathArrow));
+    }
+    return bodyFor(ToolId::PathSelect);
+}
+
+/// Per-variant artwork for the clone group.
+///
+/// CS6 keeps the rubber stamp for both and marks the Pattern Stamp's with a
+/// checkered swatch on its base, saying it prints a pattern rather than
+/// whatever was sampled. The stamp itself is reused so the pair still reads as
+/// one button's worth of tools.
+QString cloneVariantBody(int variant)
+{
+    if (static_cast<CloneType>(variant) != CloneType::PatternStamp) {
+        return bodyFor(ToolId::CloneStamp);
+    }
+
+    // The stamp's own base line is dropped: the swatch takes that row, and two
+    // horizontals a pixel apart turn to mud at this size.
+    return R"SVG(<path d="M4.6 12.4H15.4L13.3 8.4H6.7z"/>
+                  <path d="M8.3 8.4V4.6a1.7 1.7 0 0 1 3.4 0v3.8"/>
+                  <g stroke="none" fill="COLOR">
+                  <rect x="3.4" y="14.4" width="3.3" height="3.3"/>
+                  <rect x="10" y="14.4" width="3.3" height="3.3"/></g>
+                  <rect x="3.4" y="14.4" width="13.2" height="3.3" fill="none"
+                  stroke="COLOR" stroke-width="1.1"/>)SVG";
+}
+
 /// Per-variant artwork for the gradient group.
 ///
 /// The button's default is the gradient swatch; the Paint Bucket gets CS6's own
@@ -527,6 +656,21 @@ QString variantBodyFor(ToolId id, int variant)
     }
     if (id == ToolId::Dodge) {
         return dodgeVariantBody(variant);
+    }
+    if (id == ToolId::Hand) {
+        return handVariantBody(variant);
+    }
+    if (id == ToolId::Shape) {
+        return shapeVariantBody(variant);
+    }
+    if (id == ToolId::Eraser) {
+        return eraserVariantBody(variant);
+    }
+    if (id == ToolId::PathSelect) {
+        return pathSelectVariantBody(variant);
+    }
+    if (id == ToolId::CloneStamp) {
+        return cloneVariantBody(variant);
     }
     if (id == ToolId::Gradient) {
         return gradientVariantBody(variant);
