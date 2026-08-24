@@ -2,6 +2,8 @@
 
 #include "LayerIcons.h"
 
+#include <algorithm>
+
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QHBoxLayout>
@@ -248,7 +250,7 @@ void LayersPanel::buildFilterRow(QWidget *parent, QBoxLayout *into)
     const Kind kinds[] = {
         {LayerIcons::Glyph::KindPixel, tr("Show pixel layers"), true},
         {LayerIcons::Glyph::KindAdjustment, tr("Show adjustment layers"), true},
-        {LayerIcons::Glyph::KindType, tr("Show type layers"), false},
+        {LayerIcons::Glyph::KindType, tr("Show type layers"), true},
         {LayerIcons::Glyph::KindShape, tr("Show shape layers"), false},
         {LayerIcons::Glyph::KindSmartObject, tr("Show smart objects"), false},
     };
@@ -413,7 +415,7 @@ void LayersPanel::buildUi()
     m_list->setObjectName(QStringLiteral("layerList"));
     m_list->setItemDelegate(new LayerRowDelegate(m_list));
     m_list->setMouseTracking(true);
-    m_list->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
     // Photoshop reorders layers by dragging rows.
     m_list->setDragDropMode(QAbstractItemView::InternalMove);
     m_list->setDefaultDropAction(Qt::MoveAction);
@@ -515,6 +517,16 @@ int LayersPanel::currentIndex() const
     return m_list->currentRow();
 }
 
+QList<int> LayersPanel::selectedIndices() const
+{
+    QList<int> indices;
+    const auto items = m_list->selectedItems();
+    for (const auto *item : items)
+        indices.append(m_list->row(item));
+    std::sort(indices.begin(), indices.end());
+    return indices;
+}
+
 bool LayersPanel::passesFilter(int index) const
 {
     if (!m_filterSwitch->isChecked()) {
@@ -552,6 +564,8 @@ void LayersPanel::refresh()
     const int count = m_engine->getLayerCount();
     const int active = m_engine->getActiveLayerIndex();
 
+    const QList<int> prevSelected = selectedIndices();
+
     m_list->clear();
     for (int i = 0; i < count; ++i) {
         const QString name = m_engine->layerName(i);
@@ -571,20 +585,30 @@ void LayersPanel::refresh()
         // so this is the shape of the layer, not a 32px square — the delegate
         // centres it.
         const QImage thumb = m_engine->layerThumbnail(i, kThumbSize);
-        const bool adjustment = m_engine->layerKind(i) == 1;
-        const QSize size = adjustment || thumb.isNull() ? QSize(kThumbSize, kThumbSize)
-                                                        : thumb.size();
+        const int kind = m_engine->layerKind(i);
+
+        // Two kinds are shown by what they *are* rather than by what they look
+        // like: an adjustment layer has no pixels of its own, and a type layer's
+        // pixels say nothing about it being editable text. CS6 puts a glyph on
+        // white for both, and the T is how a type layer is told apart from a
+        // bitmap one at a glance.
+        const bool adjustment = kind == 1;
+        const bool type = kind == 2;
+        const bool glyphOnly = adjustment || type;
+
+        const QSize size = glyphOnly || thumb.isNull() ? QSize(kThumbSize, kThumbSize)
+                                                       : thumb.size();
         QPixmap canvas(size);
         canvas.fill(Qt::transparent);
         {
             QPainter p(&canvas);
-            if (adjustment) {
-                // An adjustment layer has no pixels of its own, so CS6 shows the
-                // adjustment's own glyph on white instead of a thumbnail.
+            if (glyphOnly) {
                 p.fillRect(canvas.rect(), Qt::white);
-                const QPixmap glyph = LayerIcons::pixmap(LayerIcons::Glyph::Adjustment,
-                                                         QColor(0x22, 0x22, 0x22), 24);
-                p.drawPixmap((size.width() - 24) / 2, (size.height() - 24) / 2, glyph);
+                const LayerIcons::Glyph glyph = adjustment ? LayerIcons::Glyph::Adjustment
+                                                           : LayerIcons::Glyph::KindType;
+                const QPixmap art =
+                    LayerIcons::pixmap(glyph, QColor(0x22, 0x22, 0x22), 24);
+                p.drawPixmap((size.width() - 24) / 2, (size.height() - 24) / 2, art);
             } else {
                 for (int y = 0; y < size.height(); y += 8) {
                     for (int x = 0; x < size.width(); x += 8) {
@@ -632,6 +656,11 @@ void LayersPanel::refresh()
 
     if (active >= 0 && active < count) {
         m_list->setCurrentRow(active);
+
+        for (int idx : prevSelected) {
+            if (idx >= 0 && idx < count)
+                m_list->item(idx)->setSelected(true);
+        }
 
         // Blend mode discriminants are dense and in list order, but separators
         // occupy rows too, so map through the item text.
@@ -882,15 +911,34 @@ void LayersPanel::deleteLayer()
     if (!m_engine) {
         return;
     }
-    const int index = currentIndex();
-    if (index < 0) {
+    QList<int> indices = selectedIndices();
+    if (indices.isEmpty()) {
+        const int cur = currentIndex();
+        if (cur >= 0)
+            indices.append(cur);
+    }
+    if (indices.isEmpty()) {
         return;
     }
-    if (m_engine->layerIsFullyLocked(index)) {
-        warnLocked(tr("delete the layer"));
+
+    const int totalLayers = m_engine->getLayerCount();
+    if (indices.size() >= totalLayers) {
+        QMessageBox::warning(this, tr("Delete Layer"),
+                             tr("Cannot delete all layers."));
         return;
     }
-    m_engine->deleteLayer(index);
+
+    for (int idx : indices) {
+        if (m_engine->layerIsFullyLocked(idx)) {
+            warnLocked(tr("delete the layer \"%1\"").arg(m_engine->layerName(idx)));
+            return;
+        }
+    }
+
+    std::sort(indices.begin(), indices.end(), std::greater<int>());
+    for (int idx : indices)
+        m_engine->deleteLayer(idx);
+
     emit documentChanged();
     refresh();
 }

@@ -272,6 +272,12 @@ bool CommandRegistry::saveUserKeymap() const
     return true;
 }
 
+QKeySequence CommandRegistry::defaultShortcut(const QString &id) const
+{
+    const auto seqs = m_defaults.value(id);
+    return seqs.isEmpty() ? QKeySequence() : seqs.first();
+}
+
 void CommandRegistry::resetToDefaults()
 {
     for (auto it = m_defaults.constBegin(); it != m_defaults.constEnd(); ++it) {

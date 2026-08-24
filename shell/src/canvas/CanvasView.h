@@ -15,6 +15,7 @@
 #include "../tools/ToolId.h"
 
 class Engine;
+class QScrollBar;
 
 /// The document viewport.
 ///
@@ -61,6 +62,9 @@ public:
     /// The tool that receives mouse input.
     void setActiveTool(ToolId tool);
     ToolId activeTool() const { return m_tool; }
+
+    /// Current brush diameter, used for the brush-circle cursor.
+    void setBrushSize(double size);
 
     /// Which marquee variant the Marquee tool draws.
     void setMarqueeType(MarqueeType type);
@@ -287,6 +291,23 @@ public:
     /// canvas wears the rubylith veil Quick Mask uses, with the text knocked
     /// out of it. Any edit in progress is committed first.
     void setTypeMask(bool mask);
+    /// Show a yellow highlight over matched text on the canvas.
+    void setSearchHighlight(int layerIndex, int charOffset, int charLength);
+    void clearSearchHighlight();
+
+    enum class TransformMode { Free, Scale, Rotate, Skew, Distort, Perspective, Warp };
+
+    /// Enter Free Transform mode on the active layer.
+    void beginFreeTransform(TransformMode mode = TransformMode::Free);
+    void commitFreeTransform();
+    void cancelFreeTransform();
+    bool isFreeTransforming() const { return m_freeTransform; }
+    TransformMode transformMode() const { return m_ftMode; }
+    QRectF transformBounds() const { return m_ftBounds; }
+    QRectF transformOrigBounds() const { return QRectF(m_ftOrigOffset, QSizeF(m_ftOrigImage.width(), m_ftOrigImage.height())); }
+    double transformRotation() const { return m_ftRotation; }
+    QPolygonF transformQuad() const { return m_ftQuad; }
+
     /// Rasterize the composed text into its layer: the one being re-edited, or
     /// a new one. Does nothing if the Type tool is not mid-edit.
     void commitTypeEdit();
@@ -329,6 +350,10 @@ signals:
     /// `MainWindow` names the tool and puts the dialog up — it holds the active
     /// variant, and the canvas does not own dialogs.
     void lockedLayerRefused();
+    void transformStarted();
+    void transformCommitted();
+    void transformCancelled();
+    void transformChanged();
     /// The Type tool reopened existing text, whose own font, colour, alignment
     /// and antialiasing are now what is being edited. `MainWindow` adopts them
     /// into the options bar, the way clicking into text in Photoshop makes the
@@ -385,6 +410,7 @@ private:
     /// Emit `lockedLayerRefused` if the engine turned an edit down because the
     /// layer's pixels are locked. Silent when it refused for any other reason.
     void reportIfLocked();
+    bool promptRasterizeIfType();
     /// Marching-ants outline of the current selection.
     void paintSelection(QPainter &painter);
     /// The combine operation for a gesture made with `modifiers` held: the
@@ -548,12 +574,17 @@ private:
     /// layer; anywhere else it commits what was being typed and starts new
     /// text. `modifiers` carries Shift, which extends the selection.
     void typePress(const QPointF &doc, Qt::KeyboardModifiers modifiers);
+    /// Put down the empty type layer a click with the Type tool makes, and
+    /// return its panel index — or -1 if it could not be made.
+    int createEmptyTypeLayer();
     /// Reopen the type layer at a panel index: its text becomes the edit in
     /// progress and its own font, colour and alignment become the Type tool's.
     /// The caret lands where in the text `doc` fell.
     void beginTypeEdit(int layerIndex, const QPointF &doc);
     /// Draw the outline of the shape being dragged out, so the user sees what
     /// they are about to commit.
+    void paintSearchHighlight(QPainter &painter);
+    void paintFreeTransform(QPainter &painter);
     void paintShapeOverlay(QPainter &painter);
     /// Draw the rectangle a Zoom drag is marking out.
     void paintZoomOverlay(QPainter &painter);
@@ -746,7 +777,14 @@ private:
     /// Pan offset in widget pixels, from the centred position.
     QPointF m_pan{0.0, 0.0};
 
+    QScrollBar *m_hScroll = nullptr;
+    QScrollBar *m_vScroll = nullptr;
+    bool m_scrollBarUpdating = false;
+    void syncScrollBars();
+    void layoutScrollBars();
+
     ToolId m_tool = ToolId::Brush;
+    double m_brushDiameter = 20.0;
     MarqueeType m_marqueeType = MarqueeType::Rectangular;
     LassoType m_lassoType = LassoType::Freehand;
     QuickSelectType m_quickSelectType = QuickSelectType::Brush;
@@ -899,6 +937,36 @@ private:
     /// release.
     QPolygonF m_freeformPoints;
 
+    // -- Free Transform --
+    bool m_freeTransform = false;
+    TransformMode m_ftMode = TransformMode::Free;
+    int m_ftLayerIndex = -1;
+    QImage m_ftOrigImage;
+    QPointF m_ftOrigOffset;
+    QRectF m_ftBounds;
+    double m_ftRotation = 0.0;
+    QPointF m_ftScale{1.0, 1.0};
+    QPolygonF m_ftQuad;
+    enum class FTHandle { None, Move, TopLeft, Top, TopRight, Right,
+                          BottomRight, Bottom, BottomLeft, Left, Rotate };
+    FTHandle m_ftHandle = FTHandle::None;
+    QPointF m_ftDragStart;
+    QRectF m_ftDragStartBounds;
+    double m_ftDragStartRotation = 0.0;
+    QPolygonF m_ftDragStartQuad;
+
+    // Warp: 4x4 bicubic Bezier control points (row-major).
+    // [0][0]=TL corner, [0][3]=TR, [3][0]=BL, [3][3]=BR.
+    // [0][1],[0][2] = top edge tangents, etc.
+    QPointF m_warpPts[4][4];
+    QPointF m_warpPtsDragStart[4][4];
+    int m_warpDragI = -1, m_warpDragJ = -1;
+
+    // -- Search highlight --
+    int m_searchHighlightLayer = -1;
+    int m_searchHighlightChar = -1;
+    int m_searchHighlightLen = 0;
+
     // -- Type --
     /// True while text is being composed on the canvas, between a click with
     /// the Type tool and Enter/the checkmark committing it or Esc cancelling.
@@ -939,6 +1007,10 @@ private:
     /// it, and committing then re-renders that layer in place instead of
     /// stacking a second copy of the text on top of it.
     int m_typeLayer = -1;
+    /// Whether that layer was put down by this edit. A layer made by clicking
+    /// with the Type tool goes away again if the edit is abandoned; one that
+    /// was reopened stays exactly as it was.
+    bool m_typeLayerIsNew = false;
 
     /// What a Path Selection / Direct Selection press grabbed.
     enum class PathSelectGesture { None, Subpath, Anchor, Handle };

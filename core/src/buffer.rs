@@ -307,6 +307,42 @@ impl Pixmap {
 
     /// Approximate memory footprint in bytes. Used by the history stack to
     /// decide when to evict old snapshots.
+    /// A copy turned or mirrored, for putting a photograph the right way up.
+    ///
+    /// The quarter turns swap the axes, so the copy's width is this one's
+    /// height. Every case is a straight remapping of whole pixels: nothing is
+    /// resampled and nothing is lost, which is what makes applying a camera's
+    /// orientation on the way in harmless.
+    pub fn transformed(&self, how: crate::metadata::Orientation) -> Pixmap {
+        use crate::metadata::Orientation;
+
+        let (w, h) = (self.width as i32, self.height as i32);
+        let (out_w, out_h) = if how.swaps_axes() {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+
+        let mut out = Pixmap::new(out_w, out_h);
+        for y in 0..h {
+            for x in 0..w {
+                // Where this pixel lands in the copy.
+                let (nx, ny) = match how {
+                    Orientation::Upright => (x, y),
+                    Orientation::FlipHorizontal => (w - 1 - x, y),
+                    Orientation::Rotate180 => (w - 1 - x, h - 1 - y),
+                    Orientation::FlipVertical => (x, h - 1 - y),
+                    Orientation::Transpose => (y, x),
+                    Orientation::Rotate90Cw => (h - 1 - y, x),
+                    Orientation::Transverse => (h - 1 - y, w - 1 - x),
+                    Orientation::Rotate90Ccw => (y, w - 1 - x),
+                };
+                out.set(nx, ny, self.get(x, y));
+            }
+        }
+        out
+    }
+
     pub fn byte_size(&self) -> usize {
         self.data.len()
     }
@@ -324,6 +360,66 @@ impl std::fmt::Debug for Pixmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 3x2 pixmap whose pixels each say where they are: red = x, green = y.
+    fn positional() -> Pixmap {
+        let mut pm = Pixmap::new(3, 2);
+        for y in 0..2 {
+            for x in 0..3 {
+                pm.set(x, y, Rgba8::opaque(x as u8, y as u8, 0));
+            }
+        }
+        pm
+    }
+
+    #[test]
+    fn a_quarter_turn_swaps_the_axes_and_moves_the_corner() {
+        use crate::metadata::Orientation;
+        let turned = positional().transformed(Orientation::Rotate90Cw);
+        assert_eq!((turned.width(), turned.height()), (2, 3));
+        // Turning clockwise sends the top-left corner to the top-right.
+        assert_eq!(turned.get(1, 0), Rgba8::opaque(0, 0, 0));
+        assert_eq!(turned.get(1, 2), Rgba8::opaque(2, 0, 0));
+    }
+
+    #[test]
+    fn a_counter_turn_is_the_inverse_of_a_turn() {
+        use crate::metadata::Orientation;
+        let original = positional();
+        let round_trip = original
+            .transformed(Orientation::Rotate90Cw)
+            .transformed(Orientation::Rotate90Ccw);
+        assert_eq!(round_trip.as_bytes(), original.as_bytes());
+    }
+
+    #[test]
+    fn flips_mirror_the_axis_they_name() {
+        use crate::metadata::Orientation;
+        let flipped = positional().transformed(Orientation::FlipHorizontal);
+        assert_eq!((flipped.width(), flipped.height()), (3, 2));
+        assert_eq!(flipped.get(0, 0), Rgba8::opaque(2, 0, 0), "x was not mirrored");
+
+        let flipped = positional().transformed(Orientation::FlipVertical);
+        assert_eq!(flipped.get(0, 0), Rgba8::opaque(0, 1, 0), "y was not mirrored");
+    }
+
+    #[test]
+    fn the_diagonal_mirrors_are_not_quarter_turns() {
+        // The pair that is easiest to get wrong: a transpose mirrors along the
+        // main diagonal, so a pixel's coordinates simply swap.
+        use crate::metadata::Orientation;
+        let transposed = positional().transformed(Orientation::Transpose);
+        assert_eq!(transposed.get(0, 2), Rgba8::opaque(2, 0, 0));
+        assert_eq!(transposed.get(1, 0), Rgba8::opaque(0, 1, 0));
+    }
+
+    #[test]
+    fn leaving_a_pixmap_upright_changes_nothing() {
+        use crate::metadata::Orientation;
+        let original = positional();
+        let same = original.transformed(Orientation::Upright);
+        assert_eq!(same.as_bytes(), original.as_bytes());
+    }
 
     #[test]
     fn new_pixmap_is_transparent() {

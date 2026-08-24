@@ -152,7 +152,7 @@ QToolBar QToolButton:checked {
    title bar, so this rule only styles the button field itself. */
 
 QWidget#toolStrip {
-    background-color: #2D3C48;    /* Tool tip floating bar background color */
+    background-color: #33444b;    /* Tool tip floating bar background color */
     border: none;
 }
 

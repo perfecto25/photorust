@@ -15,10 +15,13 @@
 //! Not yet implemented — these return [`PsdError::Unsupported`] rather than
 //! silently producing wrong pixels:
 //!
-//! * Per-layer channel image data (only the flattened composite is read, so
-//!   opening a PSD currently yields a single Background layer).
 //! * ZIP-compressed channels, 16- and 32-bit depths, CMYK/Lab/Indexed/Duotone.
-//! * Layer effects, smart objects, text layers, adjustment-layer parameters.
+//! * Layer masks: their channels are read past, so a masked layer opens
+//!   unmasked.
+//! * Layer effects, smart objects, adjustment-layer parameters.
+//! * Type layers are read as far as their text, font, size, colour and
+//!   justification (see [`text`]); anything finer — per-character runs,
+//!   warping, paragraph settings — is not.
 //! * Writing. [`write_psd`] emits a valid single-layer file only.
 //!
 //! The format is documented in Adobe's "Photoshop File Format Specification";
@@ -26,7 +29,10 @@
 
 use crate::blend::BlendMode;
 use crate::buffer::{Pixmap, Rgba8};
-use crate::layer::{Layer, LayerStack};
+use crate::layer::{Layer, LayerKind, LayerStack};
+
+pub mod text;
+pub mod text_write;
 
 /// Everything that can go wrong reading a PSD.
 #[derive(Debug, PartialEq, Eq)]
@@ -292,11 +298,14 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
     let count = raw_count.unsigned_abs() as usize;
 
     struct Record {
+        /// What the layer says, for a type layer.
+        text: Option<text::PsdText>,
         top: i32,
         left: i32,
         bottom: i32,
         right: i32,
-        channels: usize,
+        /// Each channel's id and the length of its data, in file order.
+        channels: Vec<(i16, usize)>,
         blend_mode: BlendMode,
         opacity: u8,
         clipping: bool,
@@ -312,9 +321,15 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
         let right = r.i32()?;
 
         let channel_count = r.u16()? as usize;
-        // Each channel: 2-byte id + 4-byte data length.
+        // Each channel: a 2-byte id saying which one it is, and the length of
+        // its data further down the file. Both are needed to read the pixels:
+        // the ids say which plane is red and which is transparency, and the
+        // lengths are the only way to walk from one channel to the next.
+        let mut channels = Vec::with_capacity(channel_count);
         for _ in 0..channel_count {
-            r.skip(6)?;
+            let id = r.i16()?;
+            let length = r.u32()? as usize;
+            channels.push((id, length));
         }
 
         // Blend mode signature, always '8BIM'.
@@ -344,15 +359,18 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
         // in an additional-info block, which is not read yet.
         let name = r.pascal_string(4).unwrap_or_default();
 
-        // Skip any additional layer info blocks.
+        // The additional layer information blocks, which is where a type layer
+        // keeps what it says.
+        let text = find_type_tool(r, extra_end);
         r.pos = extra_end.min(r.data.len());
 
         records.push(Record {
+            text,
             top,
             left,
             bottom,
             right,
-            channels: channel_count,
+            channels,
             blend_mode,
             opacity,
             clipping,
@@ -361,9 +379,8 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
         });
     }
 
-    // Channel image data follows. Not decoded yet — see module docs.
-    r.pos = layer_info_end.min(r.data.len());
-
+    // The channel data for every layer follows, in the same order as the
+    // records, each channel headed by its own compression flag.
     for rec in records {
         let width = (rec.right - rec.left).max(0) as u32;
         let height = (rec.bottom - rec.top).max(0) as u32;
@@ -372,7 +389,7 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
         let name = if rec.name.is_empty() {
             format!("Layer {}", stack.len() + 1)
         } else {
-            rec.name
+            rec.name.clone()
         };
         let mut layer = Layer::new_raster(id, name, width, height);
         layer.offset = (rec.left, rec.top);
@@ -380,11 +397,192 @@ fn parse_layer_section(r: &mut Reader<'_>, section_end: usize) -> Result<LayerSt
         layer.opacity = rec.opacity as f32 / 255.0;
         layer.clipping = rec.clipping;
         layer.visible = !rec.hidden;
-        let _ = rec.channels;
+
+        read_layer_pixels(r, &rec.channels, &mut layer, width, height);
+        if let Some(psd_text) = rec.text {
+            layer.text = Some(to_text_content(&psd_text, &layer));
+        }
         stack.push(layer);
     }
 
+    // Whatever the channel walk made of the file, carry on from where the
+    // section says it ends: one layer with an unreadable channel must not throw
+    // the composite off too.
+    r.pos = layer_info_end.min(r.data.len());
+
     Ok(stack)
+}
+
+/// Walk a layer's additional information blocks looking for its type data.
+///
+/// Each block is a signature, a four-character key and a length, so the ones
+/// that are not wanted can be stepped over exactly. Leaves the reader where it
+/// found it: the caller resumes from the section's stated end either way.
+fn find_type_tool(r: &mut Reader<'_>, extra_end: usize) -> Option<text::PsdText> {
+    let resume = r.pos;
+    let mut found = None;
+
+    while r.pos + 12 <= extra_end {
+        let signature = r.take(4).ok()?;
+        // '8BIM' and '8B64' are the two Photoshop writes; anything else means
+        // the walk has lost its place and should stop rather than guess.
+        if signature != b"8BIM" && signature != b"8B64" {
+            break;
+        }
+        let Ok(key) = r.take(4) else { break };
+        let key: [u8; 4] = match key.try_into() {
+            Ok(key) => key,
+            Err(_) => break,
+        };
+        let Ok(length) = r.u32() else { break };
+        let length = length as usize;
+        // Block lengths are padded to an even number of bytes.
+        let padded = length + (length & 1);
+        let Ok(body) = r.take(length) else { break };
+
+        if &key == b"TySh" {
+            found = text::parse_type_tool(body);
+            // The first one is the layer's; there is no second.
+            r.pos = resume;
+            return found;
+        }
+        r.pos = (r.pos + (padded - length)).min(r.data.len());
+    }
+
+    r.pos = resume;
+    found
+}
+
+/// Turn what the PSD says into the type record our own layers carry.
+///
+/// The origin is worked out from the layer's pixel bounds rather than from the
+/// block's transform. Photoshop measures from the first line's *baseline*, and
+/// where that sits depends on the font's ascent — which the engine cannot know,
+/// since fonts live in the shell (CLAUDE.md §2). Anchoring to the rasterized
+/// bounds instead is right to within a pixel or two, and it is only used if the
+/// user reopens the text: until then the layer draws Photoshop's own pixels.
+fn to_text_content(psd: &text::PsdText, layer: &Layer) -> crate::layer::TextContent {
+    use crate::layer::{TextAlign, TextContent, TextRun};
+
+    let bounds = layer.bounds();
+    let origin_x = match psd.align {
+        TextAlign::Center => bounds.x as f32 + bounds.width as f32 / 2.0,
+        TextAlign::Right => bounds.right() as f32,
+        TextAlign::Left => bounds.x as f32,
+    };
+
+    TextContent {
+        // One run: see `text::apply_engine_data` on why the formatting of the
+        // first character is taken to be the formatting of the whole layer.
+        runs: vec![TextRun {
+            // Photoshop separates lines with a carriage return; ours uses a
+            // newline, and a stray CR would otherwise be drawn as a glyph.
+            text: psd.text.replace('\r', "\n"),
+            family: psd.family.clone(),
+            style: psd.style.clone(),
+            size: psd.size,
+            color: psd.color,
+        }],
+        align: psd.align,
+        antialias: true,
+        vertical: false,
+        origin: (origin_x, bounds.y as f32),
+    }
+}
+
+/// Read one layer's channels into its pixels.
+///
+/// A layer stores each channel separately — red, green, blue and transparency
+/// as four planes — and they have to be interleaved to become pixels. The
+/// transparency channel is the one that matters most here: without it every
+/// layer would be a solid rectangle of its bounding box, which is exactly how a
+/// PSD looks when its channels are skipped.
+///
+/// Anything unreadable leaves the layer transparent rather than failing the
+/// open. A file with one odd layer should still come up.
+fn read_layer_pixels(
+    r: &mut Reader<'_>,
+    channels: &[(i16, usize)],
+    layer: &mut Layer,
+    width: u32,
+    height: u32,
+) {
+    let per_channel = width as usize * height as usize;
+    let mut red = Vec::new();
+    let mut green = Vec::new();
+    let mut blue = Vec::new();
+    let mut alpha = Vec::new();
+
+    for (id, length) in channels {
+        let end = (r.pos + length).min(r.data.len());
+        // Channel ids: 0/1/2 are the colour planes, -1 is transparency, and
+        // -2/-3 are the layer's masks — which have bounds of their own and are
+        // not applied yet, so they are stepped over.
+        let wanted = matches!(id, 0 | 1 | 2 | -1) && per_channel > 0;
+        if wanted {
+            if let Ok(plane) = read_channel(r, width, height) {
+                match id {
+                    0 => red = plane,
+                    1 => green = plane,
+                    2 => blue = plane,
+                    _ => alpha = plane,
+                }
+            }
+        }
+        // Always resume at the channel's stated end, whatever the decode did:
+        // the next channel's position depends on this length, not on how far
+        // the decoder happened to read.
+        r.pos = end;
+    }
+
+    if per_channel == 0 {
+        return;
+    }
+
+    let bytes = layer.pixels.as_bytes_mut();
+    for i in 0..per_channel {
+        let at = |plane: &Vec<u8>, fallback: u8| plane.get(i).copied().unwrap_or(fallback);
+        let o = i * 4;
+        // A greyscale layer has only one colour plane, so green and blue fall
+        // back to red rather than to black.
+        let r8 = at(&red, 0);
+        bytes[o] = r8;
+        bytes[o + 1] = if green.is_empty() { r8 } else { at(&green, 0) };
+        bytes[o + 2] = if blue.is_empty() { r8 } else { at(&blue, 0) };
+        // No transparency channel means the layer is fully opaque within its
+        // bounds, which is how Photoshop writes a background layer.
+        bytes[o + 3] = if alpha.is_empty() { 255 } else { at(&alpha, 255) };
+    }
+}
+
+/// Decode one channel's plane, starting at its compression flag.
+fn read_channel(r: &mut Reader<'_>, width: u32, height: u32) -> Result<Vec<u8>, PsdError> {
+    let compression = r.u16()?;
+    let (w, h) = (width as usize, height as usize);
+    let per_channel = w * h;
+
+    match compression {
+        0 => Ok(r.take(per_channel)?.to_vec()),
+        1 => {
+            // Unlike the composite, a layer channel's row lengths sit directly
+            // in front of its own rows rather than being pooled for the whole
+            // image.
+            let mut row_lengths = Vec::with_capacity(h);
+            for _ in 0..h {
+                row_lengths.push(r.u16()? as usize);
+            }
+            let mut plane = Vec::with_capacity(per_channel);
+            for length in row_lengths {
+                let packed = r.take(length)?;
+                unpack_bits(packed, w, &mut plane);
+            }
+            plane.resize(per_channel, 0);
+            Ok(plane)
+        }
+        other => Err(PsdError::Unsupported(format!(
+            "compression method {other} in layer data"
+        ))),
+    }
 }
 
 /// Decode the flattened composite at the end of the file.
@@ -568,6 +766,215 @@ fn blend_mode_key(mode: BlendMode) -> &'static [u8; 4] {
 ///
 /// This produces a file Photoshop and other readers will open, but it does not
 /// preserve the layer stack — see the module docs.
+/// Write a document's whole layer stack.
+///
+/// The counterpart to [`parse`], and the thing that makes a file saved here
+/// still a *project* when it is opened again — in Photoshop or in this program.
+/// Writing only the flattened picture, as this used to, loses every layer the
+/// moment the file is saved.
+///
+/// `composite` is the flattened image, which the file carries as well: it is
+/// what other programs show, and what Photoshop falls back to.
+///
+/// Three things are folded away rather than written as their own structures,
+/// because each needs a PSD feature this writer does not have yet. All three
+/// preserve *appearance* — the file looks right — and cost editability:
+///
+/// - a layer **mask** is multiplied into the layer's own alpha;
+/// - a **fill layer** (a shape) is rasterized to pixels.
+///
+/// Type layers are written with a `TySh` block so Photoshop reopens them as
+/// editable text rather than as a picture of text.
+pub fn write_layered_psd(stack: &LayerStack, composite: &Pixmap) -> Vec<u8> {
+    let width = composite.width();
+    let height = composite.height();
+    let mut out = Vec::new();
+
+    write_header(&mut out, width, height);
+    out.extend_from_slice(&0u32.to_be_bytes()); // colour mode data: empty
+    out.extend_from_slice(&0u32.to_be_bytes()); // image resources: empty
+
+    // -- layer and mask information ------------------------------------------
+    let mut layer_info = Vec::new();
+    // Photoshop reads a negative count as "the first alpha channel is
+    // transparency for the merged result"; a plain positive count is what an
+    // ordinary layered file has.
+    layer_info.extend_from_slice(&(stack.len() as i16).to_be_bytes());
+
+    // The records come first and the pixels after, so both are built here and
+    // joined below.
+    let mut channel_data = Vec::new();
+    for layer in stack.iter() {
+        let pixels = flattened_layer(layer);
+        write_layer_record(&mut layer_info, layer, &pixels);
+        write_layer_channels(&mut channel_data, &pixels);
+    }
+    layer_info.extend_from_slice(&channel_data);
+    pad_to_even(&mut layer_info);
+
+    let mut section = Vec::new();
+    section.extend_from_slice(&(layer_info.len() as u32).to_be_bytes());
+    section.extend_from_slice(&layer_info);
+    section.extend_from_slice(&0u32.to_be_bytes()); // no global layer mask
+
+    out.extend_from_slice(&(section.len() as u32).to_be_bytes());
+    out.extend_from_slice(&section);
+
+    write_composite(&mut out, composite);
+    out
+}
+
+/// One layer's pixels as they are to be written: its own, with any mask
+/// multiplied in, or a fill layer rasterized.
+fn flattened_layer(layer: &Layer) -> Pixmap {
+    let mut pixels = match layer.kind {
+        LayerKind::SolidColor(color) => {
+            // A fill layer has no pixels of its own — it is a colour the
+            // compositor pours through the mask — so it is rasterized at the
+            // size of whatever shapes it.
+            let (w, h) = match layer.mask.as_ref() {
+                Some(mask) => (mask.width(), mask.height()),
+                None => (layer.pixels.width(), layer.pixels.height()),
+            };
+            Pixmap::filled(w, h, color)
+        }
+        _ => layer.pixels.clone(),
+    };
+
+    if let Some(mask) = layer.mask.as_ref() {
+        if layer.mask_enabled {
+            for y in 0..pixels.height() as i32 {
+                for x in 0..pixels.width() as i32 {
+                    let coverage = mask.get(x, y).a as u32;
+                    let mut px = pixels.get(x, y);
+                    px.a = ((px.a as u32 * coverage) / 255) as u8;
+                    pixels.set(x, y, px);
+                }
+            }
+        }
+    }
+    pixels
+}
+
+/// The fixed part of a layer: where it is, how it blends, and what it is called.
+fn write_layer_record(out: &mut Vec<u8>, layer: &Layer, pixels: &Pixmap) {
+    let (left, top) = layer.offset;
+    let right = left + pixels.width() as i32;
+    let bottom = top + pixels.height() as i32;
+
+    out.extend_from_slice(&top.to_be_bytes());
+    out.extend_from_slice(&left.to_be_bytes());
+    out.extend_from_slice(&bottom.to_be_bytes());
+    out.extend_from_slice(&right.to_be_bytes());
+
+    // Four channels: transparency first, then red, green and blue, each headed
+    // by its own compression flag — which is the two bytes added below.
+    let per_channel = pixels.width() as usize * pixels.height() as usize;
+    out.extend_from_slice(&4u16.to_be_bytes());
+    for id in [-1i16, 0, 1, 2] {
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&((per_channel + 2) as u32).to_be_bytes());
+    }
+
+    out.extend_from_slice(b"8BIM");
+    out.extend_from_slice(blend_mode_key(layer.blend_mode));
+    out.push((layer.opacity.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+    out.push(u8::from(layer.clipping));
+    // Bit 1 marks a hidden layer; bit 0 is the transparency-protected flag.
+    let mut flags = 0x08; // "obsolete" bit Photoshop always sets
+    if !layer.visible {
+        flags |= 0x02;
+    }
+    out.push(flags);
+    out.push(0); // filler
+
+    // Extra data: no mask (it was folded into the alpha), no blending ranges,
+    // the name as a Pascal string, and — for type layers — a TySh block.
+    let mut extra = Vec::new();
+    extra.extend_from_slice(&0u32.to_be_bytes()); // layer mask data: none
+    extra.extend_from_slice(&0u32.to_be_bytes()); // blending ranges: none
+    write_pascal_string(&mut extra, &layer.name);
+
+    if let Some(text) = layer.text.as_ref() {
+        let (left, top) = layer.offset;
+        let bounds = (
+            0.0f32,
+            0.0,
+            pixels.width() as f32,
+            pixels.height() as f32,
+        );
+        let tysh = text_write::type_tool_block(text, bounds);
+
+        // Additional layer information: `8BIM` + key + length + data, padded
+        // to an even length. The length field is the *actual* data length;
+        // padding is implicit and not counted.
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"TySh");
+        extra.extend_from_slice(&(tysh.len() as u32).to_be_bytes());
+        extra.extend_from_slice(&tysh);
+        if tysh.len() % 2 == 1 {
+            extra.push(0);
+        }
+        let _ = (left, top);
+    }
+
+    out.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+    out.extend_from_slice(&extra);
+}
+
+/// A layer's channel data, in the order its record listed them.
+fn write_layer_channels(out: &mut Vec<u8>, pixels: &Pixmap) {
+    let src = pixels.as_bytes();
+    let count = pixels.width() as usize * pixels.height() as usize;
+
+    // Transparency first, then the colour planes: the same order as the ids.
+    for channel in [3usize, 0, 1, 2] {
+        out.extend_from_slice(&0u16.to_be_bytes()); // raw, not RLE
+        for i in 0..count {
+            out.push(src[i * 4 + channel]);
+        }
+    }
+}
+
+/// A Pascal string: one length byte, then the bytes, padded so the whole thing
+/// is a multiple of four.
+fn write_pascal_string(out: &mut Vec<u8>, name: &str) {
+    let bytes: Vec<u8> = name.bytes().take(255).collect();
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(&bytes);
+    while (out.len() % 4) != 0 {
+        out.push(0);
+    }
+}
+
+fn pad_to_even(out: &mut Vec<u8>) {
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+}
+
+fn write_header(out: &mut Vec<u8>, width: u32, height: u32) {
+    out.extend_from_slice(b"8BPS");
+    out.extend_from_slice(&1u16.to_be_bytes()); // version
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    out.extend_from_slice(&4u16.to_be_bytes()); // channels: RGBA
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&width.to_be_bytes());
+    out.extend_from_slice(&8u16.to_be_bytes()); // depth
+    out.extend_from_slice(&(ColorMode::Rgb as u16).to_be_bytes());
+}
+
+/// The flattened image at the end of the file, raw and planar.
+fn write_composite(out: &mut Vec<u8>, image: &Pixmap) {
+    out.extend_from_slice(&0u16.to_be_bytes()); // compression: raw
+    let src = image.as_bytes();
+    for channel in 0..4 {
+        for i in 0..(image.width() as usize * image.height() as usize) {
+            out.push(src[i * 4 + channel]);
+        }
+    }
+}
+
 pub fn write_psd(image: &Pixmap) -> Vec<u8> {
     let width = image.width();
     let height = image.height();
@@ -624,6 +1031,353 @@ mod tests {
         v.extend_from_slice(&depth.to_be_bytes());
         v.extend_from_slice(&mode.to_be_bytes());
         v
+    }
+
+    /// A whole PSD with one 2x2 layer of a known colour, written the way
+    /// Photoshop writes an uncompressed one.
+    ///
+    /// Built here rather than checked in as a fixture so the bytes that matter
+    /// — the channel ids, their lengths, and the order they are read in — are
+    /// visible in the test that depends on them.
+    fn psd_with_one_layer(alpha: u8) -> Vec<u8> {
+        let mut v = header_bytes(2, 2, 3, 8, 3);
+        v.extend_from_slice(&0u32.to_be_bytes()); // no colour mode data
+        v.extend_from_slice(&0u32.to_be_bytes()); // no image resources
+
+        // -- the layer section, whose length is filled in once it is built ---
+        let mut layers = Vec::new();
+        let mut info = Vec::new();
+        info.extend_from_slice(&1i16.to_be_bytes()); // one layer
+
+        // Bounds: the whole 2x2 canvas.
+        info.extend_from_slice(&0i32.to_be_bytes()); // top
+        info.extend_from_slice(&0i32.to_be_bytes()); // left
+        info.extend_from_slice(&2i32.to_be_bytes()); // bottom
+        info.extend_from_slice(&2i32.to_be_bytes()); // right
+
+        // Four channels: red, green, blue and transparency. Each is a
+        // compression flag plus four raw bytes.
+        let channel_bytes = 2 + 4;
+        info.extend_from_slice(&4u16.to_be_bytes());
+        for id in [0i16, 1, 2, -1] {
+            info.extend_from_slice(&id.to_be_bytes());
+            info.extend_from_slice(&(channel_bytes as u32).to_be_bytes());
+        }
+
+        info.extend_from_slice(b"8BIM");
+        info.extend_from_slice(b"norm");
+        info.push(255); // opacity
+        info.push(0); // not clipping
+        info.push(0); // flags: visible
+        info.push(0); // filler
+
+        // Extra data: no mask, no blending ranges, and a Pascal name padded to
+        // four bytes.
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_be_bytes());
+        extra.extend_from_slice(&0u32.to_be_bytes());
+        extra.push(5);
+        extra.extend_from_slice(b"Paint");
+        extra.extend_from_slice(&[0, 0]); // pad 6 bytes to 8
+        info.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+        info.extend_from_slice(&extra);
+
+        // The channel data itself, in the order the ids were listed.
+        for value in [200u8, 100, 50, alpha] {
+            info.extend_from_slice(&0u16.to_be_bytes()); // raw
+            info.extend_from_slice(&[value; 4]);
+        }
+
+        layers.extend_from_slice(&(info.len() as u32).to_be_bytes());
+        layers.extend_from_slice(&info);
+        layers.extend_from_slice(&0u32.to_be_bytes()); // no global mask
+
+        v.extend_from_slice(&(layers.len() as u32).to_be_bytes());
+        v.extend_from_slice(&layers);
+
+        // A flattened composite, so the file is complete: raw, three channels.
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&[9u8; 12]);
+        v
+    }
+
+    /// The same file, with the layer carrying the `TySh` block that makes it a
+    /// type layer.
+    fn psd_with_type_layer() -> Vec<u8> {
+        let plain = psd_with_one_layer(255);
+
+        // Rebuild it with the extra block appended to the layer's extra data.
+        // Easier and clearer than patching lengths in place: the extra section
+        // is the only part that changes.
+        let engine = "<< /ResourceDict << /FontSet [ << /Name (Impact) >> ] >> \
+                      /EngineDict << /StyleRun << /RunArray [ << /StyleSheet << \
+                      /StyleSheetData << /FontSize 48.0 >> >> >> ] >> >> >>";
+        let type_block = {
+            let mut block = Vec::new();
+            block.extend_from_slice(&1u16.to_be_bytes());
+            for value in [1.0f64, 0.0, 0.0, 1.0, 0.0, 0.0] {
+                block.extend_from_slice(&value.to_be_bytes());
+            }
+            block.extend_from_slice(&50u16.to_be_bytes());
+            block.extend_from_slice(&16u32.to_be_bytes());
+
+            // Descriptor: name, class, one item — the text itself.
+            block.extend_from_slice(&1u32.to_be_bytes());
+            block.extend_from_slice(&0u16.to_be_bytes());
+            block.extend_from_slice(&0u32.to_be_bytes());
+            block.extend_from_slice(b"null");
+            block.extend_from_slice(&2u32.to_be_bytes());
+
+            block.extend_from_slice(&0u32.to_be_bytes());
+            block.extend_from_slice(b"Txt ");
+            block.extend_from_slice(b"TEXT");
+            let units: Vec<u16> = "TESTTEST".encode_utf16().chain(std::iter::once(0)).collect();
+            block.extend_from_slice(&(units.len() as u32).to_be_bytes());
+            for unit in units {
+                block.extend_from_slice(&unit.to_be_bytes());
+            }
+
+            block.extend_from_slice(&(10u32).to_be_bytes());
+            block.extend_from_slice(b"EngineData");
+            block.extend_from_slice(b"tdta");
+            block.extend_from_slice(&(engine.len() as u32).to_be_bytes());
+            block.extend_from_slice(engine.as_bytes());
+            block
+        };
+
+        let mut extra_addition = Vec::new();
+        extra_addition.extend_from_slice(b"8BIM");
+        extra_addition.extend_from_slice(b"TySh");
+        extra_addition.extend_from_slice(&(type_block.len() as u32).to_be_bytes());
+        extra_addition.extend_from_slice(&type_block);
+        if type_block.len() % 2 == 1 {
+            extra_addition.push(0);
+        }
+
+        splice_extra_block(&plain, &extra_addition)
+    }
+
+    /// Insert `addition` into the single layer's extra data, fixing up the
+    /// three lengths that describe it.
+    fn splice_extra_block(psd: &[u8], addition: &[u8]) -> Vec<u8> {
+        let mut v = psd.to_vec();
+
+        // Layout of the file built by `psd_with_one_layer`: header (26), then
+        // two empty sections (4 each), then the layer section's length.
+        let section_len_at = 26 + 4 + 4;
+        let info_len_at = section_len_at + 4;
+        // The layer record's extra length sits after the record's fixed part:
+        // bounds (16), channel count (2), four channels (6 each), signature and
+        // mode (8), opacity/clipping/flags/filler (4).
+        let extra_len_at = info_len_at + 4 + 2 + 16 + 2 + 24 + 8 + 4;
+        let extra_at = extra_len_at + 4;
+
+        let read = |v: &Vec<u8>, at: usize| {
+            u32::from_be_bytes([v[at], v[at + 1], v[at + 2], v[at + 3]]) as usize
+        };
+        let extra_len = read(&v, extra_len_at);
+        let insert_at = extra_at + extra_len;
+
+        v.splice(insert_at..insert_at, addition.iter().copied());
+
+        let bump = |v: &mut Vec<u8>, at: usize, by: usize| {
+            let value = read(v, at) + by;
+            v[at..at + 4].copy_from_slice(&(value as u32).to_be_bytes());
+        };
+        bump(&mut v, extra_len_at, addition.len());
+        bump(&mut v, info_len_at, addition.len());
+        bump(&mut v, section_len_at, addition.len());
+        v
+    }
+
+    /// A stack of three layers, each recognisable: a background, a small red
+    /// square offset into the canvas, and a half-opacity multiply layer.
+    fn stack_to_write() -> LayerStack {
+        let mut stack = LayerStack::new();
+
+        let id = stack.allocate_id();
+        stack.push(Layer::new_filled(id, "Background", 4, 4, Rgba8::WHITE));
+
+        let id = stack.allocate_id();
+        let mut square = Layer::new_raster(id, "Red Square", 2, 2);
+        square.pixels.fill(Rgba8::opaque(220, 30, 30));
+        square.offset = (1, 1);
+        stack.push(square);
+
+        let id = stack.allocate_id();
+        let mut shade = Layer::new_raster(id, "Shade", 4, 4);
+        shade.pixels.fill(Rgba8::new(0, 0, 255, 128));
+        shade.blend_mode = BlendMode::Multiply;
+        shade.opacity = 0.5;
+        shade.visible = false;
+        stack.push(shade);
+
+        stack
+    }
+
+    #[test]
+    fn a_written_file_keeps_its_layers() {
+        // The regression behind "saving a PSD flattens it": the writer emitted
+        // only the composite, so every layer was lost on save.
+        let stack = stack_to_write();
+        let composite = Pixmap::filled(4, 4, Rgba8::WHITE);
+        let bytes = write_layered_psd(&stack, &composite);
+
+        let file = parse(&bytes).expect("what was written did not parse");
+        assert_eq!(file.layers.len(), 3);
+        let names: Vec<&str> = file.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["Background", "Red Square", "Shade"]);
+    }
+
+    #[test]
+    fn a_written_layers_pixels_and_place_survive_the_round_trip() {
+        let stack = stack_to_write();
+        let bytes = write_layered_psd(&stack, &Pixmap::filled(4, 4, Rgba8::WHITE));
+        let file = parse(&bytes).unwrap();
+
+        let square = file.layers.get(1).unwrap();
+        assert_eq!(square.offset, (1, 1), "the layer moved");
+        assert_eq!(square.pixels.width(), 2);
+        assert_eq!(square.pixels.get(0, 0), Rgba8::opaque(220, 30, 30));
+        // Transparency comes back too, which is what stops a layer being a
+        // solid block of its bounding box.
+        assert_eq!(file.layers.get(2).unwrap().pixels.get(0, 0).a, 128);
+    }
+
+    #[test]
+    fn a_written_layers_settings_survive_the_round_trip() {
+        let stack = stack_to_write();
+        let bytes = write_layered_psd(&stack, &Pixmap::filled(4, 4, Rgba8::WHITE));
+        let file = parse(&bytes).unwrap();
+
+        let shade = file.layers.get(2).unwrap();
+        assert_eq!(shade.blend_mode, BlendMode::Multiply);
+        assert!((shade.opacity - 0.5).abs() < 0.01);
+        assert!(!shade.visible, "a hidden layer came back visible");
+    }
+
+    #[test]
+    fn a_mask_is_written_into_the_layers_own_transparency() {
+        // Masks are not written as their own channel yet, so they are folded
+        // into the alpha: the file looks right, and the mask is no longer
+        // separately editable.
+        let mut stack = LayerStack::new();
+        let id = stack.allocate_id();
+        let mut layer = Layer::new_raster(id, "Masked", 2, 2);
+        layer.pixels.fill(Rgba8::opaque(10, 20, 30));
+        layer.add_reveal_all_mask();
+        if let Some(mask) = layer.mask.as_mut() {
+            mask.set(0, 0, Rgba8::new(0, 0, 0, 0));
+        }
+        stack.push(layer);
+
+        let bytes = write_layered_psd(&stack, &Pixmap::filled(2, 2, Rgba8::WHITE));
+        let file = parse(&bytes).unwrap();
+        let written = file.layers.get(0).unwrap();
+        assert_eq!(written.pixels.get(0, 0).a, 0, "the mask was dropped");
+        assert_eq!(written.pixels.get(1, 1).a, 255);
+    }
+
+    #[test]
+    fn a_fill_layer_is_written_as_the_colour_it_shows() {
+        // A shape layer has no pixels of its own; writing it as-is would put an
+        // empty layer in the file.
+        let mut stack = LayerStack::new();
+        let id = stack.allocate_id();
+        let mut shape = Layer::new_raster(id, "Rectangle 1", 0, 0);
+        shape.kind = LayerKind::SolidColor(Rgba8::opaque(10, 200, 10));
+        let mut mask = Pixmap::new(2, 2);
+        mask.fill(Rgba8::new(255, 255, 255, 255));
+        mask.set(0, 0, Rgba8::new(0, 0, 0, 0));
+        shape.mask = Some(mask);
+        stack.push(shape);
+
+        let bytes = write_layered_psd(&stack, &Pixmap::filled(2, 2, Rgba8::WHITE));
+        let file = parse(&bytes).unwrap();
+        let written = file.layers.get(0).unwrap();
+        assert_eq!(written.pixels.get(1, 1), Rgba8::opaque(10, 200, 10));
+        assert_eq!(written.pixels.get(0, 0).a, 0, "the shape's mask was ignored");
+    }
+
+    #[test]
+    fn the_composite_is_written_alongside_the_layers() {
+        // Other programs show this, and Photoshop falls back to it.
+        let stack = stack_to_write();
+        let composite = Pixmap::filled(4, 4, Rgba8::opaque(1, 2, 3));
+        let file = parse(&write_layered_psd(&stack, &composite)).unwrap();
+        assert_eq!(file.composite.unwrap().get(2, 2), Rgba8::opaque(1, 2, 3));
+    }
+
+    #[test]
+    fn a_type_layer_arrives_as_text_and_not_only_pixels() {
+        // The regression behind "the TESTTEST layer cannot be edited": the
+        // layer's `TySh` block was skipped, so it opened as a picture of text.
+        let file = parse(&psd_with_type_layer()).expect("did not parse");
+        let layer = file.layers.get(0).expect("no layer");
+
+        let content = layer.text.as_ref().expect("the layer is not type");
+        assert_eq!(content.text(), "TESTTEST");
+        assert_eq!(content.first_run().unwrap().family, "Impact");
+        assert_eq!(content.first_run().unwrap().size, 48.0);
+
+        // And it keeps Photoshop's own rendering until it is edited.
+        assert_eq!(layer.pixels.get(0, 0), Rgba8::new(200, 100, 50, 255));
+    }
+
+    #[test]
+    fn an_ordinary_layer_is_not_mistaken_for_type() {
+        let file = parse(&psd_with_one_layer(255)).expect("did not parse");
+        assert!(file.layers.get(0).unwrap().text.is_none());
+    }
+
+    #[test]
+    fn a_truncated_type_layer_does_not_panic() {
+        let full = psd_with_type_layer();
+        for cut in 0..full.len() {
+            let _ = parse(&full[..cut]);
+        }
+    }
+
+    #[test]
+    fn a_layered_file_comes_back_with_its_layers_pixels() {
+        // The regression behind "PSDs open flat": the records were read and the
+        // channel data skipped, so every layer was an empty rectangle and only
+        // the composite had anything in it.
+        let file = parse(&psd_with_one_layer(255)).expect("did not parse");
+        assert_eq!(file.layers.len(), 1);
+
+        let layer = file.layers.get(0).unwrap();
+        assert_eq!(layer.name, "Paint");
+        assert_eq!(layer.pixels.width(), 2);
+        assert_eq!(layer.pixels.get(0, 0), Rgba8::new(200, 100, 50, 255));
+        assert_eq!(layer.pixels.get(1, 1), Rgba8::new(200, 100, 50, 255));
+    }
+
+    #[test]
+    fn a_layers_transparency_channel_is_its_alpha() {
+        // Without this the layer is a solid block of its bounding box, which is
+        // what makes a skipped transparency channel so obvious on screen.
+        let file = parse(&psd_with_one_layer(0)).expect("did not parse");
+        assert_eq!(file.layers.get(0).unwrap().pixels.get(0, 0).a, 0);
+    }
+
+    #[test]
+    fn a_layers_metadata_survives_alongside_its_pixels() {
+        let file = parse(&psd_with_one_layer(128)).expect("did not parse");
+        let layer = file.layers.get(0).unwrap();
+        assert_eq!(layer.offset, (0, 0));
+        assert!(layer.visible);
+        assert_eq!(layer.opacity, 1.0);
+        assert_eq!(layer.pixels.get(0, 0).a, 128);
+    }
+
+    #[test]
+    fn a_truncated_layered_file_does_not_panic() {
+        // Every prefix of a real file, including ones cut mid-channel.
+        let full = psd_with_one_layer(255);
+        for cut in 0..full.len() {
+            let _ = parse(&full[..cut]);
+        }
     }
 
     #[test]

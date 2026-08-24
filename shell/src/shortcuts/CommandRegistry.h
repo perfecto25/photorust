@@ -77,6 +77,9 @@ public:
     /// Persist the current bindings as user overrides.
     bool saveUserKeymap() const;
 
+    /// Default binding for `id`, as shipped in shortcuts.json.
+    QKeySequence defaultShortcut(const QString &id) const;
+
     /// Drop all user overrides and return to the shipped defaults.
     void resetToDefaults();
 

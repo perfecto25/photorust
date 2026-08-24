@@ -5,6 +5,7 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QContextMenuEvent>
+#include <QScrollBar>
 #include <QCursor>
 #include <QGuiApplication>
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QKeyEvent>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QResizeEvent>
@@ -51,6 +53,22 @@ CanvasView::CanvasView(Engine *engine, QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
     setAttribute(Qt::WA_OpaquePaintEvent);
+
+    m_hScroll = new QScrollBar(Qt::Horizontal, this);
+    m_vScroll = new QScrollBar(Qt::Vertical, this);
+    m_hScroll->setObjectName(QStringLiteral("canvasHScroll"));
+    m_vScroll->setObjectName(QStringLiteral("canvasVScroll"));
+
+    connect(m_hScroll, &QScrollBar::valueChanged, this, [this](int value) {
+        if (m_scrollBarUpdating) return;
+        m_pan.setX(-value);
+        update();
+    });
+    connect(m_vScroll, &QScrollBar::valueChanged, this, [this](int value) {
+        if (m_scrollBarUpdating) return;
+        m_pan.setY(-value);
+        update();
+    });
 
     refresh();
 }
@@ -213,6 +231,7 @@ void CanvasView::zoomToRect(const QRectF &docRect)
 
     clampPan();
     emit zoomChanged(m_zoom);
+    updateCursor();
     update();
 }
 
@@ -240,6 +259,49 @@ void CanvasView::clampPan()
 
     m_pan.setX(qBound(-qMax(marginX, 0.0), m_pan.x(), qMax(marginX, 0.0)));
     m_pan.setY(qBound(-qMax(marginY, 0.0), m_pan.y(), qMax(marginY, 0.0)));
+    syncScrollBars();
+}
+
+void CanvasView::layoutScrollBars()
+{
+    const int sbw = m_vScroll->sizeHint().width();
+    const int sbh = m_hScroll->sizeHint().height();
+    m_hScroll->setGeometry(0, height() - sbh, width() - sbw, sbh);
+    m_vScroll->setGeometry(width() - sbw, 0, sbw, height() - sbh);
+}
+
+void CanvasView::syncScrollBars()
+{
+    m_scrollBarUpdating = true;
+
+    const double docW = m_image.width() * m_zoom;
+    const double docH = m_image.height() * m_zoom;
+    const double marginX = width() / 2.0 + docW / 2.0 - 32.0;
+    const double marginY = height() / 2.0 + docH / 2.0 - 32.0;
+    const double maxX = qMax(marginX, 0.0);
+    const double maxY = qMax(marginY, 0.0);
+
+    const bool needH = docW > width();
+    const bool needV = docH > height();
+
+    m_hScroll->setVisible(needH);
+    m_vScroll->setVisible(needV);
+
+    if (needH) {
+        m_hScroll->setRange(int(-maxX), int(maxX));
+        m_hScroll->setPageStep(width());
+        m_hScroll->setSingleStep(20);
+        m_hScroll->setValue(int(-m_pan.x()));
+    }
+    if (needV) {
+        m_vScroll->setRange(int(-maxY), int(maxY));
+        m_vScroll->setPageStep(height());
+        m_vScroll->setSingleStep(20);
+        m_vScroll->setValue(int(-m_pan.y()));
+    }
+
+    layoutScrollBars();
+    m_scrollBarUpdating = false;
 }
 
 // -------------------------------------------------------------------- zoom --
@@ -265,6 +327,7 @@ void CanvasView::setZoomAt(double zoom, const QPointF &focusWidgetPos)
 
     clampPan();
     emit zoomChanged(m_zoom);
+    updateCursor();
     update();
 }
 
@@ -398,6 +461,12 @@ void CanvasView::setActiveTool(ToolId tool)
     }
     updateCursor();
     update();
+}
+
+void CanvasView::setBrushSize(double size)
+{
+    m_brushDiameter = qBound(1.0, size, 5000.0);
+    updateCursor();
 }
 
 void CanvasView::setMarqueeType(MarqueeType type)
@@ -1109,6 +1178,24 @@ void CanvasView::reportIfLocked()
     if (m_engine && m_engine->activeLayerIsLocked()) {
         emit lockedLayerRefused();
     }
+}
+
+bool CanvasView::promptRasterizeIfType()
+{
+    if (!m_engine) return false;
+    const int active = m_engine->getActiveLayerIndex();
+    if (m_engine->layerKind(active) != 2) return false;
+
+    auto answer = QMessageBox::warning(
+        this, tr("PhotoRust"),
+        tr("This type layer must be rasterized before proceeding.  "
+           "Its text will no longer be editable.  Rasterize the type?"),
+        QMessageBox::Ok | QMessageBox::Cancel);
+    if (answer != QMessageBox::Ok) return true;
+
+    m_engine->rasterizeLayer(active);
+    refresh();
+    return false;
 }
 
 void CanvasView::setHealingType(HealingType type)
@@ -2329,11 +2416,25 @@ void CanvasView::updateCursor()
     case ToolId::Type:
         setCursor(Qt::IBeamCursor);
         break;
-    default:
-        // Brush-family tools use a crosshair; a real brush-outline cursor is a
-        // later refinement.
-        setCursor(Qt::CrossCursor);
+    default: {
+        const double screenDiam = m_brushDiameter * m_zoom;
+        if (screenDiam >= 4.0 && screenDiam <= 300.0) {
+            const int sz = qMax(int(std::ceil(screenDiam)) + 2, 8);
+            QPixmap pix(sz, sz);
+            pix.fill(Qt::transparent);
+            QPainter p(&pix);
+            p.setRenderHint(QPainter::Antialiasing);
+            p.setPen(QPen(Qt::black, 1.0));
+            p.setBrush(Qt::NoBrush);
+            const double r = screenDiam / 2.0;
+            p.drawEllipse(QPointF(sz / 2.0, sz / 2.0), r, r);
+            p.end();
+            setCursor(QCursor(pix, sz / 2, sz / 2));
+        } else {
+            setCursor(Qt::CrossCursor);
+        }
         break;
+    }
     }
 }
 
@@ -2350,6 +2451,22 @@ bool CanvasView::event(QEvent *event)
     if (event->type() == QEvent::ShortcutOverride && m_tool == ToolId::Type && m_typing) {
         event->accept();
         return true;
+    }
+
+    // Delete and Backspace belong to the canvas whenever it has something of
+    // its own to remove — a selected slice, or the last point of an unfinished
+    // outline. Without this the window's Edit ▸ Clear takes the key first and
+    // erases the layer instead, which is not what pressing Delete on a slice
+    // means.
+    if (event->type() == QEvent::ShortcutOverride) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        const bool deleting = key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace;
+        const bool hasOwnTarget = (toolIsSlice() && m_selectedSlice >= 0)
+            || (m_marqueeActive && lassoIsClicked());
+        if (deleting && hasOwnTarget) {
+            event->accept();
+            return true;
+        }
     }
     return QWidget::event(event);
 }
@@ -2423,6 +2540,8 @@ void CanvasView::paintEvent(QPaintEvent *event)
     paintGradientDrag(painter);
     paintPathOverlay(painter);
     paintTypeOverlay(painter);
+    paintFreeTransform(painter);
+    paintSearchHighlight(painter);
     paintShapeOverlay(painter);
     paintZoomOverlay(painter);
 
@@ -2568,6 +2687,120 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     }
 
     if (event->button() != Qt::LeftButton) {
+        return;
+    }
+
+    // Free Transform intercepts all left-clicks while active.
+    if (m_freeTransform) {
+        const QPointF wpos = event->position();
+
+        // Warp mode: hit-test all 16 control points.
+        if (m_ftMode == TransformMode::Warp) {
+            constexpr double hitDist = 10.0;
+            m_warpDragI = m_warpDragJ = -1;
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    if (QLineF(wpos, documentToWidget(m_warpPts[r][c])).length() <= hitDist) {
+                        m_warpDragI = r;
+                        m_warpDragJ = c;
+                        break;
+                    }
+                }
+                if (m_warpDragI >= 0) break;
+            }
+            if (m_warpDragI < 0) return;
+            m_ftDragStart = doc;
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    m_warpPtsDragStart[r][c] = m_warpPts[r][c];
+            m_dragging = true;
+            return;
+        }
+
+        const bool isQuadMode = m_ftMode == TransformMode::Skew
+                                || m_ftMode == TransformMode::Distort
+                                || m_ftMode == TransformMode::Perspective;
+
+        QPointF corners[4];
+        if (isQuadMode) {
+            for (int i = 0; i < 4; ++i)
+                corners[i] = documentToWidget(m_ftQuad.at(i));
+        } else {
+            const QPointF center = m_ftBounds.center();
+            QTransform xf;
+            xf.translate(center.x(), center.y());
+            xf.rotate(m_ftRotation);
+            xf.translate(-center.x(), -center.y());
+            corners[0] = documentToWidget(xf.map(m_ftBounds.topLeft()));
+            corners[1] = documentToWidget(xf.map(m_ftBounds.topRight()));
+            corners[2] = documentToWidget(xf.map(m_ftBounds.bottomRight()));
+            corners[3] = documentToWidget(xf.map(m_ftBounds.bottomLeft()));
+        }
+        QPointF mids[4] = {
+            (corners[0] + corners[1]) / 2.0,
+            (corners[1] + corners[2]) / 2.0,
+            (corners[2] + corners[3]) / 2.0,
+            (corners[3] + corners[0]) / 2.0
+        };
+        FTHandle handleIds[] = {
+            FTHandle::TopLeft, FTHandle::TopRight,
+            FTHandle::BottomRight, FTHandle::BottomLeft
+        };
+        FTHandle midHandleIds[] = {
+            FTHandle::Top, FTHandle::Right, FTHandle::Bottom, FTHandle::Left
+        };
+
+        constexpr double hitDist = 8.0;
+        m_ftHandle = FTHandle::None;
+
+        for (int i = 0; i < 4; ++i) {
+            if (QLineF(wpos, corners[i]).length() <= hitDist) {
+                m_ftHandle = handleIds[i];
+                break;
+            }
+        }
+        if (m_ftHandle == FTHandle::None) {
+            for (int i = 0; i < 4; ++i) {
+                if (QLineF(wpos, mids[i]).length() <= hitDist) {
+                    m_ftHandle = midHandleIds[i];
+                    break;
+                }
+            }
+        }
+
+        if (m_ftHandle == FTHandle::None) {
+            QPolygonF poly;
+            for (auto &c : corners) poly << c;
+            if (poly.containsPoint(wpos, Qt::WindingFill)) {
+                m_ftHandle = FTHandle::Move;
+            } else if (m_ftMode == TransformMode::Free
+                       || m_ftMode == TransformMode::Rotate) {
+                m_ftHandle = FTHandle::Rotate;
+            }
+        }
+
+        // Mode constraints: Scale allows only handles+move, Rotate allows
+        // only rotate+move.
+        if (m_ftMode == TransformMode::Scale
+            && (m_ftHandle == FTHandle::Rotate)) {
+            m_ftHandle = FTHandle::None;
+        }
+        if (m_ftMode == TransformMode::Rotate
+            && m_ftHandle != FTHandle::Rotate
+            && m_ftHandle != FTHandle::Move
+            && m_ftHandle != FTHandle::None) {
+            m_ftHandle = FTHandle::None;
+        }
+
+        if (m_ftHandle == FTHandle::None) {
+            return;
+        }
+
+        m_ftDragStart = doc;
+        m_ftDragStartBounds = m_ftBounds;
+        m_ftDragStartRotation = m_ftRotation;
+        m_ftDragStartQuad = m_ftQuad;
+        m_dragging = true;
         return;
     }
 
@@ -2881,6 +3114,7 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     // The Color Replacement Brush recolours what is already there, so it edits
     // the layer per dab rather than accumulating a stroke to composite.
     if (m_replaceMode && m_engine) {
+        if (promptRasterizeIfType()) return;
         if (m_engine->beginReplace(float(doc.x()), float(doc.y()), 1.0f)) {
             m_replacing = true;
             m_dragging = true;
@@ -2899,6 +3133,7 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
     }
 
     if (toolPaints(m_tool) && m_engine) {
+        if (promptRasterizeIfType()) return;
         // A tablet would supply real pressure here; a mouse reports full.
         if (m_engine->beginStroke(float(doc.x()), float(doc.y()), 1.0f)) {
             m_dragging = true;
@@ -2929,6 +3164,311 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
 
     if (m_rotatingView) {
         setViewRotation(m_rotateStartRotation + angleToPointer(pos) - m_rotateStartAngle);
+        m_lastMousePos = pos;
+        return;
+    }
+
+    // Warp drag.
+    if (m_freeTransform && m_dragging && m_ftMode == TransformMode::Warp
+        && m_warpDragI >= 0) {
+        const QPointF delta = doc - m_ftDragStart;
+        const int r = m_warpDragI, c = m_warpDragJ;
+        m_warpPts[r][c] = m_warpPtsDragStart[r][c] + delta;
+
+        // Corner points drag their adjacent tangent handles too.
+        const bool isCorner = (r == 0 || r == 3) && (c == 0 || c == 3);
+        if (isCorner) {
+            // Horizontal neighbor (same row).
+            int adjC = (c == 0) ? 1 : 2;
+            m_warpPts[r][adjC] = m_warpPtsDragStart[r][adjC] + delta;
+            // Vertical neighbor (same column).
+            int adjR = (r == 0) ? 1 : 2;
+            m_warpPts[adjR][c] = m_warpPtsDragStart[adjR][c] + delta;
+        }
+
+        m_lastMousePos = pos;
+        update();
+        emit transformChanged();
+        return;
+    }
+
+    // Free Transform drag.
+    if (m_freeTransform && m_dragging && m_ftHandle != FTHandle::None) {
+        const QPointF delta = doc - m_ftDragStart;
+        const bool isQuadMode = m_ftMode == TransformMode::Skew
+                                || m_ftMode == TransformMode::Distort
+                                || m_ftMode == TransformMode::Perspective;
+
+        if (isQuadMode) {
+            auto q = m_ftDragStartQuad;
+            const bool persp = m_ftMode == TransformMode::Perspective;
+            switch (m_ftHandle) {
+            case FTHandle::Move:
+                for (int i = 0; i < 4; ++i) q[i] += delta;
+                break;
+            case FTHandle::TopLeft:
+                q[0] += delta;
+                if (persp) q[1] += QPointF(-delta.x(), delta.y());
+                break;
+            case FTHandle::TopRight:
+                q[1] += delta;
+                if (persp) q[0] += QPointF(-delta.x(), delta.y());
+                break;
+            case FTHandle::BottomRight:
+                q[2] += delta;
+                if (persp) q[3] += QPointF(-delta.x(), delta.y());
+                break;
+            case FTHandle::BottomLeft:
+                q[3] += delta;
+                if (persp) q[2] += QPointF(-delta.x(), delta.y());
+                break;
+            case FTHandle::Top:
+                if (persp) {
+                    q[0] += QPointF(delta.x(), delta.y());
+                    q[1] += QPointF(-delta.x(), delta.y());
+                } else {
+                    q[0] += QPointF(0, delta.y());
+                    q[1] += QPointF(0, delta.y());
+                }
+                break;
+            case FTHandle::Bottom:
+                if (persp) {
+                    q[3] += QPointF(delta.x(), delta.y());
+                    q[2] += QPointF(-delta.x(), delta.y());
+                } else {
+                    q[2] += QPointF(0, delta.y());
+                    q[3] += QPointF(0, delta.y());
+                }
+                break;
+            case FTHandle::Left:
+                if (persp) {
+                    q[0] += QPointF(delta.x(), delta.y());
+                    q[3] += QPointF(delta.x(), -delta.y());
+                } else {
+                    q[0] += QPointF(delta.x(), 0);
+                    q[3] += QPointF(delta.x(), 0);
+                }
+                break;
+            case FTHandle::Right:
+                if (persp) {
+                    q[1] += QPointF(delta.x(), delta.y());
+                    q[2] += QPointF(delta.x(), -delta.y());
+                } else {
+                    q[1] += QPointF(delta.x(), 0);
+                    q[2] += QPointF(delta.x(), 0);
+                }
+                break;
+            default:
+                break;
+            }
+            m_ftQuad = q;
+        } else {
+            // Rectangle-based transforms (Free, Scale, Rotate).
+            const bool shift = event->modifiers().testFlag(Qt::ShiftModifier);
+            const double origW = m_ftDragStartBounds.width();
+            const double origH = m_ftDragStartBounds.height();
+            const double aspect = (origH > 0) ? origW / origH : 1.0;
+
+            switch (m_ftHandle) {
+            case FTHandle::Move:
+                m_ftBounds = m_ftDragStartBounds.translated(delta);
+                break;
+            case FTHandle::Rotate: {
+                QPointF center = m_ftBounds.center();
+                double startAngle = std::atan2(m_ftDragStart.y() - center.y(),
+                                               m_ftDragStart.x() - center.x());
+                double curAngle = std::atan2(doc.y() - center.y(),
+                                             doc.x() - center.x());
+                double degrees = (curAngle - startAngle) * 180.0 / M_PI;
+                if (shift) degrees = std::round(degrees / 15.0) * 15.0;
+                m_ftRotation = m_ftDragStartRotation + degrees;
+                break;
+            }
+            case FTHandle::TopLeft: {
+                QRectF b = m_ftDragStartBounds;
+                if (shift) {
+                    double dx = delta.x();
+                    double dy = dx / aspect;
+                    b.setTopLeft(b.topLeft() + QPointF(dx, dy));
+                } else {
+                    b.setTopLeft(b.topLeft() + delta);
+                }
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::TopRight: {
+                QRectF b = m_ftDragStartBounds;
+                if (shift) {
+                    double dx = delta.x();
+                    double dy = -dx / aspect;
+                    b.setTopRight(b.topRight() + QPointF(dx, dy));
+                } else {
+                    b.setTopRight(b.topRight() + delta);
+                }
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::BottomRight: {
+                QRectF b = m_ftDragStartBounds;
+                if (shift) {
+                    double dx = delta.x();
+                    double dy = dx / aspect;
+                    b.setBottomRight(b.bottomRight() + QPointF(dx, dy));
+                } else {
+                    b.setBottomRight(b.bottomRight() + delta);
+                }
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::BottomLeft: {
+                QRectF b = m_ftDragStartBounds;
+                if (shift) {
+                    double dx = delta.x();
+                    double dy = -dx / aspect;
+                    b.setBottomLeft(b.bottomLeft() + QPointF(dx, dy));
+                } else {
+                    b.setBottomLeft(b.bottomLeft() + delta);
+                }
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::Top: {
+                QRectF b = m_ftDragStartBounds;
+                b.setTop(b.top() + delta.y());
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::Bottom: {
+                QRectF b = m_ftDragStartBounds;
+                b.setBottom(b.bottom() + delta.y());
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::Left: {
+                QRectF b = m_ftDragStartBounds;
+                b.setLeft(b.left() + delta.x());
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::Right: {
+                QRectF b = m_ftDragStartBounds;
+                b.setRight(b.right() + delta.x());
+                m_ftBounds = b;
+                break;
+            }
+            case FTHandle::None:
+                break;
+            }
+        }
+        m_lastMousePos = pos;
+        update();
+        emit transformChanged();
+        return;
+    }
+
+    // Warp hover: show pointer near control points.
+    if (m_freeTransform && !m_dragging && m_ftMode == TransformMode::Warp) {
+        constexpr double hitDist = 10.0;
+        bool nearHandle = false;
+        for (int r = 0; r < 4 && !nearHandle; ++r)
+            for (int c = 0; c < 4 && !nearHandle; ++c)
+                if (QLineF(pos, documentToWidget(m_warpPts[r][c])).length() <= hitDist)
+                    nearHandle = true;
+        setCursor(nearHandle ? Qt::CrossCursor : Qt::ArrowCursor);
+        m_lastMousePos = pos;
+        return;
+    }
+
+    // Free Transform hover: update cursor based on proximity to handles.
+    if (m_freeTransform && !m_dragging) {
+        const bool isQuadMode = m_ftMode == TransformMode::Skew
+                                || m_ftMode == TransformMode::Distort
+                                || m_ftMode == TransformMode::Perspective;
+        QPointF corners[4];
+        if (isQuadMode) {
+            for (int i = 0; i < 4; ++i)
+                corners[i] = documentToWidget(m_ftQuad.at(i));
+        } else {
+            const QPointF center = m_ftBounds.center();
+            QTransform xf;
+            xf.translate(center.x(), center.y());
+            xf.rotate(m_ftRotation);
+            xf.translate(-center.x(), -center.y());
+            corners[0] = documentToWidget(xf.map(m_ftBounds.topLeft()));
+            corners[1] = documentToWidget(xf.map(m_ftBounds.topRight()));
+            corners[2] = documentToWidget(xf.map(m_ftBounds.bottomRight()));
+            corners[3] = documentToWidget(xf.map(m_ftBounds.bottomLeft()));
+        }
+        QPointF mids[4] = {
+            (corners[0] + corners[1]) / 2.0,
+            (corners[1] + corners[2]) / 2.0,
+            (corners[2] + corners[3]) / 2.0,
+            (corners[3] + corners[0]) / 2.0
+        };
+
+        constexpr double handleHit = 6.0;
+
+        static QCursor rotateCursor = [] {
+            QPixmap pm(24, 24);
+            pm.fill(Qt::transparent);
+            QPainter p(&pm);
+            p.setRenderHint(QPainter::Antialiasing);
+            p.setPen(QPen(Qt::black, 1.5));
+            QRectF arc(4, 4, 16, 16);
+            p.drawArc(arc, 30 * 16, 270 * 16);
+            p.setBrush(Qt::black);
+            QPolygonF arrow;
+            arrow << QPointF(18, 8) << QPointF(21, 11) << QPointF(15, 11);
+            p.drawPolygon(arrow);
+            p.end();
+            return QCursor(pm, 12, 12);
+        }();
+
+        bool handled = false;
+
+        Qt::CursorShape cornerCursors[] = {
+            Qt::SizeFDiagCursor, Qt::SizeBDiagCursor,
+            Qt::SizeFDiagCursor, Qt::SizeBDiagCursor
+        };
+        for (int i = 0; i < 4; ++i) {
+            if (QLineF(pos, corners[i]).length() <= handleHit) {
+                if (m_ftMode != TransformMode::Rotate) {
+                    setCursor(cornerCursors[i]);
+                    handled = true;
+                }
+                break;
+            }
+        }
+
+        if (!handled) {
+            Qt::CursorShape midCursors[] = {
+                Qt::SizeVerCursor, Qt::SizeHorCursor,
+                Qt::SizeVerCursor, Qt::SizeHorCursor
+            };
+            for (int i = 0; i < 4; ++i) {
+                if (QLineF(pos, mids[i]).length() <= handleHit) {
+                    if (m_ftMode != TransformMode::Rotate) {
+                        setCursor(midCursors[i]);
+                        handled = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!handled) {
+            QPolygonF poly;
+            for (auto &c : corners) poly << c;
+            if (poly.containsPoint(pos, Qt::WindingFill)) {
+                setCursor(Qt::SizeAllCursor);
+            } else if (m_ftMode == TransformMode::Free
+                       || m_ftMode == TransformMode::Rotate) {
+                setCursor(rotateCursor);
+            } else {
+                setCursor(Qt::ArrowCursor);
+            }
+        }
+
         m_lastMousePos = pos;
         return;
     }
@@ -3219,6 +3759,14 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
 
+    // Free Transform: end of drag.
+    if (m_freeTransform && m_dragging) {
+        m_ftHandle = FTHandle::None;
+        m_warpDragI = m_warpDragJ = -1;
+        m_dragging = false;
+        return;
+    }
+
     // The end of a drag-selection through text. The caret and its anchor stay
     // where the drag left them.
     if (m_typeSelecting) {
@@ -3458,6 +4006,9 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event)
         m_engine->endStroke();
         refresh();
     }
+    if (m_dragging && m_engine && m_tool == ToolId::Move) {
+        m_engine->sealHistory();
+    }
     m_dragging = false;
 }
 
@@ -3484,6 +4035,20 @@ void CanvasView::wheelEvent(QWheelEvent *event)
 
 void CanvasView::keyPressEvent(QKeyEvent *event)
 {
+    // Free Transform: Enter commits, Escape cancels.
+    if (m_freeTransform) {
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            commitFreeTransform();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Escape) {
+            cancelFreeTransform();
+            event->accept();
+            return;
+        }
+    }
+
     // While composing text, every key is the Type tool's — including Space,
     // which the branch below would otherwise steal for a pan override.
     if (m_tool == ToolId::Type && m_typing) {
@@ -3766,14 +4331,51 @@ void CanvasView::typePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
     }
 
     m_typing = true;
-    m_typeLayer = -1;
     m_typeOrigin = doc;
     m_typeText.clear();
     m_typeRuns.clear();
     m_typeCaret = 0;
     m_typeAnchor = 0;
+    // The layer appears now, empty, the way Photoshop's does — clicking with
+    // the Type tool *is* the act that makes a type layer, and waiting until
+    // the text is committed leaves the Layers panel disagreeing with the caret
+    // blinking on the canvas.
+    m_typeLayer = createEmptyTypeLayer();
+    m_typeLayerIsNew = m_typeLayer >= 0;
     setFocus(Qt::MouseFocusReason);
-    update();
+    refresh();
+}
+
+int CanvasView::createEmptyTypeLayer()
+{
+    if (!m_engine) {
+        return -1;
+    }
+
+    // One run holding nothing: the layer is type from the outset, so the panel
+    // marks it with a T before a single character is typed.
+    m_engine->beginTextRuns();
+    m_engine->addTextRun(QString(), m_typeFont.family(), m_typeStyleName,
+                         float(m_typeFont.pointSizeF()), m_typeColor);
+
+    // A pixel of nothing, since a layer with no pixels at all has no place in
+    // the document. What is committed later replaces it wholesale.
+    QImage empty(1, 1, QImage::Format_ARGB32_Premultiplied);
+    empty.fill(Qt::transparent);
+
+    // No name: the engine falls back to "Layer N", which is what Photoshop
+    // calls a type layer until there is text to name it after.
+    if (!m_engine->addTextLayer(empty, qRound(m_typeOrigin.x()), qRound(m_typeOrigin.y()),
+                                QString(), typeAlignCode(m_typeAlignment), m_typeAntialias,
+                                m_typeVertical, float(m_typeOrigin.x()),
+                                float(m_typeOrigin.y()))) {
+        return -1;
+    }
+
+    const int index = m_engine->getActiveLayerIndex();
+    // Hold its pixels back for the edit, exactly as reopening one does.
+    m_engine->beginTextEdit(index);
+    return index;
 }
 
 void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
@@ -3823,6 +4425,9 @@ void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
 
     m_typing = true;
     m_typeLayer = layerIndex;
+    // Reopened, not made here: abandoning this edit must leave the layer where
+    // it was rather than deleting someone's text.
+    m_typeLayerIsNew = false;
     // The caret goes where the click fell, now that there is a layout to
     // measure it against — clicking mid-word puts it mid-word.
     m_typeCaret = typeIndexAt(documentToWidget(doc));
@@ -4561,6 +5166,7 @@ void CanvasView::commitTypeEdit()
     m_typeAnchor = 0;
     const int editedLayer = m_typeLayer;
     m_typeLayer = -1;
+    m_typeLayerIsNew = false;
 
     if (!m_engine) {
         m_typeText.clear();
@@ -4656,14 +5262,24 @@ void CanvasView::cancelTypeEdit()
     m_typeSelecting = false;
     m_typeCaret = 0;
     m_typeAnchor = 0;
+    const int editedLayer = m_typeLayer;
+    const bool wasNew = m_typeLayerIsNew;
     m_typeLayer = -1;
+    m_typeLayerIsNew = false;
     m_typeText.clear();
     m_typeRuns.clear();
-    // Reopened text goes back to showing its committed rendering, untouched.
+
     if (m_engine) {
+        // Reopened text goes back to showing its committed rendering,
+        // untouched.
         m_engine->endTextEdit();
+        // A layer this edit put down has nothing to go back to: abandoning the
+        // edit abandons the layer, which is what Esc does in Photoshop.
+        if (wasNew && editedLayer >= 0) {
+            m_engine->deleteLayer(editedLayer);
+        }
     }
-    update();
+    refresh();
 }
 
 void CanvasView::paintTypeRuns(QPainter &painter, const TypeLayout &layout,
@@ -4755,6 +5371,558 @@ void CanvasView::paintPendingOutline(QPainter &painter, const QPolygonF &widgetO
     painter.setPen(dashed);
     painter.drawPolygon(widgetOutline);
     painter.restore();
+}
+
+// --------------------------------------------------------- Free Transform --
+
+void CanvasView::beginFreeTransform(TransformMode mode)
+{
+    if (m_freeTransform || !m_engine) return;
+
+    const int idx = m_engine->getActiveLayerIndex();
+    if (idx < 0) return;
+
+    m_ftLayerIndex = idx;
+    QImage fullImage = m_engine->layerImage(idx);
+    if (fullImage.isNull()) return;
+
+    const int ox = m_engine->layerOffsetX(idx);
+    const int oy = m_engine->layerOffsetY(idx);
+    m_ftOrigOffset = QPointF(ox, oy);
+
+    QRect cb = m_engine->layerContentBounds(idx);
+    if (cb.width() <= 0 || cb.height() <= 0) return;
+    m_ftBounds = QRectF(cb);
+
+    QRect cropRect(cb.x() - ox, cb.y() - oy, cb.width(), cb.height());
+    m_ftOrigImage = fullImage.copy(cropRect);
+
+    m_ftRotation = 0.0;
+    m_ftScale = {1.0, 1.0};
+    m_ftHandle = FTHandle::None;
+    m_ftMode = mode;
+    m_ftQuad = QPolygonF({m_ftBounds.topLeft(), m_ftBounds.topRight(),
+                          m_ftBounds.bottomRight(), m_ftBounds.bottomLeft()});
+
+    if (mode == TransformMode::Warp) {
+        const QRectF &b = m_ftBounds;
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                m_warpPts[r][c] = QPointF(b.left() + b.width() * c / 3.0,
+                                          b.top() + b.height() * r / 3.0);
+        m_warpDragI = m_warpDragJ = -1;
+    }
+
+    m_freeTransform = true;
+    update();
+    emit transformStarted();
+    emit transformChanged();
+}
+
+static QPointF evalBezier(const QPointF p[4], double t)
+{
+    const double u = 1.0 - t;
+    return u*u*u*p[0] + 3*u*u*t*p[1] + 3*u*t*t*p[2] + t*t*t*p[3];
+}
+
+static QPointF evalPatch(const QPointF grid[4][4], double u, double v)
+{
+    QPointF col[4];
+    for (int r = 0; r < 4; ++r) {
+        col[r] = evalBezier(grid[r], u);
+    }
+    return evalBezier(col, v);
+}
+
+void CanvasView::commitFreeTransform()
+{
+    if (!m_freeTransform || !m_engine) return;
+    m_freeTransform = false;
+
+    QRectF srcRect(0, 0, m_ftOrigImage.width(), m_ftOrigImage.height());
+
+    if (m_ftMode == TransformMode::Warp) {
+        const int N = 30;
+        const double sw = m_ftOrigImage.width();
+        const double sh = m_ftOrigImage.height();
+
+        // Compute bounding rect of warped patch.
+        double minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+        for (int j = 0; j <= N; ++j)
+            for (int i = 0; i <= N; ++i) {
+                QPointF p = evalPatch(m_warpPts, double(i)/N, double(j)/N);
+                minX = std::min(minX, p.x());
+                minY = std::min(minY, p.y());
+                maxX = std::max(maxX, p.x());
+                maxY = std::max(maxY, p.y());
+            }
+        QPointF origin(std::floor(minX), std::floor(minY));
+        int rw = qMax(1, int(std::ceil(maxX - origin.x())) + 1);
+        int rh = qMax(1, int(std::ceil(maxY - origin.y())) + 1);
+
+        QImage result(rw, rh, QImage::Format_ARGB32_Premultiplied);
+        result.fill(Qt::transparent);
+
+        QPainter p(&result);
+        p.setRenderHint(QPainter::SmoothPixmapTransform);
+        for (int j = 0; j < N; ++j) {
+            for (int i = 0; i < N; ++i) {
+                const double u0 = double(i)/N, u1 = double(i+1)/N;
+                const double v0 = double(j)/N, v1 = double(j+1)/N;
+
+                QPolygonF sp;
+                sp << QPointF(u0*sw, v0*sh) << QPointF(u1*sw, v0*sh)
+                   << QPointF(u1*sw, v1*sh) << QPointF(u0*sw, v1*sh);
+
+                QPolygonF dp;
+                dp << (evalPatch(m_warpPts, u0, v0) - origin)
+                   << (evalPatch(m_warpPts, u1, v0) - origin)
+                   << (evalPatch(m_warpPts, u1, v1) - origin)
+                   << (evalPatch(m_warpPts, u0, v1) - origin);
+
+                QTransform xf;
+                if (QTransform::quadToQuad(sp, dp, xf)) {
+                    p.save();
+                    QPainterPath clip;
+                    clip.addPolygon(dp);
+                    p.setClipPath(clip);
+                    p.setTransform(xf);
+                    p.drawImage(0, 0, m_ftOrigImage);
+                    p.restore();
+                }
+            }
+        }
+        p.end();
+
+        m_engine->replaceLayerPixels(m_ftLayerIndex, result,
+                                      int(origin.x()), int(origin.y()));
+    } else
+
+    {
+    const bool isQuadMode = m_ftMode == TransformMode::Skew
+                            || m_ftMode == TransformMode::Distort
+                            || m_ftMode == TransformMode::Perspective;
+
+    if (isQuadMode) {
+        QRectF mapped = m_ftQuad.boundingRect();
+        QImage result(qRound(mapped.width()), qRound(mapped.height()),
+                      QImage::Format_ARGB32_Premultiplied);
+        result.fill(Qt::transparent);
+
+        QPolygonF srcPoly;
+        srcPoly << srcRect.topLeft() << srcRect.topRight()
+                << srcRect.bottomRight() << srcRect.bottomLeft();
+        QPolygonF dstPoly;
+        for (int i = 0; i < 4; ++i)
+            dstPoly << (m_ftQuad.at(i) - mapped.topLeft());
+
+        QPainter p(&result);
+        p.setRenderHint(QPainter::SmoothPixmapTransform);
+        QTransform quadXf;
+        if (QTransform::quadToQuad(srcPoly, dstPoly, quadXf)) {
+            p.setTransform(quadXf);
+            p.drawImage(0, 0, m_ftOrigImage);
+        }
+        p.end();
+
+        m_engine->replaceLayerPixels(m_ftLayerIndex, result,
+                                      qRound(mapped.x()), qRound(mapped.y()));
+    } else {
+        QPointF center = m_ftBounds.center();
+        QTransform xf;
+        xf.translate(center.x(), center.y());
+        xf.rotate(m_ftRotation);
+        xf.translate(-center.x(), -center.y());
+
+        QPolygonF dstQuad;
+        dstQuad << xf.map(m_ftBounds.topLeft())
+                << xf.map(m_ftBounds.topRight())
+                << xf.map(m_ftBounds.bottomRight())
+                << xf.map(m_ftBounds.bottomLeft());
+        QRectF mapped = dstQuad.boundingRect();
+
+        QImage result(qMax(1, qRound(mapped.width())),
+                      qMax(1, qRound(mapped.height())),
+                      QImage::Format_ARGB32_Premultiplied);
+        result.fill(Qt::transparent);
+
+        QPolygonF srcPoly;
+        srcPoly << srcRect.topLeft() << srcRect.topRight()
+                << srcRect.bottomRight() << srcRect.bottomLeft();
+        QPolygonF localDst;
+        for (int i = 0; i < 4; ++i)
+            localDst << (dstQuad.at(i) - mapped.topLeft());
+
+        QPainter p(&result);
+        p.setRenderHint(QPainter::SmoothPixmapTransform);
+        QTransform quadXf;
+        if (QTransform::quadToQuad(srcPoly, localDst, quadXf)) {
+            p.setTransform(quadXf);
+            p.drawImage(0, 0, m_ftOrigImage);
+        }
+        p.end();
+
+        m_engine->replaceLayerPixels(m_ftLayerIndex, result,
+                                      qRound(mapped.x()), qRound(mapped.y()));
+    }
+    } // end else (non-warp)
+
+    m_ftOrigImage = QImage();
+    updateCursor();
+    refresh();
+    emit transformCommitted();
+}
+
+void CanvasView::cancelFreeTransform()
+{
+    if (!m_freeTransform) return;
+    m_freeTransform = false;
+    m_ftOrigImage = QImage();
+    updateCursor();
+    update();
+    emit transformCancelled();
+}
+
+void CanvasView::paintFreeTransform(QPainter &painter)
+{
+    if (!m_freeTransform) return;
+
+    if (m_ftMode == TransformMode::Warp) {
+        const int N = 20;
+        const double sw = m_ftOrigImage.width();
+        const double sh = m_ftOrigImage.height();
+
+        painter.save();
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        for (int j = 0; j < N; ++j) {
+            for (int i = 0; i < N; ++i) {
+                const double u0 = double(i) / N, u1 = double(i + 1) / N;
+                const double v0 = double(j) / N, v1 = double(j + 1) / N;
+
+                QPolygonF srcPoly;
+                srcPoly << QPointF(u0 * sw, v0 * sh)
+                        << QPointF(u1 * sw, v0 * sh)
+                        << QPointF(u1 * sw, v1 * sh)
+                        << QPointF(u0 * sw, v1 * sh);
+
+                QPolygonF dstPoly;
+                dstPoly << documentToWidget(evalPatch(m_warpPts, u0, v0))
+                        << documentToWidget(evalPatch(m_warpPts, u1, v0))
+                        << documentToWidget(evalPatch(m_warpPts, u1, v1))
+                        << documentToWidget(evalPatch(m_warpPts, u0, v1));
+
+                QTransform xf;
+                if (QTransform::quadToQuad(srcPoly, dstPoly, xf)) {
+                    painter.save();
+                    QPainterPath clip;
+                    clip.addPolygon(dstPoly);
+                    painter.setClipPath(clip);
+                    painter.setTransform(xf);
+                    painter.drawImage(0, 0, m_ftOrigImage);
+                    painter.restore();
+                }
+            }
+        }
+        painter.restore();
+
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        // Grid lines.
+        painter.setPen(QPen(QColor(255, 255, 255, 160), 1));
+        const int gridSteps = 3;
+        for (int line = 0; line <= gridSteps; ++line) {
+            double t = double(line) / gridSteps;
+            QPainterPath hPath, vPath;
+            for (int seg = 0; seg <= 40; ++seg) {
+                double s = double(seg) / 40.0;
+                QPointF hp = documentToWidget(evalPatch(m_warpPts, s, t));
+                QPointF vp = documentToWidget(evalPatch(m_warpPts, t, s));
+                if (seg == 0) { hPath.moveTo(hp); vPath.moveTo(vp); }
+                else { hPath.lineTo(hp); vPath.lineTo(vp); }
+            }
+            painter.drawPath(hPath);
+            painter.drawPath(vPath);
+        }
+
+        // Control point tangent lines and handles.
+        const double hs = 4.0;
+        const double hsc = 3.0;
+        auto drawSquare = [&](const QPointF &pt) {
+            painter.setPen(QPen(Qt::black, 1));
+            painter.setBrush(Qt::white);
+            painter.drawRect(QRectF(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2));
+        };
+        auto drawCircle = [&](const QPointF &pt) {
+            painter.setPen(QPen(Qt::black, 1));
+            painter.setBrush(Qt::white);
+            painter.drawEllipse(pt, hsc, hsc);
+        };
+
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                QPointF wp = documentToWidget(m_warpPts[r][c]);
+                bool isCorner = (r == 0 || r == 3) && (c == 0 || c == 3);
+                if (isCorner) {
+                    // Draw tangent lines from corner to adjacent control points.
+                    painter.setPen(QPen(QColor(100, 100, 100), 1));
+                    if (c == 0) {
+                        painter.drawLine(wp, documentToWidget(m_warpPts[r][1]));
+                    } else {
+                        painter.drawLine(wp, documentToWidget(m_warpPts[r][2]));
+                    }
+                    if (r == 0) {
+                        painter.drawLine(wp, documentToWidget(m_warpPts[1][c]));
+                    } else {
+                        painter.drawLine(wp, documentToWidget(m_warpPts[2][c]));
+                    }
+                    drawSquare(wp);
+                } else {
+                    drawCircle(wp);
+                }
+            }
+        }
+
+        painter.restore();
+        return;
+    }
+
+    const bool isQuadMode = m_ftMode == TransformMode::Skew
+                            || m_ftMode == TransformMode::Distort
+                            || m_ftMode == TransformMode::Perspective;
+
+    QPolygonF corners;
+    QPointF centerDoc;
+
+    if (isQuadMode) {
+        for (int i = 0; i < 4; ++i)
+            corners << documentToWidget(m_ftQuad.at(i));
+        QPointF qc;
+        for (int i = 0; i < 4; ++i) qc += m_ftQuad.at(i);
+        centerDoc = qc / 4.0;
+    } else {
+        const QPointF center = m_ftBounds.center();
+        QTransform xf;
+        xf.translate(center.x(), center.y());
+        xf.rotate(m_ftRotation);
+        xf.translate(-center.x(), -center.y());
+        corners << documentToWidget(xf.map(m_ftBounds.topLeft()))
+                << documentToWidget(xf.map(m_ftBounds.topRight()))
+                << documentToWidget(xf.map(m_ftBounds.bottomRight()))
+                << documentToWidget(xf.map(m_ftBounds.bottomLeft()));
+        centerDoc = center;
+    }
+
+    // Draw the transformed layer preview.
+    painter.save();
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    {
+        QRectF srcRect(0, 0, m_ftOrigImage.width(), m_ftOrigImage.height());
+        QPolygonF srcPoly;
+        srcPoly << srcRect.topLeft() << srcRect.topRight()
+                << srcRect.bottomRight() << srcRect.bottomLeft();
+
+        QTransform quadXf;
+        if (QTransform::quadToQuad(srcPoly, corners, quadXf)) {
+            painter.setTransform(quadXf);
+            painter.drawImage(0, 0, m_ftOrigImage);
+            painter.resetTransform();
+        }
+    }
+    painter.restore();
+
+    // Draw the bounding box and handles.
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(Qt::black, 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawPolygon(corners);
+
+    QPointF midTop = (corners[0] + corners[1]) / 2.0;
+    QPointF midRight = (corners[1] + corners[2]) / 2.0;
+    QPointF midBottom = (corners[2] + corners[3]) / 2.0;
+    QPointF midLeft = (corners[3] + corners[0]) / 2.0;
+
+    const double hs = 4.0;
+    auto drawHandle = [&](const QPointF &pt) {
+        painter.fillRect(QRectF(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2), Qt::white);
+        painter.drawRect(QRectF(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2));
+    };
+
+    for (int i = 0; i < corners.size(); ++i) drawHandle(corners[i]);
+    drawHandle(midTop);
+    drawHandle(midRight);
+    drawHandle(midBottom);
+    drawHandle(midLeft);
+
+    // Center pivot.
+    QPointF cp = documentToWidget(centerDoc);
+    painter.setPen(QPen(Qt::black, 1));
+    painter.drawLine(cp - QPointF(6, 0), cp + QPointF(6, 0));
+    painter.drawLine(cp - QPointF(0, 6), cp + QPointF(0, 6));
+    painter.drawEllipse(cp, 4.0, 4.0);
+
+    painter.restore();
+}
+
+void CanvasView::setSearchHighlight(int layerIndex, int charOffset, int charLength)
+{
+    m_searchHighlightLayer = layerIndex;
+    m_searchHighlightChar = charOffset;
+    m_searchHighlightLen = charLength;
+    update();
+}
+
+void CanvasView::clearSearchHighlight()
+{
+    m_searchHighlightLayer = -1;
+    m_searchHighlightChar = -1;
+    m_searchHighlightLen = 0;
+    update();
+}
+
+void CanvasView::paintSearchHighlight(QPainter &painter)
+{
+    if (m_searchHighlightLayer < 0 || !m_engine || m_searchHighlightLen <= 0) {
+        return;
+    }
+
+    const int idx = m_searchHighlightLayer;
+    if (m_engine->layerKind(idx) != 2) {
+        return;
+    }
+
+    const int runCount = m_engine->layerTextRunCount(idx);
+    if (runCount <= 0) {
+        return;
+    }
+
+    const float originX = m_engine->layerTextOriginX(idx);
+    const float originY = m_engine->layerTextOriginY(idx);
+    const bool vertical = m_engine->layerTextVertical(idx);
+
+    // Gather runs and full text.
+    struct RunInfo {
+        QString text;
+        QFont font;
+        int start;
+    };
+    QList<RunInfo> runs;
+    QString fullText;
+    for (int r = 0; r < runCount; ++r) {
+        RunInfo ri;
+        ri.text = m_engine->layerTextRunText(idx, r);
+        ri.start = fullText.length();
+        QString family = m_engine->layerTextRunFamily(idx, r);
+        QString style = m_engine->layerTextRunStyle(idx, r);
+        float size = m_engine->layerTextRunSize(idx, r);
+        ri.font = QFont(family);
+        ri.font.setStyleName(style);
+        ri.font.setPixelSize(qRound(size));
+        runs.append(ri);
+        fullText += ri.text;
+    }
+
+    // Split into lines and find which line(s) the match is on.
+    const int matchStart = m_searchHighlightChar;
+    const int matchEnd = matchStart + m_searchHighlightLen;
+
+    QStringList lines = fullText.split(QLatin1Char('\n'));
+    int lineCharStart = 0;
+    qreal yOffset = 0;
+
+    for (const QString &lineStr : lines) {
+        const int lineEnd = lineCharStart + lineStr.length();
+
+        // Check if the match overlaps this line.
+        const int overlapStart = qMax(matchStart, lineCharStart);
+        const int overlapEnd = qMin(matchEnd, lineEnd);
+
+        if (overlapStart < overlapEnd) {
+            // Find the font for the match start to get metrics.
+            QFont matchFont;
+            for (const RunInfo &ri : std::as_const(runs)) {
+                int runEnd = ri.start + ri.text.length();
+                if (overlapStart >= ri.start && overlapStart < runEnd) {
+                    matchFont = ri.font;
+                    break;
+                }
+            }
+            QFontMetricsF fm(matchFont);
+
+            // Measure x offset: advance of text before the match on this line.
+            qreal xBefore = 0;
+            for (const RunInfo &ri : std::as_const(runs)) {
+                int runStart = ri.start;
+                int runEnd = runStart + ri.text.length();
+                int segStart = qMax(runStart, lineCharStart);
+                int segEnd = qMin(runEnd, overlapStart);
+                if (segStart < segEnd) {
+                    QFontMetricsF sfm(ri.font);
+                    xBefore += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart));
+                }
+            }
+
+            // Measure the matched portion's width.
+            qreal matchWidth = 0;
+            for (const RunInfo &ri : std::as_const(runs)) {
+                int runStart = ri.start;
+                int runEnd = runStart + ri.text.length();
+                int segStart = qMax(runStart, overlapStart);
+                int segEnd = qMin(runEnd, overlapEnd);
+                if (segStart < segEnd) {
+                    QFontMetricsF sfm(ri.font);
+                    matchWidth += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart));
+                }
+            }
+
+            qreal lineHeight = fm.height();
+
+            QRectF highlightRect;
+            if (vertical) {
+                highlightRect = QRectF(originX + yOffset, originY + xBefore,
+                                       lineHeight, matchWidth);
+            } else {
+                highlightRect = QRectF(originX + xBefore, originY + yOffset,
+                                       matchWidth, lineHeight);
+            }
+
+            // Transform to widget coordinates and draw.
+            QPointF topLeft = documentToWidget(highlightRect.topLeft());
+            QPointF bottomRight = documentToWidget(highlightRect.bottomRight());
+            QRectF widgetRect(topLeft, bottomRight);
+
+            painter.save();
+            painter.setRenderHint(QPainter::Antialiasing, false);
+            painter.fillRect(widgetRect, QColor(255, 255, 0, 160));
+            painter.restore();
+        }
+
+        if (vertical) {
+            // Vertical text: each line is a column.
+            QFont lineFont;
+            for (const RunInfo &ri : std::as_const(runs)) {
+                if (ri.start <= lineCharStart && ri.start + ri.text.length() > lineCharStart) {
+                    lineFont = ri.font;
+                    break;
+                }
+            }
+            QFontMetricsF lfm(lineFont);
+            yOffset -= lfm.height();
+        } else {
+            QFont lineFont;
+            for (const RunInfo &ri : std::as_const(runs)) {
+                if (ri.start <= lineCharStart && ri.start + ri.text.length() > lineCharStart) {
+                    lineFont = ri.font;
+                    break;
+                }
+            }
+            QFontMetricsF lfm(lineFont);
+            yOffset += lfm.height();
+        }
+
+        lineCharStart = lineEnd + 1; // +1 for \n
+    }
 }
 
 void CanvasView::paintShapeOverlay(QPainter &painter)

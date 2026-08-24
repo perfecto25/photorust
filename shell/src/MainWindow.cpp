@@ -2,7 +2,18 @@
 
 #include "canvas/CanvasView.h"
 #include "dialogs/ColorPickerDialog.h"
+#include "dialogs/ColorSettingsDialog.h"
+#include "dialogs/ExportAsDialog.h"
+#include "dialogs/FindReplaceTextDialog.h"
+#include "dialogs/FileInfoDialog.h"
+#include "dialogs/GifWriter.h"
+#include "dialogs/IndexedColorDialog.h"
+#include "dialogs/KeyboardShortcutsDialog.h"
+#include "dialogs/NewDocumentDialog.h"
+#include "dialogs/PrintDialog.h"
+#include "dialogs/SaveForWebDialog.h"
 #include "panels/BrushPresetPicker.h"
+#include "panels/ChannelsPanel.h"
 #include "panels/ColorPanel.h"
 #include "panels/HistoryPanel.h"
 #include "panels/InfoPanel.h"
@@ -19,6 +30,7 @@
 #include <QButtonGroup>
 #include <QCache>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
@@ -29,6 +41,10 @@
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFormLayout>
+#include <QGroupBox>
+#include <QGridLayout>
+#include <QRadioButton>
+#include <QImageReader>
 #include <QInputDialog>
 #include <QIntValidator>
 #include <QLabel>
@@ -39,9 +55,13 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QPainter>
+#include <QPrintDialog>
+#include <QPrinter>
+#include <QPrinterInfo>
 #include <QMessageBox>
 #include <QPointer>
 #include <QSet>
+#include <QSettings>
 #include <QSpinBox>
 #include <QSignalBlocker>
 #include <QStatusBar>
@@ -56,22 +76,203 @@
 
 namespace {
 
+/// How many files File ▸ Open Recent remembers. Photoshop's default.
+constexpr int kMaxRecentFiles = 10;
+
+/// One entry of a file dialog's format list.
+struct FormatEntry {
+    const char *label;
+    /// Space-separated extensions, lower case and without the dot.
+    const char *extensions;
+};
+
 /// Formats accepted by File ▸ Open. PSD is ours; the rest go through Qt's
 /// image plugins.
-const char *const kOpenFilter =
-    "All Supported Formats (*.psd *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp);;"
-    "Photoshop (*.psd);;"
-    "PNG (*.png);;"
-    "JPEG (*.jpg *.jpeg);;"
-    "TIFF (*.tif *.tiff);;"
-    "All Files (*)";
+const FormatEntry kOpenFormats[] = {
+    {"Photoshop", "psd"},
+    {"PNG", "png"},
+    {"JPEG", "jpg jpeg jpe"},
+    {"GIF", "gif"},
+    {"TIFF", "tif tiff"},
+    {"BMP", "bmp"},
+    {"WebP", "webp"},
+};
 
-const char *const kSaveFilter =
-    "Photoshop (*.psd);;"
-    "PNG (*.png);;"
-    "JPEG (*.jpg *.jpeg);;"
-    "TIFF (*.tif *.tiff);;"
-    "All Files (*)";
+/// Formats File ▸ Save As can write. GIF and BMP are absent on purpose: Qt's
+/// GIF plugin only reads, and BMP would lose the alpha channel silently.
+const FormatEntry kSaveFormats[] = {
+    {"Photoshop", "psd"},
+    {"PNG", "png"},
+    {"JPEG", "jpg jpeg"},
+    {"TIFF", "tif tiff"},
+};
+
+/// Wildcards for one entry's extensions, in both cases: `*.jpg *.JPG …`.
+///
+/// Case is a real problem here rather than a detail. Cameras write `IMG_0001.JPG`
+/// while everything else writes lower case, and a file dialog that matches
+/// patterns literally shows one and hides the other. Two things deal with it,
+/// because neither is enough alone:
+///
+/// - both cases are listed here, which covers what actually exists on disk;
+/// - the dialogs below use Qt's own file dialog rather than the desktop's,
+///   because Qt matches name filters case-insensitively and so also catches the
+///   odd `Jpg` or `jpeG`. The desktop's portal dialog matches through GLib,
+///   which is case-sensitive and supports no character classes, so no pattern
+///   short of every permutation would do it there.
+QString patternsFor(const char *extensions)
+{
+    QStringList patterns;
+    const QStringList list =
+        QString::fromLatin1(extensions).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    for (const QString &extension : list) {
+        patterns << QStringLiteral("*.%1").arg(extension.toLower());
+        patterns << QStringLiteral("*.%1").arg(extension.toUpper());
+    }
+    return patterns.join(QLatin1Char(' '));
+}
+
+/// A dialog filter string built from `formats`.
+///
+/// `withCombined` puts Photoshop's "All Supported Formats" entry first, which
+/// is what the Open dialog wants and the Save dialog does not — saving is a
+/// choice of one format, not a search.
+QString buildFilter(const FormatEntry *formats, int count, bool withCombined)
+{
+    QStringList entries;
+    QStringList everything;
+
+    for (int i = 0; i < count; ++i) {
+        const QString patterns = patternsFor(formats[i].extensions);
+        entries << QStringLiteral("%1 (%2)").arg(QLatin1String(formats[i].label), patterns);
+        everything << patterns;
+    }
+    if (withCombined) {
+        entries.prepend(QStringLiteral("All Supported Formats (%1)")
+                            .arg(everything.join(QLatin1Char(' '))));
+    }
+    entries << QStringLiteral("All Files (*)");
+    return entries.join(QStringLiteral(";;"));
+}
+
+QString openFilter()
+{
+    return buildFilter(kOpenFormats, int(std::size(kOpenFormats)), true);
+}
+
+QString saveFilter()
+{
+    return buildFilter(kSaveFormats, int(std::size(kSaveFormats)), false);
+}
+
+/// The extensions one name-filter entry accepts, lower-cased and without
+/// duplicates: `Photoshop (*.psd *.PSD)` gives `psd`.
+///
+/// Entries with no `*.ext` pattern — "All Files (*)" — give nothing, which is
+/// the right answer: that entry is a request not to be second-guessed about
+/// the format.
+QStringList extensionsFor(const QString &nameFilter)
+{
+    const int open = nameFilter.indexOf(QLatin1Char('('));
+    const int close = nameFilter.lastIndexOf(QLatin1Char(')'));
+    if (open < 0 || close <= open) {
+        return {};
+    }
+
+    QStringList extensions;
+    const QStringList patterns =
+        nameFilter.mid(open + 1, close - open - 1).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    for (const QString &pattern : patterns) {
+        if (!pattern.startsWith(QLatin1String("*."))) {
+            continue;
+        }
+        const QString extension = pattern.mid(2).toLower();
+        if (!extensions.contains(extension)) {
+            extensions << extension;
+        }
+    }
+    return extensions;
+}
+
+/// `path` carrying the extension of the format chosen in the dialog's "Files of
+/// type" box, the way Photoshop does it: typing `poster` with Photoshop
+/// selected saves `poster.psd`.
+///
+/// An extension the chosen format already accepts is left alone, so `shot.jpeg`
+/// does not become `shot.jpeg.jpg`. Anything else is appended to rather than
+/// replaced: in `render.2026` the trailing part is a name, not a format, and
+/// the file still has to end in something a writer will recognize.
+QString withExtension(const QString &path, const QString &nameFilter)
+{
+    const QStringList extensions = extensionsFor(nameFilter);
+    if (path.isEmpty() || extensions.isEmpty()) {
+        return path;
+    }
+    for (const QString &extension : extensions) {
+        if (path.endsWith(QLatin1Char('.') + extension, Qt::CaseInsensitive)) {
+            return path;
+        }
+    }
+    return path + QLatin1Char('.') + extensions.first();
+}
+
+/// Ask for a file through Qt's own dialog.
+///
+/// Not the desktop's: its name filters are matched case-sensitively (see
+/// `patternsFor`), so `IMG_0001.Jpg` would be invisible under any pattern we
+/// could give it. Qt's own matching is case-insensitive, which is what makes
+/// "any supported format, whatever case it is written in" true rather than
+/// nearly true — and it themes with the rest of the application besides.
+QStringList askForFiles(QWidget *parent, const QString &caption, const QString &filter,
+                        QFileDialog::AcceptMode mode)
+{
+    QFileDialog dialog(parent, caption);
+    dialog.setOption(QFileDialog::DontUseNativeDialog);
+    dialog.setAcceptMode(mode);
+    // Opening takes as many files as are highlighted — Shift for a run,
+    // Ctrl for a scattering — and each becomes its own tab. Saving is one file
+    // by definition.
+    dialog.setFileMode(mode == QFileDialog::AcceptOpen ? QFileDialog::ExistingFiles
+                                                       : QFileDialog::AnyFile);
+    dialog.setNameFilter(filter);
+
+    if (mode == QFileDialog::AcceptSave) {
+        // Tracks the format box so the dialog itself knows what the file will be
+        // called. That matters before the dialog closes: it is what makes the
+        // overwrite prompt fire for a `poster.psd` that already exists, when all
+        // that was typed is `poster`.
+        const auto followFilter = [&dialog](const QString &nameFilter) {
+            const QStringList extensions = extensionsFor(nameFilter);
+            dialog.setDefaultSuffix(extensions.isEmpty() ? QString() : extensions.first());
+        };
+        followFilter(dialog.selectedNameFilter());
+        QObject::connect(&dialog, &QFileDialog::filterSelected, &dialog, followFilter);
+    }
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return {};
+    }
+
+    QStringList chosen = dialog.selectedFiles();
+    if (mode == QFileDialog::AcceptSave) {
+        // `setDefaultSuffix` covers a bare name and stops there — it leaves
+        // `render.2026` alone, having taken `2026` for an extension. So the name
+        // is finished here as well, where the whole of it can be judged against
+        // the chosen format.
+        const QString nameFilter = dialog.selectedNameFilter();
+        for (QString &path : chosen) {
+            path = withExtension(path, nameFilter);
+        }
+    }
+    return chosen;
+}
+
+QString askForFile(QWidget *parent, const QString &caption, const QString &filter,
+                   QFileDialog::AcceptMode mode)
+{
+    const QStringList chosen = askForFiles(parent, caption, filter, mode);
+    return chosen.isEmpty() ? QString() : chosen.first();
+}
 
 /// Line-art tint for options-bar icons, matching the tool strip.
 const QColor kOptionsIconColor(0xd4, 0xd4, 0xd4);
@@ -352,6 +553,11 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
             &MainWindow::showSelectionContextMenu);
     connect(m_canvas, &CanvasView::zoomContextMenuRequested, this,
             &MainWindow::showZoomContextMenu);
+    // Anything else taking the clipboard means the pixels on it are no longer
+    // the ones we copied, so Paste in Place must stop claiming to know where
+    // they came from. Our own copy sets the flag again straight afterwards.
+    connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this,
+            [this] { m_copyIsOurs = false; });
     // Q, and the button at the foot of the tool strip, both come through here.
     connect(m_toolStrip, &ToolStrip::quickMaskToggled, this, [this](bool on) {
         if (m_engine) {
@@ -378,6 +584,17 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         m_toolStrip->swatches()->setForeground(c);
     });
     connect(m_canvas, &CanvasView::typeStyleAdopted, this, &MainWindow::adoptTypeStyle);
+    connect(m_canvas, &CanvasView::transformStarted, this,
+            &MainWindow::showTransformOptionsBar);
+    connect(m_canvas, &CanvasView::transformCommitted, this, [this] {
+        m_hasTransformed = true;
+        if (m_transformAgainAction) m_transformAgainAction->setEnabled(true);
+        hideTransformOptionsBar();
+    });
+    connect(m_canvas, &CanvasView::transformCancelled, this,
+            &MainWindow::hideTransformOptionsBar);
+    connect(m_canvas, &CanvasView::transformChanged, this,
+            &MainWindow::updateTransformReadouts);
 
     // Let every Color Picker in the application sample the image. A QPointer
     // rather than `this`, because the sampler outlives nothing in particular
@@ -433,6 +650,13 @@ void MainWindow::createMenus()
                             &MainWindow::newDocument));
     file->addAction(command(QStringLiteral("file.open"), tr("&Open..."),
                             &MainWindow::openDocument));
+
+    // Rebuilt from the stored list every time it is about to be shown, so it
+    // is right even after opening a file from somewhere else in the session.
+    m_recentMenu = file->addMenu(tr("Open &Recent"));
+    connect(m_recentMenu, &QMenu::aboutToShow, this, &MainWindow::refreshRecentMenu);
+    refreshRecentMenu();
+
     file->addSeparator();
     file->addAction(command(QStringLiteral("file.save"), tr("&Save"),
                             [this] { saveDocument(); }));
@@ -441,9 +665,28 @@ void MainWindow::createMenus()
     file->addAction(command(QStringLiteral("file.saveSlices"), tr("Save S&lices..."),
                             &MainWindow::exportSlices));
     file->addSeparator();
+
+    QMenu *exportMenu = file->addMenu(tr("E&xport"));
+    exportMenu->addAction(command(QStringLiteral("file.exportAs"), tr("Export &As..."),
+                                  &MainWindow::exportAs));
+    exportMenu->addAction(command(QStringLiteral("file.saveForWeb"),
+                                  tr("Save for &Web (Legacy)..."),
+                                  &MainWindow::saveForWeb));
+
+    file->addSeparator();
     // Closing one document is the deliberate act that *does* prompt.
     file->addAction(command(QStringLiteral("file.close"), tr("&Close"),
                             &MainWindow::closeDocument));
+    file->addAction(command(QStringLiteral("file.closeAll"), tr("Close &All"),
+                            &MainWindow::closeAllDocuments));
+    file->addSeparator();
+    file->addAction(command(QStringLiteral("file.fileInfo"), tr("File &Info..."),
+                            &MainWindow::showFileInfo));
+    file->addSeparator();
+    file->addAction(command(QStringLiteral("file.print"), tr("&Print..."),
+                            &MainWindow::printDocument));
+    file->addAction(command(QStringLiteral("file.printOneCopy"), tr("Print &One Copy"),
+                            &MainWindow::printOneCopy));
     file->addSeparator();
     file->addAction(command(QStringLiteral("file.exit"), tr("E&xit"),
                             [this] { close(); }));
@@ -456,15 +699,282 @@ void MainWindow::createMenus()
     edit->addAction(command(QStringLiteral("edit.stepBackward"), tr("Step &Backward"),
                             &MainWindow::undo));
     edit->addSeparator();
-    edit->addAction(command(QStringLiteral("edit.fillForeground"),
+
+    auto *cutAction = command(QStringLiteral("edit.cut"), tr("Cu&t"), &MainWindow::cut);
+    edit->addAction(cutAction);
+    m_editNonTypingActions << cutAction;
+
+    auto *copyAction = command(QStringLiteral("edit.copy"), tr("&Copy"), &MainWindow::copy);
+    edit->addAction(copyAction);
+    m_editNonTypingActions << copyAction;
+
+    auto *copyMergedAction = command(QStringLiteral("edit.copyMerged"), tr("Copy &Merged"),
+                            &MainWindow::copyMerged);
+    edit->addAction(copyMergedAction);
+    m_editNonTypingActions << copyMergedAction;
+
+    auto *pasteAction = command(QStringLiteral("edit.paste"), tr("&Paste"), &MainWindow::paste);
+    edit->addAction(pasteAction);
+    m_editNonTypingActions << pasteAction;
+
+    // CS6 groups the three placed pastes under Paste Special.
+    QMenu *pasteSpecial = edit->addMenu(tr("Paste &Special"));
+    m_editNonTypingActions << pasteSpecial->menuAction();
+    pasteSpecial->addAction(command(QStringLiteral("edit.pasteInPlace"), tr("Paste in Place"),
+                                    &MainWindow::pasteInPlace));
+    pasteSpecial->addAction(command(QStringLiteral("edit.pasteInto"), tr("Paste Into"),
+                                    &MainWindow::pasteInto));
+    // Paste Outside has no default shortcut in CS6 either.
+    QAction *pasteOutside = new QAction(tr("Paste Outside"), this);
+    connect(pasteOutside, &QAction::triggered, this, &MainWindow::pasteOutside);
+    pasteSpecial->addAction(pasteOutside);
+
+    auto *clearAction = command(QStringLiteral("edit.clear"), tr("Cl&ear"),
+                            &MainWindow::clearSelection);
+    edit->addAction(clearAction);
+    m_editNonTypingActions << clearAction;
+
+    edit->addSeparator();
+
+    auto *fillFgAction = command(QStringLiteral("edit.fillForeground"),
                             tr("Fill with Foreground Color"),
-                            &MainWindow::fillWithForeground));
-    edit->addAction(command(QStringLiteral("edit.fillBackground"),
+                            &MainWindow::fillWithForeground);
+    edit->addAction(fillFgAction);
+    m_editNonTypingActions << fillFgAction;
+
+    auto *fillBgAction = command(QStringLiteral("edit.fillBackground"),
                             tr("Fill with Background Color"),
-                            &MainWindow::fillWithBackground));
+                            &MainWindow::fillWithBackground);
+    edit->addAction(fillBgAction);
+    m_editNonTypingActions << fillBgAction;
+
+    edit->addSeparator();
+
+    auto *freeTransformAction = command(QStringLiteral("edit.freeTransform"),
+                            tr("Free &Transform"),
+                            &MainWindow::freeTransform);
+    edit->addAction(freeTransformAction);
+    m_editNonTypingActions << freeTransformAction;
+
+    QMenu *transformMenu = edit->addMenu(tr("Transfor&m"));
+
+    m_transformAgainAction = command(QStringLiteral("edit.transformAgain"),
+                            tr("Again"), &MainWindow::freeTransform);
+    m_transformAgainAction->setEnabled(false);
+    transformMenu->addAction(m_transformAgainAction);
+    m_editNonTypingActions << m_transformAgainAction;
+
+    transformMenu->addSeparator();
+
+    auto *transformScaleAction = command(QStringLiteral("edit.transformScale"),
+                            tr("Scale"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Scale);
+    });
+    transformMenu->addAction(transformScaleAction);
+    m_editNonTypingActions << transformScaleAction;
+
+    auto *transformRotateAction = command(QStringLiteral("edit.transformRotate"),
+                            tr("Rotate"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Rotate);
+    });
+    transformMenu->addAction(transformRotateAction);
+    m_editNonTypingActions << transformRotateAction;
+
+    auto *transformSkewAction = command(QStringLiteral("edit.transformSkew"),
+                            tr("Skew"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Skew);
+    });
+    transformMenu->addAction(transformSkewAction);
+    m_editNonTypingActions << transformSkewAction;
+
+    auto *transformDistortAction = command(QStringLiteral("edit.transformDistort"),
+                            tr("Distort"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Distort);
+    });
+    transformMenu->addAction(transformDistortAction);
+    m_editNonTypingActions << transformDistortAction;
+
+    auto *transformPerspectiveAction = command(QStringLiteral("edit.transformPerspective"),
+                            tr("Perspective"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Perspective);
+    });
+    transformMenu->addAction(transformPerspectiveAction);
+    m_editNonTypingActions << transformPerspectiveAction;
+
+    auto *transformWarpAction = command(QStringLiteral("edit.transformWarp"),
+                            tr("Warp"), [this] {
+        if (m_canvas) m_canvas->beginFreeTransform(CanvasView::TransformMode::Warp);
+    });
+    transformMenu->addAction(transformWarpAction);
+    m_editNonTypingActions << transformWarpAction;
+
+    transformMenu->addSeparator();
+
+    auto *rotate180Action = command(QStringLiteral("edit.rotate180"),
+                            tr("Rotate 180°"), &MainWindow::transformRotate180);
+    transformMenu->addAction(rotate180Action);
+    m_editNonTypingActions << rotate180Action;
+
+    auto *rotate90CWAction = command(QStringLiteral("edit.rotate90cw"),
+                            tr("Rotate 90° Clockwise"), &MainWindow::transformRotate90CW);
+    transformMenu->addAction(rotate90CWAction);
+    m_editNonTypingActions << rotate90CWAction;
+
+    auto *rotate90CCWAction = command(QStringLiteral("edit.rotate90ccw"),
+                            tr("Rotate 90° Counter Clockwise"), &MainWindow::transformRotate90CCW);
+    transformMenu->addAction(rotate90CCWAction);
+    m_editNonTypingActions << rotate90CCWAction;
+
+    transformMenu->addSeparator();
+
+    auto *flipHAction = command(QStringLiteral("edit.flipHorizontal"),
+                            tr("Flip Horizontal"), &MainWindow::transformFlipHorizontal);
+    transformMenu->addAction(flipHAction);
+    m_editNonTypingActions << flipHAction;
+
+    auto *flipVAction = command(QStringLiteral("edit.flipVertical"),
+                            tr("Flip Vertical"), &MainWindow::transformFlipVertical);
+    transformMenu->addAction(flipVAction);
+    m_editNonTypingActions << flipVAction;
+
+    edit->addSeparator();
+
+    m_autoAlignAction = command(QStringLiteral("edit.autoAlignLayers"),
+                            tr("Auto-Align La&yers..."), [this] {
+        autoAlignLayers();
+    });
+    edit->addAction(m_autoAlignAction);
+    m_editNonTypingActions << m_autoAlignAction;
+
+    edit->addSeparator();
+
+    auto *findReplaceAction = command(QStringLiteral("edit.findReplaceText"),
+                            tr("Find and Replace Te&xt..."),
+                            &MainWindow::findReplaceText);
+    edit->addAction(findReplaceAction);
+    m_editNonTypingActions << findReplaceAction;
+
+    edit->addSeparator();
+    edit->addAction(command(QStringLiteral("edit.colorSettings"),
+                            tr("&Color Settings..."),
+                            &MainWindow::editColorSettings));
+    edit->addAction(command(QStringLiteral("edit.keyboardShortcuts"),
+                            tr("&Keyboard Shortcuts..."),
+                            &MainWindow::editKeyboardShortcuts));
+
+    connect(edit, &QMenu::aboutToShow, this, [this] {
+        const bool typing = m_canvas && m_canvas->isTyping();
+        for (QAction *a : std::as_const(m_editNonTypingActions)) {
+            a->setEnabled(!typing);
+        }
+        if (m_transformAgainAction && !m_hasTransformed) {
+            m_transformAgainAction->setEnabled(false);
+        }
+        if (m_autoAlignAction && m_layersPanel) {
+            if (m_layersPanel->selectedIndices().size() < 2)
+                m_autoAlignAction->setEnabled(false);
+        }
+    });
 
     // -- Image --------------------------------------------------------------
     QMenu *image = menuBar()->addMenu(tr("&Image"));
+
+    // -- Mode submenu -------------------------------------------------------
+    QMenu *modeMenu = image->addMenu(tr("&Mode"));
+
+    struct ModeEntry { int index; const char *label; };
+    const ModeEntry modeEntries[] = {
+        {0, "Bitmap"},
+        {1, "Grayscale"},
+        {2, "Duotone"},
+        {3, "Indexed Color..."},
+        {4, "RGB Color"},
+        {5, "CMYK Color"},
+        {6, "Lab Color"},
+        {7, "Multichannel"},
+    };
+    auto *modeGroup = new QActionGroup(this);
+    modeGroup->setExclusive(true);
+    for (const auto &entry : modeEntries) {
+        auto *action = modeMenu->addAction(tr(entry.label));
+        action->setCheckable(true);
+        modeGroup->addAction(action);
+        const int modeIdx = entry.index;
+        connect(action, &QAction::triggered, this, [this, modeIdx] {
+            if (modeIdx == 1 && m_engine->colorMode() != 1) {
+                QMessageBox msgBox(this);
+                msgBox.setWindowTitle(tr("Message"));
+                msgBox.setText(tr("Discard color information?"));
+                msgBox.setInformativeText(
+                    tr("To control the conversion, use\n"
+                       "Image > Adjustments > Black & White."));
+                msgBox.setIcon(QMessageBox::Question);
+                auto *discardBtn = msgBox.addButton(tr("Discard"), QMessageBox::AcceptRole);
+                msgBox.addButton(QMessageBox::Cancel);
+                msgBox.exec();
+                if (msgBox.clickedButton() != discardBtn)
+                    return;
+            }
+            if (modeIdx == 3) {
+                IndexedColorDialog dlg(m_engine, this);
+                if (dlg.exec() != QDialog::Accepted)
+                    return;
+                refreshAll();
+                return;
+            }
+            m_engine->setColorMode(modeIdx);
+            refreshAll();
+        });
+    }
+
+    modeMenu->addSeparator();
+
+    auto *depthGroup = new QActionGroup(this);
+    depthGroup->setExclusive(true);
+    struct DepthEntry { int bits; const char *label; };
+    const DepthEntry depthEntries[] = {
+        {8,  "8 Bits/Channel"},
+        {16, "16 Bits/Channel"},
+        {32, "32 Bits/Channel"},
+    };
+    for (const auto &entry : depthEntries) {
+        auto *action = modeMenu->addAction(tr(entry.label));
+        action->setCheckable(true);
+        depthGroup->addAction(action);
+        const int bits = entry.bits;
+        connect(action, &QAction::triggered, this, [this, bits] {
+            m_engine->setBitDepth(bits);
+            refreshAll();
+        });
+    }
+
+    modeMenu->addSeparator();
+    auto *colorTableAction = modeMenu->addAction(tr("Color Table..."));
+    colorTableAction->setEnabled(false);
+
+    connect(modeMenu, &QMenu::aboutToShow, this, [this, modeGroup, depthGroup] {
+        const int curMode = m_engine->colorMode();
+        const int curDepth = m_engine->bitDepth();
+        const auto modeActions = modeGroup->actions();
+        // indices: 0=Bitmap 1=Grayscale 2=Duotone 3=Indexed 4=RGB 5=CMYK 6=Lab 7=Multi
+        for (int i = 0; i < modeActions.size(); ++i) {
+            modeActions[i]->setChecked(i == curMode);
+            modeActions[i]->setEnabled(true);
+        }
+        // Bitmap only available from Grayscale
+        if (curMode != 1)
+            modeActions[0]->setEnabled(false);
+        // Duotone only available from Grayscale
+        if (curMode != 1)
+            modeActions[2]->setEnabled(false);
+        // Already-active mode stays checked but clickable is fine
+        const auto depthActions = depthGroup->actions();
+        for (auto *a : depthActions) {
+            if (a->text().startsWith(QString::number(curDepth)))
+                a->setChecked(true);
+        }
+    });
+
     QMenu *adjustments = image->addMenu(tr("&Adjustments"));
 
     // Each entry names an adjustment the engine already knows; the string is
@@ -3530,6 +4040,9 @@ void MainWindow::pushBrushSettings()
     // The Pencil paints aliased; every other tool in the family antialiases.
     m_engine->setBrushAntialias(!m_pencilMode);
     m_engine->setAutoErase(m_pencilMode && m_autoErase);
+    if (m_canvas) {
+        m_canvas->setBrushSize(m_brushSizeValue);
+    }
 }
 
 BrushPresetPicker *MainWindow::brushPicker()
@@ -3620,8 +4133,9 @@ void MainWindow::createDocks()
                                        Qt::RightDockWidgetArea,
                                        QStringLiteral("window.layers"));
 
-    // CS6 tabs Layers, Channels and Paths together at the bottom right. There
-    // is no Channels panel yet, so Paths joins Layers alone.
+    m_channelsPanel = new ChannelsPanel(m_engine, this);
+    QDockWidget *channelsDock = addPanel(tr("Channels"), m_channelsPanel, Qt::RightDockWidgetArea);
+
     m_pathsPanel = new PathsPanel(m_engine, this);
     QDockWidget *pathsDock = addPanel(tr("Paths"), m_pathsPanel, Qt::RightDockWidgetArea);
 
@@ -3634,7 +4148,8 @@ void MainWindow::createDocks()
         }
         colorDock->raise();
     }
-    tabifyDockWidget(layersDock, pathsDock);
+    tabifyDockWidget(layersDock, channelsDock);
+    tabifyDockWidget(channelsDock, pathsDock);
     layersDock->raise();
 
     resizeDocks({historyDock, layersDock}, {220, 380}, Qt::Vertical);
@@ -3735,6 +4250,7 @@ void MainWindow::connectEngine()
     // re-reads. No panel pushes state at another panel.
     connect(m_engine, &Engine::canvasChanged, m_canvas, &CanvasView::refresh);
     connect(m_engine, &Engine::layersChanged, m_layersPanel, &LayersPanel::refresh);
+    connect(m_engine, &Engine::canvasChanged, m_channelsPanel, &ChannelsPanel::refresh);
     connect(m_engine, &Engine::historyChanged, m_historyPanel, &HistoryPanel::refresh);
     connect(m_engine, &Engine::selectionChanged, m_canvas, &CanvasView::refreshSelection);
     connect(m_engine, &Engine::slicesChanged, m_canvas, &CanvasView::refreshSlices);
@@ -3769,67 +4285,120 @@ void MainWindow::connectEngine()
 
 void MainWindow::newDocument()
 {
-    // No prompt: this opens a tab alongside whatever is already open rather
-    // than replacing it, so there is nothing to lose.
-    QDialog dialog(this);
-    dialog.setWindowTitle(tr("New"));
-    auto *form = new QFormLayout(&dialog);
-
-    auto *width = new QSpinBox(&dialog);
-    width->setRange(1, 30000);
-    width->setValue(1280);
-    width->setSuffix(tr(" px"));
-    form->addRow(tr("Width:"), width);
-
-    auto *height = new QSpinBox(&dialog);
-    height->setRange(1, 30000);
-    height->setValue(800);
-    height->setSuffix(tr(" px"));
-    form->addRow(tr("Height:"), height);
-
-    auto *fill = new QComboBox(&dialog);
-    fill->addItems({tr("White"), tr("Transparent"), tr("Background Color")});
-    form->addRow(tr("Background Contents:"), fill);
-
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
-                                         &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    form->addRow(buttons);
-
-    if (dialog.exec() != QDialog::Accepted) {
+    const int docNumber = m_engine->documentCount() + 1;
+    NewDocumentDialog dialog(docNumber, this);
+    if (dialog.exec() != QDialog::Accepted)
         return;
-    }
 
-    m_engine->newDocument(width->value(), height->value(), fill->currentIndex());
+    m_engine->newDocument(dialog.widthPixels(), dialog.heightPixels(),
+                          dialog.backgroundFill());
     refreshAll();
     fitOnScreen();
 }
 
+bool MainWindow::openAnimatedFrames(const QString &path)
+{
+    // Qt reports the frame count for the formats that have one; -1 means it
+    // does not know, which for our purposes is the same as "one image".
+    QImageReader reader(path);
+    // A camera's own orientation, applied by Qt as it decodes — the same thing
+    // the engine does for the files it reads itself.
+    reader.setAutoTransform(true);
+    if (reader.imageCount() <= 1) {
+        return false;
+    }
+
+    QImage frame = reader.read();
+    if (frame.isNull() || !m_engine->loadImage(frame, path)) {
+        return false;
+    }
+
+    // The document arrives with one layer holding the first frame; the rest
+    // stack above it in order, so the composite shows the last frame and the
+    // Layers panel reads like the animation.
+    m_engine->setLayerName(0, tr("Frame 1"));
+    int count = 1;
+    while (reader.canRead()) {
+        const QImage next = reader.read();
+        if (next.isNull()) {
+            break;
+        }
+        ++count;
+        if (!m_engine->addImageLayer(next, 0, 0, tr("Frame %1").arg(count))) {
+            break;
+        }
+    }
+
+    statusBar()->showMessage(tr("Opened %1 frames as layers").arg(count), 4000);
+    return true;
+}
+
 void MainWindow::openDocument()
 {
-    // Opens in its own tab, so nothing already open is at risk.
-    const QString path = QFileDialog::getOpenFileName(this, tr("Open"), QString(),
-                                                      QLatin1String(kOpenFilter));
-    if (path.isEmpty()) {
+    // Every file opens in its own tab, so nothing already open is at risk.
+    const QStringList paths =
+        askForFiles(this, tr("Open"), openFilter(), QFileDialog::AcceptOpen);
+    if (paths.isEmpty()) {
         return;
+    }
+
+    // One warning at the end rather than one per file: choosing thirty photos
+    // and being asked to dismiss five dialogs is worse than being told once
+    // which five did not open.
+    QStringList failed;
+    for (const QString &path : paths) {
+        if (!loadPath(path)) {
+            failed.append(QFileInfo(path).fileName());
+        }
+    }
+
+    if (!failed.isEmpty()) {
+        QMessageBox::warning(this, tr("Open"),
+                             tr("Could not open:\n\n%1\n\n"
+                                "They may be corrupt, or in a format that is not "
+                                "supported yet.")
+                                 .arg(failed.join(QLatin1String("\n"))));
+    }
+}
+
+void MainWindow::openPath(const QString &path)
+{
+    if (!loadPath(path)) {
+        QMessageBox::warning(this, tr("Open"),
+                             tr("Could not open \"%1\".\n\n"
+                                "The file may be corrupt, or in a format that is "
+                                "not supported yet.")
+                                 .arg(QFileInfo(path).fileName()));
+    }
+}
+
+bool MainWindow::loadPath(const QString &path)
+{
+    // An animated GIF is several images in one file, and opening only the
+    // first would throw the rest away without saying so.
+    if (openAnimatedFrames(path)) {
+        rememberRecentFile(path);
+        refreshAll();
+        fitOnScreen();
+        return true;
     }
 
     if (!m_engine->openFile(path)) {
         // The engine reads PSD itself and delegates the rest to Qt's plugins;
         // if it declined, try decoding here and handing the pixels over.
-        QImage image(path);
+        // Through a reader rather than QImage's constructor, so a photograph's
+        // EXIF orientation is applied on this path too.
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        const QImage image = reader.read();
         if (image.isNull() || !m_engine->loadImage(image, path)) {
-            QMessageBox::warning(this, tr("Open"),
-                                 tr("Could not open \"%1\".\n\n"
-                                    "The file may be corrupt, or in a format that is "
-                                    "not supported yet.")
-                                     .arg(QFileInfo(path).fileName()));
-            return;
+            return false;
         }
     }
+    rememberRecentFile(path);
     refreshAll();
     fitOnScreen();
+    return true;
 }
 
 bool MainWindow::saveDocument()
@@ -3840,8 +4409,7 @@ bool MainWindow::saveDocument()
 
 bool MainWindow::saveDocumentAs()
 {
-    const QString path = QFileDialog::getSaveFileName(this, tr("Save As"), QString(),
-                                                      QLatin1String(kSaveFilter));
+    const QString path = askForFile(this, tr("Save As"), saveFilter(), QFileDialog::AcceptSave);
     if (path.isEmpty()) {
         return false;
     }
@@ -3875,7 +4443,15 @@ void MainWindow::exportSlices()
         return;
     }
 
-    const QString dir = QFileDialog::getExistingDirectory(this, tr("Save Slices To"));
+    // Qt's own dialog here too, so every file chooser in the application looks
+    // and behaves the same way.
+    QFileDialog chooser(this, tr("Save Slices To"));
+    chooser.setOption(QFileDialog::DontUseNativeDialog);
+    chooser.setFileMode(QFileDialog::Directory);
+    chooser.setOption(QFileDialog::ShowDirsOnly);
+    const QString dir = chooser.exec() == QDialog::Accepted && !chooser.selectedFiles().isEmpty()
+        ? chooser.selectedFiles().first()
+        : QString();
     if (dir.isEmpty()) {
         return;
     }
@@ -3921,6 +4497,180 @@ void MainWindow::exportSlices()
     }
 }
 
+void MainWindow::exportAs()
+{
+    if (!m_engine)
+        return;
+
+    const QImage composite = m_engine->compositeImage();
+    if (composite.isNull())
+        return;
+
+    const QString docName = m_engine->getDocumentTitle();
+    ExportAsDialog dialog(composite, docName, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    // Build the save filter from the chosen format.
+    QString formatFilter;
+    QString defaultExt;
+    switch (dialog.chosenFormat()) {
+    case ExportAsDialog::PNG:
+        formatFilter = tr("PNG (*.png)");
+        defaultExt = QStringLiteral("png");
+        break;
+    case ExportAsDialog::JPG:
+        formatFilter = tr("JPEG (*.jpg *.jpeg)");
+        defaultExt = QStringLiteral("jpg");
+        break;
+    case ExportAsDialog::PNG8:
+        formatFilter = tr("PNG (*.png)");
+        defaultExt = QStringLiteral("png");
+        break;
+    case ExportAsDialog::GIF:
+        formatFilter = tr("GIF (*.gif)");
+        defaultExt = QStringLiteral("gif");
+        break;
+    }
+
+    const QString path = askForFile(this, tr("Export As"), formatFilter, QFileDialog::AcceptSave);
+    if (path.isEmpty())
+        return;
+
+    const QImage img = dialog.exportImage();
+    bool ok = false;
+    if (dialog.chosenFormat() == ExportAsDialog::JPG) {
+        ok = img.save(path, "JPEG", dialog.jpegQuality());
+    } else if (dialog.chosenFormat() == ExportAsDialog::GIF) {
+        ok = writeGif(img, path);
+    } else {
+        ok = img.save(path);
+    }
+
+    if (!ok) {
+        QMessageBox::warning(this, tr("Export"), tr("Could not write \"%1\".").arg(path));
+    } else {
+        statusBar()->showMessage(tr("Exported to %1").arg(path), 4000);
+    }
+}
+
+void MainWindow::saveForWeb()
+{
+    if (!m_engine)
+        return;
+
+    const QImage composite = m_engine->compositeImage();
+    if (composite.isNull())
+        return;
+
+    SaveForWebDialog dialog(composite, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    // Build a filter for the chosen format.
+    const QString ext = dialog.fileExtension();
+    const QString filter = QStringLiteral("%1 (*.%2)")
+                               .arg(ext.toUpper(), ext);
+
+    const QString path = askForFile(this, tr("Save Optimized As"), filter, QFileDialog::AcceptSave);
+    if (path.isEmpty())
+        return;
+
+    const QImage img = dialog.exportImage();
+    bool ok = false;
+    if (dialog.chosenFormat() == SaveForWebDialog::JPEG) {
+        ok = img.save(path, "JPEG", dialog.jpegQuality());
+    } else if (dialog.chosenFormat() == SaveForWebDialog::GIF) {
+        ok = writeGif(img, path);
+    } else if (dialog.chosenFormat() == SaveForWebDialog::WBMP) {
+        ok = img.save(path, "BMP");
+    } else {
+        ok = img.save(path);
+    }
+
+    if (!ok) {
+        QMessageBox::warning(this, tr("Save for Web"),
+                             tr("Could not write \"%1\".").arg(path));
+    } else {
+        statusBar()->showMessage(tr("Saved for web: %1").arg(path), 4000);
+    }
+}
+
+void MainWindow::printDocument()
+{
+    if (!m_engine)
+        return;
+
+    const QImage composite = m_engine->compositeImage();
+    if (composite.isNull())
+        return;
+
+    PrintDialog dialog(composite, this);
+    dialog.exec();
+}
+
+void MainWindow::printOneCopy()
+{
+    if (!m_engine)
+        return;
+
+    const QImage composite = m_engine->compositeImage();
+    if (composite.isNull())
+        return;
+
+    // Letter size at 72 DPI — the baseline Photoshop uses for the clipping
+    // check. Images wider or taller than this at 1:1 will be clipped.
+    constexpr double kLetterWidthIn = 8.5;
+    constexpr double kLetterHeightIn = 11.0;
+    constexpr double kDpi = 72.0;
+    const double pageWidthPx = kLetterWidthIn * kDpi;
+    const double pageHeightPx = kLetterHeightIn * kDpi;
+
+    if (composite.width() > pageWidthPx || composite.height() > pageHeightPx) {
+        QMessageBox box(QMessageBox::Warning, tr("PhotoRust"),
+                        tr("The image is larger than the paper's printable area;\n"
+                           "some clipping will occur."),
+                        QMessageBox::NoButton, this);
+        auto *proceed = box.addButton(tr("Proceed"), QMessageBox::AcceptRole);
+        box.addButton(QMessageBox::Cancel);
+        box.exec();
+        if (box.clickedButton() != proceed)
+            return;
+    }
+
+    const QString path = askForFile(this, tr("Save Print Output As"),
+                                    tr("PDF Document (*.pdf *.PDF)"),
+                                    QFileDialog::AcceptSave);
+    if (path.isEmpty())
+        return;
+
+    QPrinter printer(QPrinter::HighResolution);
+    printer.setOutputFormat(QPrinter::PdfFormat);
+    printer.setOutputFileName(path);
+    printer.setPageSize(QPageSize::Letter);
+    printer.setCopyCount(1);
+
+    QPainter painter(&printer);
+    if (!painter.isActive()) {
+        QMessageBox::warning(this, tr("Print"),
+                             tr("Could not write \"%1\".").arg(path));
+        return;
+    }
+
+    const QRectF pageRect = printer.pageLayout().paintRectPixels(printer.resolution());
+    const double scaleX = pageRect.width() / (kLetterWidthIn * kDpi);
+    const double scaleY = pageRect.height() / (kLetterHeightIn * kDpi);
+    const double imgW = composite.width() * scaleX;
+    const double imgH = composite.height() * scaleY;
+    const double x = (pageRect.width() - imgW) / 2.0;
+    const double y = (pageRect.height() - imgH) / 2.0;
+
+    painter.drawImage(QRectF(x, y, imgW, imgH), composite);
+    painter.end();
+
+    statusBar()->showMessage(tr("Saved print output to %1").arg(path), 4000);
+}
+
 void MainWindow::undo()
 {
     m_engine->undo();
@@ -3948,6 +4698,45 @@ void MainWindow::fillWithBackground()
 void MainWindow::clearSelection()
 {
     m_engine->clearSelection();
+    refreshAll();
+}
+
+void MainWindow::freeTransform()
+{
+    if (m_canvas) {
+        m_canvas->beginFreeTransform();
+    }
+}
+
+void MainWindow::transformRotate180()
+{
+    if (m_engine) { m_engine->rotateLayer(180); m_hasTransformed = true; m_transformAgainAction->setEnabled(true); refreshAll(); }
+}
+
+void MainWindow::transformRotate90CW()
+{
+    if (m_engine) { m_engine->rotateLayer(90); m_hasTransformed = true; m_transformAgainAction->setEnabled(true); refreshAll(); }
+}
+
+void MainWindow::transformRotate90CCW()
+{
+    if (m_engine) { m_engine->rotateLayer(270); m_hasTransformed = true; m_transformAgainAction->setEnabled(true); refreshAll(); }
+}
+
+void MainWindow::transformFlipHorizontal()
+{
+    if (m_engine) { m_engine->flipLayer(true); m_hasTransformed = true; m_transformAgainAction->setEnabled(true); refreshAll(); }
+}
+
+void MainWindow::transformFlipVertical()
+{
+    if (m_engine) { m_engine->flipLayer(false); m_hasTransformed = true; m_transformAgainAction->setEnabled(true); refreshAll(); }
+}
+
+void MainWindow::findReplaceText()
+{
+    FindReplaceTextDialog dlg(m_engine, m_canvas, this);
+    dlg.exec();
     refreshAll();
 }
 
@@ -4283,6 +5072,194 @@ bool MainWindow::confirmDiscardAll()
     return true;
 }
 
+void MainWindow::cut()
+{
+    if (!copy()) {
+        return;
+    }
+    // Cut is a copy followed by a clear, and the clear is the same one the
+    // menu's own Clear does — so a cut leaves exactly what deleting would.
+    clearSelection();
+}
+
+bool MainWindow::copy()
+{
+    return copyToClipboard(false);
+}
+
+bool MainWindow::copyMerged()
+{
+    return copyToClipboard(true);
+}
+
+bool MainWindow::copyToClipboard(bool merged)
+{
+    if (!m_engine) {
+        return false;
+    }
+
+    const QImage region = m_engine->copySelection(merged);
+    if (region.isNull()) {
+        statusBar()->showMessage(tr("Nothing is selected to copy"), 3000);
+        return false;
+    }
+
+    // The system clipboard, so what is copied here can be pasted into another
+    // application — and what another application copied can be pasted here.
+    QGuiApplication::clipboard()->setImage(region);
+    // Where it came from, which the clipboard itself cannot carry. Kept so
+    // Paste in Place can put it back, and dropped the moment anything else
+    // takes the clipboard over.
+    m_copyOrigin = QPoint(m_engine->copyOriginX(), m_engine->copyOriginY());
+    m_copyIsOurs = true;
+    return true;
+}
+
+void MainWindow::paste()
+{
+    // Photoshop drops a plain paste in the middle of what you are looking at,
+    // which is where you are working.
+    const QImage image = QGuiApplication::clipboard()->image();
+    if (image.isNull()) {
+        statusBar()->showMessage(tr("The clipboard has no image in it"), 3000);
+        return;
+    }
+
+    const QPointF centre = m_canvas->widgetToDocument(
+        QPointF(m_canvas->width() / 2.0, m_canvas->height() / 2.0));
+    const QPoint at(qRound(centre.x()) - image.width() / 2,
+                    qRound(centre.y()) - image.height() / 2);
+    pasteAt(image, at, 0);
+}
+
+void MainWindow::pasteInPlace()
+{
+    const QImage image = QGuiApplication::clipboard()->image();
+    if (image.isNull()) {
+        statusBar()->showMessage(tr("The clipboard has no image in it"), 3000);
+        return;
+    }
+    // Only a copy made here knows where it came from; anything from another
+    // application has no place in this document and goes to the top-left.
+    pasteAt(image, m_copyIsOurs ? m_copyOrigin : QPoint(0, 0), 0);
+}
+
+void MainWindow::pasteInto()
+{
+    pasteConfined(1);
+}
+
+void MainWindow::pasteOutside()
+{
+    pasteConfined(2);
+}
+
+void MainWindow::pasteConfined(int mode)
+{
+    if (!m_engine || !m_engine->hasSelection()) {
+        QMessageBox::information(this, tr("Paste"),
+                                 tr("Paste Into and Paste Outside need a selection to "
+                                    "paste inside or outside of."));
+        return;
+    }
+
+    const QImage image = QGuiApplication::clipboard()->image();
+    if (image.isNull()) {
+        statusBar()->showMessage(tr("The clipboard has no image in it"), 3000);
+        return;
+    }
+
+    // Into and Outside land where they came from when that is known, so the
+    // pasted pixels line up with the hole they are going into.
+    pasteAt(image, m_copyIsOurs ? m_copyOrigin : QPoint(0, 0), mode);
+}
+
+void MainWindow::pasteAt(const QImage &image, const QPoint &at, int mode)
+{
+    if (!m_engine->pasteImage(image, at.x(), at.y(), mode)) {
+        QMessageBox::warning(this, tr("Paste"), tr("Could not paste the clipboard image."));
+        return;
+    }
+    refreshAll();
+}
+
+void MainWindow::closeAllDocuments()
+{
+    // One prompt per unsaved document, and any Cancel abandons the whole thing
+    // — the same rule quitting follows, and for the same reason.
+    if (!confirmDiscardAll()) {
+        return;
+    }
+
+    // From the back, so closing one does not renumber the ones still to go.
+    for (int i = m_engine->documentCount() - 1; i >= 0; --i) {
+        m_engine->closeDocument(i);
+    }
+    refreshAll();
+    refreshDocumentTabs();
+}
+
+void MainWindow::showFileInfo()
+{
+    FileInfoDialog::show(m_engine, m_engine ? m_engine->documentPath() : QString(), this);
+}
+
+QStringList MainWindow::recentFiles() const
+{
+    return QSettings().value(QStringLiteral("recentFiles")).toStringList();
+}
+
+void MainWindow::rememberRecentFile(const QString &path)
+{
+    if (path.isEmpty()) {
+        return;
+    }
+
+    // Most recent first, no duplicates, and a bounded list — the same shape
+    // every application's is, because it is the one that stays useful.
+    QStringList files = recentFiles();
+    files.removeAll(path);
+    files.prepend(path);
+    while (files.size() > kMaxRecentFiles) {
+        files.removeLast();
+    }
+    QSettings().setValue(QStringLiteral("recentFiles"), files);
+}
+
+void MainWindow::refreshRecentMenu()
+{
+    if (!m_recentMenu) {
+        return;
+    }
+    m_recentMenu->clear();
+
+    const QStringList files = recentFiles();
+    if (files.isEmpty()) {
+        QAction *none = m_recentMenu->addAction(tr("No Recent Files"));
+        none->setEnabled(false);
+        return;
+    }
+
+    for (const QString &path : files) {
+        // The file name alone would be ambiguous across folders, so the whole
+        // path is the tooltip and the name carries the menu.
+        QAction *entry = m_recentMenu->addAction(QFileInfo(path).fileName());
+        entry->setToolTip(path);
+        // A file that has since been moved or deleted is shown greyed rather
+        // than dropped: it tells the user where it went, and the list is a
+        // history, not an index of what still exists.
+        entry->setEnabled(QFileInfo::exists(path));
+        connect(entry, &QAction::triggered, this, [this, path] { openPath(path); });
+    }
+
+    m_recentMenu->addSeparator();
+    QAction *clear = m_recentMenu->addAction(tr("Clear Recent File List"));
+    connect(clear, &QAction::triggered, this, [this] {
+        QSettings().remove(QStringLiteral("recentFiles"));
+        refreshRecentMenu();
+    });
+}
+
 void MainWindow::closeDocument()
 {
     if (m_documentTabs) {
@@ -4297,4 +5274,237 @@ void MainWindow::closeEvent(QCloseEvent *event)
     } else {
         event->ignore();
     }
+}
+
+// ------------------------------------------------- Transform Options Bar --
+
+void MainWindow::showTransformOptionsBar()
+{
+    if (!m_canvas || m_transformBarActive) return;
+    m_transformBarActive = true;
+    m_preTransformTool = m_activeTool;
+    m_preTransformVariant = m_activeVariant;
+
+    m_optionsBar->clear();
+    m_brushOpacity = nullptr;
+    m_brushFlow = nullptr;
+    m_brushTipButton = nullptr;
+    m_mixerLoadButton = nullptr;
+
+    auto addLabel = [&](const QString &text) {
+        auto *l = new QLabel(text, m_optionsBar);
+        m_optionsBar->addWidget(l);
+    };
+    auto addSpin = [&](const QString &suffix, double min, double max,
+                       double val, int decimals) -> QDoubleSpinBox * {
+        auto *s = new QDoubleSpinBox(m_optionsBar);
+        s->setRange(min, max);
+        s->setDecimals(decimals);
+        s->setSuffix(suffix);
+        s->setValue(val);
+        s->setButtonSymbols(QAbstractSpinBox::NoButtons);
+        s->setFixedWidth(80);
+        s->setReadOnly(true);
+        m_optionsBar->addWidget(s);
+        return s;
+    };
+
+    addLabel(tr("X:"));
+    addSpin(QStringLiteral(" px"), -99999, 99999, 0, 2);
+    addLabel(tr("Y:"));
+    addSpin(QStringLiteral(" px"), -99999, 99999, 0, 2);
+    m_optionsBar->addSeparator();
+
+    addLabel(tr("W:"));
+    addSpin(QStringLiteral("%"), -99999, 99999, 100, 2);
+    addLabel(tr("H:"));
+    addSpin(QStringLiteral("%"), -99999, 99999, 100, 2);
+    m_optionsBar->addSeparator();
+
+    addLabel(QStringLiteral("∠"));
+    addSpin(QStringLiteral("°"), -360, 360, 0, 2);
+    m_optionsBar->addSeparator();
+
+    addLabel(tr("H:"));
+    addSpin(QStringLiteral("°"), -89, 89, 0, 2);
+    addLabel(tr("V:"));
+    addSpin(QStringLiteral("°"), -89, 89, 0, 2);
+
+    m_optionsBar->addSeparator();
+
+    auto *cancelBtn = new QToolButton(m_optionsBar);
+    cancelBtn->setIcon(QIcon::fromTheme(QStringLiteral("dialog-cancel")));
+    cancelBtn->setToolTip(tr("Cancel Transform (Esc)"));
+    cancelBtn->setText(QStringLiteral("✘"));
+    connect(cancelBtn, &QToolButton::clicked, this, [this] {
+        if (m_canvas) m_canvas->cancelFreeTransform();
+    });
+    m_optionsBar->addWidget(cancelBtn);
+
+    auto *commitBtn = new QToolButton(m_optionsBar);
+    commitBtn->setIcon(QIcon::fromTheme(QStringLiteral("dialog-ok")));
+    commitBtn->setToolTip(tr("Commit Transform (Enter)"));
+    commitBtn->setText(QStringLiteral("✔"));
+    connect(commitBtn, &QToolButton::clicked, this, [this] {
+        if (m_canvas) m_canvas->commitFreeTransform();
+    });
+    m_optionsBar->addWidget(commitBtn);
+
+    updateTransformReadouts();
+}
+
+void MainWindow::hideTransformOptionsBar()
+{
+    if (!m_transformBarActive) return;
+    m_transformBarActive = false;
+    populateOptionsBar(m_preTransformTool, m_preTransformVariant);
+}
+
+void MainWindow::updateTransformReadouts()
+{
+    if (!m_transformBarActive || !m_canvas) return;
+
+    QList<QDoubleSpinBox *> spins = m_optionsBar->findChildren<QDoubleSpinBox *>();
+    if (spins.size() < 7) return;
+
+    const QRectF orig = m_canvas->transformOrigBounds();
+    const QRectF cur = m_canvas->transformBounds();
+    const bool isQuad = m_canvas->transformMode() == CanvasView::TransformMode::Skew
+                     || m_canvas->transformMode() == CanvasView::TransformMode::Distort
+                     || m_canvas->transformMode() == CanvasView::TransformMode::Perspective;
+
+    double cx, cy, wPct, hPct;
+    if (isQuad) {
+        QRectF qb = m_canvas->transformQuad().boundingRect();
+        cx = qb.center().x();
+        cy = qb.center().y();
+        wPct = orig.width() > 0 ? (qb.width() / orig.width()) * 100.0 : 100.0;
+        hPct = orig.height() > 0 ? (qb.height() / orig.height()) * 100.0 : 100.0;
+    } else {
+        cx = cur.center().x();
+        cy = cur.center().y();
+        wPct = orig.width() > 0 ? (cur.width() / orig.width()) * 100.0 : 100.0;
+        hPct = orig.height() > 0 ? (cur.height() / orig.height()) * 100.0 : 100.0;
+    }
+
+    spins[0]->setValue(cx);
+    spins[1]->setValue(cy);
+    spins[2]->setValue(wPct);
+    spins[3]->setValue(hPct);
+    spins[4]->setValue(m_canvas->transformRotation());
+    spins[5]->setValue(0);
+    spins[6]->setValue(0);
+}
+
+// ------------------------------------------------- Keyboard Shortcuts --
+
+void MainWindow::editKeyboardShortcuts()
+{
+    KeyboardShortcutsDialog dlg(m_registry, this);
+    dlg.exec();
+}
+
+void MainWindow::editColorSettings()
+{
+    ColorSettingsDialog dlg(this);
+    dlg.exec();
+}
+
+// ----------------------------------------------------- Auto-Align Layers --
+
+void MainWindow::autoAlignLayers()
+{
+    if (!m_engine) return;
+
+    const int count = m_engine->property("layerCount").toInt();
+    if (count < 2) {
+        QMessageBox::information(this, tr("Auto-Align Layers"),
+            tr("Auto-Align Layers requires at least two layers."));
+        return;
+    }
+
+    // Build the dialog.
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Auto-Align Layers"));
+    dlg.setMinimumWidth(460);
+
+    auto *mainLayout = new QVBoxLayout(&dlg);
+
+    // Projection group.
+    auto *projGroup = new QGroupBox(tr("Projection"), &dlg);
+    auto *projLayout = new QGridLayout(projGroup);
+
+    auto *autoRadio = new QRadioButton(tr("Auto"), projGroup);
+    auto *perspRadio = new QRadioButton(tr("Perspective"), projGroup);
+    auto *collageRadio = new QRadioButton(tr("Collage"), projGroup);
+    auto *cylRadio = new QRadioButton(tr("Cylindrical"), projGroup);
+    auto *sphRadio = new QRadioButton(tr("Spherical"), projGroup);
+    auto *reposRadio = new QRadioButton(tr("Reposition"), projGroup);
+    autoRadio->setChecked(true);
+
+    projLayout->addWidget(autoRadio, 0, 0);
+    projLayout->addWidget(perspRadio, 0, 1);
+    projLayout->addWidget(collageRadio, 0, 2);
+    projLayout->addWidget(cylRadio, 1, 0);
+    projLayout->addWidget(sphRadio, 1, 1);
+    projLayout->addWidget(reposRadio, 1, 2);
+
+    mainLayout->addWidget(projGroup);
+
+    // Lens Correction group.
+    auto *lensGroup = new QGroupBox(tr("Lens Correction"), &dlg);
+    auto *lensLayout = new QVBoxLayout(lensGroup);
+    auto *vignetteCheck = new QCheckBox(tr("Vignette Removal"), lensGroup);
+    auto *geoCheck = new QCheckBox(tr("Geometric Distortion"), lensGroup);
+    lensLayout->addWidget(vignetteCheck);
+    lensLayout->addWidget(geoCheck);
+    mainLayout->addWidget(lensGroup);
+
+    // Buttons.
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    mainLayout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    // Check overlap between all layer pairs.
+    const int active = m_engine->getActiveLayerIndex();
+    QRect activeBounds = m_engine->layerContentBounds(active);
+    if (activeBounds.isEmpty()) {
+        QMessageBox::information(this, tr("Auto-Align Layers"),
+            tr("The active layer has no content."));
+        return;
+    }
+
+    bool hasOverlap = false;
+    for (int i = 0; i < count; ++i) {
+        if (i == active) continue;
+        QRect other = m_engine->layerContentBounds(i);
+        if (other.isEmpty()) continue;
+        QRect inter = activeBounds.intersected(other);
+        if (!inter.isEmpty()) {
+            double overlapArea = double(inter.width()) * inter.height();
+            double activeArea = double(activeBounds.width()) * activeBounds.height();
+            double otherArea = double(other.width()) * other.height();
+            double minArea = std::min(activeArea, otherArea);
+            if (minArea > 0 && (overlapArea / minArea) >= 0.1) {
+                hasOverlap = true;
+                break;
+            }
+        }
+    }
+
+    if (!hasOverlap) {
+        QMessageBox::information(this, tr("Auto-Align Layers"),
+            tr("Layers do not overlap enough to detect alignment. "
+               "In general, images intended for alignment should "
+               "overlap by approximately 40%."));
+        return;
+    }
+
+    QMessageBox::information(this, tr("Auto-Align Layers"),
+        tr("Auto-alignment is not yet implemented. "
+           "The selected layers overlap sufficiently for alignment."));
 }

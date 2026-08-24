@@ -28,6 +28,8 @@ class LayersPanel : public QWidget
 public:
     explicit LayersPanel(Engine *engine, QWidget *parent = nullptr);
 
+    QList<int> selectedIndices() const;
+
 public slots:
     /// Rebuild the list from the engine.
     void refresh();

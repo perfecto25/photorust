@@ -51,6 +51,7 @@ pub mod healing;
 pub mod history;
 pub mod layer;
 pub mod magnetic;
+pub mod metadata;
 pub mod mixer;
 pub mod path;
 pub mod pattern;

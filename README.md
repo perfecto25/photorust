@@ -322,7 +322,8 @@ stored, so future default changes still reach the user.
 ## Development progress
 
 ```
-ToolTip floating bar
+
+## ToolTip floating bar
 
 - move tool - done
 - marquee tools - done
@@ -347,15 +348,126 @@ ToolTip floating bar
 - Color picker tool - done
 - Mask modes - quick mask and standard modes - done
 
-Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
+## Side bar (Layers, Channels, Paths, History, Color, Swatches, Text etc)
 
+- Layers 
+  - add ability to lock layer from modification - done
+- Channels - in progress
+
+## Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
+
+- File dropdown
+
+    - add Open Recent - done
+    - add Close All - done
+    - add File Info tool - done
+    - File Open > open multiple files by holding Shift + Clicking - done
+    - open Photoshop PSD file with layers and full PSD info - done
+    - add Print dialogue and Print options - done
+    - Export As - done
+
+- Edit dropdown - in progress
+    ---  DONE
+      - Cut
+      - Copy
+      - Copy Merged
+      - Paste
+      - Paste special
+      - Clear
+
+    --- DONE
+    - check spelling - skip for now
+    - find and replace text - done
+    
+    --- - in progress
+    - Fill 
+    - Stroke
+
+    --- - in progress
+    - Content Aware Scale
+    - Puppet Warp
+    - Perspective Warp
+    - Free Transform - done
+    - Transform - Scale, Rotate, Skew, Distort, Perspective, Warp -  done
+    - Auto Align Layers - in progress
+    - Auto Blend layers
+
+    ---
+    - Define Bursh Preset
+    - Define Pattern
+    - Define Custom Shape
+    ---
+    - Purge > Undo, Clipboard, Histories, All
+    ---
+    - Color Settings - UI done, need engine work
+    - Assign Profile
+    ---
+    - Keyboard Shortcuts - done
+    - Menus
+    - Preferences
+    
+- Image dropdown
+    ---
+    Mode >  - in progress
+      - Bitmap
+      - Grayscale - done 
+      - Duotone
+      - Indexed Color - in progress
+      - RGB Color
+      - CMYK Color
+      - Lab Color
+      - Multichannel
+      ---
+      - 8 bits/channel
+      - 16 bits/channel
+      - 32 bits/channel
+    Adjustments > 
+      --- 
+      - Brightness/Contrast - not started
+      - Levels - not started
+      - Curves - not started
+      - Exposure - not started
+      ---
+      - Vibrance - not started
+      - Hue/Saturation - not started
+      - Color Balance - not started
+      - Black & White - not started
+      - Photo Filter - not started
+      - Channel Mixer - not started
+      - Color Lookup - not started
+      ---
+      - Invert - not started
+      - Posterize - not started
+      - Threshold - not started
+      - Gradient Map - not started
+      - Selective Color - not started
+      ---
+      - Shadows/Highlights
+      - HDR Toning
+      ---
+      - Desaturate - not started
+      - match color - not started
+      - Replace color - not started
+      - Equalize
+      ---
+    Image Size
+    Canvas Size
+    Image Rotation > 180, 90 clockwise, 90 counter clock, arbitrary, flip canvas H, flip canvas V
+      
+- Layer dropdown
+- Type dropdown
+- Select dropdown
+- Filter dropdown
+- View dropdown
+- Window dropdown
+- Help dropdown
 Auto recovery - save working project to temp file for auto recover - not started
 
-Layers - add ability to lock layer from modification - done
+
 
 File format support:
 
-- GIF - in progress
+- GIF - in progress 
 - JPG
 - BMP
 - PSD - not started

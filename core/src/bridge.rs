@@ -17,7 +17,7 @@ use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
 use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
-use crate::document::{Document, PatchOptions};
+use crate::document::{Document, ImageMode, PasteMode, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
 use crate::layer::{LayerId, LayerKind, TextAlign, TextContent, TextRun};
@@ -30,6 +30,7 @@ use crate::smudge::SmudgeOptions;
 use crate::tone::{SpongeMode, ToneOptions, ToneRange, ToneTool};
 use crate::bucket::BucketOptions;
 use crate::gradient::{self, GradientOptions, GradientType};
+use crate::metadata;
 use crate::pattern;
 use crate::shape::{self, ShapeKind, ShapeMode, ShapeOptions};
 use crate::stamp::CloneSampling;
@@ -38,7 +39,7 @@ use crate::selection::{Selection, SelectionOp};
 use crate::wand::{self, QuickSelector};
 // `rust_mut()` on a generated QObject comes from this trait.
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QColor, QImage, QImageFormat, QPointF, QPolygonF, QString};
+use cxx_qt_lib::{QColor, QImage, QImageFormat, QPointF, QPolygonF, QRect, QString};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -59,6 +60,9 @@ pub mod ffi {
         /// Carries a shape's outline out — the points the canvas previews and
         /// the engine commits, in one Qt container rather than a builder.
         type QPolygonF = cxx_qt_lib::QPolygonF;
+
+        include!("cxx-qt-lib/qrect.h");
+        type QRect = cxx_qt_lib::QRect;
 
         include!("cxx-qt-lib/qvector.h");
         /// Carries lasso vertices in. Qt's own container, so the shell builds
@@ -167,6 +171,28 @@ pub mod ffi {
         #[cxx_name = "markSavedAs"]
         fn mark_saved_as(self: Pin<&mut Engine>, path: &QString);
 
+        /// Where the active document was opened from or last saved to, or an
+        /// empty string for one that has never been saved.
+        #[qinvokable]
+        #[cxx_name = "documentPath"]
+        fn document_path(self: &Engine) -> QString;
+
+        /// What a file on disk says about itself, for File ▸ File Info.
+        ///
+        /// One record per line, each `category<TAB>label<TAB>value` — the same
+        /// newline-separated shape the preset lists use, since the dialog only
+        /// ever lays these out as rows under a heading. An unreadable file
+        /// gives an empty string.
+        #[qinvokable]
+        #[cxx_name = "fileMetadata"]
+        fn file_metadata(self: &Engine, path: &QString) -> QString;
+
+        /// The XMP packet embedded in a file, verbatim, for the Raw Data pane.
+        /// Empty when the file carries none.
+        #[qinvokable]
+        #[cxx_name = "fileXmp"]
+        fn file_xmp(self: &Engine, path: &QString) -> QString;
+
         /// The composited document as a premultiplied ARGB image.
         #[qinvokable]
         #[cxx_name = "compositeImage"]
@@ -183,6 +209,31 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "documentSizeBytes"]
         fn document_size_bytes(self: &Engine) -> Vec<f64>;
+
+        /// Current color mode index (0=Bitmap .. 7=Multichannel).
+        #[qinvokable]
+        #[cxx_name = "colorMode"]
+        fn color_mode(self: &Engine) -> i32;
+
+        /// Set the color mode by index.
+        #[qinvokable]
+        #[cxx_name = "setColorMode"]
+        fn set_color_mode(self: Pin<&mut Engine>, mode: i32);
+
+        /// Convert to indexed color with quantization and optional dithering.
+        #[qinvokable]
+        #[cxx_name = "convertToIndexed"]
+        fn convert_to_indexed(self: Pin<&mut Engine>, max_colors: i32, dither_amount: i32);
+
+        /// Current bit depth (8, 16, or 32).
+        #[qinvokable]
+        #[cxx_name = "bitDepth"]
+        fn bit_depth(self: &Engine) -> i32;
+
+        /// Set the bit depth.
+        #[qinvokable]
+        #[cxx_name = "setBitDepth"]
+        fn set_bit_depth(self: Pin<&mut Engine>, depth: i32);
 
         /// Resize the canvas without scaling the content.
         #[qinvokable]
@@ -598,8 +649,9 @@ pub mod ffi {
         #[cxx_name = "layerHasMask"]
         fn layer_has_mask(self: &Engine, index: i32) -> bool;
 
-        /// What the layer is: 0 = raster (pixels), 1 = adjustment. The panel
-        /// draws these differently and filters on them, as CS6's Kind row does.
+        /// What the layer is: 0 = raster (pixels), 1 = adjustment, 2 = type.
+        /// The panel draws these differently and filters on them, as CS6's Kind
+        /// row does.
         #[qinvokable]
         #[cxx_name = "layerKind"]
         fn layer_kind(self: &Engine, index: i32) -> i32;
@@ -643,6 +695,47 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "layerThumbnail"]
         fn layer_thumbnail(self: &Engine, index: i32, size: i32) -> QImage;
+
+        /// The full-size image of a layer's pixels, for Free Transform.
+        #[qinvokable]
+        #[cxx_name = "layerImage"]
+        fn layer_image(self: &Engine, index: i32) -> QImage;
+
+        /// Tight bounding box of non-transparent pixels in document space:
+        /// (x, y, width, height). Returns (0,0,0,0) when the layer is empty.
+        #[qinvokable]
+        #[cxx_name = "layerContentBounds"]
+        fn layer_content_bounds(self: &Engine, index: i32) -> QRect;
+
+        /// The layer's offset (top-left of its pixels in document space).
+        #[qinvokable]
+        #[cxx_name = "layerOffsetX"]
+        fn layer_offset_x(self: &Engine, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "layerOffsetY"]
+        fn layer_offset_y(self: &Engine, index: i32) -> i32;
+
+        /// Replace a layer's pixels and offset after a transform.
+        #[qinvokable]
+        #[cxx_name = "replaceLayerPixels"]
+        fn replace_layer_pixels(
+            self: Pin<&mut Engine>,
+            index: i32,
+            image: &QImage,
+            x: i32,
+            y: i32,
+        );
+
+        /// Rotate the active layer by 90°, 180°, or 270°.
+        #[qinvokable]
+        #[cxx_name = "rotateLayer"]
+        fn rotate_layer(self: Pin<&mut Engine>, degrees: i32);
+
+        /// Flip the active layer horizontally or vertically.
+        #[qinvokable]
+        #[cxx_name = "flipLayer"]
+        fn flip_layer(self: Pin<&mut Engine>, horizontal: bool);
 
         #[qinvokable]
         #[cxx_name = "setActiveLayer"]
@@ -722,6 +815,18 @@ pub mod ffi {
         #[cxx_name = "offsetLayer"]
         fn offset_layer(self: Pin<&mut Engine>, index: i32, dx: i32, dy: i32);
 
+        /// Seal history coalescing so the next coalescing commit starts a new entry.
+        #[qinvokable]
+        #[cxx_name = "sealHistory"]
+        fn seal_history(self: Pin<&mut Engine>);
+
+        /// Strip the text record from a type layer, turning it into plain
+        /// raster pixels. The layer keeps its image, position, blend mode and
+        /// everything else — it just stops being editable as text.
+        #[qinvokable]
+        #[cxx_name = "rasterizeLayer"]
+        fn rasterize_layer(self: Pin<&mut Engine>, index: i32);
+
         /// Start describing a piece of text, run by run.
         ///
         /// Character formatting is per-character — two letters in the middle of
@@ -747,6 +852,19 @@ pub mod ffi {
             size: f32,
             color: &QColor,
         );
+
+        /// Add a layer from an image the shell already decoded — the frames of
+        /// an animated GIF, which arrive one at a time from Qt's reader.
+        /// `x`/`y` place the image's top-left in document space.
+        #[qinvokable]
+        #[cxx_name = "addImageLayer"]
+        fn add_image_layer(
+            self: Pin<&mut Engine>,
+            image: &QImage,
+            x: i32,
+            y: i32,
+            name: &QString,
+        ) -> bool;
 
         /// Add a layer from pixels the shell already rasterized — what the
         /// Type tool commits. `x`/`y` place the image's top-left in document
@@ -1488,6 +1606,35 @@ pub mod ffi {
         #[cxx_name = "setQuickMask"]
         fn set_quick_mask(self: Pin<&mut Engine>, on: bool);
 
+        /// The pixels a Copy takes: what the selection covers, from the active
+        /// layer or — when `merged` — from the whole visible image.
+        ///
+        /// An empty image when there is nothing to copy. `copyOriginX`/`Y` say
+        /// where in the document it came from, which is what Paste in Place
+        /// needs and what an image on the system clipboard cannot carry.
+        #[qinvokable]
+        #[cxx_name = "copySelection"]
+        fn copy_selection(self: Pin<&mut Engine>, merged: bool) -> QImage;
+
+        #[qinvokable]
+        #[cxx_name = "copyOriginX"]
+        fn copy_origin_x(self: &Engine) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "copyOriginY"]
+        fn copy_origin_y(self: &Engine) -> i32;
+
+        /// Paste an image as a new layer with its top-left at `x`, `y`.
+        ///
+        /// `mode` is what the current selection does to it: 0 nothing, 1 keeps
+        /// the paste inside the selection, 2 keeps it outside — Photoshop's
+        /// Paste, Paste Into and Paste Outside. Both of the latter make a layer
+        /// mask, so what was pasted can still be moved within it.
+        #[qinvokable]
+        #[cxx_name = "pasteImage"]
+        fn paste_image(self: Pin<&mut Engine>, image: &QImage, x: i32, y: i32, mode: i32)
+            -> bool;
+
         /// Sample the composited colour at a point, for the eyedropper.
         #[qinvokable]
         #[cxx_name = "pickColor"]
@@ -1769,6 +1916,10 @@ pub struct EngineRust {
     /// clean off, once each stroke ends.
     mixer_load_after_stroke: bool,
     mixer_clean_after_stroke: bool,
+    /// Where the last Copy came from in the document. The system clipboard
+    /// carries pixels and nothing else, so Paste in Place remembers it here.
+    copy_origin: (i32, i32),
+
     /// The shape tools' options bar, held between drags like every other
     /// tool's.
     shape_options: ShapeOptions,
@@ -1863,6 +2014,7 @@ impl Default for EngineRust {
             mixer_reservoir: Rgba8::BLACK,
             mixer_load_after_stroke: false,
             mixer_clean_after_stroke: false,
+            copy_origin: (0, 0),
             shape_options: ShapeOptions::default(),
             bg_erase_options: BackgroundEraseOptions {
                 // CS6's defaults: sample as you go, keep to what the crosshair
@@ -2163,19 +2315,44 @@ impl ffi::Engine {
             return false;
         };
 
-        let pixmap = if path.to_lowercase().ends_with(".psd") {
-            match crate::psd::parse(&bytes) {
-                Ok(file) => crate::psd::to_pixmap(&file),
-                Err(_) => return false,
-            }
-        } else {
+        if path.to_lowercase().ends_with(".psd") {
+            let Ok(file) = crate::psd::parse(&bytes) else {
+                return false;
+            };
+
+            // A PSD is a stack, not a picture. The flattened composite it also
+            // carries is only used when the file has no layer section — a
+            // flattened save, or one written by something that does not store
+            // layers — because opening a layered file as one layer throws the
+            // work away.
+            let mut doc = if file.layers.is_empty() {
+                Document::from_pixmap(crate::psd::to_pixmap(&file))
+            } else {
+                Document::from_layers(file.layers, file.header.width, file.header.height)
+            };
+            doc.path = Some(path);
+            doc.mark_saved();
+            self.as_mut().add_document(doc);
+            self.sync();
+            return true;
+        }
+
+        let pixmap = {
             // Everything else goes through Qt's image plugins, which already
             // cover PNG/JPEG/TIFF/WebP — no reason to reimplement them.
             let Some(pm) = QImage::from_data(&bytes, None).as_ref().and_then(qimage_to_pixmap)
             else {
                 return false;
             };
-            pm
+
+            // A camera held sideways writes the pixels as the sensor read them
+            // and records which way up they go in EXIF. Applying it here, once,
+            // is what makes a portrait photograph open portrait — and means
+            // nothing downstream has to carry an orientation around.
+            match metadata::read(&bytes).orientation {
+                Some(value) => pm.transformed(metadata::Orientation::from_exif(value)),
+                None => pm,
+            }
         };
 
         let mut doc = Document::from_pixmap(pixmap);
@@ -2209,8 +2386,12 @@ impl ffi::Engine {
             return false;
         }
 
-        let flat = self.doc.flattened(Rgba8::WHITE);
-        if std::fs::write(&path, crate::psd::write_psd(&flat)).is_err() {
+        // The whole stack, not the flattened picture: a PSD that comes back as
+        // one layer is a project that has been thrown away. The composite goes
+        // in alongside it, which is what other programs display.
+        let composite = self.doc.composite();
+        let bytes = crate::psd::write_layered_psd(self.doc.layers(), &composite);
+        if std::fs::write(&path, bytes).is_err() {
             return false;
         }
 
@@ -2225,6 +2406,30 @@ impl ffi::Engine {
         self.as_mut().rust_mut().doc.path = Some(path);
         self.as_mut().rust_mut().doc.mark_saved();
         self.sync();
+    }
+
+    fn document_path(&self) -> QString {
+        QString::from(self.doc.path.clone().unwrap_or_default().as_str())
+    }
+
+    fn file_metadata(&self, path: &QString) -> QString {
+        let Ok(bytes) = std::fs::read(path.to_string()) else {
+            return QString::default();
+        };
+        let meta = metadata::read(&bytes);
+        let records: Vec<String> = meta
+            .fields
+            .iter()
+            .map(|f| format!("{}\t{}\t{}", f.category, f.label, f.value))
+            .collect();
+        QString::from(records.join("\n").as_str())
+    }
+
+    fn file_xmp(&self, path: &QString) -> QString {
+        let Ok(bytes) = std::fs::read(path.to_string()) else {
+            return QString::default();
+        };
+        QString::from(metadata::read(&bytes).xmp.unwrap_or_default().as_str())
     }
 
     fn composite_image(&self) -> QImage {
@@ -2975,6 +3180,37 @@ impl ffi::Engine {
         vec![flat, self.doc.layers().byte_size() as f64]
     }
 
+    fn color_mode(&self) -> i32 {
+        self.doc.color_mode().to_index()
+    }
+
+    fn set_color_mode(mut self: core::pin::Pin<&mut Self>, mode: i32) {
+        if let Some(m) = ImageMode::from_index(mode) {
+            self.as_mut().rust_mut().doc.set_color_mode(m);
+            self.sync();
+        }
+    }
+
+    fn convert_to_indexed(mut self: core::pin::Pin<&mut Self>, max_colors: i32, dither_amount: i32) {
+        let colors = max_colors.clamp(2, 256) as u32;
+        let dither = dither_amount.clamp(0, 100) as u32;
+        self.as_mut().rust_mut().doc.convert_to_indexed(colors, dither);
+        self.sync();
+    }
+
+    fn bit_depth(&self) -> i32 {
+        self.doc.bit_depth() as i32
+    }
+
+    fn set_bit_depth(mut self: core::pin::Pin<&mut Self>, depth: i32) {
+        let d = match depth {
+            8 | 16 | 32 => depth as u8,
+            _ => return,
+        };
+        self.as_mut().rust_mut().doc.set_bit_depth(d);
+        self.sync();
+    }
+
     fn resize_canvas(mut self: core::pin::Pin<&mut Self>, width: i32, height: i32) {
         let w = width.clamp(1, 30_000) as u32;
         let h = height.clamp(1, 30_000) as u32;
@@ -3076,6 +3312,10 @@ impl ffi::Engine {
             .and_then(|id| self.doc.layers().by_id(id))
             .map_or(0, |l| match l.kind {
                 LayerKind::Adjustment(_) => 1,
+                // A type layer is raster underneath — it carries the pixels its
+                // text was rendered to — so what makes it type is the record
+                // beside them, not its kind.
+                _ if l.text.is_some() => 2,
                 _ => 0,
             })
     }
@@ -3174,6 +3414,143 @@ impl ffi::Engine {
             }
         }
         pixmap_to_qimage(thumb)
+    }
+
+    fn layer_image(&self, index: i32) -> QImage {
+        let Some(layer) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+        else {
+            return QImage::default();
+        };
+        pixmap_to_qimage(layer.pixels.clone())
+    }
+
+    fn layer_content_bounds(&self, index: i32) -> QRect {
+        let Some(layer) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+        else {
+            return QRect::new(0, 0, 0, 0);
+        };
+        let w = layer.pixels.width() as i32;
+        let h = layer.pixels.height() as i32;
+        if w == 0 || h == 0 {
+            return QRect::new(0, 0, 0, 0);
+        }
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0i32;
+        let mut max_y = 0i32;
+        for y in 0..h {
+            for x in 0..w {
+                if layer.pixels.get(x, y).a > 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if max_x < min_x {
+            return QRect::new(0, 0, 0, 0);
+        }
+        QRect::new(
+            layer.offset.0 + min_x,
+            layer.offset.1 + min_y,
+            max_x - min_x + 1,
+            max_y - min_y + 1,
+        )
+    }
+
+    fn layer_offset_x(&self, index: i32) -> i32 {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .map_or(0, |l| l.offset.0)
+    }
+
+    fn layer_offset_y(&self, index: i32) -> i32 {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .map_or(0, |l| l.offset.1)
+    }
+
+    fn replace_layer_pixels(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        image: &QImage,
+        x: i32,
+        y: i32,
+    ) {
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        let Some(pixels) = qimage_to_pixmap(image) else {
+            return;
+        };
+        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+            layer.pixels = pixels;
+            layer.offset = (x, y);
+        }
+        self.as_mut().rust_mut().doc.commit("Free Transform");
+        self.sync();
+    }
+
+    fn rotate_layer(mut self: core::pin::Pin<&mut Self>, degrees: i32) {
+        use crate::metadata::Orientation;
+        let orient = match degrees.rem_euclid(360) {
+            90 => Orientation::Rotate90Cw,
+            180 => Orientation::Rotate180,
+            270 => Orientation::Rotate90Ccw,
+            _ => return,
+        };
+        let id = self.doc.active_layer_id();
+        let (cw, ch) = self.doc.size();
+        let cw = cw as i32;
+        let ch = ch as i32;
+        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+            let (ox, oy) = layer.offset;
+            let lw = layer.pixels.width() as i32;
+            let lh = layer.pixels.height() as i32;
+            layer.pixels = layer.pixels.transformed(orient);
+            match degrees.rem_euclid(360) {
+                90 => layer.offset = (cw - oy - lh, ox),
+                180 => layer.offset = (cw - ox - lw, ch - oy - lh),
+                270 => layer.offset = (oy, ch - ox - lw),
+                _ => {}
+            }
+        }
+        let label = match degrees.rem_euclid(360) {
+            90 => "Rotate 90\u{b0} CW",
+            180 => "Rotate 180\u{b0}",
+            270 => "Rotate 90\u{b0} CCW",
+            _ => "Rotate",
+        };
+        self.as_mut().rust_mut().doc.commit(label);
+        self.sync();
+    }
+
+    fn flip_layer(mut self: core::pin::Pin<&mut Self>, horizontal: bool) {
+        use crate::metadata::Orientation;
+        let id = self.doc.active_layer_id();
+        let (cw, ch) = self.doc.size();
+        let cw = cw as i32;
+        let ch = ch as i32;
+        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+            let (ox, oy) = layer.offset;
+            let lw = layer.pixels.width() as i32;
+            let lh = layer.pixels.height() as i32;
+            if horizontal {
+                layer.pixels = layer.pixels.transformed(Orientation::FlipHorizontal);
+                layer.offset = (cw - ox - lw, oy);
+            } else {
+                layer.pixels = layer.pixels.transformed(Orientation::FlipVertical);
+                layer.offset = (ox, ch - oy - lh);
+            }
+        }
+        let label = if horizontal { "Flip Horizontal" } else { "Flip Vertical" };
+        self.as_mut().rust_mut().doc.commit(label);
+        self.sync();
     }
 
     fn set_active_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
@@ -3316,6 +3693,35 @@ impl ffi::Engine {
             self.as_mut().rust_mut().doc.offset_layer(id, dx, dy);
             self.sync();
         }
+    }
+
+    fn seal_history(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.seal_history();
+    }
+
+    fn rasterize_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
+        if let Some(id) = self.layer_id_at(index) {
+            self.as_mut().rust_mut().doc.rasterize_type(id);
+            self.sync();
+        }
+    }
+
+    fn add_image_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        image: &QImage,
+        x: i32,
+        y: i32,
+        name: &QString,
+    ) -> bool {
+        let Some(pixels) = qimage_to_pixmap(image) else {
+            return false;
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .add_image_layer(pixels, (x, y), name.to_string());
+        self.sync();
+        true
     }
 
     fn begin_text_runs(mut self: core::pin::Pin<&mut Self>) {
@@ -4497,6 +4903,42 @@ impl ffi::Engine {
         // off, and the marching ants give way to it.
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
+    }
+
+    fn copy_selection(mut self: core::pin::Pin<&mut Self>, merged: bool) -> QImage {
+        let Some((pixels, origin)) = self.as_mut().rust_mut().doc.copy_selection(merged) else {
+            return QImage::default();
+        };
+        self.as_mut().rust_mut().copy_origin = origin;
+        pixmap_to_qimage(pixels)
+    }
+
+    fn copy_origin_x(&self) -> i32 {
+        self.copy_origin.0
+    }
+
+    fn copy_origin_y(&self) -> i32 {
+        self.copy_origin.1
+    }
+
+    fn paste_image(
+        mut self: core::pin::Pin<&mut Self>,
+        image: &QImage,
+        x: i32,
+        y: i32,
+        mode: i32,
+    ) -> bool {
+        let Some(pixels) = qimage_to_pixmap(image) else {
+            return false;
+        };
+        let mode = match mode {
+            1 => PasteMode::Into,
+            2 => PasteMode::Outside,
+            _ => PasteMode::Plain,
+        };
+        self.as_mut().rust_mut().doc.paste_into(pixels, (x, y), mode);
+        self.sync();
+        true
     }
 
     fn pick_color(&self, x: i32, y: i32) -> QColor {

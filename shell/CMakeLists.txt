@@ -14,9 +14,31 @@ set(SHELL_SOURCES
 
     src/dialogs/ColorPickerDialog.cpp
     src/dialogs/ColorPickerDialog.h
+    src/dialogs/ColorSettingsDialog.cpp
+    src/dialogs/ColorSettingsDialog.h
+    src/dialogs/ExportAsDialog.cpp
+    src/dialogs/ExportAsDialog.h
+    src/dialogs/FileInfoDialog.cpp
+    src/dialogs/FindReplaceTextDialog.cpp
+    src/dialogs/FindReplaceTextDialog.h
+    src/dialogs/FileInfoDialog.h
+    src/dialogs/GifWriter.cpp
+    src/dialogs/GifWriter.h
+    src/dialogs/IndexedColorDialog.cpp
+    src/dialogs/IndexedColorDialog.h
+    src/dialogs/KeyboardShortcutsDialog.cpp
+    src/dialogs/KeyboardShortcutsDialog.h
+    src/dialogs/NewDocumentDialog.cpp
+    src/dialogs/NewDocumentDialog.h
+    src/dialogs/PrintDialog.cpp
+    src/dialogs/PrintDialog.h
+    src/dialogs/SaveForWebDialog.cpp
+    src/dialogs/SaveForWebDialog.h
 
     src/panels/BrushPresetPicker.cpp
     src/panels/BrushPresetPicker.h
+    src/panels/ChannelsPanel.cpp
+    src/panels/ChannelsPanel.h
     src/panels/ColorPanel.cpp
     src/panels/ColorPanel.h
     src/panels/HistoryPanel.cpp
@@ -54,6 +76,7 @@ target_link_libraries(photorust PRIVATE
     photorust_core
     Qt::Core
     Qt::Gui
+    Qt::PrintSupport
     Qt::Svg
     Qt::Widgets
 )

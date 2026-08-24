@@ -4,10 +4,12 @@
 #include <QFont>
 #include <QLabel>
 #include <QMainWindow>
+#include <QStringList>
 
 #include "tools/ToolId.h"
 
 class CanvasView;
+class ChannelsPanel;
 class ColorPanel;
 class CommandRegistry;
 class Engine;
@@ -20,6 +22,7 @@ class ToolStrip;
 class QLineEdit;
 class QComboBox;
 class QDockWidget;
+class QMenu;
 class QTabBar;
 class QToolButton;
 class QDoubleSpinBox;
@@ -46,17 +49,49 @@ private slots:
     // -- File --
     void newDocument();
     void openDocument();
+    /// Close every open document, prompting for each unsaved one.
+    void closeAllDocuments();
+    /// Show what the active document's file says about itself.
+    void showFileInfo();
     bool saveDocument();
     bool saveDocumentAs();
     /// Write every slice out as its own image file (File ▸ Save Slices).
     void exportSlices();
+    /// File ▸ Export ▸ Export As.
+    void exportAs();
+    /// File ▸ Export ▸ Save for Web (Legacy).
+    void saveForWeb();
+    /// File ▸ Print.
+    void printDocument();
+    /// File ▸ Print One Copy.
+    void printOneCopy();
 
     // -- Edit --
     void undo();
     void redo();
+    /// Copy what is selected, then clear it.
+    void cut();
+    /// Copy what is selected from the active layer, or — merged — from the
+    /// whole visible image. False when there was nothing to copy.
+    bool copy();
+    bool copyMerged();
+    /// Paste the clipboard image as a new layer, centred on the view.
+    void paste();
+    /// Paste it back where it was copied from.
+    void pasteInPlace();
+    /// Paste it inside the selection, or outside it, as a masked layer.
+    void pasteInto();
+    void pasteOutside();
     void fillWithForeground();
     void fillWithBackground();
     void clearSelection();
+    void findReplaceText();
+    void freeTransform();
+    void transformRotate180();
+    void transformRotate90CW();
+    void transformRotate90CCW();
+    void transformFlipHorizontal();
+    void transformFlipVertical();
 
     // -- Image --
     void showCanvasSize();
@@ -104,6 +139,32 @@ private:
     /// Keeps every menu entry going through the keymap.
     template <typename Slot>
     QAction *command(const QString &id, const QString &text, Slot slot);
+
+    /// The work behind Copy and Copy Merged.
+    bool copyToClipboard(bool merged);
+    /// The work behind Paste Into and Paste Outside — `mode` 1 or 2.
+    void pasteConfined(int mode);
+    /// Put a clipboard image into the document at `at`.
+    void pasteAt(const QImage &image, const QPoint &at, int mode);
+
+    /// Open a file by path, telling the user if it could not be read — what
+    /// File ▸ Open Recent needs.
+    void openPath(const QString &path);
+    /// The work behind it: open the file into its own tab and return whether
+    /// that worked, saying nothing either way. Opening several files at once
+    /// reports on them together rather than one dialog at a time.
+    bool loadPath(const QString &path);
+    /// The remembered list, most recent first.
+    QStringList recentFiles() const;
+    /// Put a path at the top of it.
+    void rememberRecentFile(const QString &path);
+    /// Rebuild the Open Recent submenu from that list.
+    void refreshRecentMenu();
+
+    /// Open a multi-frame image — an animated GIF — with each frame as a
+    /// layer. False when the file is an ordinary single image, which the
+    /// caller then opens the usual way.
+    bool openAnimatedFrames(const QString &path);
 
     /// Prompt to save the active document if it has unsaved changes.
     /// Returns false if the user cancelled.
@@ -233,6 +294,10 @@ private:
     void warnHealingSourceRequired();
     /// Tell the user an edit was refused because the layer is locked.
     void warnLayerLocked();
+    /// Show the Auto-Align Layers dialog.
+    void autoAlignLayers();
+    void editKeyboardShortcuts();
+    void editColorSettings();
     /// Add the options for the healing group's region-based variants.
     void addHealingRegionOptions(HealingType type);
     /// Add the annotation tools' readouts and Clear button.
@@ -262,6 +327,18 @@ private:
     /// Redraw the options-bar tip button from the current size and hardness.
     void refreshBrushTipButton();
 
+    QList<QAction *> m_editNonTypingActions;
+    QAction *m_transformAgainAction = nullptr;
+    QAction *m_autoAlignAction = nullptr;
+    bool m_hasTransformed = false;
+
+    void showTransformOptionsBar();
+    void hideTransformOptionsBar();
+    void updateTransformReadouts();
+    bool m_transformBarActive = false;
+    ToolId m_preTransformTool = ToolId::Move;
+    int m_preTransformVariant = 0;
+
     Engine *m_engine = nullptr;
     CommandRegistry *m_registry = nullptr;
 
@@ -273,6 +350,7 @@ private:
     QTabBar *m_documentTabs = nullptr;
 
     LayersPanel *m_layersPanel = nullptr;
+    ChannelsPanel *m_channelsPanel = nullptr;
     PathsPanel *m_pathsPanel = nullptr;
     ColorPanel *m_colorPanel = nullptr;
     HistoryPanel *m_historyPanel = nullptr;
@@ -353,6 +431,15 @@ private:
     /// True while the Vertical Type tool is the one in hand, or while text that
     /// is itself vertical is open for editing.
     bool m_typeVertical = false;
+
+    /// Where the last Copy made here came from, and whether the clipboard is
+    /// still holding it. The system clipboard carries pixels alone, so this is
+    /// what lets Paste in Place put them back.
+    QPoint m_copyOrigin;
+    bool m_copyIsOurs = false;
+
+    /// File ▸ Open Recent, rebuilt from settings each time it opens.
+    QMenu *m_recentMenu = nullptr;
 
     /// The shape tools' options, which persist across tool switches like every
     /// other tool's.

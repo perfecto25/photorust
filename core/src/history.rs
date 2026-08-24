@@ -38,6 +38,8 @@ pub struct History {
     max_states: usize,
     /// Soft cap on total snapshot memory.
     max_bytes: usize,
+    /// When true, the next `push_coalescing` acts as a plain `push`.
+    coalesce_sealed: bool,
 }
 
 impl History {
@@ -57,6 +59,7 @@ impl History {
             cursor: 0,
             max_states: Self::DEFAULT_MAX_STATES,
             max_bytes: Self::DEFAULT_MAX_BYTES,
+            coalesce_sealed: false,
         }
     }
 
@@ -132,6 +135,33 @@ impl History {
         });
         self.cursor = self.states.len() - 1;
         self.evict();
+    }
+
+    /// Like [`push`](Self::push), but if the entry at the cursor already has
+    /// the same name, replace it instead of adding a new state. This is how
+    /// Photoshop coalesces rapid slider-driven changes (opacity, fill) into a
+    /// single undo step.
+    pub fn push_coalescing(
+        &mut self,
+        name: impl Into<String>,
+        stack: LayerStack,
+        size: (u32, u32),
+    ) {
+        let name = name.into();
+        if !self.coalesce_sealed
+            && self.cursor > 0
+            && self.states[self.cursor].name == name
+        {
+            self.states[self.cursor].stack = stack;
+            self.states[self.cursor].size = size;
+        } else {
+            self.coalesce_sealed = false;
+            self.push(name, stack, size);
+        }
+    }
+
+    pub fn seal_coalescing(&mut self) {
+        self.coalesce_sealed = true;
     }
 
     /// Step back one state, returning the state to restore.

@@ -45,10 +45,67 @@ pub struct PatchOptions {
     pub transparent: bool,
 }
 
+/// The image's color mode, matching Photoshop's Image > Mode submenu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMode {
+    Bitmap,
+    Grayscale,
+    Duotone,
+    Indexed,
+    Rgb,
+    Cmyk,
+    Lab,
+    Multichannel,
+}
+
+impl ImageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bitmap => "Bitmap",
+            Self::Grayscale => "Grayscale",
+            Self::Duotone => "Duotone",
+            Self::Indexed => "Indexed Color",
+            Self::Rgb => "RGB Color",
+            Self::Cmyk => "CMYK Color",
+            Self::Lab => "Lab Color",
+            Self::Multichannel => "Multichannel",
+        }
+    }
+
+    pub fn from_index(i: i32) -> Option<Self> {
+        Some(match i {
+            0 => Self::Bitmap,
+            1 => Self::Grayscale,
+            2 => Self::Duotone,
+            3 => Self::Indexed,
+            4 => Self::Rgb,
+            5 => Self::Cmyk,
+            6 => Self::Lab,
+            7 => Self::Multichannel,
+            _ => return None,
+        })
+    }
+
+    pub fn to_index(self) -> i32 {
+        match self {
+            Self::Bitmap => 0,
+            Self::Grayscale => 1,
+            Self::Duotone => 2,
+            Self::Indexed => 3,
+            Self::Rgb => 4,
+            Self::Cmyk => 5,
+            Self::Lab => 6,
+            Self::Multichannel => 7,
+        }
+    }
+}
+
 /// One open image.
 pub struct Document {
     width: u32,
     height: u32,
+    color_mode: ImageMode,
+    bit_depth: u8,
     stack: LayerStack,
     selection: Selection,
     history: History,
@@ -131,6 +188,93 @@ pub struct Document {
     text_edit: Option<(LayerId, bool)>,
 }
 
+// ---------------------------------------------------------------------------
+// Median-cut color quantization
+// ---------------------------------------------------------------------------
+
+fn median_cut(samples: &[[u8; 3]], max_colors: usize) -> Vec<[u8; 3]> {
+    if samples.is_empty() || max_colors == 0 {
+        return vec![[0, 0, 0]];
+    }
+
+    let mut buckets: Vec<Vec<[u8; 3]>> = vec![samples.to_vec()];
+
+    while buckets.len() < max_colors {
+        let mut best = 0;
+        let mut best_range = 0u32;
+        for (i, bucket) in buckets.iter().enumerate() {
+            if bucket.len() < 2 {
+                continue;
+            }
+            for ch in 0..3 {
+                let lo = bucket.iter().map(|p| p[ch]).min().unwrap_or(0);
+                let hi = bucket.iter().map(|p| p[ch]).max().unwrap_or(0);
+                let range = (hi - lo) as u32;
+                if range > best_range {
+                    best_range = range;
+                    best = i;
+                }
+            }
+        }
+        if best_range == 0 {
+            break;
+        }
+
+        let bucket = &buckets[best];
+        let mut split_ch = 0;
+        let mut split_range = 0u32;
+        for ch in 0..3 {
+            let lo = bucket.iter().map(|p| p[ch]).min().unwrap_or(0);
+            let hi = bucket.iter().map(|p| p[ch]).max().unwrap_or(0);
+            let r = (hi - lo) as u32;
+            if r > split_range {
+                split_range = r;
+                split_ch = ch;
+            }
+        }
+
+        let mut sorted = buckets.swap_remove(best);
+        sorted.sort_unstable_by_key(|p| p[split_ch]);
+        let mid = sorted.len() / 2;
+        let right = sorted.split_off(mid);
+        buckets.push(sorted);
+        buckets.push(right);
+    }
+
+    buckets
+        .iter()
+        .map(|bucket| {
+            if bucket.is_empty() {
+                return [0, 0, 0];
+            }
+            let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+            for p in bucket {
+                sr += p[0] as u64;
+                sg += p[1] as u64;
+                sb += p[2] as u64;
+            }
+            let n = bucket.len() as u64;
+            [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8]
+        })
+        .collect()
+}
+
+fn nearest_color(palette: &[[u8; 3]], r: u8, g: u8, b: u8) -> [u8; 3] {
+    let mut best = palette[0];
+    let mut best_dist = i32::MAX;
+    for &entry in palette {
+        let dr = r as i32 - entry[0] as i32;
+        let dg = g as i32 - entry[1] as i32;
+        let db = b as i32 - entry[2] as i32;
+        let dist = dr * dr + dg * dg + db * db;
+        if dist < best_dist {
+            best_dist = dist;
+            best = entry;
+        }
+    }
+    best
+}
+
 /// Paint a finished stroke into a selection — Quick Mask's whole mechanism.
 ///
 /// How light the paint is decides what the pixel becomes: black masks it out,
@@ -158,6 +302,17 @@ fn paint_stroke_into_selection(
             }
         }
     }
+}
+
+/// What a paste does with the selection that was in place when it happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PasteMode {
+    /// Ignore it: an ordinary paste lands as a layer of its own.
+    Plain,
+    /// Confine the pasted pixels to the selection — Photoshop's Paste Into.
+    Into,
+    /// Confine them to everything *but* the selection — Paste Outside.
+    Outside,
 }
 
 /// Where the dabs of a direct-to-layer stroke fall between two mouse positions.
@@ -203,6 +358,8 @@ impl Document {
         Self {
             width,
             height,
+            color_mode: ImageMode::Rgb,
+            bit_depth: 8,
             stack,
             selection: Selection::new(width, height),
             history,
@@ -242,6 +399,59 @@ impl Document {
     }
 
     /// Wrap an existing image as the Background of a new document.
+    /// A document from a layer stack that was read from a file.
+    ///
+    /// The canvas size comes from the file rather than from the layers: a PSD's
+    /// layers may hang off the edge of its canvas, and several may be smaller
+    /// than it, so neither their union nor the largest of them is the document.
+    /// An empty stack gets one transparent layer, since a document with no
+    /// layers at all is a state nothing else here expects.
+    pub fn from_layers(mut stack: LayerStack, width: u32, height: u32) -> Self {
+        if stack.is_empty() {
+            let id = stack.allocate_id();
+            stack.push(Layer::new_raster(id, "Background", width, height));
+        }
+        // Photoshop selects the top layer on open, which is also the one the
+        // panel highlights.
+        let active_layer = stack
+            .as_slice()
+            .last()
+            .map_or(LayerId::NONE, |layer| layer.id);
+
+        let history = History::new(stack.clone(), (width, height));
+        Self {
+            width,
+            height,
+            color_mode: ImageMode::Rgb,
+            bit_depth: 8,
+            stack,
+            selection: Selection::new(width, height),
+            history,
+            slices: SliceSet::new(),
+            annotations: Annotations::new(),
+            paths: PathSet::new(),
+            active_layer,
+            stroke: None,
+            stroke_undo_base: None,
+            replacer: None,
+            replace_last: None,
+            bg_eraser: None,
+            bg_erase_last: None,
+            mixer: None,
+            mixer_last: None,
+            focus: None,
+            smudge: None,
+            tone: None,
+            retouch_last: None,
+            clone: None,
+            path: None,
+            untitled_number: 1,
+            dirty: false,
+            quick_mask: false,
+            text_edit: None,
+        }
+    }
+
     pub fn from_pixmap(pixels: Pixmap) -> Self {
         let (width, height) = (pixels.width(), pixels.height());
         let mut stack = LayerStack::new();
@@ -254,6 +464,8 @@ impl Document {
         Self {
             width,
             height,
+            color_mode: ImageMode::Rgb,
+            bit_depth: 8,
             stack,
             selection: Selection::new(width, height),
             history,
@@ -300,6 +512,172 @@ impl Document {
         self.dirty
     }
 
+    pub fn color_mode(&self) -> ImageMode {
+        self.color_mode
+    }
+
+    pub fn bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+
+    pub fn set_color_mode(&mut self, mode: ImageMode) {
+        if mode == self.color_mode {
+            return;
+        }
+        let old = self.color_mode;
+        self.color_mode = mode;
+
+        if old == ImageMode::Rgb && mode == ImageMode::Grayscale {
+            for layer in self.stack.iter_mut() {
+                let (w, h) = (layer.pixels.width(), layer.pixels.height());
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let px = layer.pixels.get(x, y);
+                        let gray = ((px.r as u32 * 299
+                            + px.g as u32 * 587
+                            + px.b as u32 * 114)
+                            / 1000) as u8;
+                        layer.pixels.set(x, y, Rgba8::new(gray, gray, gray, px.a));
+                    }
+                }
+            }
+        }
+
+        if mode == ImageMode::Cmyk {
+            for layer in self.stack.iter_mut() {
+                let (w, h) = (layer.pixels.width(), layer.pixels.height());
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let px = layer.pixels.get(x, y);
+                        if px.a == 0 {
+                            continue;
+                        }
+                        let (r, g, b) = if old == ImageMode::Grayscale {
+                            (px.r, px.r, px.r)
+                        } else {
+                            (px.r, px.g, px.b)
+                        };
+                        let rf = r as f32 / 255.0;
+                        let gf = g as f32 / 255.0;
+                        let bf = b as f32 / 255.0;
+                        let k = 1.0 - rf.max(gf).max(bf);
+                        let (c, m, y_val) = if k >= 1.0 {
+                            (0.0, 0.0, 0.0)
+                        } else {
+                            let inv = 1.0 / (1.0 - k);
+                            ((1.0 - rf - k) * inv, (1.0 - gf - k) * inv, (1.0 - bf - k) * inv)
+                        };
+                        let ro = ((1.0 - c) * (1.0 - k) * 255.0 + 0.5) as u8;
+                        let go = ((1.0 - m) * (1.0 - k) * 255.0 + 0.5) as u8;
+                        let bo = ((1.0 - y_val) * (1.0 - k) * 255.0 + 0.5) as u8;
+                        layer.pixels.set(x, y, Rgba8::new(ro, go, bo, px.a));
+                    }
+                }
+            }
+        }
+
+        self.commit(mode.as_str());
+    }
+
+    /// Convert to indexed color with median-cut quantization and optional
+    /// Floyd-Steinberg dithering. `dither_amount` is 0–100 (0 = no dither).
+    pub fn convert_to_indexed(&mut self, max_colors: u32, dither_amount: u32) {
+        let old = self.color_mode;
+        self.color_mode = ImageMode::Indexed;
+
+        for layer in self.stack.iter_mut() {
+            let (w, h) = (layer.pixels.width(), layer.pixels.height());
+            if w == 0 || h == 0 {
+                continue;
+            }
+
+            // Collect opaque pixels for palette building
+            let mut samples: Vec<[u8; 3]> = Vec::new();
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let px = layer.pixels.get(x, y);
+                    if px.a > 0 {
+                        samples.push([px.r, px.g, px.b]);
+                    }
+                }
+            }
+
+            let palette = median_cut(&samples, max_colors.min(256) as usize);
+
+            if dither_amount > 0 {
+                // Floyd-Steinberg dithering
+                let strength = dither_amount as f32 / 100.0;
+                let mut errors: Vec<[f32; 3]> = vec![[0.0; 3]; (w * h) as usize];
+
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let px = layer.pixels.get(x, y);
+                        if px.a == 0 {
+                            continue;
+                        }
+                        let idx = (y as usize) * (w as usize) + (x as usize);
+                        let r = (px.r as f32 + errors[idx][0] * strength).clamp(0.0, 255.0);
+                        let g = (px.g as f32 + errors[idx][1] * strength).clamp(0.0, 255.0);
+                        let b = (px.b as f32 + errors[idx][2] * strength).clamp(0.0, 255.0);
+
+                        let nearest = nearest_color(&palette, r as u8, g as u8, b as u8);
+                        layer.pixels.set(x, y, Rgba8::new(nearest[0], nearest[1], nearest[2], px.a));
+
+                        let er = r - nearest[0] as f32;
+                        let eg = g - nearest[1] as f32;
+                        let eb = b - nearest[2] as f32;
+
+                        let distribute = |errors: &mut Vec<[f32; 3]>, idx: usize, f: f32| {
+                            errors[idx][0] += er * f;
+                            errors[idx][1] += eg * f;
+                            errors[idx][2] += eb * f;
+                        };
+
+                        if x + 1 < w as i32 {
+                            distribute(&mut errors, idx + 1, 7.0 / 16.0);
+                        }
+                        if y + 1 < h as i32 {
+                            let next_row = idx + w as usize;
+                            if x > 0 {
+                                distribute(&mut errors, next_row - 1, 3.0 / 16.0);
+                            }
+                            distribute(&mut errors, next_row, 5.0 / 16.0);
+                            if x + 1 < w as i32 {
+                                distribute(&mut errors, next_row + 1, 1.0 / 16.0);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No dithering — snap each pixel to the nearest palette entry
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let px = layer.pixels.get(x, y);
+                        if px.a == 0 {
+                            continue;
+                        }
+                        let nearest = nearest_color(&palette, px.r, px.g, px.b);
+                        layer.pixels.set(x, y, Rgba8::new(nearest[0], nearest[1], nearest[2], px.a));
+                    }
+                }
+            }
+        }
+
+        self.commit(if old == self.color_mode {
+            "Indexed Color"
+        } else {
+            ImageMode::Indexed.as_str()
+        });
+    }
+
+    pub fn set_bit_depth(&mut self, depth: u8) {
+        if depth == self.bit_depth {
+            return;
+        }
+        self.bit_depth = depth;
+        self.commit(&format!("{} Bits/Channel", depth));
+    }
+
     pub fn mark_saved(&mut self) {
         self.dirty = false;
     }
@@ -312,17 +690,28 @@ impl Document {
             .as_deref()
             .and_then(|p| p.rsplit('/').next())
             .unwrap_or(&untitled);
-        if self.dirty {
-            format!("{}*", base)
-        } else {
-            base.to_string()
-        }
+        let mode_label = match self.color_mode {
+            ImageMode::Rgb => "RGB",
+            ImageMode::Grayscale => "Gray",
+            ImageMode::Cmyk => "CMYK",
+            ImageMode::Lab => "Lab",
+            ImageMode::Bitmap => "Bitmap",
+            ImageMode::Duotone => "Duotone",
+            ImageMode::Indexed => "Indexed",
+            ImageMode::Multichannel => "Multi",
+        };
+        let dirty = if self.dirty { "*" } else { "" };
+        format!("{}{} ({}/{})", base, dirty, mode_label, self.bit_depth)
     }
 
     // -- layers -------------------------------------------------------------
 
     pub fn layers(&self) -> &LayerStack {
         &self.stack
+    }
+
+    pub fn layers_mut_raw(&mut self) -> &mut LayerStack {
+        &mut self.stack
     }
 
     pub fn layer_count(&self) -> usize {
@@ -461,6 +850,24 @@ impl Document {
         id
     }
 
+    /// Add a layer of already-decoded pixels above the active one and select
+    /// it — an animated GIF's frames, say.
+    ///
+    /// `offset` places the pixels in document space, so a layer smaller than
+    /// the canvas can sit anywhere on it.
+    pub fn add_image_layer(&mut self, pixels: Pixmap, offset: (i32, i32), name: String) -> LayerId {
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.pixels = pixels;
+        layer.offset = offset;
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("New Layer");
+        id
+    }
+
     /// Add a layer of already-rasterized pixels above the active one and
     /// select it — what the Type tool commits.
     ///
@@ -477,6 +884,14 @@ impl Document {
         text: TextContent,
     ) -> LayerId {
         let id = self.stack.allocate_id();
+        // An unnamed one is a layer that has nothing in it yet — the empty
+        // layer Photoshop puts down the moment the Type tool is clicked, before
+        // there is any text to name it after.
+        let name = if name.is_empty() {
+            self.stack.suggest_name()
+        } else {
+            name
+        };
         let mut layer = Layer::new_raster(id, name, 0, 0);
         layer.pixels = pixels;
         layer.offset = offset;
@@ -688,14 +1103,14 @@ impl Document {
     pub fn set_layer_opacity(&mut self, id: LayerId, opacity: f32) {
         if let Some(l) = self.stack.by_id_mut(id) {
             l.opacity = opacity.clamp(0.0, 1.0);
-            self.commit("Layer Opacity");
+            self.commit_coalescing("Layer Opacity");
         }
     }
 
     pub fn set_layer_fill_opacity(&mut self, id: LayerId, opacity: f32) {
         if let Some(l) = self.stack.by_id_mut(id) {
             l.fill_opacity = opacity.clamp(0.0, 1.0);
-            self.commit("Fill Opacity");
+            self.commit_coalescing("Fill Opacity");
         }
     }
 
@@ -743,6 +1158,39 @@ impl Document {
     }
 
     /// Move a layer's pixels by a delta, as the Move tool does.
+    pub fn rasterize_type(&mut self, id: LayerId) {
+        if let Some(l) = self.stack.by_id_mut(id) {
+            if l.text.is_none() {
+                return;
+            }
+            l.text = None;
+
+            let (ox, oy) = l.offset;
+            let old = &l.pixels;
+            let ow = old.width();
+            let oh = old.height();
+
+            let mut expanded = Pixmap::new(self.width, self.height);
+            for sy in 0..oh as i32 {
+                let dy = sy + oy;
+                if dy < 0 || dy >= self.height as i32 {
+                    continue;
+                }
+                for sx in 0..ow as i32 {
+                    let dx = sx + ox;
+                    if dx < 0 || dx >= self.width as i32 {
+                        continue;
+                    }
+                    expanded.set(dx, dy, old.get(sx, sy));
+                }
+            }
+            l.pixels = expanded;
+            l.offset = (0, 0);
+
+            self.commit("Rasterize Type");
+        }
+    }
+
     pub fn offset_layer(&mut self, id: LayerId, dx: i32, dy: i32) {
         if let Some(l) = self.stack.by_id_mut(id) {
             if l.lock_position {
@@ -757,7 +1205,7 @@ impl Document {
                 text.origin.0 += dx as f32;
                 text.origin.1 += dy as f32;
             }
-            self.commit("Move Layer");
+            self.commit_coalescing("Move Layer");
         }
     }
 
@@ -2341,6 +2789,102 @@ impl Document {
     }
 
     /// Erase within the selection (or the whole layer).
+    // -- the clipboard --------------------------------------------------------
+
+    /// The pixels a Copy takes: what the selection covers, cut out of the
+    /// active layer or of the whole visible image.
+    ///
+    /// Comes back with its place in the document, since where a copy came from
+    /// is what Paste in Place needs. Partly selected pixels come out partly
+    /// transparent, so a feathered selection copies with a soft edge — the same
+    /// coverage that governs every other selection-aware operation here.
+    ///
+    /// `None` when there is nothing to copy: no selection, or a selection that
+    /// falls entirely outside the layer.
+    pub fn copy_selection(&mut self, merged: bool) -> Option<(Pixmap, (i32, i32))> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let bounds = self.selection.bounds().intersect(&Rect::from_size(self.width, self.height));
+        if bounds.is_empty() {
+            return None;
+        }
+
+        // Merged copies the composite; an ordinary copy takes the active layer
+        // alone, which is the difference between the two menu entries.
+        let source = if merged {
+            self.composite()
+        } else {
+            let layer = self.active_layer()?;
+            let offset = layer.offset;
+            let mut placed = Pixmap::new(self.width, self.height);
+            for y in 0..layer.pixels.height() as i32 {
+                for x in 0..layer.pixels.width() as i32 {
+                    placed.set(x + offset.0, y + offset.1, layer.pixels.get(x, y));
+                }
+            }
+            placed
+        };
+
+        let mut out = Pixmap::new(bounds.width, bounds.height);
+        for y in 0..bounds.height as i32 {
+            for x in 0..bounds.width as i32 {
+                let (doc_x, doc_y) = (bounds.x + x, bounds.y + y);
+                let coverage = self.selection.coverage_at(doc_x, doc_y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let mut px = source.get(doc_x, doc_y);
+                px.a = (px.a as f32 * coverage).round().clamp(0.0, 255.0) as u8;
+                out.set(x, y, px);
+            }
+        }
+        Some((out, (bounds.x, bounds.y)))
+    }
+
+    /// How a paste is confined by the selection that was in place.
+    pub fn paste_into(&mut self, pixels: Pixmap, offset: (i32, i32), mode: PasteMode) -> LayerId {
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, self.stack.suggest_shape_name("Layer"), 0, 0);
+        layer.pixels = pixels;
+        layer.offset = offset;
+
+        // Paste Into and Paste Outside are the same paste wearing the selection
+        // as a mask — which is exactly what Photoshop makes: a layer plus a
+        // layer mask, so the pasted pixels can still be moved about inside it
+        // afterwards.
+        if mode != PasteMode::Plain && !self.selection.is_empty() {
+            let mut mask = Pixmap::new(self.width, self.height);
+            for y in 0..self.height as i32 {
+                for x in 0..self.width as i32 {
+                    let mut coverage = self.selection.coverage_at(x, y);
+                    if mode == PasteMode::Outside {
+                        coverage = 1.0 - coverage;
+                    }
+                    let a = (coverage * 255.0 + 0.5) as u8;
+                    mask.set(x, y, Rgba8::new(a, a, a, a));
+                }
+            }
+            // The mask is canvas-sized and starts at the origin, so the layer's
+            // own offset has to be too, and the pixels move instead.
+            let mut placed = Pixmap::new(self.width, self.height);
+            for y in 0..layer.pixels.height() as i32 {
+                for x in 0..layer.pixels.width() as i32 {
+                    placed.set(x + offset.0, y + offset.1, layer.pixels.get(x, y));
+                }
+            }
+            layer.pixels = placed;
+            layer.offset = (0, 0);
+            layer.mask = Some(mask);
+        }
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("Paste");
+        id
+    }
+
     pub fn clear_selection_pixels(&mut self) {
         let selection_empty = self.selection.is_empty();
         let selection = if selection_empty {
@@ -2831,6 +3375,16 @@ impl Document {
     pub fn commit(&mut self, name: impl Into<String>) {
         self.history.push(name, self.stack.clone(), (self.width, self.height));
         self.dirty = true;
+    }
+
+    pub fn commit_coalescing(&mut self, name: impl Into<String>) {
+        self.history
+            .push_coalescing(name, self.stack.clone(), (self.width, self.height));
+        self.dirty = true;
+    }
+
+    pub fn seal_history(&mut self) {
+        self.history.seal_coalescing();
     }
 
     /// Adopt a canvas size restored from history.
@@ -3585,6 +4139,106 @@ mod tests {
             tolerance: 40,
             protect_foreground: false,
         }
+    }
+
+    /// A red document with a blue square in the middle of the active layer.
+    fn clipboard_fixture() -> Document {
+        let mut d = Document::new(20, 20, Rgba8::opaque(200, 0, 0));
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(5, 5, 10, 10), Rgba8::opaque(0, 0, 200));
+        }
+        d.commit("Setup");
+        d
+    }
+
+    #[test]
+    fn copying_takes_the_selection_and_says_where_it_came_from() {
+        let mut d = clipboard_fixture();
+        d.select_rect(Rect::new(5, 5, 10, 10), SelectionOp::Replace, 0);
+
+        let (pixels, origin) = d.copy_selection(false).expect("nothing was copied");
+        assert_eq!(origin, (5, 5), "the copy forgot where it came from");
+        assert_eq!((pixels.width(), pixels.height()), (10, 10));
+        assert_eq!(pixels.get(0, 0), Rgba8::opaque(0, 0, 200));
+    }
+
+    #[test]
+    fn copying_without_a_selection_copies_nothing() {
+        let mut d = clipboard_fixture();
+        assert!(d.copy_selection(false).is_none());
+    }
+
+    #[test]
+    fn what_falls_outside_the_selection_comes_out_transparent() {
+        // A copy is the shape of the selection, not of its bounding box.
+        let mut d = clipboard_fixture();
+        d.select_ellipse(Rect::new(0, 0, 20, 20), SelectionOp::Replace, 0);
+
+        let (pixels, _) = d.copy_selection(true).unwrap();
+        assert_eq!(pixels.get(10, 10).a, 255, "the middle of the ellipse was dropped");
+        assert_eq!(pixels.get(0, 0).a, 0, "a corner outside the ellipse was copied");
+    }
+
+    #[test]
+    fn a_merged_copy_sees_the_layers_below() {
+        let mut d = clipboard_fixture();
+        // A second layer with a hole in it: merged sees red through the hole,
+        // an ordinary copy sees nothing there.
+        d.add_layer(None);
+        if let Some(layer) = d.active_layer_mut() {
+            layer.pixels.fill_rect(Rect::new(0, 0, 5, 5), Rgba8::opaque(0, 200, 0));
+        }
+        d.select_rect(Rect::new(0, 0, 20, 20), SelectionOp::Replace, 0);
+
+        let (plain, _) = d.copy_selection(false).unwrap();
+        assert_eq!(plain.get(10, 10).a, 0, "the empty part of the layer was not empty");
+
+        let (merged, _) = d.copy_selection(true).unwrap();
+        assert_eq!(merged.get(10, 10), Rgba8::opaque(0, 0, 200), "merged missed the layer below");
+        assert_eq!(merged.get(2, 2), Rgba8::opaque(0, 200, 0));
+    }
+
+    #[test]
+    fn pasting_puts_the_pixels_on_a_layer_of_their_own() {
+        let mut d = clipboard_fixture();
+        let before = d.layer_count();
+        let patch = Pixmap::filled(4, 4, Rgba8::opaque(0, 255, 0));
+
+        d.paste_into(patch, (2, 3), PasteMode::Plain);
+        assert_eq!(d.layer_count(), before + 1);
+        assert_eq!(d.composite().get(2, 3), Rgba8::opaque(0, 255, 0));
+        assert_eq!(d.composite().get(1, 3), Rgba8::opaque(200, 0, 0), "the paste spread");
+
+        assert!(d.undo(), "the paste left no undo step");
+        assert_eq!(d.layer_count(), before);
+    }
+
+    #[test]
+    fn pasting_into_a_selection_is_masked_to_it() {
+        let mut d = clipboard_fixture();
+        d.select_rect(Rect::new(0, 0, 4, 4), SelectionOp::Replace, 0);
+
+        // A patch bigger than the selection: only the part inside shows.
+        let patch = Pixmap::filled(10, 10, Rgba8::opaque(0, 255, 0));
+        d.paste_into(patch, (0, 0), PasteMode::Into);
+
+        assert_eq!(d.composite().get(1, 1), Rgba8::opaque(0, 255, 0));
+        assert_eq!(d.composite().get(6, 6), Rgba8::opaque(0, 0, 200), "it leaked outside");
+        // As a mask, so the pasted pixels are still all there underneath.
+        let layer = d.active_layer().unwrap();
+        assert!(layer.mask.is_some(), "Paste Into did not make a mask");
+    }
+
+    #[test]
+    fn pasting_outside_a_selection_is_the_other_way_round() {
+        let mut d = clipboard_fixture();
+        d.select_rect(Rect::new(0, 0, 4, 4), SelectionOp::Replace, 0);
+
+        let patch = Pixmap::filled(10, 10, Rgba8::opaque(0, 255, 0));
+        d.paste_into(patch, (0, 0), PasteMode::Outside);
+
+        assert_eq!(d.composite().get(1, 1), Rgba8::opaque(200, 0, 0), "it landed inside");
+        assert_eq!(d.composite().get(6, 6), Rgba8::opaque(0, 255, 0));
     }
 
     #[test]
@@ -4510,18 +5164,18 @@ mod tests {
     #[test]
     fn display_name_marks_unsaved_changes() {
         let mut d = doc();
-        assert_eq!(d.display_name(), "Untitled-1");
+        assert_eq!(d.display_name(), "Untitled-1 (RGB/8)");
         d.add_layer(None);
-        assert_eq!(d.display_name(), "Untitled-1*");
+        assert_eq!(d.display_name(), "Untitled-1* (RGB/8)");
         d.mark_saved();
-        assert_eq!(d.display_name(), "Untitled-1");
+        assert_eq!(d.display_name(), "Untitled-1 (RGB/8)");
     }
 
     #[test]
     fn display_name_uses_the_file_name() {
         let mut d = doc();
         d.path = Some("/home/user/pictures/sunset.psd".to_string());
-        assert_eq!(d.display_name(), "sunset.psd");
+        assert_eq!(d.display_name(), "sunset.psd (RGB/8)");
     }
 
     #[test]
@@ -4698,5 +5352,22 @@ mod tests {
         assert!(d.begin_text_edit(id));
         d.end_text_edit();
         assert!(!d.layers().by_id(id).unwrap().visible, "the edit turned a hidden layer on");
+    }
+
+    #[test]
+    fn grayscale_converts_pixels() {
+        let red = Rgba8::new(255, 0, 0, 255);
+        let mut d = Document::new(4, 4, red);
+        assert_eq!(d.color_mode(), ImageMode::Rgb);
+        let px_before = d.layers().as_slice()[0].pixels.get(0, 0);
+        assert_eq!(px_before.r, 255);
+        assert_eq!(px_before.g, 0);
+
+        d.set_color_mode(ImageMode::Grayscale);
+        assert_eq!(d.color_mode(), ImageMode::Grayscale);
+        let px_after = d.layers().as_slice()[0].pixels.get(0, 0);
+        assert_eq!(px_after.r, px_after.g);
+        assert_eq!(px_after.g, px_after.b);
+        assert!(px_after.r > 0 && px_after.r < 255, "should be a mid gray, got {}", px_after.r);
     }
 }
