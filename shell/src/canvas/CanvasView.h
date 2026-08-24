@@ -230,6 +230,13 @@ public:
     /// Re-fetch the composited image from the engine and repaint.
     void refresh();
 
+    /// Channel visibility mask from the Channels panel.
+    /// Bits: 0=Red/Cyan, 1=Green/Magenta, 2=Blue/Yellow, 3=Black(K).
+    /// 0xFF (default) = all visible. The composite channel's eye toggles
+    /// all bits at once; individual channel eyes toggle one bit each.
+    void setChannelMask(uint8_t mask);
+    uint8_t channelMask() const { return m_channelMask; }
+
     /// Drop the Clone Stamp's and Healing Brush's sampled source points.
     ///
     /// Called when the document changes. Photoshop holds a clone source per
@@ -755,6 +762,9 @@ private:
 
     /// Cached composite. Refreshed from the engine, never edited here.
     QImage m_image;
+
+    /// Channel visibility bitmask. 0xFF = all visible.
+    uint8_t m_channelMask = 0xFF;
 
     double m_zoom = 1.0;
     /// Degrees the view is turned by, clockwise. Purely a way of looking at

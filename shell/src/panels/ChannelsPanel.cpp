@@ -5,6 +5,7 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QStyledItemDelegate>
@@ -28,6 +29,7 @@ const QColor kRowHover(0x46, 0x46, 0x46);
 constexpr int kVisibleRole = Qt::UserRole + 1;
 constexpr int kThumbRole = Qt::UserRole + 2;
 constexpr int kShortcutRole = Qt::UserRole + 3;
+constexpr int kIsAlphaRole = Qt::UserRole + 4;
 
 int nameLeft()
 {
@@ -164,13 +166,13 @@ QPixmap channelThumb(const QImage &composite, int channelIndex, int mode, int si
             int value = 0;
             if (channelIndex == 0) {
                 value = qGray(px);
-            } else if (mode == 4) { // RGB
+            } else if (mode == 4) {
                 switch (channelIndex) {
                 case 1: value = qRed(px); break;
                 case 2: value = qGreen(px); break;
                 case 3: value = qBlue(px); break;
                 }
-            } else if (mode == 5) { // CMYK — derive from RGB representation
+            } else if (mode == 5) {
                 int r = qRed(px), g = qGreen(px), b = qBlue(px);
                 float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
                 float k = 1.0f - qMax(rf, qMax(gf, bf));
@@ -247,12 +249,11 @@ void ChannelsPanel::buildUi()
     footerLayout->setSpacing(2);
 
     auto makeButton = [&](LayerIcons::Glyph glyph, const QColor &color,
-                          const QString &tip, bool enabled = false) {
+                          const QString &tip) {
         auto *b = new QToolButton(footer);
         b->setIconSize(QSize(kFooterGlyph, kFooterGlyph));
         b->setIcon(LayerIcons::icon(glyph, color, kFooterGlyph));
-        b->setToolTip(enabled ? tip : tr("Not implemented yet"));
-        b->setEnabled(enabled);
+        b->setToolTip(tip);
         b->setAutoRaise(true);
         footerLayout->addWidget(b);
         return b;
@@ -260,11 +261,15 @@ void ChannelsPanel::buildUi()
 
     m_loadSelectionButton = makeButton(LayerIcons::Glyph::Mask, kGlyphOff,
                                        tr("Load channel as selection"));
+    m_loadSelectionButton->setEnabled(false);
     footerLayout->addStretch(1);
-    m_addButton = makeButton(LayerIcons::Glyph::NewLayer, kGlyphOff,
+    m_addButton = makeButton(LayerIcons::Glyph::NewLayer, kGlyph,
                              tr("Create new channel"));
-    m_deleteButton = makeButton(LayerIcons::Glyph::Delete, kGlyphOff,
+    m_deleteButton = makeButton(LayerIcons::Glyph::Delete, kGlyph,
                                 tr("Delete channel"));
+
+    connect(m_addButton, &QToolButton::clicked, this, &ChannelsPanel::addChannel);
+    connect(m_deleteButton, &QToolButton::clicked, this, &ChannelsPanel::deleteChannel);
 
     root->addWidget(footer);
 }
@@ -276,8 +281,99 @@ void ChannelsPanel::toggleVisibility(int row)
 
     auto *item = m_list->item(row);
     const bool wasVisible = item->data(kVisibleRole).toBool();
-    item->setData(kVisibleRole, !wasVisible);
+
+    if (row == 0) {
+        // Composite channel: toggle all channels at once
+        const bool newVis = !wasVisible;
+        for (int i = 0; i < m_list->count(); ++i)
+            m_list->item(i)->setData(kVisibleRole, newVis);
+    } else {
+        item->setData(kVisibleRole, !wasVisible);
+        // Update composite eye: it's on when all component channels are visible
+        bool allVisible = true;
+        for (int i = 1; i < m_builtinCount; ++i) {
+            if (!m_list->item(i)->data(kVisibleRole).toBool()) {
+                allVisible = false;
+                break;
+            }
+        }
+        m_list->item(0)->setData(kVisibleRole, allVisible);
+    }
+
     m_list->viewport()->update();
+    updateMask();
+}
+
+void ChannelsPanel::updateMask()
+{
+    if (!m_engine)
+        return;
+
+    const int mode = m_engine->colorMode();
+    uint8_t mask = 0xFF;
+
+    if (mode == 4 && m_builtinCount >= 4) {
+        // RGB: bit 0=R, 1=G, 2=B
+        mask = 0;
+        if (m_list->item(1)->data(kVisibleRole).toBool()) mask |= 0x01;
+        if (m_list->item(2)->data(kVisibleRole).toBool()) mask |= 0x02;
+        if (m_list->item(3)->data(kVisibleRole).toBool()) mask |= 0x04;
+    } else if (mode == 5 && m_builtinCount >= 5) {
+        // CMYK: bit 0=C, 1=M, 2=Y, 3=K
+        mask = 0;
+        if (m_list->item(1)->data(kVisibleRole).toBool()) mask |= 0x01;
+        if (m_list->item(2)->data(kVisibleRole).toBool()) mask |= 0x02;
+        if (m_list->item(3)->data(kVisibleRole).toBool()) mask |= 0x04;
+        if (m_list->item(4)->data(kVisibleRole).toBool()) mask |= 0x08;
+    } else if (mode == 6 && m_builtinCount >= 4) {
+        // Lab: bit 0=L, 1=a, 2=b
+        mask = 0;
+        if (m_list->item(1)->data(kVisibleRole).toBool()) mask |= 0x01;
+        if (m_list->item(2)->data(kVisibleRole).toBool()) mask |= 0x02;
+        if (m_list->item(3)->data(kVisibleRole).toBool()) mask |= 0x04;
+    } else if (m_builtinCount == 1) {
+        // Grayscale / Bitmap / etc: one channel
+        if (!m_list->item(0)->data(kVisibleRole).toBool())
+            mask = 0;
+    }
+
+    emit channelMaskChanged(mask);
+}
+
+void ChannelsPanel::addChannel()
+{
+    bool ok = false;
+    QString name = QInputDialog::getText(this, tr("New Channel"),
+                                         tr("Name:"), QLineEdit::Normal,
+                                         tr("Alpha 1"), &ok);
+    if (!ok || name.isEmpty())
+        return;
+
+    auto *item = new QListWidgetItem;
+    item->setText(name);
+    item->setData(kVisibleRole, true);
+    item->setData(kShortcutRole, QString());
+    item->setData(kIsAlphaRole, true);
+
+    QPixmap thumb(kThumbSize, kThumbSize);
+    thumb.fill(Qt::black);
+    item->setData(kThumbRole, thumb);
+    item->setSizeHint(QSize(0, kRowHeight));
+    item->setFlags(item->flags() | Qt::ItemIsEditable);
+    m_list->addItem(item);
+}
+
+void ChannelsPanel::deleteChannel()
+{
+    const int row = m_list->currentRow();
+    if (row < 0 || row >= m_list->count())
+        return;
+
+    // Don't delete built-in channels
+    if (row < m_builtinCount)
+        return;
+
+    delete m_list->takeItem(row);
 }
 
 void ChannelsPanel::refresh()
@@ -289,6 +385,7 @@ void ChannelsPanel::refresh()
 
     const int mode = m_engine->colorMode();
     const auto entries = channelsForMode(mode);
+    m_builtinCount = entries.size();
 
     QImage composite = m_engine->compositeImage();
 
@@ -298,6 +395,7 @@ void ChannelsPanel::refresh()
         item->setText(entry.name);
         item->setData(kVisibleRole, true);
         item->setData(kShortcutRole, entry.shortcut);
+        item->setData(kIsAlphaRole, false);
         item->setData(kThumbRole, channelThumb(composite, i, mode, kThumbSize));
         item->setSizeHint(QSize(0, kRowHeight));
         item->setFlags(item->flags() & ~Qt::ItemIsEditable);
@@ -306,4 +404,7 @@ void ChannelsPanel::refresh()
 
     if (m_list->count() > 0)
         m_list->setCurrentRow(0);
+
+    // Reset mask to all-visible on mode change
+    emit channelMaskChanged(0xFF);
 }

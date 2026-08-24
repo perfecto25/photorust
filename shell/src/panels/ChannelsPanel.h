@@ -22,9 +22,18 @@ public:
 public slots:
     void refresh();
 
+signals:
+    /// Emitted when the channel visibility mask changes.
+    /// Bits: 0 = Red/Cyan, 1 = Green/Magenta, 2 = Blue/Yellow, 3 = Black(K).
+    /// 0xFF = all visible.
+    void channelMaskChanged(uint8_t mask);
+
 private:
     void buildUi();
     void toggleVisibility(int row);
+    void updateMask();
+    void addChannel();
+    void deleteChannel();
 
     Engine *m_engine = nullptr;
     ChannelListWidget *m_list = nullptr;
@@ -32,4 +41,7 @@ private:
     QToolButton *m_loadSelectionButton = nullptr;
     QToolButton *m_addButton = nullptr;
     QToolButton *m_deleteButton = nullptr;
+
+    /// Number of built-in channels for the current mode (composite + components).
+    int m_builtinCount = 0;
 };

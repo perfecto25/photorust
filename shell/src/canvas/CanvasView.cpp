@@ -83,6 +83,14 @@ void CanvasView::refresh()
     update();
 }
 
+void CanvasView::setChannelMask(uint8_t mask)
+{
+    if (mask == m_channelMask)
+        return;
+    m_channelMask = mask;
+    update();
+}
+
 void CanvasView::refreshSelection()
 {
     m_selectionPath = QPainterPath();
@@ -2522,7 +2530,61 @@ void CanvasView::paintEvent(QPaintEvent *event)
     // would leave every edge in the image jagged.
     painter.setRenderHint(QPainter::SmoothPixmapTransform,
                           m_zoom < 2.0 || !qFuzzyIsNull(m_viewRotation));
-    painter.drawImage(target, m_image);
+
+    if (m_channelMask == 0xFF || m_image.isNull()) {
+        painter.drawImage(target, m_image);
+    } else {
+        // Convert to ARGB32 so QRgb*/qRed/qGreen/qBlue work correctly
+        // (the engine's RGBA8888 format has different byte order).
+        QImage masked = m_image.convertToFormat(QImage::Format_ARGB32);
+        const int mode = m_engine ? m_engine->colorMode() : 4;
+        if (mode == 5) {
+            const bool showC = m_channelMask & 0x01;
+            const bool showM = m_channelMask & 0x02;
+            const bool showY = m_channelMask & 0x04;
+            const bool showK = m_channelMask & 0x08;
+            for (int y = 0; y < masked.height(); ++y) {
+                auto *line = reinterpret_cast<QRgb *>(masked.scanLine(y));
+                for (int x = 0; x < masked.width(); ++x) {
+                    const QRgb px = line[x];
+                    float rf = qRed(px) / 255.0f;
+                    float gf = qGreen(px) / 255.0f;
+                    float bf = qBlue(px) / 255.0f;
+                    float k = 1.0f - qMax(rf, qMax(gf, bf));
+                    float c = 0, m = 0, yv = 0;
+                    if (k < 1.0f) {
+                        float inv = 1.0f / (1.0f - k);
+                        c = (1.0f - rf - k) * inv;
+                        m = (1.0f - gf - k) * inv;
+                        yv = (1.0f - bf - k) * inv;
+                    }
+                    if (!showC) c = 0;
+                    if (!showM) m = 0;
+                    if (!showY) yv = 0;
+                    if (!showK) k = 0;
+                    int ro = qBound(0, int((1.0f - c) * (1.0f - k) * 255 + 0.5f), 255);
+                    int go = qBound(0, int((1.0f - m) * (1.0f - k) * 255 + 0.5f), 255);
+                    int bo = qBound(0, int((1.0f - yv) * (1.0f - k) * 255 + 0.5f), 255);
+                    line[x] = qRgba(ro, go, bo, qAlpha(px));
+                }
+            }
+        } else {
+            const bool showR = m_channelMask & 0x01;
+            const bool showG = m_channelMask & 0x02;
+            const bool showB = m_channelMask & 0x04;
+            for (int y = 0; y < masked.height(); ++y) {
+                auto *line = reinterpret_cast<QRgb *>(masked.scanLine(y));
+                for (int x = 0; x < masked.width(); ++x) {
+                    const QRgb px = line[x];
+                    line[x] = qRgba(showR ? qRed(px) : 0,
+                                    showG ? qGreen(px) : 0,
+                                    showB ? qBlue(px) : 0,
+                                    qAlpha(px));
+                }
+            }
+        }
+        painter.drawImage(target, masked);
+    }
 
     // A thin border so the document edge reads against the surround.
     painter.setPen(QPen(QColor(0x00, 0x00, 0x00, 160), 1));

@@ -537,6 +537,13 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
 
     createOptionsBar();
     createMenus();
+
+    auto *brandLabel = new QLabel(QStringLiteral("photorust"), menuBar());
+    brandLabel->setStyleSheet(
+        QStringLiteral("color: #e8a020; font-weight: bold; font-style: italic;"
+                       " font-size: 13px; padding-right: 8px;"));
+    menuBar()->setCornerWidget(brandLabel, Qt::TopRightCorner);
+
     createDocks();
     createStatusBar();
     connectEngine();
@@ -4160,6 +4167,8 @@ void MainWindow::createDocks()
             this, &MainWindow::onDocumentChanged);
     connect(m_pathsPanel, &PathsPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
+    connect(m_channelsPanel, &ChannelsPanel::channelMaskChanged,
+            m_canvas, &CanvasView::setChannelMask);
 }
 
 void MainWindow::createStatusBar()
@@ -4216,6 +4225,8 @@ void MainWindow::refreshDocumentTabs()
 void MainWindow::onTabSelected(int index)
 {
     if (m_engine && index >= 0) {
+        if (m_canvas && m_canvas->isFreeTransforming())
+            m_canvas->cancelFreeTransform();
         m_engine->setActiveDocument(index);
     }
 }

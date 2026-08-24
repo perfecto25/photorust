@@ -25,8 +25,9 @@ paint, manage layers, select, filter and undo.
 
 **Working**
 
-- CS6-style dark UI: menu bar, options bar, left tool strip, dockable panels
-  (Color/Swatches/Info tabbed, History, Layers), status bar.
+- CS6-style dark UI: menu bar with "photorust" branding, options bar, left tool
+  strip, dockable panels (Color/Swatches/Info tabbed, History,
+  Layers/Channels/Paths tabbed), status bar.
 - **Several documents open at once**, one tab each above the canvas. Each keeps
   its own layers, selection, history and zoom; File ▸ New and File ▸ Open add a
   tab rather than replacing what you had.
@@ -36,8 +37,9 @@ paint, manage layers, select, filter and undo.
 - Canvas viewport with zoom (CS6's zoom stops), an editable zoom field in the
   status bar, cursor-anchored wheel zoom,
   pan (space-drag or middle-drag), and a transparency checkerboard.
-- Layers: add, delete, duplicate, reorder, merge down, flatten, rename,
-  show/hide, opacity, fill opacity, clipping masks, layer masks, thumbnails.
+- Layers: add, delete (multi-select with Shift/Ctrl click), duplicate, reorder,
+  merge down, flatten, rename, show/hide, opacity, fill opacity, clipping masks,
+  layer masks, thumbnails.
 - **Layer locks**, enforced in the engine rather than by greying out buttons:
   lock transparent pixels, lock image pixels, lock position, and lock all. A
   pixel-locked layer refuses every tool — brushes, healing, filters, fills — and
@@ -46,7 +48,17 @@ paint, manage layers, select, filter and undo.
 - A **CS6-shaped Layers panel**: the filter row, blend mode and Opacity, the Lock
   row and Fill, delegate-painted rows (eye column, bordered thumbnail, italic
   Background, padlock badge) and CS6's seven footer glyphs — all drawn as line
-  art on the same 20×20 grid as the tool icons.
+  art on the same 20×20 grid as the tool icons. Multi-layer selection
+  (Shift+click for range, Ctrl+click for toggle) and bulk delete.
+- A **Channels panel** tabbed alongside Layers and Paths, showing the composite
+  channel and individual colour channels for the current mode (RGB shows
+  Red/Green/Blue, CMYK shows Cyan/Magenta/Yellow/Black, Grayscale shows Gray,
+  Lab shows Lightness/a/b). Each row has a visibility eye, a grayscale
+  thumbnail extracted from the composite, and the CS6 shortcut label. Toggling
+  a channel's eye hides that channel on the canvas in real time (hiding Red
+  shows cyan, hiding Blue shows yellow, etc.). The composite eye toggles all
+  channels at once. New Channel and Delete Channel buttons for user alpha
+  channels.
 - All **27 Photoshop blend modes**, including the non-separable ones (Hue,
   Saturation, Color, Luminosity, Darker/Lighter Color).
 - Brush engine: dab-based strokes with spacing, hardness falloff, flow and
@@ -155,6 +167,20 @@ paint, manage layers, select, filter and undo.
   A snapshot carries the canvas size as well as the layer stack, so Crop and
   Canvas Size step back correctly.
 - Photoshop CS6 default keymap, loaded from data and user-remappable.
+- **Edit ▸ Keyboard Shortcuts** dialog: tree of all commands grouped by menu,
+  inline key-capture editing, conflict detection, Undo/Use Default per binding,
+  saved to user keymap on OK.
+- **Edit ▸ Color Settings** dialog: CS6 layout with Working Spaces, Color
+  Management Policies, Conversion Options and Advanced Controls. Settings
+  persist to `~/.config/PhotoRust/color_settings.json`.
+- **Image ▸ Mode** submenu with Bitmap, Grayscale, Duotone, Indexed Color, RGB
+  Color, CMYK Color, Lab Color, Multichannel and bit-depth toggles. Grayscale
+  prompts "Discard color information?" and converts pixels via Rec. 601
+  luminance. **CMYK Color** converts through the CMYK colour space (RGB→CMYK→RGB
+  round-trip clips out-of-gamut colours). **Indexed Color** opens a CS6-style
+  dialog with Palette, Colors, Forced, Dither and a live Preview checkbox;
+  quantisation uses median-cut with Floyd-Steinberg dithering. Bitmap and
+  Duotone are greyed out unless the image is already Grayscale, matching CS6.
 
 **Not yet implemented**
 
@@ -165,8 +191,11 @@ paint, manage layers, select, filter and undo.
   single-layer file. This is the largest remaining piece — see CLAUDE.md §8.
 - GPU canvas rendering. Painting is `QPainter` today; the backend-agnostic
   renderer described in CLAUDE.md §7 has not been built.
-- Text, shapes, paths, gradients, transforms, layer effects, adjustment-layer
-  parameter dialogs, Channels/Paths/Navigator panels.
+- Text, shapes, transforms, layer effects, adjustment-layer parameter dialogs,
+  Navigator panel.
+- Channel visibility is view-only — selecting an individual channel does not
+  yet isolate it for editing. Alpha channels created via the Channels panel's
+  New Channel button are display-only placeholders (not wired to the engine).
 - Marquee, Lasso and Quick Selection are the fully implemented strip groups.
   For every other tool the flyout lists the full CS6 group, but only the first
   entry works; the rest are shown disabled rather than silently falling back to
@@ -235,7 +264,7 @@ what gives it a launcher, a name and a file association for `.psd`.
 The engine's tests live beside the code they cover:
 
 ```bash
-cd core && cargo test        # 358 tests
+cd core && cargo test        # 605 tests
 ```
 
 or through CTest, which runs them as part of the project:
@@ -279,8 +308,9 @@ core/                 Rust image engine
 
 shell/                C++ / Qt QWidgets application
   src/MainWindow.*      menus, docks, options bar
-  src/canvas/           viewport, zoom/pan, input → document coordinates
-  src/panels/           Layers, Paths, Color, History (LayerIcons/PathIcons hold the artwork)
+  src/dialogs/          Keyboard Shortcuts, Color Settings, Indexed Color, etc.
+  src/canvas/           viewport, zoom/pan, channel masking, input → document coordinates
+  src/panels/           Layers, Channels, Paths, Color, History (LayerIcons/PathIcons hold the artwork)
   src/tools/            tool strip and tool metadata
   src/shortcuts/        command registry and keymap loading
   resources/theme.qss       CS6 dark theme
