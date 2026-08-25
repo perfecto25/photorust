@@ -1808,6 +1808,16 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "applyAdjustment"]
         fn apply_adjustment(self: Pin<&mut Engine>, name: &QString, p1: f32, p2: f32, p3: f32);
+
+        /// channel: 0=RGB (all), 1=Red, 2=Green, 3=Blue
+        #[qinvokable]
+        #[cxx_name = "applyLevels"]
+        fn apply_levels(self: Pin<&mut Engine>, in_black: f32, in_white: f32, gamma: f32, out_black: f32, out_white: f32, channel: i32);
+
+        /// Apply a curves lookup table. `lut` is 256 u8 values. channel: 0=RGB, 1=R, 2=G, 3=B
+        #[qinvokable]
+        #[cxx_name = "applyCurvesLut"]
+        fn apply_curves_lut(self: Pin<&mut Engine>, lut: &[u8], channel: i32);
     }
 
     // -- history -----------------------------------------------------------
@@ -2120,10 +2130,11 @@ fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
 /// lifetime is genuinely independent of this call; the natural fix is to keep
 /// a persistent back-buffer in [`EngineRust`] and hand out a `QImage` that
 /// borrows it, which is worth doing once the canvas renderer lands.
-fn pixmap_to_qimage(mut pm: Pixmap) -> QImage {
+fn pixmap_to_qimage(pm: Pixmap) -> QImage {
     if pm.is_empty() {
         return QImage::default();
     }
+    let mut pm = if pm.bpc() != 1 { pm.to_8bit() } else { pm };
     let (w, h) = (pm.width() as i32, pm.height() as i32);
     // Qt paints premultiplied ARGB fastest; convert once here rather than
     // making Qt do it on every repaint.
@@ -5229,6 +5240,49 @@ impl ffi::Engine {
             },
         };
         self.as_mut().rust_mut().doc.apply_adjustment(adjustment);
+        self.sync();
+    }
+
+    fn apply_levels(
+        mut self: core::pin::Pin<&mut Self>,
+        in_black: f32,
+        in_white: f32,
+        gamma: f32,
+        out_black: f32,
+        out_white: f32,
+        channel: i32,
+    ) {
+        if channel >= 1 && channel <= 3 {
+            self.as_mut().rust_mut().doc.apply_levels_channel(
+                (channel - 1) as usize,
+                in_black,
+                in_white,
+                gamma.max(0.01),
+                out_black,
+                out_white,
+            );
+        } else {
+            let adjustment = Adjustment::Levels {
+                in_black,
+                in_white,
+                gamma: gamma.max(0.01),
+                out_black,
+                out_white,
+            };
+            self.as_mut().rust_mut().doc.apply_adjustment(adjustment);
+        }
+        self.sync();
+    }
+
+    fn apply_curves_lut(
+        mut self: core::pin::Pin<&mut Self>,
+        lut: &[u8],
+        channel: i32,
+    ) {
+        if lut.len() != 256 {
+            return;
+        }
+        self.as_mut().rust_mut().doc.apply_curves_lut(lut, channel);
         self.sync();
     }
 

@@ -381,8 +381,38 @@ stored, so future default changes still reach the user.
 ## Side bar (Layers, Channels, Paths, History, Color, Swatches, Text etc)
 
 - Layers 
-  - add ability to lock layer from modification - done
+  - add ability to lock layer from modification - DONE
+  - Layer filters:  - DONE
+    - Normal
+    - Dissolve - 
+    - Darken
+    - Multiply
+    - Color Burn
+    - Linear Burn
+    - Darker Color
+    - Lighten
+    - Screen
+    - Color Dodge
+    - Linear Dodge (Add)
+    - Lighter Color
+    - Overlay
+    - Soft Light
+    - Hard Light
+    - Vivid Light
+    - Linear Light
+    - Pin Light
+    - Hard Mix
+    - Difference
+    - Exclusion
+    - Subtract
+    - Divide
+    - Hue
+    - Saturation
+    - Color
+    - Luminosity
 - Channels - in progress
+  - adding (8bit/16bit/32 bit)
+  - 
 
 ## Top Menu bar - about 10% done, missing many features like Adjustments, Filters, etc
 
@@ -442,20 +472,20 @@ stored, so future default changes still reach the user.
       - Bitmap
       - Grayscale - done 
       - Duotone
-      - Indexed Color - in progress
-      - RGB Color
-      - CMYK Color
-      - Lab Color
-      - Multichannel
+      - Indexed Color - DONE
+      - RGB Color DONE
+      - CMYK Color DONE
+      - Lab Color DONE
+      - Multichannel DONE
       ---
-      - 8 bits/channel
-      - 16 bits/channel
-      - 32 bits/channel
+      - 8 bits/channel DONE
+      - 16 bits/channel DONE
+      - 32 bits/channel DONE
     Adjustments > 
       --- 
-      - Brightness/Contrast - not started
-      - Levels - not started
-      - Curves - not started
+      - Brightness/Contrast - DONE
+      - Levels - DONE
+      - Curves - In progress
       - Exposure - not started
       ---
       - Vibrance - not started

@@ -1,7 +1,10 @@
 #include "MainWindow.h"
 
 #include "canvas/CanvasView.h"
+#include "dialogs/BrightnessContrastDialog.h"
 #include "dialogs/ColorPickerDialog.h"
+#include "dialogs/CurvesDialog.h"
+#include "dialogs/LevelsDialog.h"
 #include "dialogs/ColorSettingsDialog.h"
 #include "dialogs/ExportAsDialog.h"
 #include "dialogs/FindReplaceTextDialog.h"
@@ -929,6 +932,21 @@ void MainWindow::createMenus()
                 refreshAll();
                 return;
             }
+            if (modeIdx != 4 && m_engine->property("layerCount").toInt() > 1) {
+                QMessageBox flatBox(this);
+                flatBox.setWindowTitle(tr("Adobe Photoshop"));
+                flatBox.setText(tr("Changing modes can affect the appearance of layers.\n"
+                                   "Flatten image before mode change?"));
+                flatBox.setIcon(QMessageBox::Question);
+                auto *flattenBtn = flatBox.addButton(tr("Flatten"), QMessageBox::AcceptRole);
+                flatBox.addButton(tr("Don't Flatten"), QMessageBox::RejectRole);
+                auto *cancelBtn = flatBox.addButton(QMessageBox::Cancel);
+                flatBox.exec();
+                if (flatBox.clickedButton() == cancelBtn)
+                    return;
+                if (flatBox.clickedButton() == flattenBtn)
+                    m_engine->flattenImage();
+            }
             m_engine->setColorMode(modeIdx);
             refreshAll();
         });
@@ -984,34 +1002,65 @@ void MainWindow::createMenus()
 
     QMenu *adjustments = image->addMenu(tr("&Adjustments"));
 
-    // Each entry names an adjustment the engine already knows; the string is
-    // the contract between the two sides.
     struct AdjustmentEntry {
         const char *commandId;
         const char *engineName;
     };
-    const AdjustmentEntry adjustmentEntries[] = {
+
+    // Top group: Brightness/Contrast, Levels, Exposure (matches CS6 order)
+    {
+        auto *bcAction = new QAction(tr("Brightness/Contrast..."), this);
+        connect(bcAction, &QAction::triggered, this,
+                [this] { applyAdjustment(QStringLiteral("Brightness/Contrast")); });
+        adjustments->addAction(bcAction);
+    }
+    const AdjustmentEntry topEntries[] = {
         {"image.levels", "Levels"},
+        {"image.curves", "Curves"},
+    };
+    for (const auto &entry : topEntries) {
+        const QString engineName = QString::fromUtf8(entry.engineName);
+        adjustments->addAction(
+            command(QLatin1String(entry.commandId), engineName,
+                    [this, engineName] { applyAdjustment(engineName); }));
+    }
+    {
+        auto *expAction = new QAction(tr("Exposure..."), this);
+        connect(expAction, &QAction::triggered, this,
+                [this] { applyAdjustment(QStringLiteral("Exposure")); });
+        adjustments->addAction(expAction);
+    }
+    adjustments->addSeparator();
+
+    // Middle group: Hue/Saturation, Color Balance, Black & White
+    const AdjustmentEntry midEntries[] = {
         {"image.hueSaturation", "Hue/Saturation"},
         {"image.colorBalance", "Color Balance"},
         {"image.blackAndWhite", "Black & White"},
-        {"image.invert", "Invert"},
-        {"image.desaturate", "Black & White"},
     };
-    for (const auto &entry : adjustmentEntries) {
+    for (const auto &entry : midEntries) {
         const QString engineName = QString::fromUtf8(entry.engineName);
         adjustments->addAction(
             command(QLatin1String(entry.commandId), engineName,
                     [this, engineName] { applyAdjustment(engineName); }));
     }
     adjustments->addSeparator();
-    for (const char *name : {"Posterize", "Threshold", "Brightness/Contrast", "Exposure"}) {
+
+    // Bottom group: Invert, Posterize, Threshold
+    adjustments->addAction(
+        command(QStringLiteral("image.invert"), tr("Invert"),
+                [this] { applyAdjustment(QStringLiteral("Invert")); }));
+    for (const char *name : {"Posterize", "Threshold"}) {
         const QString engineName = QString::fromUtf8(name);
-        auto *action = new QAction(engineName, this);
+        auto *action = new QAction(engineName + QStringLiteral("..."), this);
         connect(action, &QAction::triggered, this,
                 [this, engineName] { applyAdjustment(engineName); });
         adjustments->addAction(action);
     }
+    adjustments->addSeparator();
+    adjustments->addAction(
+        command(QStringLiteral("image.desaturate"), tr("Desaturate"),
+                [this] { applyAdjustment(QStringLiteral("Black & White")); }));
 
     image->addSeparator();
     image->addAction(command(QStringLiteral("image.canvasSize"), tr("&Canvas Size..."),
@@ -4796,12 +4845,29 @@ void MainWindow::applyAdjustment(const QString &name)
         p1 = float(QInputDialog::getInt(this, name, tr("Threshold Level:"), 128, 0, 255,
                                         1, &ok));
     } else if (name == QLatin1String("Brightness/Contrast")) {
-        p1 = float(QInputDialog::getDouble(this, name, tr("Brightness (-1 to 1):"), 0.0,
-                                           -1.0, 1.0, 2, &ok));
-        if (ok) {
-            p2 = float(QInputDialog::getDouble(this, name, tr("Contrast (-1 to 1):"), 0.0,
-                                               -1.0, 1.0, 2, &ok));
+        BrightnessContrastDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
         }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Levels")) {
+        LevelsDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Curves")) {
+        CurvesDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
     } else if (name == QLatin1String("Hue/Saturation")) {
         p1 = float(QInputDialog::getDouble(this, name, tr("Hue (-1 to 1):"), 0.0, -1.0,
                                            1.0, 2, &ok));

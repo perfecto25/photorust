@@ -2538,7 +2538,7 @@ void CanvasView::paintEvent(QPaintEvent *event)
         // (the engine's RGBA8888 format has different byte order).
         QImage masked = m_image.convertToFormat(QImage::Format_ARGB32);
         const int mode = m_engine ? m_engine->colorMode() : 4;
-        if (mode == 5) {
+        if (mode == 5 || mode == 7) {
             const bool showC = m_channelMask & 0x01;
             const bool showM = m_channelMask & 0x02;
             const bool showY = m_channelMask & 0x04;

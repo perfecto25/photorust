@@ -12,6 +12,7 @@
 //! byte budget, and evicts from the oldest end. Replacing snapshots with tile
 //! deltas is the obvious later optimisation.
 
+use crate::document::ImageMode;
 use crate::layer::LayerStack;
 
 /// One entry in the History panel.
@@ -21,6 +22,10 @@ pub struct HistoryState {
     pub stack: LayerStack,
     /// Canvas size when the state was recorded.
     pub size: (u32, u32),
+    /// Color mode when the state was recorded.
+    pub color_mode: ImageMode,
+    /// Bit depth when the state was recorded.
+    pub bit_depth: u8,
 }
 
 impl HistoryState {
@@ -55,6 +60,8 @@ impl History {
                 name: "Open".to_string(),
                 stack: initial,
                 size,
+                color_mode: ImageMode::Rgb,
+                bit_depth: 8,
             }],
             cursor: 0,
             max_states: Self::DEFAULT_MAX_STATES,
@@ -126,12 +133,21 @@ impl History {
     ///
     /// Anything after the cursor is discarded — the redo branch is lost, which
     /// is what Photoshop does.
-    pub fn push(&mut self, name: impl Into<String>, stack: LayerStack, size: (u32, u32)) {
+    pub fn push(
+        &mut self,
+        name: impl Into<String>,
+        stack: LayerStack,
+        size: (u32, u32),
+        color_mode: ImageMode,
+        bit_depth: u8,
+    ) {
         self.states.truncate(self.cursor + 1);
         self.states.push(HistoryState {
             name: name.into(),
             stack,
             size,
+            color_mode,
+            bit_depth,
         });
         self.cursor = self.states.len() - 1;
         self.evict();
@@ -146,6 +162,8 @@ impl History {
         name: impl Into<String>,
         stack: LayerStack,
         size: (u32, u32),
+        color_mode: ImageMode,
+        bit_depth: u8,
     ) {
         let name = name.into();
         if !self.coalesce_sealed
@@ -154,9 +172,11 @@ impl History {
         {
             self.states[self.cursor].stack = stack;
             self.states[self.cursor].size = size;
+            self.states[self.cursor].color_mode = color_mode;
+            self.states[self.cursor].bit_depth = bit_depth;
         } else {
             self.coalesce_sealed = false;
-            self.push(name, stack, size);
+            self.push(name, stack, size, color_mode, bit_depth);
         }
     }
 
@@ -248,7 +268,7 @@ mod tests {
     #[test]
     fn push_advances_the_cursor() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("New Layer", stack_with_name("a"), (16, 16));
+        h.push("New Layer", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
         assert_eq!(h.len(), 2);
         assert_eq!(h.cursor(), 1);
         assert!(h.can_undo());
@@ -258,7 +278,7 @@ mod tests {
     #[test]
     fn undo_then_redo_returns_to_the_same_state() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("New Layer", stack_with_name("a"), (16, 16));
+        h.push("New Layer", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
 
         assert_eq!(h.undo().unwrap().stack.len(), 0);
         assert_eq!(h.cursor(), 0);
@@ -278,19 +298,19 @@ mod tests {
     #[test]
     fn redo_at_the_end_returns_none() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("x", stack_with_name("a"), (16, 16));
+        h.push("x", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
         assert!(h.redo().is_none());
     }
 
     #[test]
     fn pushing_after_undo_discards_the_redo_branch() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("first", stack_with_name("a"), (16, 16));
-        h.push("second", stack_with_name("b"), (16, 16));
+        h.push("first", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
+        h.push("second", stack_with_name("b"), (16, 16), ImageMode::Rgb, 8);
         h.undo();
         assert!(h.can_redo());
 
-        h.push("third", stack_with_name("c"), (16, 16));
+        h.push("third", stack_with_name("c"), (16, 16), ImageMode::Rgb, 8);
         assert!(!h.can_redo(), "redo branch survived a new action");
         assert_eq!(h.state_names(), vec!["Open", "first", "third"]);
     }
@@ -300,7 +320,7 @@ mod tests {
         let mut h = History::new(LayerStack::new(), (16, 16));
         assert_eq!(h.undo_name(), None);
 
-        h.push("Brush Tool", stack_with_name("a"), (16, 16));
+        h.push("Brush Tool", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
         assert_eq!(h.undo_name(), Some("Brush Tool"));
         assert_eq!(h.redo_name(), None);
 
@@ -312,8 +332,8 @@ mod tests {
     #[test]
     fn jump_to_moves_the_cursor_anywhere() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("a", stack_with_name("a"), (16, 16));
-        h.push("b", stack_with_name("b"), (16, 16));
+        h.push("a", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
+        h.push("b", stack_with_name("b"), (16, 16), ImageMode::Rgb, 8);
 
         assert!(h.jump_to(0).is_some());
         assert_eq!(h.cursor(), 0);
@@ -328,7 +348,7 @@ mod tests {
         let mut h = History::new(LayerStack::new(), (16, 16));
         h.set_max_states(3);
         for i in 0..5 {
-            h.push(format!("s{}", i), stack_with_name("x"), (16, 16));
+            h.push(format!("s{}", i), stack_with_name("x"), (16, 16), ImageMode::Rgb, 8);
         }
         assert_eq!(h.len(), 3);
         // The oldest entries, including "Open", were dropped.
@@ -340,8 +360,8 @@ mod tests {
     fn eviction_keeps_the_cursor_pointing_at_the_same_state() {
         let mut h = History::new(LayerStack::new(), (16, 16));
         h.set_max_states(2);
-        h.push("a", stack_with_name("a"), (16, 16));
-        h.push("b", stack_with_name("b"), (16, 16));
+        h.push("a", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
+        h.push("b", stack_with_name("b"), (16, 16), ImageMode::Rgb, 8);
         // The cursor must still address the newest state.
         assert_eq!(h.state_names()[h.cursor()], "b");
     }
@@ -366,7 +386,7 @@ mod tests {
         };
         h.set_max_bytes(40 * 1024);
         for _ in 0..6 {
-            h.push("big", big(), (16, 16));
+            h.push("big", big(), (16, 16), ImageMode::Rgb, 8);
         }
         assert!(h.byte_size() <= 40 * 1024, "budget exceeded: {}", h.byte_size());
         assert!(h.len() >= 1);
@@ -375,7 +395,7 @@ mod tests {
     #[test]
     fn current_reflects_the_cursor() {
         let mut h = History::new(LayerStack::new(), (16, 16));
-        h.push("a", stack_with_name("a"), (16, 16));
+        h.push("a", stack_with_name("a"), (16, 16), ImageMode::Rgb, 8);
         assert_eq!(h.current().len(), 1);
         h.undo();
         assert_eq!(h.current().len(), 0);

@@ -24,8 +24,14 @@ set(SHELL_SOURCES
     src/dialogs/FileInfoDialog.h
     src/dialogs/GifWriter.cpp
     src/dialogs/GifWriter.h
+    src/dialogs/BrightnessContrastDialog.cpp
+    src/dialogs/BrightnessContrastDialog.h
     src/dialogs/IndexedColorDialog.cpp
     src/dialogs/IndexedColorDialog.h
+    src/dialogs/CurvesDialog.cpp
+    src/dialogs/CurvesDialog.h
+    src/dialogs/LevelsDialog.cpp
+    src/dialogs/LevelsDialog.h
     src/dialogs/KeyboardShortcutsDialog.cpp
     src/dialogs/KeyboardShortcutsDialog.h
     src/dialogs/NewDocumentDialog.cpp

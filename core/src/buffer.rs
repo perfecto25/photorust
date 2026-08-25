@@ -112,38 +112,68 @@ impl Rect {
     }
 }
 
-/// A dense, row-major RGBA8 image.
-#[derive(Clone, PartialEq, Eq)]
+/// A dense, row-major RGBA image that can store 8, 16, or 32-bit per
+/// component. The raw byte layout changes with the depth, but the public
+/// `get`/`set` API always speaks `Rgba8` so existing code is unaffected.
+#[derive(Clone)]
 pub struct Pixmap {
     width: u32,
     height: u32,
-    /// `width * height * 4` bytes, row-major, no padding.
+    /// Bytes per component: 1 = u8, 2 = u16, 4 = f32.
+    bpc: u8,
     data: Vec<u8>,
 }
 
+impl PartialEq for Pixmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.bpc == other.bpc
+            && self.data == other.data
+    }
+}
+impl Eq for Pixmap {}
+
 impl Pixmap {
-    /// Allocate a fully transparent pixmap.
+    /// Allocate a fully transparent 8-bit pixmap.
     pub fn new(width: u32, height: u32) -> Self {
+        Self::new_with_depth(width, height, 1)
+    }
+
+    /// Allocate a fully transparent pixmap at the given depth.
+    pub fn new_with_depth(width: u32, height: u32, bpc: u8) -> Self {
+        let bpc = match bpc { 2 | 4 => bpc, _ => 1 };
         Self {
             width,
             height,
-            data: vec![0u8; (width as usize) * (height as usize) * 4],
+            bpc,
+            data: vec![0u8; (width as usize) * (height as usize) * 4 * bpc as usize],
         }
     }
 
-    /// Allocate and fill with a single colour.
+    /// Allocate and fill with a single colour (always 8-bit).
     pub fn filled(width: u32, height: u32, color: Rgba8) -> Self {
         let mut pm = Self::new(width, height);
         pm.fill(color);
         pm
     }
 
-    /// Wrap existing bytes. Returns `None` unless `data.len() == w * h * 4`.
+    /// Wrap existing 8-bit bytes. Returns `None` unless `data.len() == w * h * 4`.
     pub fn from_raw(width: u32, height: u32, data: Vec<u8>) -> Option<Self> {
         if data.len() != (width as usize) * (height as usize) * 4 {
             return None;
         }
-        Some(Self { width, height, data })
+        Some(Self { width, height, bpc: 1, data })
+    }
+
+    /// Bytes per component (1 = 8-bit, 2 = 16-bit, 4 = 32-bit float).
+    pub fn bpc(&self) -> u8 {
+        self.bpc
+    }
+
+    /// Bit depth as shown in the UI (8, 16, or 32).
+    pub fn bit_depth(&self) -> u8 {
+        self.bpc * 8
     }
 
     pub fn width(&self) -> u32 {
@@ -164,7 +194,7 @@ impl Pixmap {
 
     /// Bytes per row.
     pub fn stride(&self) -> usize {
-        self.width as usize * 4
+        self.width as usize * 4 * self.bpc as usize
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -203,34 +233,118 @@ impl Pixmap {
         self.data.chunks_exact_mut(stride)
     }
 
-    /// Read a pixel. Out-of-bounds reads return transparent, which lets callers
-    /// sample freely near edges without bounds-checking every access.
+    /// Read a pixel as `Rgba8`, converting from the internal depth.
     pub fn get(&self, x: i32, y: i32) -> Rgba8 {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return Rgba8::TRANSPARENT;
         }
-        let i = (y as usize * self.width as usize + x as usize) * 4;
-        Rgba8::new(self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3])
+        let px_offset = y as usize * self.width as usize + x as usize;
+        match self.bpc {
+            2 => {
+                let i = px_offset * 8;
+                let r = u16::from_ne_bytes([self.data[i], self.data[i + 1]]);
+                let g = u16::from_ne_bytes([self.data[i + 2], self.data[i + 3]]);
+                let b = u16::from_ne_bytes([self.data[i + 4], self.data[i + 5]]);
+                let a = u16::from_ne_bytes([self.data[i + 6], self.data[i + 7]]);
+                Rgba8::new(
+                    (r >> 8) as u8,
+                    (g >> 8) as u8,
+                    (b >> 8) as u8,
+                    (a >> 8) as u8,
+                )
+            }
+            4 => {
+                let i = px_offset * 16;
+                let r = f32::from_ne_bytes([self.data[i], self.data[i+1], self.data[i+2], self.data[i+3]]);
+                let g = f32::from_ne_bytes([self.data[i+4], self.data[i+5], self.data[i+6], self.data[i+7]]);
+                let b = f32::from_ne_bytes([self.data[i+8], self.data[i+9], self.data[i+10], self.data[i+11]]);
+                let a = f32::from_ne_bytes([self.data[i+12], self.data[i+13], self.data[i+14], self.data[i+15]]);
+                Rgba8::new(
+                    (r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (b.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (a.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                )
+            }
+            _ => {
+                let i = px_offset * 4;
+                Rgba8::new(self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3])
+            }
+        }
     }
 
-    /// Write a pixel. Out-of-bounds writes are silently dropped.
+    /// Write a pixel from `Rgba8`, converting to the internal depth.
     pub fn set(&mut self, x: i32, y: i32, px: Rgba8) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
-        let i = (y as usize * self.width as usize + x as usize) * 4;
-        self.data[i] = px.r;
-        self.data[i + 1] = px.g;
-        self.data[i + 2] = px.b;
-        self.data[i + 3] = px.a;
+        let px_offset = y as usize * self.width as usize + x as usize;
+        match self.bpc {
+            2 => {
+                let i = px_offset * 8;
+                for (c, v) in [(0, px.r), (1, px.g), (2, px.b), (3, px.a)] {
+                    let v16: u16 = (v as u16) << 8 | v as u16;
+                    let bytes = v16.to_ne_bytes();
+                    self.data[i + c * 2] = bytes[0];
+                    self.data[i + c * 2 + 1] = bytes[1];
+                }
+            }
+            4 => {
+                let i = px_offset * 16;
+                for (c, v) in [(0, px.r), (1, px.g), (2, px.b), (3, px.a)] {
+                    let vf = v as f32 / 255.0;
+                    let bytes = vf.to_ne_bytes();
+                    self.data[i + c * 4..i + c * 4 + 4].copy_from_slice(&bytes);
+                }
+            }
+            _ => {
+                let i = px_offset * 4;
+                self.data[i] = px.r;
+                self.data[i + 1] = px.g;
+                self.data[i + 2] = px.b;
+                self.data[i + 3] = px.a;
+            }
+        }
     }
 
     pub fn fill(&mut self, color: Rgba8) {
-        for px in self.data.chunks_exact_mut(4) {
-            px[0] = color.r;
-            px[1] = color.g;
-            px[2] = color.b;
-            px[3] = color.a;
+        match self.bpc {
+            2 => {
+                let vals: [u16; 4] = [
+                    (color.r as u16) << 8 | color.r as u16,
+                    (color.g as u16) << 8 | color.g as u16,
+                    (color.b as u16) << 8 | color.b as u16,
+                    (color.a as u16) << 8 | color.a as u16,
+                ];
+                for px in self.data.chunks_exact_mut(8) {
+                    for (c, v) in vals.iter().enumerate() {
+                        let b = v.to_ne_bytes();
+                        px[c * 2] = b[0];
+                        px[c * 2 + 1] = b[1];
+                    }
+                }
+            }
+            4 => {
+                let vals: [f32; 4] = [
+                    color.r as f32 / 255.0,
+                    color.g as f32 / 255.0,
+                    color.b as f32 / 255.0,
+                    color.a as f32 / 255.0,
+                ];
+                for px in self.data.chunks_exact_mut(16) {
+                    for (c, v) in vals.iter().enumerate() {
+                        px[c * 4..c * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                    }
+                }
+            }
+            _ => {
+                for px in self.data.chunks_exact_mut(4) {
+                    px[0] = color.r;
+                    px[1] = color.g;
+                    px[2] = color.b;
+                    px[3] = color.a;
+                }
+            }
         }
     }
 
@@ -241,13 +355,8 @@ impl Pixmap {
             return;
         }
         for y in r.y..r.bottom() {
-            let row = self.row_mut(y as u32);
             for x in r.x..r.right() {
-                let i = x as usize * 4;
-                row[i] = color.r;
-                row[i + 1] = color.g;
-                row[i + 2] = color.b;
-                row[i + 3] = color.a;
+                self.set(x, y, color);
             }
         }
     }
@@ -258,7 +367,7 @@ impl Pixmap {
 
     /// Copy out a sub-region. Areas outside the source read as transparent.
     pub fn crop(&self, rect: Rect) -> Pixmap {
-        let mut out = Pixmap::new(rect.width, rect.height);
+        let mut out = Pixmap::new_with_depth(rect.width, rect.height, self.bpc);
         for y in 0..rect.height {
             for x in 0..rect.width {
                 let px = self.get(rect.x + x as i32, rect.y + y as i32);
@@ -266,6 +375,118 @@ impl Pixmap {
             }
         }
         out
+    }
+
+    /// Convert this pixmap to a different bit depth, returning a new pixmap.
+    pub fn convert_depth(&self, new_bpc: u8) -> Pixmap {
+        let new_bpc = match new_bpc { 2 | 4 => new_bpc, _ => 1 };
+        if new_bpc == self.bpc {
+            return self.clone();
+        }
+        let npixels = self.width as usize * self.height as usize;
+        let mut out = Pixmap::new_with_depth(self.width, self.height, new_bpc);
+
+        match (self.bpc, new_bpc) {
+            (1, 2) => {
+                // 8→16: expand u8 to u16 (v * 257 maps 0→0, 255→65535)
+                for p in 0..npixels {
+                    let si = p * 4;
+                    let di = p * 8;
+                    for c in 0..4 {
+                        let v = self.data[si + c] as u16;
+                        let v16 = v << 8 | v;
+                        let b = v16.to_ne_bytes();
+                        out.data[di + c * 2] = b[0];
+                        out.data[di + c * 2 + 1] = b[1];
+                    }
+                }
+            }
+            (1, 4) => {
+                // 8→32: expand u8 to f32 in [0,1]
+                for p in 0..npixels {
+                    let si = p * 4;
+                    let di = p * 16;
+                    for c in 0..4 {
+                        let vf = self.data[si + c] as f32 / 255.0;
+                        out.data[di + c * 4..di + c * 4 + 4].copy_from_slice(&vf.to_ne_bytes());
+                    }
+                }
+            }
+            (2, 1) => {
+                // 16→8: take high byte of u16
+                for p in 0..npixels {
+                    let si = p * 8;
+                    let di = p * 4;
+                    for c in 0..4 {
+                        let v16 = u16::from_ne_bytes([
+                            self.data[si + c * 2],
+                            self.data[si + c * 2 + 1],
+                        ]);
+                        out.data[di + c] = (v16 >> 8) as u8;
+                    }
+                }
+            }
+            (2, 4) => {
+                // 16→32: u16 to f32
+                for p in 0..npixels {
+                    let si = p * 8;
+                    let di = p * 16;
+                    for c in 0..4 {
+                        let v16 = u16::from_ne_bytes([
+                            self.data[si + c * 2],
+                            self.data[si + c * 2 + 1],
+                        ]);
+                        let vf = v16 as f32 / 65535.0;
+                        out.data[di + c * 4..di + c * 4 + 4].copy_from_slice(&vf.to_ne_bytes());
+                    }
+                }
+            }
+            (4, 1) => {
+                // 32→8: clamp f32 to [0,1] then scale to u8
+                for p in 0..npixels {
+                    let si = p * 16;
+                    let di = p * 4;
+                    for c in 0..4 {
+                        let vf = f32::from_ne_bytes([
+                            self.data[si + c * 4],
+                            self.data[si + c * 4 + 1],
+                            self.data[si + c * 4 + 2],
+                            self.data[si + c * 4 + 3],
+                        ]);
+                        out.data[di + c] = (vf.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                }
+            }
+            (4, 2) => {
+                // 32→16: clamp f32 then scale to u16
+                for p in 0..npixels {
+                    let si = p * 16;
+                    let di = p * 8;
+                    for c in 0..4 {
+                        let vf = f32::from_ne_bytes([
+                            self.data[si + c * 4],
+                            self.data[si + c * 4 + 1],
+                            self.data[si + c * 4 + 2],
+                            self.data[si + c * 4 + 3],
+                        ]);
+                        let v16 = (vf.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                        let b = v16.to_ne_bytes();
+                        out.data[di + c * 2] = b[0];
+                        out.data[di + c * 2 + 1] = b[1];
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Return an 8-bit copy if not already 8-bit.
+    pub fn to_8bit(&self) -> Pixmap {
+        if self.bpc == 1 {
+            return self.clone();
+        }
+        self.convert_depth(1)
     }
 
     /// Convert to premultiplied alpha in place.
@@ -323,7 +544,7 @@ impl Pixmap {
             (self.width, self.height)
         };
 
-        let mut out = Pixmap::new(out_w, out_h);
+        let mut out = Pixmap::new_with_depth(out_w, out_h, self.bpc);
         for y in 0..h {
             for x in 0..w {
                 // Where this pixel lands in the copy.

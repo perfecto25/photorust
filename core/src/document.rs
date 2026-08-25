@@ -674,6 +674,17 @@ impl Document {
         if depth == self.bit_depth {
             return;
         }
+        let bpc: u8 = match depth {
+            16 => 2,
+            32 => 4,
+            _ => 1,
+        };
+        for layer in self.stack.iter_mut() {
+            layer.pixels = layer.pixels.convert_depth(bpc);
+            if let Some(ref mask) = layer.mask {
+                layer.mask = Some(mask.convert_depth(bpc));
+            }
+        }
         self.bit_depth = depth;
         self.commit(&format!("{} Bits/Channel", depth));
     }
@@ -2944,6 +2955,63 @@ impl Document {
         self.commit(adjustment.name());
     }
 
+    /// Apply levels to a single channel (0=R, 1=G, 2=B) on the active layer.
+    pub fn apply_levels_channel(
+        &mut self,
+        channel: usize,
+        in_black: f32,
+        in_white: f32,
+        gamma: f32,
+        out_black: f32,
+        out_white: f32,
+    ) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            let span = (in_white - in_black).max(1e-6);
+            let inv_gamma = 1.0 / gamma.max(1e-6);
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let v = px[channel] as f32 / 255.0;
+                let n = ((v - in_black) / span).clamp(0.0, 1.0).powf(inv_gamma);
+                let out = (out_black + n * (out_white - out_black)).clamp(0.0, 1.0);
+                px[channel] = (out * 255.0 + 0.5) as u8;
+            }
+        }
+        self.commit("Levels");
+    }
+
+    /// Apply a 256-entry LUT curve to the active layer.
+    /// channel: 0 = all RGB, 1 = R only, 2 = G only, 3 = B only.
+    pub fn apply_curves_lut(&mut self, lut: &[u8], channel: i32) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                match channel {
+                    1 => px[0] = lut[px[0] as usize],
+                    2 => px[1] = lut[px[1] as usize],
+                    3 => px[2] = lut[px[2] as usize],
+                    _ => {
+                        px[0] = lut[px[0] as usize];
+                        px[1] = lut[px[1] as usize];
+                        px[2] = lut[px[2] as usize];
+                    }
+                }
+            }
+        }
+        self.commit("Curves");
+    }
+
     // -- canvas -------------------------------------------------------------
 
     /// Resize the canvas without scaling layer content.
@@ -3328,6 +3396,8 @@ impl Document {
         if let Some(state) = self.history.undo() {
             let (stack, size) = (state.stack.clone(), state.size);
             self.stack = stack;
+            self.color_mode = state.color_mode;
+            self.bit_depth = state.bit_depth;
             self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
@@ -3345,6 +3415,8 @@ impl Document {
         if let Some(state) = self.history.redo() {
             let (stack, size) = (state.stack.clone(), state.size);
             self.stack = stack;
+            self.color_mode = state.color_mode;
+            self.bit_depth = state.bit_depth;
             self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
@@ -3362,6 +3434,8 @@ impl Document {
         if let Some(state) = self.history.jump_to(index) {
             let (stack, size) = (state.stack.clone(), state.size);
             self.stack = stack;
+            self.color_mode = state.color_mode;
+            self.bit_depth = state.bit_depth;
             self.restore_size(size);
             self.reconcile_active_layer();
             self.dirty = true;
@@ -3373,13 +3447,24 @@ impl Document {
 
     /// Record the current stack as a new history state.
     pub fn commit(&mut self, name: impl Into<String>) {
-        self.history.push(name, self.stack.clone(), (self.width, self.height));
+        self.history.push(
+            name,
+            self.stack.clone(),
+            (self.width, self.height),
+            self.color_mode,
+            self.bit_depth,
+        );
         self.dirty = true;
     }
 
     pub fn commit_coalescing(&mut self, name: impl Into<String>) {
-        self.history
-            .push_coalescing(name, self.stack.clone(), (self.width, self.height));
+        self.history.push_coalescing(
+            name,
+            self.stack.clone(),
+            (self.width, self.height),
+            self.color_mode,
+            self.bit_depth,
+        );
         self.dirty = true;
     }
 

@@ -139,7 +139,9 @@ QList<ChannelDef> channelsForMode(int mode)
         entries.append({QObject::tr("b"),         QStringLiteral("Ctrl+5"), Qt::white});
         break;
     case 7:
-        entries.append({QObject::tr("Multichannel"), QStringLiteral("Ctrl+1"), Qt::white});
+        entries.append({QObject::tr("Cyan"),    QStringLiteral("Ctrl+3"), Qt::cyan});
+        entries.append({QObject::tr("Magenta"), QStringLiteral("Ctrl+4"), Qt::magenta});
+        entries.append({QObject::tr("Yellow"),  QStringLiteral("Ctrl+5"), Qt::yellow});
         break;
     default:
         entries.append({QObject::tr("RGB"),   QStringLiteral("Ctrl+2"), Qt::white});
@@ -188,6 +190,23 @@ QPixmap channelThumb(const QImage &composite, int channelIndex, int mode, int si
                 case 2: value = 255 - int(m * 255 + 0.5f); break;
                 case 3: value = 255 - int(yy * 255 + 0.5f); break;
                 case 4: value = 255 - int(k * 255 + 0.5f); break;
+                }
+            } else if (mode == 7) {
+                // Multichannel: no composite row; channels are CMY from RGB
+                int r = qRed(px), g = qGreen(px), b = qBlue(px);
+                float rf = r / 255.0f, gf = g / 255.0f, bf = b / 255.0f;
+                float k = 1.0f - qMax(rf, qMax(gf, bf));
+                float c = 0, m = 0, yy = 0;
+                if (k < 1.0f) {
+                    float inv = 1.0f / (1.0f - k);
+                    c = (1.0f - rf - k) * inv;
+                    m = (1.0f - gf - k) * inv;
+                    yy = (1.0f - bf - k) * inv;
+                }
+                switch (channelIndex) {
+                case 0: value = 255 - int(c * 255 + 0.5f); break;
+                case 1: value = 255 - int(m * 255 + 0.5f); break;
+                case 2: value = 255 - int(yy * 255 + 0.5f); break;
                 }
             } else {
                 value = qGray(px);
@@ -282,22 +301,27 @@ void ChannelsPanel::toggleVisibility(int row)
     auto *item = m_list->item(row);
     const bool wasVisible = item->data(kVisibleRole).toBool();
 
-    if (row == 0) {
+    const int mode = m_engine ? m_engine->colorMode() : 4;
+    const bool hasComposite = (mode != 7);
+
+    if (hasComposite && row == 0) {
         // Composite channel: toggle all channels at once
         const bool newVis = !wasVisible;
         for (int i = 0; i < m_list->count(); ++i)
             m_list->item(i)->setData(kVisibleRole, newVis);
     } else {
         item->setData(kVisibleRole, !wasVisible);
-        // Update composite eye: it's on when all component channels are visible
-        bool allVisible = true;
-        for (int i = 1; i < m_builtinCount; ++i) {
-            if (!m_list->item(i)->data(kVisibleRole).toBool()) {
-                allVisible = false;
-                break;
+        if (hasComposite) {
+            // Update composite eye: it's on when all component channels are visible
+            bool allVisible = true;
+            for (int i = 1; i < m_builtinCount; ++i) {
+                if (!m_list->item(i)->data(kVisibleRole).toBool()) {
+                    allVisible = false;
+                    break;
+                }
             }
+            m_list->item(0)->setData(kVisibleRole, allVisible);
         }
-        m_list->item(0)->setData(kVisibleRole, allVisible);
     }
 
     m_list->viewport()->update();
@@ -331,6 +355,12 @@ void ChannelsPanel::updateMask()
         if (m_list->item(1)->data(kVisibleRole).toBool()) mask |= 0x01;
         if (m_list->item(2)->data(kVisibleRole).toBool()) mask |= 0x02;
         if (m_list->item(3)->data(kVisibleRole).toBool()) mask |= 0x04;
+    } else if (mode == 7 && m_builtinCount >= 3) {
+        // Multichannel: no composite row; bit 0=C, 1=M, 2=Y
+        mask = 0;
+        if (m_list->item(0)->data(kVisibleRole).toBool()) mask |= 0x01;
+        if (m_list->item(1)->data(kVisibleRole).toBool()) mask |= 0x02;
+        if (m_list->item(2)->data(kVisibleRole).toBool()) mask |= 0x04;
     } else if (m_builtinCount == 1) {
         // Grayscale / Bitmap / etc: one channel
         if (!m_list->item(0)->data(kVisibleRole).toBool())
