@@ -5,6 +5,9 @@
 
 A from-scratch clone of Adobe Photoshop CS6 (the 2012–2013 "Kona" dark UI).
 
+
+
+
 A **C++/Qt QWidgets shell** over a **Rust image engine**, joined by
 [CXX-Qt](https://github.com/KDAB/cxx-qt).
 
@@ -15,6 +18,8 @@ A **C++/Qt QWidgets shell** over a **Rust image engine**, joined by
 
 Targets **Linux and macOS**. Windows is out of scope, and the top-level
 `CMakeLists.txt` fails the configure step there rather than half-working.
+
+![demo1](docs/img/screen1.png)
 
 ---
 
@@ -470,7 +475,7 @@ stored, so future default changes still reach the user.
     ---
     Mode >  - in progress
       - Bitmap
-      - Grayscale - done 
+      - Grayscale - 
       - Duotone
       - Indexed Color - DONE
       - RGB Color DONE
@@ -485,21 +490,21 @@ stored, so future default changes still reach the user.
       --- 
       - Brightness/Contrast - DONE
       - Levels - DONE
-      - Curves - In progress
-      - Exposure - not started
+      - Curves - DONE
+      - Exposure - DONE
       ---
-      - Vibrance - not started
-      - Hue/Saturation - not started
-      - Color Balance - not started
-      - Black & White - not started
-      - Photo Filter - not started
-      - Channel Mixer - not started
-      - Color Lookup - not started
+      - Vibrance - DONE
+      - Hue/Saturation - DONE
+      - Color Balance - DONE
+      - Black & White - DONE
+      - Photo Filter - DONE
+      - Channel Mixer - DONE
+      - Color Lookup - not implemented
       ---
-      - Invert - not started
-      - Posterize - not started
-      - Threshold - not started
-      - Gradient Map - not started
+      - Invert - DONE
+      - Posterize - DONE
+      - Threshold - DONE
+      - Gradient Map - in prog
       - Selective Color - not started
       ---
       - Shadows/Highlights

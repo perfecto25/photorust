@@ -527,7 +527,7 @@ impl Document {
         let old = self.color_mode;
         self.color_mode = mode;
 
-        if old == ImageMode::Rgb && mode == ImageMode::Grayscale {
+        if mode == ImageMode::Grayscale && old != ImageMode::Grayscale {
             for layer in self.stack.iter_mut() {
                 let (w, h) = (layer.pixels.width(), layer.pixels.height());
                 for y in 0..h as i32 {
@@ -3010,6 +3010,430 @@ impl Document {
             }
         }
         self.commit("Curves");
+    }
+
+    /// CS6-style Black & White conversion with per-hue-range weights.
+    /// Each weight is a percentage (-200..300); default is Reds=40, Yellows=60,
+    /// Greens=40, Cyans=60, Blues=20, Magentas=80.
+    /// Optional tint applies a colorize pass with the given hue (0..360) and
+    /// saturation (0..100).
+    pub fn apply_black_and_white(
+        &mut self,
+        reds: f32,
+        yellows: f32,
+        greens: f32,
+        cyans: f32,
+        blues: f32,
+        magentas: f32,
+        tint: bool,
+        tint_hue: f32,
+        tint_saturation: f32,
+    ) {
+        use crate::filters::adjust::{rgb_to_hsl, hsl_to_rgb};
+
+        let weights = [reds, yellows, greens, cyans, blues, magentas];
+        // Centres at 0°, 60°, 120°, 180°, 240°, 300° (in 0..1 space)
+        let centres: [f32; 6] = [0.0, 1.0/6.0, 2.0/6.0, 3.0/6.0, 4.0/6.0, 5.0/6.0];
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+                let (h, s, l) = rgb_to_hsl([r, g, b]);
+
+                // Base luminance
+                let base_lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                // Compute weighted contribution from each range.
+                // Each range is a triangle centered at its hue, 1/6 wide (60°)
+                // on each side, overlapping neighbours. Weights sum to ~1 for
+                // any hue, so the default (40,60,40,60,20,80) reproduces the
+                // classic channel-mixer B&W look.
+                let mut total_weight = 0.0_f32;
+                let mut weighted_pct = 0.0_f32;
+
+                for i in 0..6 {
+                    let mut dist = (h - centres[i]).abs();
+                    if dist > 0.5 {
+                        dist = 1.0 - dist;
+                    }
+                    let w = (1.0 - dist * 6.0).max(0.0);
+                    total_weight += w;
+                    weighted_pct += w * weights[i];
+                }
+
+                let pct = if total_weight > 1e-6 {
+                    weighted_pct / total_weight
+                } else {
+                    0.0
+                };
+
+                // Mix: for saturated pixels the slider has full effect;
+                // for desaturated pixels it fades to base luminance.
+                let gray = (base_lum + s * (pct / 100.0) * base_lum).clamp(0.0, 1.0);
+
+                if tint {
+                    let th = (tint_hue / 360.0).rem_euclid(1.0);
+                    let ts = (tint_saturation / 100.0).clamp(0.0, 1.0);
+                    let out = hsl_to_rgb(th, ts, gray);
+                    px[0] = (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[1] = (out[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[2] = (out[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                } else {
+                    let v = (gray * 255.0 + 0.5) as u8;
+                    px[0] = v;
+                    px[1] = v;
+                    px[2] = v;
+                }
+            }
+        }
+        self.commit("Black & White");
+    }
+
+    /// Apply a CS6-style photo filter: blend a solid colour onto the image at
+    /// a given density, optionally preserving luminosity.
+    pub fn apply_photo_filter(
+        &mut self,
+        r: f32,
+        g: f32,
+        b: f32,
+        density: f32,
+        preserve_luminosity: bool,
+    ) {
+        use crate::filters::adjust::rgb_to_hsl;
+
+        let d = (density / 100.0).clamp(0.0, 1.0);
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let orig_r = px[0] as f32 / 255.0;
+                let orig_g = px[1] as f32 / 255.0;
+                let orig_b = px[2] as f32 / 255.0;
+
+                let mut nr = orig_r * (1.0 - d) + r * d;
+                let mut ng = orig_g * (1.0 - d) + g * d;
+                let mut nb = orig_b * (1.0 - d) + b * d;
+
+                if preserve_luminosity {
+                    let orig_lum = 0.299 * orig_r + 0.587 * orig_g + 0.114 * orig_b;
+                    let new_lum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
+                    if new_lum > 1e-6 {
+                        let scale = orig_lum / new_lum;
+                        nr *= scale;
+                        ng *= scale;
+                        nb *= scale;
+                    }
+                }
+
+                px[0] = (nr.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[1] = (ng.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[2] = (nb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+        self.commit("Photo Filter");
+    }
+
+    /// CS6-style Channel Mixer.
+    ///
+    /// `matrix` is row-major 3×3: `[rr, rg, rb, gr, gg, gb, br, bg, bb]` where
+    /// e.g. `rr` is the Red source weight for the Red output channel (in percent,
+    /// -200..+200). `constants` are the per-channel constant offsets (percent).
+    /// When `monochrome` is true, only the first row is used and the result is
+    /// written to all three channels.
+    pub fn apply_channel_mixer(
+        &mut self,
+        matrix: &[f32; 9],
+        constants: &[f32; 3],
+        monochrome: bool,
+    ) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+
+                if monochrome {
+                    let v = r * matrix[0] / 100.0
+                          + g * matrix[1] / 100.0
+                          + b * matrix[2] / 100.0
+                          + constants[0] / 100.0;
+                    let v = v.clamp(0.0, 1.0);
+                    let out = (v * 255.0 + 0.5) as u8;
+                    px[0] = out;
+                    px[1] = out;
+                    px[2] = out;
+                } else {
+                    let nr = r * matrix[0] / 100.0
+                           + g * matrix[1] / 100.0
+                           + b * matrix[2] / 100.0
+                           + constants[0] / 100.0;
+                    let ng = r * matrix[3] / 100.0
+                           + g * matrix[4] / 100.0
+                           + b * matrix[5] / 100.0
+                           + constants[1] / 100.0;
+                    let nb = r * matrix[6] / 100.0
+                           + g * matrix[7] / 100.0
+                           + b * matrix[8] / 100.0
+                           + constants[2] / 100.0;
+                    px[0] = (nr.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[1] = (ng.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[2] = (nb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        self.commit("Channel Mixer");
+    }
+
+    /// CS6-style Gradient Map: replace each pixel's colour with the gradient
+    /// colour at its luminance position.
+    pub fn apply_gradient_map(
+        &mut self,
+        gradient: &crate::gradient::Gradient,
+        dither: bool,
+    ) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            // Build a 256-entry LUT for speed.
+            let lut: Vec<Rgba8> = (0..256)
+                .map(|i| gradient.sample(i as f32 / 255.0))
+                .collect();
+
+            let mut rng_state: u32 = 0x12345678;
+
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let lum = (0.299 * px[0] as f32
+                         + 0.587 * px[1] as f32
+                         + 0.114 * px[2] as f32)
+                    .clamp(0.0, 255.0);
+
+                if dither {
+                    // Ordered dither: use the fractional luminance to
+                    // probabilistically round up or down, giving smoother
+                    // transitions.
+                    let frac = lum - lum.floor();
+                    // Simple xorshift PRNG for per-pixel noise.
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 17;
+                    rng_state ^= rng_state << 5;
+                    let rand01 = (rng_state & 0xFFFF) as f32 / 65535.0;
+                    let idx = if rand01 < frac {
+                        (lum as usize + 1).min(255)
+                    } else {
+                        lum as usize
+                    };
+                    let c = lut[idx];
+                    px[0] = c.r;
+                    px[1] = c.g;
+                    px[2] = c.b;
+                } else {
+                    let idx = (lum + 0.5) as usize;
+                    let idx = idx.min(255);
+                    let c = lut[idx];
+                    px[0] = c.r;
+                    px[1] = c.g;
+                    px[2] = c.b;
+                }
+            }
+        }
+        self.commit("Gradient Map");
+    }
+
+    /// Apply CS6-style color balance with tone-weighted shifts and optional
+    /// luminosity preservation.
+    /// `cyan_red`, `magenta_green`, `yellow_blue` are each -100..100.
+    /// `tone`: 0=Shadows, 1=Midtones, 2=Highlights.
+    pub fn apply_color_balance(
+        &mut self,
+        cyan_red: f32,
+        magenta_green: f32,
+        yellow_blue: f32,
+        tone: i32,
+        preserve_luminosity: bool,
+    ) {
+        use crate::filters::adjust::{rgb_to_hsl, hsl_to_rgb};
+
+        // GIMP/PS-compatible scaling: ±100 maps to roughly ±0.39 (100/256).
+        let cr = cyan_red / 256.0;
+        let mg = magenta_green / 256.0;
+        let yb = yellow_blue / 256.0;
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+
+                let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                // GIMP-style smooth transfer functions per tone range.
+                let (shadows, midtones, highlights) = {
+                    let s = if lum <= 0.5 {
+                        (0.5 - lum) / 0.5
+                    } else {
+                        0.0
+                    };
+                    let h = if lum >= 0.5 {
+                        (lum - 0.5) / 0.5
+                    } else {
+                        0.0
+                    };
+                    let m = 1.0 - (s + h);
+                    (s, m, h)
+                };
+
+                let weight = match tone {
+                    0 => shadows,
+                    1 => midtones,
+                    2 => highlights,
+                    _ => 1.0,
+                };
+
+                if weight < 1e-6 {
+                    continue;
+                }
+
+                let nr = (r + cr * weight).clamp(0.0, 1.0);
+                let ng = (g + mg * weight).clamp(0.0, 1.0);
+                let nb = (b + yb * weight).clamp(0.0, 1.0);
+
+                if preserve_luminosity {
+                    let (h, s, _) = rgb_to_hsl([nr, ng, nb]);
+                    let (_, _, orig_l) = rgb_to_hsl([r, g, b]);
+                    let out = hsl_to_rgb(h, s, orig_l);
+                    px[0] = (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[1] = (out[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    px[2] = (out[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                } else {
+                    px[0] = (nr * 255.0 + 0.5) as u8;
+                    px[1] = (ng * 255.0 + 0.5) as u8;
+                    px[2] = (nb * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        self.commit("Color Balance");
+    }
+
+    /// Apply hue/saturation/lightness only to pixels whose hue falls in a
+    /// specific colour range (channel 0=Master, 1=Reds, 2=Yellows, 3=Greens,
+    /// 4=Cyans, 5=Blues, 6=Magentas).
+    pub fn apply_hue_saturation_range(
+        &mut self,
+        hue_shift: f32,
+        saturation: f32,
+        lightness: f32,
+        channel: i32,
+    ) {
+        use crate::filters::adjust::{rgb_to_hsl, hsl_to_rgb};
+
+        if channel == 0 {
+            let adj = crate::filters::adjust::Adjustment::HueSaturation {
+                hue: hue_shift,
+                saturation,
+                lightness,
+            };
+            self.apply_adjustment(adj);
+            return;
+        }
+
+        // Centre hue (in 0..1) and half-widths for each range.
+        // Inner: full effect. Outer: feather zone.
+        let (center, inner_half, outer_half) = match channel {
+            1 => (0.0_f32, 15.0 / 360.0, 45.0 / 360.0),   // Reds
+            2 => (60.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0),  // Yellows
+            3 => (120.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Greens
+            4 => (180.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Cyans
+            5 => (240.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Blues
+            6 => (300.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Magentas
+            _ => return,
+        };
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let c = [
+                    px[0] as f32 / 255.0,
+                    px[1] as f32 / 255.0,
+                    px[2] as f32 / 255.0,
+                ];
+                let (h, s, l) = rgb_to_hsl(c);
+
+                // Hue distance on the circle
+                let mut dist = (h - center).abs();
+                if dist > 0.5 {
+                    dist = 1.0 - dist;
+                }
+
+                let weight = if dist <= inner_half {
+                    1.0
+                } else if dist <= outer_half {
+                    1.0 - (dist - inner_half) / (outer_half - inner_half)
+                } else {
+                    0.0
+                };
+
+                if weight < 1e-6 {
+                    continue;
+                }
+
+                let new_h = (h + hue_shift * weight).rem_euclid(1.0);
+                let new_s = if saturation >= 0.0 {
+                    s + (1.0 - s) * saturation.min(1.0) * weight
+                } else {
+                    s * (1.0 + saturation.max(-1.0) * weight)
+                };
+                let new_l = if lightness >= 0.0 {
+                    l + (1.0 - l) * lightness.min(1.0) * weight
+                } else {
+                    l * (1.0 + lightness.max(-1.0) * weight)
+                };
+
+                let out = hsl_to_rgb(new_h, new_s.clamp(0.0, 1.0), new_l.clamp(0.0, 1.0));
+                px[0] = (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[1] = (out[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[2] = (out[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+        self.commit("Hue/Saturation");
     }
 
     // -- canvas -------------------------------------------------------------

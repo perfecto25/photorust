@@ -34,6 +34,13 @@ pub enum Adjustment {
     /// Multiply each channel independently.
     ColorBalance { r: f32, g: f32, b: f32 },
     Exposure { exposure: f32, offset: f32, gamma: f32 },
+    /// `vibrance` is `-1.0..=1.0`, `saturation` is `-1.0..=1.0`.
+    /// Vibrance selectively boosts less-saturated colours more.
+    Vibrance { vibrance: f32, saturation: f32 },
+    /// Colorize: desaturate then tint to an absolute hue and saturation.
+    /// `hue` is `0.0..=1.0` (fraction of 360°), `saturation` `0.0..=1.0`,
+    /// `lightness` `-1.0..=1.0`.
+    Colorize { hue: f32, saturation: f32, lightness: f32 },
 }
 
 impl Default for Adjustment {
@@ -57,6 +64,8 @@ impl Adjustment {
             Adjustment::Threshold { .. } => "Threshold",
             Adjustment::ColorBalance { .. } => "Color Balance",
             Adjustment::Exposure { .. } => "Exposure",
+            Adjustment::Vibrance { .. } => "Vibrance",
+            Adjustment::Colorize { .. } => "Colorize",
         }
     }
 
@@ -93,6 +102,15 @@ impl Adjustment {
                 exposure: 0.0,
                 offset: 0.0,
                 gamma: 1.0,
+            },
+            "Vibrance" => Adjustment::Vibrance {
+                vibrance: 0.0,
+                saturation: 0.0,
+            },
+            "Colorize" => Adjustment::Colorize {
+                hue: 0.0,
+                saturation: 0.25,
+                lightness: 0.0,
             },
             _ => return None,
         })
@@ -184,6 +202,38 @@ impl Adjustment {
                 let gain = 2f32.powf(exposure);
                 let inv_gamma = 1.0 / gamma.max(1e-6);
                 map3(c, |v| clamp01((v * gain + offset).max(0.0).powf(inv_gamma)))
+            }
+
+            Adjustment::Vibrance {
+                vibrance,
+                saturation,
+            } => {
+                let max = c[0].max(c[1]).max(c[2]);
+                let min = c[0].min(c[1]).min(c[2]);
+                let cur_sat = if max > 1e-6 { 1.0 - min / max } else { 0.0 };
+                // Vibrance: scale factor rises as current saturation falls.
+                let vib_scale = vibrance * (1.0 - cur_sat);
+                let total = 1.0 + vib_scale + saturation;
+                let l = luma(c);
+                [
+                    clamp01(l + (c[0] - l) * total),
+                    clamp01(l + (c[1] - l) * total),
+                    clamp01(l + (c[2] - l) * total),
+                ]
+            }
+
+            Adjustment::Colorize {
+                hue,
+                saturation,
+                lightness,
+            } => {
+                let (_, _, l) = rgb_to_hsl(c);
+                let l = if lightness >= 0.0 {
+                    l + (1.0 - l) * lightness.min(1.0)
+                } else {
+                    l * (1.0 + lightness.max(-1.0))
+                };
+                hsl_to_rgb(hue.rem_euclid(1.0), clamp01(saturation), clamp01(l))
             }
         }
     }
@@ -336,6 +386,10 @@ mod tests {
                 exposure: 0.0,
                 offset: 0.0,
                 gamma: 1.0,
+            },
+            Adjustment::Vibrance {
+                vibrance: 0.0,
+                saturation: 0.0,
             },
         ];
         for a in identities {

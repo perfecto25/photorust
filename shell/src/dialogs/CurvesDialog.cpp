@@ -454,7 +454,10 @@ CurvesDialog::CurvesDialog(Engine *engine, QWidget *parent)
     connect(m_baselineCheck, &QCheckBox::toggled,
             m_curveWidget, &CurveWidget::setShowBaseline);
 
-    connect(okBtn, &QPushButton::clicked, this, &QDialog::accept);
+    connect(okBtn, &QPushButton::clicked, this, [this] {
+        m_previewApplied = false;
+        accept();
+    });
     connect(cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
 
     rebuildHistogram();

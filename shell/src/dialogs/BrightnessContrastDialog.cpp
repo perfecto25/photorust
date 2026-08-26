@@ -97,7 +97,10 @@ BrightnessContrastDialog::BrightnessContrastDialog(Engine *engine, QWidget *pare
             revertPreview();
     });
 
-    connect(okBtn, &QPushButton::clicked, this, &QDialog::accept);
+    connect(okBtn, &QPushButton::clicked, this, [this] {
+        m_previewApplied = false;
+        accept();
+    });
     connect(cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
 }
 

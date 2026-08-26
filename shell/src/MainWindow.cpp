@@ -1,20 +1,30 @@
 #include "MainWindow.h"
 
 #include "canvas/CanvasView.h"
+#include "dialogs/BlackWhiteDialog.h"
 #include "dialogs/BrightnessContrastDialog.h"
+#include "dialogs/ChannelMixerDialog.h"
+#include "dialogs/ColorBalanceDialog.h"
 #include "dialogs/ColorPickerDialog.h"
 #include "dialogs/CurvesDialog.h"
 #include "dialogs/LevelsDialog.h"
 #include "dialogs/ColorSettingsDialog.h"
+#include "dialogs/ExposureDialog.h"
+#include "dialogs/GradientMapDialog.h"
 #include "dialogs/ExportAsDialog.h"
+#include "dialogs/HueSaturationDialog.h"
 #include "dialogs/FindReplaceTextDialog.h"
 #include "dialogs/FileInfoDialog.h"
 #include "dialogs/GifWriter.h"
 #include "dialogs/IndexedColorDialog.h"
+#include "dialogs/PhotoFilterDialog.h"
+#include "dialogs/PosterizeDialog.h"
 #include "dialogs/KeyboardShortcutsDialog.h"
 #include "dialogs/NewDocumentDialog.h"
 #include "dialogs/PrintDialog.h"
 #include "dialogs/SaveForWebDialog.h"
+#include "dialogs/ThresholdDialog.h"
+#include "dialogs/VibranceDialog.h"
 #include "panels/BrushPresetPicker.h"
 #include "panels/ChannelsPanel.h"
 #include "panels/ColorPanel.h"
@@ -1032,11 +1042,22 @@ void MainWindow::createMenus()
     }
     adjustments->addSeparator();
 
-    // Middle group: Hue/Saturation, Color Balance, Black & White
+    // Vibrance (CS6 places it between Exposure and Hue/Saturation)
+    {
+        auto *vibAction = new QAction(tr("Vibrance..."), this);
+        connect(vibAction, &QAction::triggered, this,
+                [this] { applyAdjustment(QStringLiteral("Vibrance")); });
+        adjustments->addAction(vibAction);
+    }
+
+    // Middle group: Hue/Saturation, Color Balance, Black & White, Photo Filter, Channel Mixer, Gradient Map
     const AdjustmentEntry midEntries[] = {
         {"image.hueSaturation", "Hue/Saturation"},
         {"image.colorBalance", "Color Balance"},
         {"image.blackAndWhite", "Black & White"},
+        {"image.photoFilter", "Photo Filter"},
+        {"image.channelMixer", "Channel Mixer"},
+        {"image.gradientMap", "Gradient Map"},
     };
     for (const auto &entry : midEntries) {
         const QString engineName = QString::fromUtf8(entry.engineName);
@@ -4840,10 +4861,21 @@ void MainWindow::applyAdjustment(const QString &name)
     bool ok = true;
 
     if (name == QLatin1String("Posterize")) {
-        p1 = float(QInputDialog::getInt(this, name, tr("Levels:"), 4, 2, 255, 1, &ok));
+        PosterizeDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
     } else if (name == QLatin1String("Threshold")) {
-        p1 = float(QInputDialog::getInt(this, name, tr("Threshold Level:"), 128, 0, 255,
-                                        1, &ok));
+        ThresholdDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
     } else if (name == QLatin1String("Brightness/Contrast")) {
         BrightnessContrastDialog dlg(m_engine, this);
         if (dlg.exec() != QDialog::Accepted) {
@@ -4868,13 +4900,70 @@ void MainWindow::applyAdjustment(const QString &name)
         }
         refreshAll();
         return;
-    } else if (name == QLatin1String("Hue/Saturation")) {
-        p1 = float(QInputDialog::getDouble(this, name, tr("Hue (-1 to 1):"), 0.0, -1.0,
-                                           1.0, 2, &ok));
-        if (ok) {
-            p2 = float(QInputDialog::getDouble(this, name, tr("Saturation (-1 to 1):"),
-                                               0.0, -1.0, 1.0, 2, &ok));
+    } else if (name == QLatin1String("Exposure")) {
+        ExposureDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
         }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Vibrance")) {
+        VibranceDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Hue/Saturation")) {
+        HueSaturationDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Color Balance")) {
+        ColorBalanceDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Black & White")) {
+        BlackWhiteDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Photo Filter")) {
+        PhotoFilterDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Channel Mixer")) {
+        ChannelMixerDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Gradient Map")) {
+        GradientMapDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
     }
 
     if (!ok) {

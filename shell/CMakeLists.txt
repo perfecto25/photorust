@@ -12,22 +12,40 @@ set(SHELL_SOURCES
     src/canvas/CanvasView.cpp
     src/canvas/CanvasView.h
 
+    src/dialogs/ChannelMixerDialog.cpp
+    src/dialogs/ChannelMixerDialog.h
+    src/dialogs/ColorBalanceDialog.cpp
+    src/dialogs/ColorBalanceDialog.h
     src/dialogs/ColorPickerDialog.cpp
     src/dialogs/ColorPickerDialog.h
     src/dialogs/ColorSettingsDialog.cpp
     src/dialogs/ColorSettingsDialog.h
+    src/dialogs/ExposureDialog.cpp
+    src/dialogs/ExposureDialog.h
     src/dialogs/ExportAsDialog.cpp
     src/dialogs/ExportAsDialog.h
+    src/dialogs/GradientEditorDialog.cpp
+    src/dialogs/GradientEditorDialog.h
+    src/dialogs/GradientMapDialog.cpp
+    src/dialogs/GradientMapDialog.h
     src/dialogs/FileInfoDialog.cpp
     src/dialogs/FindReplaceTextDialog.cpp
     src/dialogs/FindReplaceTextDialog.h
     src/dialogs/FileInfoDialog.h
     src/dialogs/GifWriter.cpp
     src/dialogs/GifWriter.h
+    src/dialogs/BlackWhiteDialog.cpp
+    src/dialogs/BlackWhiteDialog.h
     src/dialogs/BrightnessContrastDialog.cpp
     src/dialogs/BrightnessContrastDialog.h
+    src/dialogs/HueSaturationDialog.cpp
+    src/dialogs/HueSaturationDialog.h
     src/dialogs/IndexedColorDialog.cpp
     src/dialogs/IndexedColorDialog.h
+    src/dialogs/PhotoFilterDialog.cpp
+    src/dialogs/PhotoFilterDialog.h
+    src/dialogs/PosterizeDialog.cpp
+    src/dialogs/PosterizeDialog.h
     src/dialogs/CurvesDialog.cpp
     src/dialogs/CurvesDialog.h
     src/dialogs/LevelsDialog.cpp
@@ -40,6 +58,10 @@ set(SHELL_SOURCES
     src/dialogs/PrintDialog.h
     src/dialogs/SaveForWebDialog.cpp
     src/dialogs/SaveForWebDialog.h
+    src/dialogs/ThresholdDialog.cpp
+    src/dialogs/ThresholdDialog.h
+    src/dialogs/VibranceDialog.cpp
+    src/dialogs/VibranceDialog.h
 
     src/panels/BrushPresetPicker.cpp
     src/panels/BrushPresetPicker.h

@@ -528,7 +528,10 @@ LevelsDialog::LevelsDialog(Engine *engine, QWidget *parent)
         m_inWhite->setValue(qMax(minVal + 1, maxVal));
     });
 
-    connect(okBtn, &QPushButton::clicked, this, &QDialog::accept);
+    connect(okBtn, &QPushButton::clicked, this, [this] {
+        m_previewApplied = false;
+        accept();
+    });
     connect(cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
 
     rebuildHistogram();

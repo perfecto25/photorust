@@ -1818,6 +1818,55 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "applyCurvesLut"]
         fn apply_curves_lut(self: Pin<&mut Engine>, lut: &[u8], channel: i32);
+
+        /// Hue/Saturation with per-colour-range targeting.
+        /// channel: 0=Master, 1=Reds, 2=Yellows, 3=Greens, 4=Cyans, 5=Blues, 6=Magentas
+        #[qinvokable]
+        #[cxx_name = "applyHueSaturationRange"]
+        fn apply_hue_saturation_range(self: Pin<&mut Engine>, hue: f32, saturation: f32, lightness: f32, channel: i32);
+
+        /// Color Balance with tone targeting.
+        /// tone: 0=Shadows, 1=Midtones, 2=Highlights
+        #[qinvokable]
+        #[cxx_name = "applyColorBalance"]
+        fn apply_color_balance(self: Pin<&mut Engine>, cyan_red: f32, magenta_green: f32, yellow_blue: f32, tone: i32, preserve_luminosity: bool);
+
+        /// Black & White with per-hue weights and optional tint.
+        #[qinvokable]
+        #[cxx_name = "applyBlackAndWhite"]
+        fn apply_black_and_white(self: Pin<&mut Engine>, reds: f32, yellows: f32, greens: f32, cyans: f32, blues: f32, magentas: f32, tint: bool, tint_hue: f32, tint_sat: f32);
+
+        /// Photo Filter: blend a colour at a density, optionally preserving luminosity.
+        #[qinvokable]
+        #[cxx_name = "applyPhotoFilter"]
+        fn apply_photo_filter(self: Pin<&mut Engine>, r: f32, g: f32, b: f32, density: f32, preserve_luminosity: bool);
+
+        /// Gradient Map: map luminance through a named gradient, optionally
+        /// reversed and/or dithered.
+        #[qinvokable]
+        #[cxx_name = "applyGradientMap"]
+        fn apply_gradient_map_bridge(self: Pin<&mut Engine>, name: &QString, reverse: bool, dither: bool);
+
+        /// Gradient Map with custom stops. `stops_str` is semicolon-separated
+        /// entries of "pos,r,g,b" (0-1 position, 0-255 RGB).
+        #[qinvokable]
+        #[cxx_name = "applyGradientMapCustom"]
+        fn apply_gradient_map_custom(self: Pin<&mut Engine>, stops_str: &QString, reverse: bool, dither: bool);
+
+        /// Render a custom gradient preview. Same stop format as above.
+        #[qinvokable]
+        #[cxx_name = "customGradientPreview"]
+        fn custom_gradient_preview(self: &Engine, stops_str: &QString, width: i32, height: i32) -> QImage;
+
+        /// Channel Mixer: 3x3 source matrix (row-major, percent) + 3 constants + monochrome.
+        #[qinvokable]
+        #[cxx_name = "applyChannelMixer"]
+        fn apply_channel_mixer_bridge(self: Pin<&mut Engine>,
+            rr: f32, rg: f32, rb: f32,
+            gr: f32, gg: f32, gb: f32,
+            br: f32, bg: f32, bb: f32,
+            cr: f32, cg: f32, cb: f32,
+            monochrome: bool);
     }
 
     // -- history -----------------------------------------------------------
@@ -2128,6 +2177,32 @@ fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
 /// This costs one memcpy per composite, against CLAUDE.md §8's "avoid copying
 /// buffers across the FFI bridge". Removing it means giving Qt a buffer whose
 /// lifetime is genuinely independent of this call; the natural fix is to keep
+/// Parse "pos,r,g,b;pos,r,g,b;..." into a Gradient.
+fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
+    use crate::gradient::{Gradient, GradientStop};
+    let text = s.to_string();
+    let mut stops = Vec::new();
+    for entry in text.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = entry.split(',').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let pos: f32 = parts[0].parse().ok()?;
+        let r: u8 = parts[1].parse().ok()?;
+        let g: u8 = parts[2].parse().ok()?;
+        let b: u8 = parts[3].parse().ok()?;
+        stops.push(GradientStop::new(pos, Rgba8::opaque(r, g, b)));
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    Some(Gradient::new(stops))
+}
+
 /// a persistent back-buffer in [`EngineRust`] and hand out a `QImage` that
 /// borrows it, which is worth doing once the canvas renderer lands.
 fn pixmap_to_qimage(pm: Pixmap) -> QImage {
@@ -5233,6 +5308,15 @@ impl ffi::Engine {
                 offset: p2,
                 gamma: p3.max(0.01),
             },
+            "Vibrance" => Adjustment::Vibrance {
+                vibrance: p1,
+                saturation: p2,
+            },
+            "Colorize" => Adjustment::Colorize {
+                hue: p1,
+                saturation: p2,
+                lightness: p3,
+            },
             // Parameterless adjustments fall through to their defaults.
             other => match Adjustment::default_for(other) {
                 Some(a) => a,
@@ -5283,6 +5367,117 @@ impl ffi::Engine {
             return;
         }
         self.as_mut().rust_mut().doc.apply_curves_lut(lut, channel);
+        self.sync();
+    }
+
+    fn apply_hue_saturation_range(
+        mut self: core::pin::Pin<&mut Self>,
+        hue: f32,
+        saturation: f32,
+        lightness: f32,
+        channel: i32,
+    ) {
+        self.as_mut().rust_mut().doc.apply_hue_saturation_range(hue, saturation, lightness, channel);
+        self.sync();
+    }
+
+    fn apply_color_balance(
+        mut self: core::pin::Pin<&mut Self>,
+        cyan_red: f32,
+        magenta_green: f32,
+        yellow_blue: f32,
+        tone: i32,
+        preserve_luminosity: bool,
+    ) {
+        self.as_mut().rust_mut().doc.apply_color_balance(cyan_red, magenta_green, yellow_blue, tone, preserve_luminosity);
+        self.sync();
+    }
+
+    fn apply_black_and_white(
+        mut self: core::pin::Pin<&mut Self>,
+        reds: f32,
+        yellows: f32,
+        greens: f32,
+        cyans: f32,
+        blues: f32,
+        magentas: f32,
+        tint: bool,
+        tint_hue: f32,
+        tint_sat: f32,
+    ) {
+        self.as_mut().rust_mut().doc.apply_black_and_white(reds, yellows, greens, cyans, blues, magentas, tint, tint_hue, tint_sat);
+        self.sync();
+    }
+
+    fn apply_photo_filter(
+        mut self: core::pin::Pin<&mut Self>,
+        r: f32,
+        g: f32,
+        b: f32,
+        density: f32,
+        preserve_luminosity: bool,
+    ) {
+        self.as_mut().rust_mut().doc.apply_photo_filter(r, g, b, density, preserve_luminosity);
+        self.sync();
+    }
+
+    fn apply_gradient_map_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        reverse: bool,
+        dither: bool,
+    ) {
+        let name_str = name.to_string();
+        let fg = self.as_ref().rust().foreground;
+        let bg = self.as_ref().rust().background;
+        if let Some(grad) = crate::gradient::preset(&name_str, fg, bg) {
+            let grad = if reverse { grad.reversed() } else { grad };
+            self.as_mut().rust_mut().doc.apply_gradient_map(&grad, dither);
+            self.sync();
+        }
+    }
+
+    fn apply_gradient_map_custom(
+        mut self: core::pin::Pin<&mut Self>,
+        stops_str: &QString,
+        reverse: bool,
+        dither: bool,
+    ) {
+        if let Some(grad) = parse_gradient_stops(stops_str) {
+            let grad = if reverse { grad.reversed() } else { grad };
+            self.as_mut().rust_mut().doc.apply_gradient_map(&grad, dither);
+            self.sync();
+        }
+    }
+
+    fn custom_gradient_preview(
+        &self,
+        stops_str: &QString,
+        width: i32,
+        height: i32,
+    ) -> QImage {
+        let w = width.max(1) as u32;
+        let h = height.max(1) as u32;
+        if let Some(grad) = parse_gradient_stops(stops_str) {
+            let pix = grad.preview(w, h);
+            pixmap_to_qimage(pix)
+        } else {
+            let pix = Pixmap::new(w, h);
+            pixmap_to_qimage(pix)
+        }
+    }
+
+    fn apply_channel_mixer_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        rr: f32, rg: f32, rb: f32,
+        gr: f32, gg: f32, gb: f32,
+        br: f32, bg: f32, bb: f32,
+        cr: f32, cg: f32, cb: f32,
+        monochrome: bool,
+    ) {
+        let matrix = [rr, rg, rb, gr, gg, gb, br, bg, bb];
+        let constants = [cr, cg, cb];
+        self.as_mut().rust_mut().doc.apply_channel_mixer(&matrix, &constants, monochrome);
         self.sync();
     }
 
