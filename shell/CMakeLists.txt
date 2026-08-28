@@ -24,10 +24,14 @@ set(SHELL_SOURCES
     src/dialogs/ExposureDialog.h
     src/dialogs/ExportAsDialog.cpp
     src/dialogs/ExportAsDialog.h
+    src/dialogs/FillDialog.cpp
+    src/dialogs/FillDialog.h
     src/dialogs/GradientEditorDialog.cpp
     src/dialogs/GradientEditorDialog.h
     src/dialogs/GradientMapDialog.cpp
     src/dialogs/GradientMapDialog.h
+    src/dialogs/HdrToningDialog.cpp
+    src/dialogs/HdrToningDialog.h
     src/dialogs/FileInfoDialog.cpp
     src/dialogs/FindReplaceTextDialog.cpp
     src/dialogs/FindReplaceTextDialog.h
@@ -56,8 +60,16 @@ set(SHELL_SOURCES
     src/dialogs/NewDocumentDialog.h
     src/dialogs/PrintDialog.cpp
     src/dialogs/PrintDialog.h
+    src/dialogs/ReplaceColorDialog.cpp
+    src/dialogs/ReplaceColorDialog.h
     src/dialogs/SaveForWebDialog.cpp
     src/dialogs/SaveForWebDialog.h
+    src/dialogs/SelectiveColorDialog.cpp
+    src/dialogs/SelectiveColorDialog.h
+    src/dialogs/ShadowsHighlightsDialog.cpp
+    src/dialogs/ShadowsHighlightsDialog.h
+    src/dialogs/StrokeDialog.cpp
+    src/dialogs/StrokeDialog.h
     src/dialogs/ThresholdDialog.cpp
     src/dialogs/ThresholdDialog.h
     src/dialogs/VibranceDialog.cpp

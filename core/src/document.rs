@@ -30,6 +30,16 @@ use crate::path::PathSet;
 use crate::pattern;
 use crate::slice::{Slice, SliceSet};
 
+/// One colour picked with Replace Color's eyedropper: the RGB that was read
+/// and the pixel it came from. The position is only consulted when Localized
+/// Color Clusters is on.
+#[derive(Clone, Copy, Debug)]
+pub struct ColorSample {
+    pub x: i32,
+    pub y: i32,
+    pub rgb: [u8; 3],
+}
+
 /// What the Patch tool was asked to do — CS6's options bar, as one value.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PatchOptions {
@@ -2659,6 +2669,232 @@ impl Document {
         self.commit("Fill");
     }
 
+    /// Fill with a colour at a given opacity (0..1), respecting selection and
+    /// lock-transparency. Used by the Fill dialog.
+    pub fn fill_with_opacity(&mut self, color: Rgba8, opacity: f32, mode: BlendMode) {
+        self.fill_pixels(opacity, mode, |_x, _y| color);
+    }
+
+    pub fn fill_with_pattern(&mut self, pattern_index: usize, opacity: f32, mode: BlendMode) {
+        let tile = match pattern::tile(pattern_index) {
+            Some(t) => t,
+            None => return,
+        };
+        let (tw, th) = (tile.width() as i32, tile.height() as i32);
+        if tw <= 0 || th <= 0 {
+            return;
+        }
+        self.fill_pixels(opacity, mode, |x, y| {
+            tile.get(x.rem_euclid(tw), y.rem_euclid(th))
+        });
+    }
+
+    fn fill_pixels<F>(&mut self, opacity: f32, mode: BlendMode, src_at: F)
+    where
+        F: Fn(i32, i32) -> Rgba8,
+    {
+        use crate::blend::blend_rgb;
+
+        let opacity = opacity.clamp(0.0, 1.0);
+        let selection_empty = self.selection.is_empty();
+        let selection = if selection_empty {
+            None
+        } else {
+            Some(self.selection.clone())
+        };
+        let id = self.active_layer;
+
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels {
+                return;
+            }
+            let offset = layer.offset;
+            let lock_alpha = layer.lock_transparency;
+            let (w, h) = (layer.pixels.width(), layer.pixels.height());
+
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let mut alpha = opacity;
+                    if let Some(sel) = &selection {
+                        alpha *= sel.coverage_at(x + offset.0, y + offset.1);
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                    }
+                    let dst = layer.pixels.get(x, y);
+                    if lock_alpha {
+                        if dst.a == 0 {
+                            continue;
+                        }
+                        alpha *= dst.a as f32 / 255.0;
+                    }
+                    let src = src_at(x, y);
+                    let blended = if matches!(mode, BlendMode::Normal) {
+                        src
+                    } else {
+                        let db = [dst.r as f32 / 255.0, dst.g as f32 / 255.0, dst.b as f32 / 255.0];
+                        let sb = [src.r as f32 / 255.0, src.g as f32 / 255.0, src.b as f32 / 255.0];
+                        let rb = blend_rgb(mode, db, sb);
+                        Rgba8::new(
+                            (rb[0] * 255.0 + 0.5) as u8,
+                            (rb[1] * 255.0 + 0.5) as u8,
+                            (rb[2] * 255.0 + 0.5) as u8,
+                            src.a,
+                        )
+                    };
+                    layer
+                        .pixels
+                        .set(x, y, crate::brush::source_over(dst, blended, alpha));
+                }
+            }
+        }
+        self.commit("Fill");
+    }
+
+    /// Stroke the selection boundary with a given colour, width, opacity, and
+    /// location (0 = inside, 1 = center, 2 = outside).
+    pub fn stroke_selection(
+        &mut self,
+        color: Rgba8,
+        width: i32,
+        opacity: f32,
+        location: i32,
+    ) {
+        if width < 1 {
+            return;
+        }
+        let opacity = opacity.clamp(0.0, 1.0);
+        let id = self.active_layer;
+
+        if self.selection.is_empty() {
+            // No selection — stroke the canvas boundary (like Photoshop).
+            if let Some(layer) = self.stack.by_id_mut(id) {
+                if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                    return;
+                }
+                let lock_alpha = layer.lock_transparency;
+                let (lw, lh) = (layer.pixels.width(), layer.pixels.height());
+
+                let effective = match location {
+                    0 => width as f32,
+                    2 => 0.0,
+                    _ => width as f32 / 2.0,
+                };
+
+                for y in 0..lh as i32 {
+                    for x in 0..lw as i32 {
+                        let dist = (x as f32)
+                            .min(y as f32)
+                            .min((lw as i32 - 1 - x) as f32)
+                            .min((lh as i32 - 1 - y) as f32);
+                        if dist >= effective {
+                            continue;
+                        }
+                        let mut alpha = opacity;
+                        let dst = layer.pixels.get(x, y);
+                        if lock_alpha {
+                            if dst.a == 0 {
+                                continue;
+                            }
+                            alpha *= dst.a as f32 / 255.0;
+                        }
+                        layer
+                            .pixels
+                            .set(x, y, crate::brush::source_over(dst, color, alpha));
+                    }
+                }
+            }
+            self.commit("Stroke");
+            return;
+        }
+
+        let sel = self.selection.clone();
+
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            let offset = layer.offset;
+            let lock_alpha = layer.lock_transparency;
+            let (lw, lh) = (layer.pixels.width(), layer.pixels.height());
+
+            for y in 0..lh as i32 {
+                for x in 0..lw as i32 {
+                    let gx = x + offset.0;
+                    let gy = y + offset.1;
+                    let cov = sel.coverage_at(gx, gy);
+
+                    let mut is_edge = false;
+                    for dy in -1..=1_i32 {
+                        for dx in -1..=1_i32 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let nc = sel.coverage_at(gx + dx, gy + dy);
+                            if (cov > 0.5) != (nc > 0.5) {
+                                is_edge = true;
+                                break;
+                            }
+                        }
+                        if is_edge {
+                            break;
+                        }
+                    }
+
+                    if !is_edge {
+                        if width > 1 {
+                            let half = width as f32 / 2.0;
+                            let mut min_dist = half + 1.0;
+                            let search = width + 1;
+                            for dy in -search..=search {
+                                for dx in -search..=search {
+                                    let nc = sel.coverage_at(gx + dx, gy + dy);
+                                    if (cov > 0.5) != (nc > 0.5) {
+                                        let d = ((dx * dx + dy * dy) as f32).sqrt();
+                                        if d < min_dist {
+                                            min_dist = d;
+                                        }
+                                    }
+                                }
+                            }
+                            let inside_sel = cov > 0.5;
+                            let in_stroke = match location {
+                                0 => inside_sel && min_dist <= width as f32,
+                                2 => !inside_sel && min_dist <= width as f32,
+                                _ => min_dist <= half,
+                            };
+                            if !in_stroke {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        let inside_sel = cov > 0.5;
+                        match location {
+                            0 if !inside_sel => continue,
+                            2 if inside_sel => continue,
+                            _ => {}
+                        }
+                    }
+
+                    let mut alpha = opacity;
+                    let dst = layer.pixels.get(x, y);
+                    if lock_alpha {
+                        if dst.a == 0 {
+                            continue;
+                        }
+                        alpha *= dst.a as f32 / 255.0;
+                    }
+                    layer
+                        .pixels
+                        .set(x, y, crate::brush::source_over(dst, color, alpha));
+                }
+            }
+        }
+        self.commit("Stroke");
+    }
+
     /// Draw a gradient over the active layer — the Gradient tool.
     ///
     /// `start` and `end` are the drag, in document space. The gradient covers
@@ -2944,13 +3180,55 @@ impl Document {
     }
 
     /// Apply an adjustment destructively to the active layer.
+    /// Apply an adjustment to the active layer.
+    ///
+    /// A selection confines it: only the selected pixels change, blended by
+    /// the selection's coverage so a feathered edge fades the adjustment in
+    /// rather than showing a hard border.
     pub fn apply_adjustment(&mut self, adjustment: Adjustment) {
+        let selection = if self.selection.is_empty() {
+            None
+        } else {
+            Some(&self.selection)
+        };
+
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            adjustment.apply_to(&mut layer.pixels);
+            match selection {
+                None => adjustment.apply_to(&mut layer.pixels),
+                Some(sel) => {
+                    // The layer may hang off the canvas, so its pixels have to
+                    // be put back into document space before the selection can
+                    // be asked about them.
+                    let (ox, oy) = layer.offset;
+                    let w = layer.pixels.width();
+                    for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
+                        if px[3] == 0 {
+                            continue;
+                        }
+                        let x = (i as u32 % w) as i32 + ox;
+                        let y = (i as u32 / w) as i32 + oy;
+                        let coverage = sel.coverage_at(x, y);
+                        if coverage <= 0.0 {
+                            continue;
+                        }
+
+                        let c = [
+                            px[0] as f32 / 255.0,
+                            px[1] as f32 / 255.0,
+                            px[2] as f32 / 255.0,
+                        ];
+                        let out = adjustment.apply_rgb(c);
+                        for ch in 0..3 {
+                            let v = c[ch] + (out[ch] - c[ch]) * coverage;
+                            px[ch] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        }
+                    }
+                }
+            }
         }
         self.commit(adjustment.name());
     }
@@ -3263,6 +3541,585 @@ impl Document {
             }
         }
         self.commit("Gradient Map");
+    }
+
+    /// CS6-style Selective Color adjustment.
+    ///
+    /// `adjustments` is a 9×4 array: 9 color ranges (Reds, Yellows, Greens,
+    /// Cyans, Blues, Magentas, Whites, Neutrals, Blacks), each with 4 CMYK
+    /// adjustment values in -100..+100. `relative` selects relative mode
+    /// (adjusts proportionally to existing CMY amounts) vs absolute mode.
+    pub fn apply_selective_color(
+        &mut self,
+        adjustments: &[[f32; 4]; 9],
+        relative: bool,
+    ) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+
+                // Convert to CMY (not CMYK — Selective Color works in CMY space)
+                let mut c = 1.0 - r;
+                let mut m = 1.0 - g;
+                let mut y = 1.0 - b;
+
+                let max = r.max(g).max(b);
+                let min = r.min(g).min(b);
+
+                // Determine how much this pixel belongs to each color range.
+                // Photoshop uses the dominant hue and the secondary overlaps.
+                let ranges = Self::selective_color_weights(r, g, b, max, min);
+
+                for (range_idx, weight) in ranges.iter().enumerate() {
+                    if *weight <= 0.0 {
+                        continue;
+                    }
+                    let adj = &adjustments[range_idx];
+                    if adj[0] == 0.0 && adj[1] == 0.0 && adj[2] == 0.0 && adj[3] == 0.0 {
+                        continue;
+                    }
+
+                    let dc = adj[0] / 100.0;
+                    let dm = adj[1] / 100.0;
+                    let dy = adj[2] / 100.0;
+                    let dk = adj[3] / 100.0;
+
+                    let w = *weight;
+
+                    if relative {
+                        c += (dc * c + dk * c) * w;
+                        m += (dm * m + dk * m) * w;
+                        y += (dy * y + dk * y) * w;
+                    } else {
+                        c += (dc + dk) * w;
+                        m += (dm + dk) * w;
+                        y += (dy + dk) * w;
+                    }
+                }
+
+                px[0] = ((1.0 - c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                px[1] = ((1.0 - m.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                px[2] = ((1.0 - y.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+            }
+        }
+        self.commit("Selective Color");
+    }
+
+    fn selective_color_weights(r: f32, g: f32, b: f32, max: f32, min: f32) -> [f32; 9] {
+        // Ranges: 0=Reds, 1=Yellows, 2=Greens, 3=Cyans, 4=Blues, 5=Magentas,
+        //         6=Whites, 7=Neutrals, 8=Blacks
+        let mut w = [0.0f32; 9];
+
+        // Chromatic ranges — weight by how dominant the hue is
+        let chroma = max - min;
+        if chroma > 0.0 {
+            // Reds: R dominant, hue near 0° or 360°
+            if r >= g && r >= b {
+                // Red is max
+                if g >= b {
+                    // hue 0–60° (red–yellow)
+                    let red_w = (chroma * (1.0 - (g - b) / chroma)).min(chroma);
+                    w[0] = red_w;   // Reds
+                    w[1] = chroma - red_w; // Yellows
+                } else {
+                    // hue 300–360° (magenta–red)
+                    let red_w = (chroma * (1.0 - (b - g) / chroma)).min(chroma);
+                    w[0] = red_w;   // Reds
+                    w[5] = chroma - red_w; // Magentas
+                }
+            } else if g >= r && g >= b {
+                // Green is max
+                if r >= b {
+                    // hue 60–120° (yellow–green)
+                    let grn_w = (chroma * (1.0 - (r - b) / chroma)).min(chroma);
+                    w[2] = grn_w;   // Greens
+                    w[1] = chroma - grn_w; // Yellows
+                } else {
+                    // hue 120–180° (green–cyan)
+                    let grn_w = (chroma * (1.0 - (b - r) / chroma)).min(chroma);
+                    w[2] = grn_w;   // Greens
+                    w[3] = chroma - grn_w; // Cyans
+                }
+            } else {
+                // Blue is max
+                if g >= r {
+                    // hue 180–240° (cyan–blue)
+                    let blu_w = (chroma * (1.0 - (g - r) / chroma)).min(chroma);
+                    w[4] = blu_w;   // Blues
+                    w[3] = chroma - blu_w; // Cyans
+                } else {
+                    // hue 240–300° (blue–magenta)
+                    let blu_w = (chroma * (1.0 - (r - g) / chroma)).min(chroma);
+                    w[4] = blu_w;   // Blues
+                    w[5] = chroma - blu_w; // Magentas
+                }
+            }
+        }
+
+        // Tonal ranges — Whites, Neutrals, Blacks
+        // These use the min-of-RGB approach that Photoshop uses.
+        w[6] = min;                         // Whites
+        w[8] = 1.0 - max;                   // Blacks
+        w[7] = 1.0 - (w[6] + w[8] + chroma).min(1.0); // Neutrals
+
+        w
+    }
+
+    /// CS6-style Shadows/Highlights.
+    ///
+    /// `shadow_amount` (0..100) lifts dark pixels, `highlight_amount` (0..100)
+    /// darkens bright pixels. Works in luminance space to avoid hue shifts,
+    /// using an additive delta that is capped to prevent colour fringing.
+    pub fn apply_shadows_highlights(
+        &mut self,
+        shadow_amount: f32,
+        highlight_amount: f32,
+    ) {
+        let sa = (shadow_amount / 100.0).clamp(0.0, 1.0);
+        let ha = (highlight_amount / 100.0).clamp(0.0, 1.0);
+        if sa == 0.0 && ha == 0.0 {
+            return;
+        }
+
+        // Build a LUT: luminance index → additive delta for each channel.
+        // Shadows lift dark luminances, highlights pull down bright ones.
+        // The magnitudes are calibrated to match CS6's default-radius output.
+        let delta_lut: [f32; 256] = std::array::from_fn(|i| {
+            let l = i as f32 / 255.0;
+
+            // Shadow: smoothstep weight peaks at black, fades to zero by ~0.5.
+            let st = (1.0 - l * 2.0).clamp(0.0, 1.0);
+            let sw = st * st * (3.0 - 2.0 * st);
+            let shadow_delta = sw * sa * 0.35;
+
+            // Highlight: smoothstep weight peaks at white, fades to zero by ~0.5.
+            let ht = ((l - 0.5) * 2.0).clamp(0.0, 1.0);
+            let hw = ht * ht * (3.0 - 2.0 * ht);
+            let highlight_delta = hw * ha * 0.30;
+
+            shadow_delta - highlight_delta
+        });
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+                if px[3] == 0 {
+                    continue;
+                }
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+
+                let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                let idx = (lum * 255.0 + 0.5).clamp(0.0, 255.0) as usize;
+                let delta = delta_lut[idx];
+
+                if delta.abs() < 1e-6 {
+                    continue;
+                }
+
+                // Add delta uniformly to all channels — preserves hue and
+                // saturation while shifting lightness.
+                px[0] = ((r + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[1] = ((g + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                px[2] = ((b + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        }
+        self.commit("Shadows/Highlights");
+    }
+
+    /// CS6-style HDR Toning (local adaptation).
+    ///
+    /// This is a local tone-mapping operator that uses a blurred version of the
+    /// image as a local luminance estimate, then adjusts each pixel relative to
+    /// its neighbourhood.
+    ///
+    /// Parameters match CS6's "Local Adaptation" controls:
+    /// - `radius`: edge glow radius in pixels (1–500)
+    /// - `strength`: edge glow strength (0.01–4.0)
+    /// - `gamma`: tone-and-detail gamma (0.01–9.99)
+    /// - `exposure`: tone-and-detail exposure (-5.0..+5.0)
+    /// - `detail`: tone-and-detail detail enhancement (-100..+300 %)
+    /// - `shadow`: advanced shadow (-100..+100 %)
+    /// - `highlight`: advanced highlight (-100..+100 %)
+    /// - `vibrance`: advanced vibrance (-100..+100 %)
+    /// - `saturation`: advanced saturation (-100..+100 %)
+    pub fn apply_hdr_toning(
+        &mut self,
+        radius: f32,
+        strength: f32,
+        gamma: f32,
+        exposure: f32,
+        detail: f32,
+        shadow: f32,
+        highlight: f32,
+        vibrance: f32,
+        saturation: f32,
+    ) {
+        use crate::filters::convolve::gaussian_blur_accelerated;
+        use crate::filters::adjust::rgb_to_hsl;
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+
+            let (w, h) = (layer.pixels.width(), layer.pixels.height());
+
+            // Build a luminance-only blurred copy for local adaptation.
+            // Accelerated: this is the dominant cost of HDR Toning, and it is
+            // re-run on every slider move while the dialog is open.
+            let mut blurred = layer.pixels.clone();
+            if radius >= 1.0 {
+                gaussian_blur_accelerated(&mut blurred, radius);
+            }
+
+            let strength = strength.clamp(0.01, 4.0);
+            let gamma = gamma.clamp(0.01, 9.99);
+            let exposure = exposure.clamp(-5.0, 5.0);
+            let detail_amt = detail.clamp(-100.0, 300.0) / 100.0;
+            let shadow_amt = shadow.clamp(-100.0, 100.0) / 100.0;
+            let highlight_amt = highlight.clamp(-100.0, 100.0) / 100.0;
+            let vib_amt = vibrance.clamp(-100.0, 100.0) / 100.0;
+            let sat_amt = saturation.clamp(-100.0, 100.0) / 100.0;
+
+            // Local Adaptation works on a log-domain base/detail split:
+            // the blurred copy is the base layer, the per-pixel residual is
+            // the detail layer. Gamma compresses the base layer's dynamic
+            // range (so a large gamma flattens rather than brightens), while
+            // Detail scales the residual independently. That separation is
+            // what lets Detail -100% give a smooth image and +300% give the
+            // heavy texture and edge glow.
+            const EPS: f32 = 1e-3;
+            // Clamped so an extreme Gamma cannot blow the log-domain
+            // deviation up into exp() overflow.
+            let compress = (1.0 / gamma).clamp(0.1, 4.0);
+            // Edge Glow Strength modulates how much of the detail layer
+            // survives, normalised so the mid of the slider is neutral.
+            let detail_scale = (1.0 + detail_amt * (strength * 0.5).min(1.0)).max(0.0);
+            let exposure_ln = exposure * std::f32::consts::LN_2;
+
+            // Anchor the compression around the image's log-average
+            // luminance (the "key"), so flattening pulls toward the
+            // picture's own midtone instead of an arbitrary constant.
+            let pivot = {
+                let bytes = layer.pixels.as_bytes();
+                let mut sum = 0.0f64;
+                let mut count = 0u64;
+                for px in bytes.chunks_exact(4) {
+                    if px[3] == 0 {
+                        continue;
+                    }
+                    let l = (0.299 * px[0] as f32
+                        + 0.587 * px[1] as f32
+                        + 0.114 * px[2] as f32) / 255.0;
+                    sum += (l + EPS).ln() as f64;
+                    count += 1;
+                }
+                if count > 0 {
+                    (sum / count as f64) as f32
+                } else {
+                    (0.18f32).ln()
+                }
+            };
+
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let px_idx = (y as u32 * w + x as u32) as usize * 4;
+                    let bytes = layer.pixels.as_bytes_mut();
+                    if bytes[px_idx + 3] == 0 {
+                        continue;
+                    }
+
+                    let r = bytes[px_idx] as f32 / 255.0;
+                    let g = bytes[px_idx + 1] as f32 / 255.0;
+                    let b = bytes[px_idx + 2] as f32 / 255.0;
+
+                    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                    let bp = blurred.get(x, y);
+                    let local_lum = (0.299 * bp.r as f32 + 0.587 * bp.g as f32
+                        + 0.114 * bp.b as f32) / 255.0;
+
+                    // 1. Split into base (blurred) and detail (residual)
+                    //    in the log domain.
+                    let log_lum = (lum + EPS).ln();
+                    let log_base = (local_lum + EPS).ln();
+                    let log_detail = log_lum - log_base;
+
+                    // 2. Shrink very small residuals before boosting them.
+                    //    In a smooth region (sky) the real detail is the
+                    //    same magnitude as the source's JPEG block noise,
+                    //    so amplifying it uniformly makes the 8x8 blocks
+                    //    visible. Gating by magnitude keeps genuine edges
+                    //    and drops the noise floor.
+                    const DETAIL_KNEE: f32 = 0.06;
+                    let t = (log_detail.abs() / DETAIL_KNEE).min(1.0);
+                    let gate = t * t * (3.0 - 2.0 * t);
+
+                    // 3. Compress the base around the key, scale the
+                    //    detail, then apply exposure as a log-domain shift.
+                    let base_dev = ((log_base - pivot) * compress).clamp(-8.0, 8.0);
+                    let log_out = pivot
+                        + base_dev
+                        + log_detail * gate * detail_scale
+                        + exposure_ln;
+                    let mut target = log_out.exp();
+
+                    // 3. Shadow/highlight recovery.
+                    if shadow_amt.abs() > 1e-4 {
+                        let st = (1.0 - target * 2.0).clamp(0.0, 1.0);
+                        let sw = st * st * (3.0 - 2.0 * st);
+                        target += sw * shadow_amt * 0.15;
+                    }
+                    if highlight_amt.abs() > 1e-4 {
+                        let ht = ((target - 0.5) * 2.0).clamp(0.0, 1.0);
+                        let hw = ht * ht * (3.0 - 2.0 * ht);
+                        target += hw * highlight_amt * 0.15;
+                    }
+
+                    // 4. Filmic S-curve: soft shoulder + toe to simulate
+                    //    32-bit headroom. Values that exceed [0,1] get
+                    //    smoothly compressed instead of hard-clipping.
+                    if target > 1.0 {
+                        let ex = target - 1.0;
+                        target = 1.0 - (-ex * 2.0).exp() * 0.15;
+                    } else if target > 0.85 {
+                        let t = (target - 0.85) / 0.15;
+                        let shoulder = 0.85 + 0.15 * (1.0 - (1.0 - t).powi(2));
+                        target = shoulder;
+                    }
+                    if target < 0.0 {
+                        let ex = -target;
+                        target = (-ex * 2.0).exp() * 0.05;
+                    } else if target < 0.10 {
+                        let t = target / 0.10;
+                        target = 0.10 * t * t;
+                    }
+
+                    // 4. Additive delta preserves chrominance exactly.
+                    let delta = target - lum;
+                    let mut nr = (r + delta).clamp(0.0, 1.0);
+                    let mut ng = (g + delta).clamp(0.0, 1.0);
+                    let mut nb = (b + delta).clamp(0.0, 1.0);
+
+                    // 5. Vibrance + saturation in HSL, with a gate
+                    //    that skips near-gray pixels whose hue is
+                    //    unreliable (prevents JPEG noise amplification).
+                    if vib_amt.abs() > 1e-4 || sat_amt.abs() > 1e-4 {
+                        let (h_hsl, mut s_hsl, l_hsl) = rgb_to_hsl([nr, ng, nb]);
+                        let orig_s = s_hsl;
+
+                        if vib_amt.abs() > 1e-4 {
+                            let boost = (1.0 - s_hsl) * vib_amt;
+                            s_hsl = (s_hsl + boost).clamp(0.0, 1.0);
+                        }
+                        if sat_amt >= 0.0 {
+                            s_hsl += (1.0 - s_hsl) * sat_amt;
+                        } else {
+                            s_hsl += s_hsl * sat_amt;
+                        }
+                        s_hsl = s_hsl.clamp(0.0, 1.0);
+
+                        let gate = (orig_s / 0.15).min(1.0);
+                        s_hsl = orig_s + (s_hsl - orig_s) * gate;
+
+                        let rgb = crate::filters::adjust::hsl_to_rgb(h_hsl, s_hsl, l_hsl);
+                        nr = rgb[0];
+                        ng = rgb[1];
+                        nb = rgb[2];
+                    }
+
+                    bytes[px_idx]     = (nr * 255.0 + 0.5) as u8;
+                    bytes[px_idx + 1] = (ng * 255.0 + 0.5) as u8;
+                    bytes[px_idx + 2] = (nb * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        self.commit("HDR Toning");
+    }
+
+    /// Selection weight for one pixel under Replace Color's rules.
+    ///
+    /// Distance is the largest per-channel difference, matching the way
+    /// Photoshop's Fuzziness reads as a tolerance in 0..255 levels. Several
+    /// samples are combined by taking the best match, so "Add to Sample"
+    /// widens the selection rather than averaging it away.
+    fn replace_color_weight(
+        r: u8,
+        g: u8,
+        b: u8,
+        x: i32,
+        y: i32,
+        samples: &[ColorSample],
+        fuzziness: f32,
+        localized: bool,
+        sigma_sq: f32,
+    ) -> f32 {
+        let mut best = 0.0f32;
+        for s in samples {
+            let d = (r as i32 - s.rgb[0] as i32)
+                .abs()
+                .max((g as i32 - s.rgb[1] as i32).abs())
+                .max((b as i32 - s.rgb[2] as i32).abs()) as f32;
+            let mut w = if fuzziness <= 0.0 {
+                if d == 0.0 { 1.0 } else { 0.0 }
+            } else {
+                (1.0 - d / fuzziness).clamp(0.0, 1.0)
+            };
+            // Localized Color Clusters keeps the selection near where the
+            // colour was actually picked, so a colour that recurs elsewhere
+            // in the frame is not dragged in with it. This is a spatial
+            // falloff around each sample, not Photoshop's exact clustering.
+            if localized && w > 0.0 {
+                let dx = (x - s.x) as f32;
+                let dy = (y - s.y) as f32;
+                w *= (-(dx * dx + dy * dy) / (2.0 * sigma_sq)).exp();
+            }
+            best = best.max(w);
+        }
+        best
+    }
+
+    /// Spatial falloff width for Localized Color Clusters, as a fraction of
+    /// the image diagonal.
+    fn replace_color_sigma_sq(w: u32, h: u32) -> f32 {
+        let diag = ((w * w + h * h) as f32).sqrt().max(1.0);
+        let sigma = diag * 0.18;
+        sigma * sigma
+    }
+
+    /// The Replace Color selection mask, fitted into a `size` box for the
+    /// dialog's preview. White is fully selected.
+    pub fn replace_color_mask(
+        &self,
+        samples: &[ColorSample],
+        fuzziness: f32,
+        localized: bool,
+        size: u32,
+    ) -> Pixmap {
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id(id) else {
+            return Pixmap::new(1, 1);
+        };
+        let (sw, sh) = (layer.pixels.width(), layer.pixels.height());
+        if sw == 0 || sh == 0 || size == 0 {
+            return Pixmap::new(1, 1);
+        }
+
+        let scale = (size as f32 / sw as f32).min(size as f32 / sh as f32);
+        let tw = ((sw as f32 * scale).round() as u32).max(1);
+        let th = ((sh as f32 * scale).round() as u32).max(1);
+        let sigma_sq = Self::replace_color_sigma_sq(sw, sh);
+
+        let mut out = Pixmap::new(tw, th);
+        for y in 0..th {
+            for x in 0..tw {
+                let sx = (x as f32 / scale) as i32;
+                let sy = (y as f32 / scale) as i32;
+                let px = layer.pixels.get(sx, sy);
+                let w = if px.a == 0 {
+                    0.0
+                } else {
+                    Self::replace_color_weight(
+                        px.r, px.g, px.b, sx, sy, samples, fuzziness, localized, sigma_sq,
+                    )
+                };
+                let v = (w * 255.0 + 0.5) as u8;
+                out.set(x as i32, y as i32, Rgba8::opaque(v, v, v));
+            }
+        }
+        out
+    }
+
+    /// Photoshop's Image > Adjustments > Replace Color: shift the sampled
+    /// colour range in HSL, feathered by the selection mask.
+    ///
+    /// `hue` is in degrees (-180..180); `saturation` and `lightness` are
+    /// -100..100.
+    pub fn apply_replace_color(
+        &mut self,
+        samples: &[ColorSample],
+        fuzziness: f32,
+        localized: bool,
+        hue: f32,
+        saturation: f32,
+        lightness: f32,
+    ) {
+        use crate::filters::adjust::{hsl_to_rgb, rgb_to_hsl};
+
+        if samples.is_empty() {
+            return;
+        }
+
+        let hue_shift = hue.clamp(-180.0, 180.0) / 360.0;
+        let sat_amt = saturation.clamp(-100.0, 100.0) / 100.0;
+        let light_amt = lightness.clamp(-100.0, 100.0) / 100.0;
+
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            let (w, h) = (layer.pixels.width(), layer.pixels.height());
+            let sigma_sq = Self::replace_color_sigma_sq(w, h);
+
+            let bytes = layer.pixels.as_bytes_mut();
+            for (i, px) in bytes.chunks_exact_mut(4).enumerate() {
+                if px[3] == 0 {
+                    continue;
+                }
+                let x = (i as u32 % w) as i32;
+                let y = (i as u32 / w) as i32;
+                let weight = Self::replace_color_weight(
+                    px[0], px[1], px[2], x, y, samples, fuzziness, localized, sigma_sq,
+                );
+                if weight <= 0.0 {
+                    continue;
+                }
+
+                let r = px[0] as f32 / 255.0;
+                let g = px[1] as f32 / 255.0;
+                let b = px[2] as f32 / 255.0;
+                let (hh, ss, ll) = rgb_to_hsl([r, g, b]);
+
+                let nh = (hh + hue_shift).rem_euclid(1.0);
+                let ns = if sat_amt >= 0.0 {
+                    ss + (1.0 - ss) * sat_amt
+                } else {
+                    ss * (1.0 + sat_amt)
+                };
+                let nl = if light_amt >= 0.0 {
+                    ll + (1.0 - ll) * light_amt
+                } else {
+                    ll * (1.0 + light_amt)
+                };
+
+                let out = hsl_to_rgb(nh, ns.clamp(0.0, 1.0), nl.clamp(0.0, 1.0));
+                // Feather by the mask so the edge of the range blends in
+                // rather than showing a hard cut.
+                let pairs = [(r, out[0]), (g, out[1]), (b, out[2])];
+                for c in 0..3 {
+                    let (orig, new) = pairs[c];
+                    let v = orig + (new - orig) * weight;
+                    px[c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+            }
+        }
+        self.commit("Replace Color");
     }
 
     /// Apply CS6-style color balance with tone-weighted shifts and optional
@@ -3781,11 +4638,19 @@ impl Document {
     // -- compositing --------------------------------------------------------
 
     /// Composite the whole document.
+    ///
+    /// Goes through the active backend: this runs on every repaint, so it is
+    /// the single hottest path in the engine.
     pub fn composite(&self) -> Pixmap {
-        compositor::composite(&self.stack, self.width, self.height)
+        crate::gpu::shared().composite(&self.stack, self.width, self.height)
     }
 
     /// Composite only `region`.
+    ///
+    /// Stays on the CPU deliberately. Partial repaints are already small — a
+    /// brush dab's bounding box — so they sit below the size where the GPU
+    /// wins, and uploading the whole stack to recompute a few hundred pixels
+    /// would be slower than doing it here.
     pub fn composite_region(&self, region: Rect) -> Pixmap {
         compositor::composite_region(&self.stack, self.width, self.height, region).pixels
     }
@@ -4378,6 +5243,23 @@ mod tests {
         let mut d = doc();
         d.apply_adjustment(Adjustment::Invert);
         assert!(d.layers().get(0).unwrap().pixels.get(8, 8).r < 5);
+    }
+
+    #[test]
+    fn a_selection_confines_a_destructive_adjustment() {
+        let mut d = doc();
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 8, height: 16 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.apply_adjustment(Adjustment::Invert);
+
+        let pixels = &d.layers().get(0).unwrap().pixels;
+        // Inside the marquee the white background inverts to black.
+        assert!(pixels.get(4, 8).r < 5, "selected pixels were not adjusted");
+        // Outside it nothing moved.
+        assert_eq!(pixels.get(12, 8), Rgba8::WHITE);
     }
 
     #[test]

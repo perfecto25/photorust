@@ -149,6 +149,37 @@ QColor CanvasView::colorAtGlobal(const QPoint &globalPos) const
     return m_engine->pickColor(int(doc.x()), int(doc.y()));
 }
 
+bool CanvasView::sampleAtGlobal(const QPoint &globalPos, QColor *color, QPoint *docPos) const
+{
+    if (!m_engine || m_image.isNull()) {
+        return false;
+    }
+    const QPoint local = mapFromGlobal(globalPos);
+    if (!rect().contains(local)) {
+        return false;
+    }
+
+    const QPointF doc = widgetToDocument(QPointF(local));
+    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_image.width()
+        || doc.y() >= m_image.height()) {
+        return false;
+    }
+
+    const int x = int(doc.x());
+    const int y = int(doc.y());
+    const QColor sampled = m_engine->pickColor(x, y);
+    if (!sampled.isValid()) {
+        return false;
+    }
+    if (color) {
+        *color = sampled;
+    }
+    if (docPos) {
+        *docPos = QPoint(x, y);
+    }
+    return true;
+}
+
 void CanvasView::setHandTool(HandTool tool)
 {
     if (m_handTool == tool) {

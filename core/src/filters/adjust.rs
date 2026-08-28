@@ -27,6 +27,11 @@ pub enum Adjustment {
     Invert,
     /// Weighted desaturation using Rec. 601 luma, as Photoshop does.
     Desaturate,
+    /// Photoshop's Image > Adjustments > Desaturate: HSL lightness,
+    /// `(max + min) / 2`. Equivalent to Hue/Saturation with Saturation
+    /// at -100, and deliberately *not* the same as [`Adjustment::Desaturate`]
+    /// above, which is luma-weighted and backs Black & White.
+    DesaturateLightness,
     /// Reduce to `levels` steps per channel.
     Posterize { levels: u32 },
     /// Hard cut at `threshold` (0..=255) on luma.
@@ -60,6 +65,7 @@ impl Adjustment {
             Adjustment::Levels { .. } => "Levels",
             Adjustment::Invert => "Invert",
             Adjustment::Desaturate => "Black & White",
+            Adjustment::DesaturateLightness => "Desaturate",
             Adjustment::Posterize { .. } => "Posterize",
             Adjustment::Threshold { .. } => "Threshold",
             Adjustment::ColorBalance { .. } => "Color Balance",
@@ -91,6 +97,7 @@ impl Adjustment {
             },
             "Invert" => Adjustment::Invert,
             "Black & White" => Adjustment::Desaturate,
+            "Desaturate" => Adjustment::DesaturateLightness,
             "Posterize" => Adjustment::Posterize { levels: 4 },
             "Threshold" => Adjustment::Threshold { level: 128 },
             "Color Balance" => Adjustment::ColorBalance {
@@ -173,6 +180,13 @@ impl Adjustment {
 
             Adjustment::Desaturate => {
                 let l = luma(c);
+                [l, l, l]
+            }
+
+            Adjustment::DesaturateLightness => {
+                let max = c[0].max(c[1]).max(c[2]);
+                let min = c[0].min(c[1]).min(c[2]);
+                let l = (max + min) * 0.5;
                 [l, l, l]
             }
 

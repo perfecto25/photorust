@@ -10,7 +10,9 @@
 #include "dialogs/LevelsDialog.h"
 #include "dialogs/ColorSettingsDialog.h"
 #include "dialogs/ExposureDialog.h"
+#include "dialogs/FillDialog.h"
 #include "dialogs/GradientMapDialog.h"
+#include "dialogs/HdrToningDialog.h"
 #include "dialogs/ExportAsDialog.h"
 #include "dialogs/HueSaturationDialog.h"
 #include "dialogs/FindReplaceTextDialog.h"
@@ -22,7 +24,11 @@
 #include "dialogs/KeyboardShortcutsDialog.h"
 #include "dialogs/NewDocumentDialog.h"
 #include "dialogs/PrintDialog.h"
+#include "dialogs/ReplaceColorDialog.h"
 #include "dialogs/SaveForWebDialog.h"
+#include "dialogs/SelectiveColorDialog.h"
+#include "dialogs/ShadowsHighlightsDialog.h"
+#include "dialogs/StrokeDialog.h"
 #include "dialogs/ThresholdDialog.h"
 #include "dialogs/VibranceDialog.h"
 #include "panels/BrushPresetPicker.h"
@@ -624,6 +630,14 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         return canvas ? canvas->colorAtGlobal(globalPos) : QColor();
     });
 
+    // Replace Color reads the same way, but needs the pixel's position too,
+    // for its Localized Color Clusters option.
+    ReplaceColorDialog::setSampler([canvas = QPointer<CanvasView>(m_canvas)](
+                                       const QPoint &globalPos, QColor *color,
+                                       QPoint *docPos) -> bool {
+        return canvas && canvas->sampleAtGlobal(globalPos, color, docPos);
+    });
+
     // Keep the tool strip's swatch and the Color panel showing the same pair.
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged,
             m_colorPanel, &ColorPanel::setForegroundColor);
@@ -756,17 +770,15 @@ void MainWindow::createMenus()
 
     edit->addSeparator();
 
-    auto *fillFgAction = command(QStringLiteral("edit.fillForeground"),
-                            tr("Fill with Foreground Color"),
-                            &MainWindow::fillWithForeground);
-    edit->addAction(fillFgAction);
-    m_editNonTypingActions << fillFgAction;
+    auto *fillDialogAction = command(QStringLiteral("edit.fill"),
+                            tr("Fill..."), &MainWindow::showFillDialog);
+    edit->addAction(fillDialogAction);
+    m_editNonTypingActions << fillDialogAction;
 
-    auto *fillBgAction = command(QStringLiteral("edit.fillBackground"),
-                            tr("Fill with Background Color"),
-                            &MainWindow::fillWithBackground);
-    edit->addAction(fillBgAction);
-    m_editNonTypingActions << fillBgAction;
+    auto *strokeDialogAction = command(QStringLiteral("edit.stroke"),
+                            tr("Stroke..."), &MainWindow::showStrokeDialog);
+    edit->addAction(strokeDialogAction);
+    m_editNonTypingActions << strokeDialogAction;
 
     edit->addSeparator();
 
@@ -1057,6 +1069,9 @@ void MainWindow::createMenus()
         {"image.blackAndWhite", "Black & White"},
         {"image.photoFilter", "Photo Filter"},
         {"image.channelMixer", "Channel Mixer"},
+        {"image.selectiveColor", "Selective Color"},
+        {"image.shadowsHighlights", "Shadows/Highlights"},
+        {"image.hdrToning", "HDR Toning"},
         {"image.gradientMap", "Gradient Map"},
     };
     for (const auto &entry : midEntries) {
@@ -1081,7 +1096,10 @@ void MainWindow::createMenus()
     adjustments->addSeparator();
     adjustments->addAction(
         command(QStringLiteral("image.desaturate"), tr("Desaturate"),
-                [this] { applyAdjustment(QStringLiteral("Black & White")); }));
+                [this] { applyAdjustment(QStringLiteral("Desaturate")); }));
+    adjustments->addAction(
+        command(QStringLiteral("image.replaceColor"), tr("Replace Color..."),
+                [this] { applyAdjustment(QStringLiteral("Replace Color")); }));
 
     image->addSeparator();
     image->addAction(command(QStringLiteral("image.canvasSize"), tr("&Canvas Size..."),
@@ -1180,11 +1198,18 @@ void MainWindow::createMenus()
     QMenu *help = menuBar()->addMenu(tr("&Help"));
     auto *about = new QAction(tr("&About PhotoRust"), this);
     connect(about, &QAction::triggered, this, [this] {
+        // The rendering backend is worth showing here: whether a machine is
+        // on the GPU or quietly fell back to the CPU is the first thing to
+        // establish when it turns out to be slow.
         QMessageBox::about(this, tr("About PhotoRust"),
                            tr("<h3>PhotoRust</h3>"
                               "<p>A Photoshop CS6 clone.</p>"
-                              "<p>Qt %1 shell over a Rust image engine.</p>")
-                               .arg(QLatin1String(qVersion())));
+                              "<p>Qt %1 shell over a Rust image engine.</p>"
+                              "<p><b>Rendering:</b> %2<br>"
+                              "<small>%3</small></p>")
+                               .arg(QLatin1String(qVersion()),
+                                    m_engine->renderBackend(),
+                                    m_engine->renderBackendDetail()));
     });
     help->addAction(about);
 
@@ -1319,8 +1344,8 @@ void MainWindow::showSelectionContextMenu(const QPoint &globalPos)
         {"edit.freeTransform", "Free Transform", false},
         {nullptr, "Transform Selection", false},
         {nullptr, nullptr, false},
-        {"edit.fill", "Fill...", false},
-        {nullptr, "Stroke...", false},
+        {"edit.fill", "Fill...", true},
+        {"edit.stroke", "Stroke...", true},
         {nullptr, nullptr, false},
         {"filter.last", "Last Filter", false},
         {"edit.fade", "Fade...", false},
@@ -4764,15 +4789,33 @@ void MainWindow::redo()
     refreshAll();
 }
 
-void MainWindow::fillWithForeground()
+void MainWindow::showFillDialog()
 {
-    m_engine->fillForeground();
+    FillDialog dlg(m_engine, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    float opacity = static_cast<float>(dlg.opacity()) / 100.0f;
+    int blendMode = dlg.blendModeIndex();
+    if (dlg.isPatternFill()) {
+        m_engine->fillPattern(dlg.selectedPatternIndex(), opacity, blendMode);
+    } else {
+        QColor c = dlg.fillColor();
+        m_engine->fillColor(c.red(), c.green(), c.blue(), c.alpha(), opacity, blendMode);
+    }
     refreshAll();
 }
 
-void MainWindow::fillWithBackground()
+void MainWindow::showStrokeDialog()
 {
-    m_engine->fillBackground();
+    StrokeDialog dlg(m_engine, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    QColor c = dlg.strokeColor();
+    float opacity = static_cast<float>(dlg.opacity()) / 100.0f;
+    m_engine->strokeSelection(c.red(), c.green(), c.blue(),
+                              dlg.strokeWidth(), opacity, dlg.location());
     refreshAll();
 }
 
@@ -4950,6 +4993,51 @@ void MainWindow::applyAdjustment(const QString &name)
         return;
     } else if (name == QLatin1String("Channel Mixer")) {
         ChannelMixerDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Selective Color")) {
+        SelectiveColorDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Shadows/Highlights")) {
+        ShadowsHighlightsDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("HDR Toning")) {
+        // HDR Toning requires a flat image — ask to flatten first.
+        if (m_engine->property("layerCount").toInt() > 1) {
+            auto answer = QMessageBox::warning(
+                this, tr("Adobe Photoshop"),
+                tr("HDR Toning requires that the document be flattened before proceeding. "
+                   "Flatten and continue?"),
+                QMessageBox::Ok | QMessageBox::Cancel,
+                QMessageBox::Ok);
+            if (answer != QMessageBox::Ok)
+                return;
+            m_engine->flattenImage();
+            refreshAll();
+        }
+        HdrToningDialog dlg(m_engine, this);
+        if (dlg.exec() != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        refreshAll();
+        return;
+    } else if (name == QLatin1String("Replace Color")) {
+        ReplaceColorDialog dlg(m_engine, this);
         if (dlg.exec() != QDialog::Accepted) {
             refreshAll();
             return;

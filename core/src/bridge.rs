@@ -17,7 +17,7 @@ use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
 use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
-use crate::document::{Document, ImageMode, PasteMode, PatchOptions};
+use crate::document::{ColorSample, Document, ImageMode, PasteMode, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
 use crate::layer::{LayerId, LayerKind, TextAlign, TextContent, TextRun};
@@ -197,6 +197,24 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "compositeImage"]
         fn composite_image(self: &Engine) -> QImage;
+
+        /// The rendering backend in use, as one line for the UI — for
+        /// example "GPU — AMD Radeon 780M Graphics (Vulkan)".
+        #[qinvokable]
+        #[cxx_name = "renderBackend"]
+        fn render_backend(self: &Engine) -> QString;
+
+        /// Why that backend was chosen. On a machine that fell back to the
+        /// CPU this carries the reason, which is the thing worth having when
+        /// a machine is unexpectedly slow.
+        #[qinvokable]
+        #[cxx_name = "renderBackendDetail"]
+        fn render_backend_detail(self: &Engine) -> QString;
+
+        /// Whether the GPU is actually being used, as opposed to available.
+        #[qinvokable]
+        #[cxx_name = "usingGpu"]
+        fn using_gpu(self: &Engine) -> bool;
 
         /// The composite with the in-progress brush stroke drawn on top.
         /// Falls back to [`Engine::composite_image`] when no stroke is active.
@@ -1590,6 +1608,22 @@ pub mod ffi {
         #[cxx_name = "fillBackground"]
         fn fill_background(self: Pin<&mut Engine>);
 
+        /// Fill with an arbitrary colour at a given opacity and blend mode.
+        #[qinvokable]
+        #[cxx_name = "fillColor"]
+        fn fill_color(self: Pin<&mut Engine>, r: i32, g: i32, b: i32, a: i32, opacity: f32, blend_mode: i32);
+
+        /// Fill with a tiled pattern at a given opacity and blend mode.
+        #[qinvokable]
+        #[cxx_name = "fillPattern"]
+        fn fill_pattern_bridge(self: Pin<&mut Engine>, pattern_index: i32, opacity: f32, blend_mode: i32);
+
+        /// Stroke the selection boundary.
+        /// Location: 0=Inside, 1=Center, 2=Outside.
+        #[qinvokable]
+        #[cxx_name = "strokeSelection"]
+        fn stroke_selection_bridge(self: Pin<&mut Engine>, r: i32, g: i32, b: i32, width: i32, opacity: f32, location: i32);
+
         /// Erase the selected pixels.
         #[qinvokable]
         #[cxx_name = "clearSelection"]
@@ -1840,6 +1874,44 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "applyPhotoFilter"]
         fn apply_photo_filter(self: Pin<&mut Engine>, r: f32, g: f32, b: f32, density: f32, preserve_luminosity: bool);
+
+        /// Shadows/Highlights: lift shadows and/or darken highlights.
+        #[qinvokable]
+        #[cxx_name = "applyShadowsHighlights"]
+        fn apply_shadows_highlights_bridge(self: Pin<&mut Engine>, shadow_amount: f32, highlight_amount: f32);
+
+        /// HDR Toning (Local Adaptation).
+        #[qinvokable]
+        #[cxx_name = "applyHdrToning"]
+        fn apply_hdr_toning_bridge(
+            self: Pin<&mut Engine>,
+            radius: f32, strength: f32,
+            gamma: f32, exposure: f32, detail: f32,
+            shadow: f32, highlight: f32,
+            vibrance: f32, saturation: f32,
+        );
+
+        /// Selective Color: per-range CMYK adjustments.
+        /// `data` is 9 semicolon-separated groups of "c,m,y,k" values (-100..100).
+        /// Ranges: Reds;Yellows;Greens;Cyans;Blues;Magentas;Whites;Neutrals;Blacks.
+        #[qinvokable]
+        #[cxx_name = "applySelectiveColor"]
+        fn apply_selective_color_bridge(self: Pin<&mut Engine>, data: &QString, relative: bool);
+
+        /// Replace Color: shift a sampled colour range in HSL.
+        ///
+        /// `samples` is semicolon-separated entries of "x,y,r,g,b" — the
+        /// pixel each colour was picked from, then its 0-255 RGB. `hue` is
+        /// in degrees (-180..180); `saturation` and `lightness` are -100..100.
+        #[qinvokable]
+        #[cxx_name = "applyReplaceColor"]
+        fn apply_replace_color_bridge(self: Pin<&mut Engine>, samples: &QString, fuzziness: f32, localized: bool, hue: f32, saturation: f32, lightness: f32);
+
+        /// The Replace Color selection mask, fitted into a `size` box, for
+        /// the dialog's preview thumbnail. Same `samples` format as above.
+        #[qinvokable]
+        #[cxx_name = "replaceColorMask"]
+        fn replace_color_mask_bridge(self: &Engine, samples: &QString, fuzziness: f32, localized: bool, size: i32) -> QImage;
 
         /// Gradient Map: map luminance through a named gradient, optionally
         /// reversed and/or dithered.
@@ -2178,6 +2250,34 @@ fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
 /// buffers across the FFI bridge". Removing it means giving Qt a buffer whose
 /// lifetime is genuinely independent of this call; the natural fix is to keep
 /// Parse "pos,r,g,b;pos,r,g,b;..." into a Gradient.
+/// Parse Replace Color's sample list: semicolon-separated "x,y,r,g,b".
+/// Malformed entries are skipped rather than failing the whole list, so a
+/// stray separator cannot discard colours the user picked.
+fn parse_color_samples(text: &str) -> Vec<ColorSample> {
+    let mut out = Vec::new();
+    for entry in text.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = entry.split(',').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let (Ok(x), Ok(y), Ok(r), Ok(g), Ok(b)) = (
+            parts[0].trim().parse::<i32>(),
+            parts[1].trim().parse::<i32>(),
+            parts[2].trim().parse::<u8>(),
+            parts[3].trim().parse::<u8>(),
+            parts[4].trim().parse::<u8>(),
+        ) else {
+            continue;
+        };
+        out.push(ColorSample { x, y, rgb: [r, g, b] });
+    }
+    out
+}
+
 fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
     use crate::gradient::{Gradient, GradientStop};
     let text = s.to_string();
@@ -2524,6 +2624,18 @@ impl ffi::Engine {
             apply_quick_mask_veil(&mut composite, self.doc.selection());
         }
         pixmap_to_qimage(composite)
+    }
+
+    fn render_backend(&self) -> QString {
+        QString::from(&crate::gpu::shared().info().summary())
+    }
+
+    fn render_backend_detail(&self) -> QString {
+        QString::from(&crate::gpu::shared().info().detail)
+    }
+
+    fn using_gpu(&self) -> bool {
+        crate::gpu::shared().kind() == crate::gpu::BackendKind::Gpu
     }
 
     fn preview_image(&self) -> QImage {
@@ -4974,6 +5086,40 @@ impl ffi::Engine {
         self.sync();
     }
 
+    fn fill_color(
+        mut self: core::pin::Pin<&mut Self>,
+        r: i32, g: i32, b: i32, a: i32,
+        opacity: f32, blend_mode: i32,
+    ) {
+        let c = Rgba8::new(r.clamp(0, 255) as u8, g.clamp(0, 255) as u8,
+                           b.clamp(0, 255) as u8, a.clamp(0, 255) as u8);
+        let mode = BlendMode::from_i32(blend_mode);
+        self.as_mut().rust_mut().doc.fill_with_opacity(c, opacity, mode);
+        self.sync();
+    }
+
+    fn fill_pattern_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        pattern_index: i32,
+        opacity: f32, blend_mode: i32,
+    ) {
+        if pattern_index < 0 { return; }
+        let mode = BlendMode::from_i32(blend_mode);
+        self.as_mut().rust_mut().doc.fill_with_pattern(pattern_index as usize, opacity, mode);
+        self.sync();
+    }
+
+    fn stroke_selection_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        r: i32, g: i32, b: i32,
+        width: i32, opacity: f32, location: i32,
+    ) {
+        let c = Rgba8::opaque(r.clamp(0, 255) as u8, g.clamp(0, 255) as u8,
+                              b.clamp(0, 255) as u8);
+        self.as_mut().rust_mut().doc.stroke_selection(c, width, opacity, location);
+        self.sync();
+    }
+
     fn clear_selection(mut self: core::pin::Pin<&mut Self>) {
         self.as_mut().rust_mut().doc.clear_selection_pixels();
         self.sync();
@@ -5419,6 +5565,78 @@ impl ffi::Engine {
     ) {
         self.as_mut().rust_mut().doc.apply_photo_filter(r, g, b, density, preserve_luminosity);
         self.sync();
+    }
+
+    fn apply_shadows_highlights_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        shadow_amount: f32,
+        highlight_amount: f32,
+    ) {
+        self.as_mut().rust_mut().doc.apply_shadows_highlights(shadow_amount, highlight_amount);
+        self.sync();
+    }
+
+    fn apply_hdr_toning_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        radius: f32, strength: f32,
+        gamma: f32, exposure: f32, detail: f32,
+        shadow: f32, highlight: f32,
+        vibrance: f32, saturation: f32,
+    ) {
+        self.as_mut().rust_mut().doc.apply_hdr_toning(
+            radius, strength, gamma, exposure, detail,
+            shadow, highlight, vibrance, saturation,
+        );
+        self.sync();
+    }
+
+    fn apply_selective_color_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        data: &QString,
+        relative: bool,
+    ) {
+        let s = data.to_string();
+        let mut adj = [[0.0f32; 4]; 9];
+        for (i, group) in s.split(';').enumerate() {
+            if i >= 9 { break; }
+            for (j, val) in group.split(',').enumerate() {
+                if j >= 4 { break; }
+                adj[i][j] = val.trim().parse::<f32>().unwrap_or(0.0);
+            }
+        }
+        self.as_mut().rust_mut().doc.apply_selective_color(&adj, relative);
+        self.sync();
+    }
+
+    fn apply_replace_color_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        samples: &QString,
+        fuzziness: f32,
+        localized: bool,
+        hue: f32,
+        saturation: f32,
+        lightness: f32,
+    ) {
+        let parsed = parse_color_samples(&samples.to_string());
+        if parsed.is_empty() {
+            return;
+        }
+        self.as_mut().rust_mut().doc.apply_replace_color(
+            &parsed, fuzziness, localized, hue, saturation, lightness,
+        );
+        self.sync();
+    }
+
+    fn replace_color_mask_bridge(
+        &self,
+        samples: &QString,
+        fuzziness: f32,
+        localized: bool,
+        size: i32,
+    ) -> QImage {
+        let parsed = parse_color_samples(&samples.to_string());
+        let size = size.clamp(1, 512) as u32;
+        pixmap_to_qimage(self.doc.replace_color_mask(&parsed, fuzziness, localized, size))
     }
 
     fn apply_gradient_map_bridge(

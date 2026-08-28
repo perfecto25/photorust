@@ -3,6 +3,16 @@
 This file gives Claude Code (and any contributor) the context needed to work on this
 project effectively. Read it fully before making architectural decisions.
 
+Companion documents:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — tech stack, module layout, and
+  the conventions that cause real bugs if missed.
+- [docs/gpu-migration.md](docs/gpu-migration.md) — GPU phase plan, benchmarks,
+  and findings. Read before any GPU work.
+- [docs/BUILDING.md](docs/BUILDING.md) — prerequisites and build steps.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — what is done and what is not.
+- [docs/REFERENCE.md](docs/REFERENCE.md) — the CS6 interface being reproduced.
+
 ---
 
 ## 1. What this project is
@@ -35,7 +45,7 @@ strength. **Do not blur this boundary.**
 │  C++ / Qt shell  (QWidgets)                               │
 │  - Main window, dock widgets, toolbars, menus, panels     │
 │  - Photoshop-style docking UX (native to QWidgets)        │
-│  - Canvas viewport + GPU presentation                     │
+│  - Canvas viewport (presents with QPainter today)          │
 │  - Keyboard shortcut / command registry                   │
 │  - Tool input handling (mouse, tablet/pressure)           │
 └───────────────────────────┬───────────────────────────────┘
@@ -48,7 +58,8 @@ strength. **Do not blur this boundary.**
 │  - Selections, masks                                       │
 │  - History / undo stack                                    │
 │  - .psd parsing and serialization                          │
-│  - Multithreaded image operations                          │
+│  - Multithreaded image operations (rayon)                  │
+│  - GPU compute via wgpu, CPU path as the reference (§7)    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -93,12 +104,17 @@ strength. **Do not blur this boundary.**
 | Image engine     | **Rust** (stable toolchain, `cargo`)                          |
 | FFI bridge       | **CXX-Qt** (`cxx-qt`, `cxx-qt-lib`, `cxx-qt-build`)           |
 | Build system     | **CMake** orchestrating C++ + invoking Cargo for the Rust core|
-| GPU              | Abstraction layer over OpenGL/Vulkan (see §7)                 |
+| GPU              | **`wgpu`** compute behind a backend seam, CPU fallback (§7)    |
 | `.psd` support   | Custom Rust parser (optionally referencing `libpsd`)          |
 
 ---
 
-## 5. Suggested directory layout
+## 5. Directory layout
+
+> The full, current module-by-module map is in
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This is the shape, not an
+> inventory.
+
 
 ```
 /
@@ -109,7 +125,7 @@ strength. **Do not blur this boundary.**
 │   │   ├── main.cpp
 │   │   ├── MainWindow.*      # dock layout, menus, toolbars
 │   │   ├── panels/           # Layers, Color, History, etc. (one widget each)
-│   │   ├── canvas/           # viewport widget + GPU presentation
+│   │   ├── canvas/           # viewport widget, zoom/pan, input mapping
 │   │   ├── tools/            # tool input handling (brush, selection, crop…)
 │   │   └── shortcuts/        # command registry + keymap loading
 │   └── resources/
@@ -124,6 +140,7 @@ strength. **Do not blur this boundary.**
 │       ├── buffer.rs         # pixel buffers
 │       ├── layer.rs          # layer model
 │       ├── compositor.rs     # blend modes + compositing
+│       ├── gpu/              # wgpu backend seam, CPU fallback, shaders
 │       ├── filters/          # convolutions, adjustments
 │       ├── selection.rs
 │       ├── history.rs        # undo/redo
@@ -135,25 +152,24 @@ strength. **Do not blur this boundary.**
 
 ## 6. Build & run
 
-> Exact commands depend on the final CMake setup; keep this section updated as it
-> stabilizes.
-
-Prerequisites: a C++ toolchain, **Qt 6** (with QWidgets), a stable **Rust** toolchain,
-and **CMake**.
+Prerequisites and per-distro package names: [docs/BUILDING.md](docs/BUILDING.md).
 
 ```bash
 # Configure + build everything (CMake drives Cargo for the Rust core)
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j$(nproc)
 
 # Run
-./build/shell/photoclone        # Linux
-./build/shell/photoclone.app    # macOS bundle
+./build/photorust
 
 # Work on the Rust core in isolation
 cd core
 cargo build
 cargo test
+
+# Force the CPU backend, or pin a graphics API
+PHOTORUST_BACKEND=cpu ./build/photorust
+WGPU_BACKEND=vulkan   ./build/photorust
 ```
 
 When debugging, remember failures can originate on **either** side of the bridge — check
@@ -161,19 +177,65 @@ both the C++ shell and the Rust core.
 
 ---
 
-## 7. GPU acceleration (platform-specific — plan for this early)
+## 7. GPU acceleration
 
-GPU support differs between our two target platforms and **must be designed against an
-abstraction layer from day one**, not retrofitted:
+**This exists now.** The abstraction layer this section used to ask for is
+`core/src/gpu/`, built on **`wgpu`** — Vulkan on Linux, Metal on macOS, without
+routing through MoltenVK by hand. The full phase plan, measurements and open
+questions live in **`docs/gpu-migration.md`**; read it before doing GPU work.
 
-- **Linux:** OpenGL / Vulkan directly.
-- **macOS:** Apple has deprecated OpenGL in favor of **Metal**. Plan to route through
-  **MoltenVK** (Vulkan-on-Metal) or otherwise abstract the backend.
+The rules that matter when touching this:
 
-Qt abstracts a lot of this for general UI rendering. But **if we hand-roll the canvas
-renderer** (likely, for real-time brushes and large-image compositing), put it behind a
-backend-agnostic interface. `wgpu` (Rust, targets Vulkan/Metal/etc.) is a strong option
-if the renderer lives on the Rust side.
+- **The CPU path is the reference and never goes away.** Every accelerated
+  operation has a CPU implementation it must agree with, and a machine with no
+  usable adapter runs every feature. A GPU is a speed-up, never a requirement.
+- **Every migrated operation needs a parity test** against the CPU before it
+  counts as done. A wrong blend mode is a subtly wrong colour, not a crash, so
+  this will not be caught by "it ran".
+- **Measure before enabling.** Compositing is the cautionary tale: the shader is
+  complete and matches the CPU on all 27 blend modes, but it is *slower*,
+  because each call re-uploads the whole layer stack. It is deliberately left
+  switched off. Correct-but-slower is not worth shipping.
+- **No `#[cfg(target_os)]` branching on graphics APIs** in engine code. `wgpu`
+  is the abstraction; if something needs a platform branch, it belongs behind
+  the `RenderBackend` seam.
+- **One device per process.** Use `gpu::shared()`. Creating a device per call
+  site — or per test — crashes the driver.
+- The C++ shell gets **no shader code**. Pixels are Rust's business (§2). The
+  one legitimate exception would be canvas presentation, which is not built.
+
+### Writing a new pixel operation — filter, adjustment, brush, anything
+
+This applies to **all** future work, not just to the migration phases. Do not
+add a CPU-only pixel operation and consider it finished.
+
+1. **Write the CPU version first.** It is the reference, it is what runs on a
+   machine without a GPU, and the GPU version is defined as "agrees with this".
+2. **Decide whether it fits the GPU.** It fits when the work is per-pixel or
+   per-neighbourhood, the same for every pixel, and there is enough of it. It
+   does *not* fit when the algorithm is inherently sequential (flood fill,
+   magic wand region growing), when it touches only a small region (a brush
+   dab's bounding box), or when the caller would immediately need the result
+   back on the CPU anyway.
+3. **If it fits, add it to `RenderBackend`** and implement both sides. Keep the
+   trait narrow — it is for work worth accelerating, not for every function in
+   the engine.
+4. **Write the parity test before believing it.** Compare against the CPU
+   across sizes that are not multiples of the workgroup, at edges, and with
+   transparency. Match exactly where the operation is discrete (Dissolve), and
+   within a level or so where float accumulation order differs.
+5. **Benchmark it, then decide whether to switch it on.** Add a case to
+   `core/examples/` and record the numbers in `docs/gpu-migration.md`. A
+   correct shader that is slower stays off — compositing is the standing
+   example.
+6. **Gate on size, and fall back on anything unexpected.** `MIN_GPU_PIXELS`
+   exists because the fixed per-operation cost dominates small images. Wrong
+   bit depth, oversized input or a device error must fall back to the CPU, not
+   fail the user's edit.
+
+If an operation does not fit the GPU, say so in a comment where the next person
+will look, and why. "Considered and rejected, because flood fill is sequential"
+is a useful thing to find; silence is not.
 
 ---
 
@@ -189,6 +251,11 @@ if the renderer lives on the Rust side.
 - **Real-time performance** for brush strokes and large-image compositing is a core
   requirement, not a nice-to-have. Keep hot pixel paths in Rust, use SIMD/threads, and
   avoid copying buffers across the FFI bridge — pass views/handles, not data.
+- **Moving pixels to and from the GPU is the cost that dominates**, not the
+  arithmetic once they are there. An operation that uploads its input and reads
+  the result straight back can easily be slower than doing it on the CPU — that
+  is exactly why GPU compositing is written but not enabled. Batch work while it
+  is resident; measure before assuming a shader is a win.
 
 ---
 
@@ -217,3 +284,7 @@ if the renderer lives on the Rust side.
   through the bridge.
 - Prefer correctness and clear module boundaries over premature optimization — except on
   the known hot paths (compositing, brush rendering), where performance is the spec.
+- **Every new pixel operation is a GPU candidate.** Write the CPU version first,
+  then apply the checklist in §7 before calling it done. "It works on the CPU"
+  is not a finished feature for anything that touches more than a few thousand
+  pixels.

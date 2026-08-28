@@ -154,7 +154,18 @@ pub fn gaussian_blur(pixmap: &mut Pixmap, radius: f32) {
     pixmap.unpremultiply();
 }
 
-fn gaussian_kernel_1d(sigma: f32, taps: i32) -> Vec<f32> {
+/// Gaussian blur through the active rendering backend.
+///
+/// Use this from anything the user waits on. [`gaussian_blur`] above stays the
+/// CPU reference: the GPU backend falls back to it, and the parity tests
+/// compare against it, so it must not itself dispatch or the two would recurse.
+pub fn gaussian_blur_accelerated(pixmap: &mut Pixmap, radius: f32) {
+    crate::gpu::shared().gaussian_blur(pixmap, radius);
+}
+
+/// Shared with the GPU backend, which must use byte-identical weights or its
+/// output will drift from the CPU reference.
+pub(crate) fn gaussian_kernel_1d(sigma: f32, taps: i32) -> Vec<f32> {
     let mut k = Vec::with_capacity((taps * 2 + 1) as usize);
     let two_sigma_sq = 2.0 * sigma * sigma;
     for i in -taps..=taps {
@@ -233,7 +244,7 @@ pub fn unsharp_mask(pixmap: &mut Pixmap, amount: f32, radius: f32, threshold: u8
     }
     let original = pixmap.clone();
     let mut blurred = pixmap.clone();
-    gaussian_blur(&mut blurred, radius);
+    gaussian_blur_accelerated(&mut blurred, radius);
 
     let width = pixmap.width();
     let height = pixmap.height();

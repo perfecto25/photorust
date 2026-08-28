@@ -16,6 +16,15 @@ cxx-qt = "0.9"
 # though this is a QWidgets-only application.
 cxx-qt-lib = { version = "0.9", features = ["qt_gui"] }
 rayon = "1.10"
+# GPU backend. `wgpu` targets Vulkan on Linux and Metal on macOS, which is what
+# CLAUDE.md §7 asks for without dragging in MoltenVK by hand. `pollster` drives
+# wgpu's async device setup to completion; the engine has no async runtime and
+# does not want one, and device init happens once at startup.
+wgpu = "30"
+pollster = "0.4"
+# Safe reinterpretation of the uniform/kernel structs as the byte slices wgpu
+# wants, without hand-rolled `unsafe` transmutes.
+bytemuck = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 cxx-qt-build = "0.9"

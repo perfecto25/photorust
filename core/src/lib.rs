@@ -46,6 +46,7 @@ pub mod document;
 pub mod erase;
 pub mod filters;
 pub mod focus;
+pub mod gpu;
 pub mod gradient;
 pub mod healing;
 pub mod history;

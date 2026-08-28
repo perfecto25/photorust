@@ -47,7 +47,9 @@ impl Filter {
     /// Apply the filter to `pixmap` in place.
     pub fn apply(&self, pixmap: &mut Pixmap) {
         match *self {
-            Filter::GaussianBlur { radius } => gaussian_blur(pixmap, radius),
+            Filter::GaussianBlur { radius } => {
+                convolve::gaussian_blur_accelerated(pixmap, radius)
+            }
             Filter::BoxBlur { radius } => convolve::box_blur(pixmap, radius),
             Filter::Sharpen => sharpen(pixmap),
             Filter::UnsharpMask {

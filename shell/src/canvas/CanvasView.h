@@ -261,6 +261,13 @@ public:
     /// zoom, the transparency checkerboard or any overlay drawn on top.
     QColor colorAtGlobal(const QPoint &globalPos) const;
 
+    /// As `colorAtGlobal`, but also reports which document pixel was read.
+    ///
+    /// Replace Color needs the position as well as the colour: its Localized
+    /// Color Clusters option restricts the selection to the neighbourhood the
+    /// colour was picked from. Returns false when the point is off the image.
+    bool sampleAtGlobal(const QPoint &globalPos, QColor *color, QPoint *docPos) const;
+
     /// Convert a widget point to document space.
     QPointF widgetToDocument(const QPointF &pos) const;
     /// A movement measured on screen, turned back into the frame the pan is

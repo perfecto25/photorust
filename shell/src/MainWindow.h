@@ -82,8 +82,8 @@ private slots:
     /// Paste it inside the selection, or outside it, as a masked layer.
     void pasteInto();
     void pasteOutside();
-    void fillWithForeground();
-    void fillWithBackground();
+    void showFillDialog();
+    void showStrokeDialog();
     void clearSelection();
     void findReplaceText();
     void freeTransform();
