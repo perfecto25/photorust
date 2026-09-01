@@ -16,7 +16,7 @@ paint, manage layers, select, filter and undo.
 **Working**
 
 - CS6-style dark UI: menu bar with "photorust" branding, options bar, left tool
-  strip, dockable panels (Color/Swatches/Info tabbed, History,
+  strip, dockable panels (Color/Swatches/Info/Properties tabbed, History,
   Layers/Channels/Paths tabbed), status bar.
 - **Several documents open at once**, one tab each above the canvas. Each keeps
   its own layers, selection, history and zoom; File ▸ New and File ▸ Open add a
@@ -30,6 +30,19 @@ paint, manage layers, select, filter and undo.
 - Layers: add, delete (multi-select with Shift/Ctrl click), duplicate, reorder,
   merge down, flatten, rename, show/hide, opacity, fill opacity, clipping masks,
   layer masks, thumbnails.
+- **Layer groups**: Layer ▸ Group Layers (`Ctrl+G`) and Ungroup. The stack stays
+  one flat list — a group is a folder layer plus the run of layers beneath it
+  that name it as their parent — so every index-based operation and panel index
+  keeps working. The compositor renders a group's members into a buffer of
+  their own before blending it, so the group's opacity, mask and blend mode
+  apply to the result rather than to each member, and an adjustment layer
+  inside a group reaches only what is in the group. Deleting a folder takes its
+  contents, moving one moves them with it, and a layer added or dropped between
+  two members joins the group. Dragging a layer onto a folder lights the whole
+  row up and drops it inside, which is also the only way into a closed or empty
+  group; the bands at the row's top and bottom edges still mean above and
+  below. Groups are always isolated (CS6 defaults a new group to Pass
+  Through), cannot be nested, and Merge Group is not built.
 - **Layer locks**, enforced in the engine rather than by greying out buttons:
   lock transparent pixels, lock image pixels, lock position, and lock all. A
   pixel-locked layer refuses every tool — brushes, healing, filters, fills — and
@@ -143,6 +156,21 @@ paint, manage layers, select, filter and undo.
   document's memory footprint. With the Ruler active it switches to CS6's
   ruler layout — angle and length in place of CMYK, and the ruler's deltas in
   place of the selection size.
+- A **Properties panel**, floating or docked, editing **every** adjustment
+  layer live — one history entry per gesture, previewing on the canvas as the
+  slider moves. Brightness/Contrast, Levels, Exposure, Vibrance, Posterize,
+  Threshold, Color Balance, Photo Filter, Channel Mixer and Selective Color get
+  their sliders; Hue/Saturation gets CS6's whole page (preset menu, colour-range
+  menu, ramp-grooved sliders, Colorize and the two spectrum bars); Curves gets
+  the curve editor; Gradient Map and Color Lookup get their preset menus. The
+  footer is CS6's: clip to layer, reset to defaults, visibility, delete.
+  Anything that is not an adjustment layer gets a readout of what it is: kind,
+  size, position, blend mode, opacity, fill, mask and locks.
+
+  The controls are described per adjustment and built from that description
+  rather than hand-laid out, and each one knows only the *name* of the
+  parameter it edits — `Adjustment::value`/`set_value` in the engine are the
+  other end. A new parameter is a key there and a row here, not a new page.
 - Slices: cut the canvas with the Slice tool and the rest is auto-sliced around
   it, numbered in reading order with CS6's blue and grey badges. Slice Select
   moves, resizes and deletes them, and File ▸ Save Slices writes each one out
@@ -182,8 +210,16 @@ paint, manage layers, select, filter and undo.
 - GPU canvas *presentation*. The engine uses the GPU for pixel work (see
   below), but the canvas widget still blits the finished composite with
   `QPainter`.
-- Text, shapes, transforms, layer effects, adjustment-layer parameter dialogs,
-  Navigator panel.
+- Navigator panel.
+- In the Properties panel: the eyedroppers that pick a colour range off the
+  image, the Auto buttons, and "view previous state". Selecting a layer *mask*
+  shows the layer's properties rather than CS6's Density and Feather. The
+  Curves editor opens on a straight line rather than the layer's current curve
+  — a curve is stored as its 256-entry table, which cannot be turned back into
+  control points — and a Curves layer holds one curve for one channel rather
+  than a curve per channel. Black & White has no per-colour weights or tint,
+  and Brightness/Contrast has no Use Legacy, so those adjustments have fewer
+  controls here than in CS6.
 - Channel visibility is view-only — selecting an individual channel does not
   yet isolate it for editing. Alpha channels created via the Channels panel's
   New Channel button are display-only placeholders (not wired to the engine).
@@ -326,8 +362,9 @@ paint, manage layers, select, filter and undo.
     - Preferences
     
 - Image dropdown
-    ---
+
     Mode >  - in progress
+
       - Bitmap
       - Grayscale - 
       - Duotone
@@ -340,40 +377,122 @@ paint, manage layers, select, filter and undo.
       - 8 bits/channel DONE
       - 16 bits/channel DONE
       - 32 bits/channel DONE
+- 
     Adjustments > 
-      --- 
+
       - Brightness/Contrast - DONE
       - Levels - DONE
       - Curves - partly done - if area selected PR still does change on entire image vs selected area
       - Exposure - partly done - need work on eye dropper tool, presets
+
       ---
       - Vibrance - DONE
       - Hue/Saturation - DONE
-      - Color Balance - partly done - if area selected PR still does change on entire image vs selected area
-      - Black & White - partly done - if area selected PR still does change on entire image vs selected area
-      - Photo Filter - partly done - if area selected PR still does change on entire image vs selected area
-      - Channel Mixer - partly done - if area selected PR still does change on entire image vs selected area
+      - Color Balance - DONE
+      - Black & White - DONE
+      - Photo Filter - DONE
+      - Channel Mixer - DONE
       - Color Lookup - not implemented
+
       ---
       - Invert - DONE
       - Posterize - DONE
       - Threshold - DONE
       - Gradient Map - DONE
       - Selective Color - DONE
+
       ---
       - Shadows/Highlights - DONE
       - HDR Toning - partly done, presets need more work, doesnt look like PS presets
+
       ---
       - Desaturate - DONE
       - match color - not implemented
-      - Replace color - in progress - needs work, unable to move dialog, PR freezing up
-      - Equalize - not started
+      - Replace color - DDONE
+      - Equalize - DONE
       ---
-    Image Size
-    Canvas Size
-    Image Rotation > 180, 90 clockwise, 90 counter clock, arbitrary, flip canvas H, flip canvas V
+
+    Image Size - DONE
+
+    Canvas Size - DONE
+
+    Image Rotation > 180, 90 clockwise, 90 counter clock, arbitrary, flip canvas H, flip canvas V - DONE
+
+    Crop - DONE
+
+    Trim - DONE 
+
+    Reveal All - DONE 
+
+    Duplicate - DONE 
+
+    Calculations - not implemented
+
+    Analysis: 
+
+    - Ruler Tool - DONE
+    - Count Tool - DONE
       
 - Layer dropdown
+
+    New > Layer..., Layer from Background..., Layer Via Copy, Layer Via Cut - DONE
+    New > Group..., Group from Layers... - DONE. The first makes an empty
+      group to drag layers into, the second wraps the panel's selection; both
+      take the New Layer dialog's name, colour, mode and opacity. The Layers
+      panel's folder button makes an empty one without asking, as CS6's does.
+    New > Artboard... - CC only, not part of CS6.
+    Duplicate Layer... - DONE (with Destination: this document, another open
+      document, or a new one)
+    Delete:
+      - Layer - DONE
+      - Hidden Layers - DONE
+    Quick Export as PNG - DONE
+    Export As - 
+    Rename Layer - 
+    Layer Style - PARTLY DONE
+      Drop Shadow, Inner Shadow, Outer Glow, Inner Glow, Color Overlay,
+      Blending Options - DONE except Knockout, Blend Interior/Clipped as Group
+        and Vector Mask Hides Effects, which need layer groups and vector masks.
+      Styles are not yet written to or read from .psd.
+      - Blending Options - DONE (General, Advanced, Blend If with split handles;
+        Knockout and the group options need layer groups)
+      - Bevel Emboss - done, need to test consistency vs PS
+      - Stroke - DONE
+      - Inner Shadow - DONE
+      - Inner Glow - DONE
+      - Satin - DONE (no Contour curve, so the falloff is a plain difference)
+      - Color Overlay - DONE
+      - Gradient Overlay - DONE (all five shapes, Scale, Dither, Reverse,
+        Align with Layer; two stops rather than a full gradient editor)
+      - Pattern Overlay - DONE (the engine's own generated tiles, not Adobe's
+        artwork; no pattern picker beyond the eight built in) 
+      - Outer Glow - DONE
+      - Drop Shadow - DONE
+      - Copy Layer Style - 
+      - Paste Layer style -
+      - Clear layer style -
+      - Global Light - 
+      - Create Layer - 
+      - Hide All Effects - 
+      - Scale Effects -  
+
+    Rename Layer - 
+
+    New Fill Layer - DONE (Solid Color, Gradient, Pattern — all evaluated per
+      pixel rather than painted, so they stay editable)
+      
+    New Adjustment Layer - DONE
+    Layer Mask - not implemented (I dont know how this works in PS)
+    Vector Mask - not implemented (I dont know how this works in PS)
+    Create Clipping Mask - not implemented (I dont know how this works in PS)
+    Smart Objects - not implemented (I dont know how this works in PS)
+    Video Layers - not implemented (I dont know how this works in PS)
+    Group Layers - DONE (Ctrl+G). Ungroup Layers too, from the folder or from
+      anything inside it. Groups are isolated rather than CS6's Pass Through
+      default, cannot be nested, and Merge Group is not built.
+    Hide Layers - DONE (Ctrl+,), on the panel's whole selection, and reads
+      Show Layers once all of it is hidden.
+
 - Type dropdown
 - Select dropdown
 - Filter dropdown

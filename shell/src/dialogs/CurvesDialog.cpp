@@ -320,6 +320,18 @@ static QVector<CurvesPreset> buildPresets()
 // CurvesDialog
 // ---------------------------------------------------------------------------
 
+CurvesDialog::CurvesDialog(Engine *engine, int layerIndex, QWidget *parent)
+    : CurvesDialog(engine, parent)
+{
+    // Editing a layer, not the pixels: the curve is stored on the layer and
+    // the canvas shows it through that layer's mask.
+    m_adjustmentLayer = layerIndex;
+    if (m_engine) {
+        m_engine->beginAdjustmentEdit(layerIndex);
+    }
+    applyPreview();
+}
+
 CurvesDialog::CurvesDialog(Engine *engine, QWidget *parent)
     : QDialog(parent)
     , m_engine(engine)
@@ -465,7 +477,11 @@ CurvesDialog::CurvesDialog(Engine *engine, QWidget *parent)
 
 CurvesDialog::~CurvesDialog()
 {
-    revertPreview();
+    // Only the destructive path leaves a preview to undo; a layer edit has
+    // already been settled by `accept` or `reject`.
+    if (m_adjustmentLayer < 0) {
+        revertPreview();
+    }
 }
 
 void CurvesDialog::applyPreview()
@@ -473,17 +489,38 @@ void CurvesDialog::applyPreview()
     if (!m_engine || !m_preview->isChecked())
         return;
 
-    revertPreview();
-
     uint8_t lut[256];
     m_curveWidget->buildLut(lut);
-
     const int channel = m_channelCombo->currentIndex();
-    QByteArray lutData(reinterpret_cast<const char *>(lut), 256);
-    m_engine->applyCurvesLut(
-        rust::Slice<const uint8_t>(reinterpret_cast<const uint8_t *>(lutData.constData()), 256),
-        channel);
+    const rust::Slice<const uint8_t> table(lut, 256);
+
+    if (m_adjustmentLayer >= 0) {
+        // The layer carries the curve, so there is nothing to undo between
+        // previews — setting it again simply replaces what it was.
+        m_engine->setLayerCurves(table, channel);
+        return;
+    }
+
+    revertPreview();
+    m_engine->applyCurvesLut(table, channel);
     m_previewApplied = true;
+}
+
+void CurvesDialog::accept()
+{
+    if (m_adjustmentLayer >= 0 && m_engine) {
+        m_engine->endAdjustmentEdit(true);
+    }
+    QDialog::accept();
+}
+
+void CurvesDialog::reject()
+{
+    if (m_adjustmentLayer >= 0 && m_engine) {
+        // Nothing was committed, so the curve itself is what goes back.
+        m_engine->endAdjustmentEdit(false);
+    }
+    QDialog::reject();
 }
 
 void CurvesDialog::revertPreview()

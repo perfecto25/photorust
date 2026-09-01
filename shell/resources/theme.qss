@@ -758,12 +758,20 @@ QWidget#colorSwatches {
     background: transparent;
 }
 
-/* Rows in the Layers panel are taller than a normal list row to fit the
-   thumbnail — CS6 uses 40px at the default thumbnail size. */
-QListWidget#layerList::item {
+/* The Layers panel is a tree: a layer row is 40px to fit its thumbnail, an
+   effect row beneath it is short. The heights come from the delegate rather
+   than from here, since one rule cannot say both — and the divider under a
+   layer row is drawn there too, so it can be left off the effect rows. */
+QTreeView#layerList::item {
     padding: 0px;
-    min-height: 40px;
-    border-bottom: 1px solid #4a4a4a;
+}
+
+/* No branch artwork: CS6 puts the expander at the right of the row, which the
+   delegate draws. */
+QTreeView#layerList::branch {
+    background: transparent;
+    border-image: none;
+    image: none;
 }
 
 /* History rows are compact by comparison. */

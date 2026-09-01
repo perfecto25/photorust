@@ -3,14 +3,19 @@
 #include "canvas/CanvasView.h"
 #include "dialogs/BlackWhiteDialog.h"
 #include "dialogs/BrightnessContrastDialog.h"
+#include "dialogs/CanvasSizeDialog.h"
 #include "dialogs/ChannelMixerDialog.h"
 #include "dialogs/ColorBalanceDialog.h"
 #include "dialogs/ColorPickerDialog.h"
 #include "dialogs/CurvesDialog.h"
+#include "dialogs/LayerStyleDialog.h"
 #include "dialogs/LevelsDialog.h"
 #include "dialogs/ColorSettingsDialog.h"
+#include "dialogs/DuplicateImageDialog.h"
+#include "dialogs/DuplicateLayerDialog.h"
 #include "dialogs/ExposureDialog.h"
 #include "dialogs/FillDialog.h"
+#include "dialogs/FillLayerDialog.h"
 #include "dialogs/GradientMapDialog.h"
 #include "dialogs/HdrToningDialog.h"
 #include "dialogs/ExportAsDialog.h"
@@ -18,13 +23,17 @@
 #include "dialogs/FindReplaceTextDialog.h"
 #include "dialogs/FileInfoDialog.h"
 #include "dialogs/GifWriter.h"
+#include "dialogs/ImageSizeDialog.h"
 #include "dialogs/IndexedColorDialog.h"
 #include "dialogs/PhotoFilterDialog.h"
 #include "dialogs/PosterizeDialog.h"
 #include "dialogs/KeyboardShortcutsDialog.h"
 #include "dialogs/NewDocumentDialog.h"
+#include "dialogs/NewLayerDialog.h"
 #include "dialogs/PrintDialog.h"
 #include "dialogs/ReplaceColorDialog.h"
+#include "dialogs/RotateCanvasDialog.h"
+#include "dialogs/TrimDialog.h"
 #include "dialogs/SaveForWebDialog.h"
 #include "dialogs/SelectiveColorDialog.h"
 #include "dialogs/ShadowsHighlightsDialog.h"
@@ -38,6 +47,7 @@
 #include "panels/InfoPanel.h"
 #include "panels/LayersPanel.h"
 #include "panels/PathsPanel.h"
+#include "panels/PropertiesPanel.h"
 #include "panels/PanelHeader.h"
 #include "shortcuts/CommandRegistry.h"
 #include "tools/ToolIcons.h"
@@ -242,12 +252,18 @@ QString withExtension(const QString &path, const QString &nameFilter)
 /// could give it. Qt's own matching is case-insensitive, which is what makes
 /// "any supported format, whatever case it is written in" true rather than
 /// nearly true — and it themes with the rest of the application besides.
+/// `suggestedName` pre-fills the name box when saving, so a command that
+/// already knows what the file should be called does not make the user type it.
 QStringList askForFiles(QWidget *parent, const QString &caption, const QString &filter,
-                        QFileDialog::AcceptMode mode)
+                        QFileDialog::AcceptMode mode,
+                        const QString &suggestedName = QString())
 {
     QFileDialog dialog(parent, caption);
     dialog.setOption(QFileDialog::DontUseNativeDialog);
     dialog.setAcceptMode(mode);
+    if (!suggestedName.isEmpty()) {
+        dialog.selectFile(suggestedName);
+    }
     // Opening takes as many files as are highlighted — Shift for a run,
     // Ctrl for a scattering — and each becomes its own tab. Saving is one file
     // by definition.
@@ -287,9 +303,10 @@ QStringList askForFiles(QWidget *parent, const QString &caption, const QString &
 }
 
 QString askForFile(QWidget *parent, const QString &caption, const QString &filter,
-                   QFileDialog::AcceptMode mode)
+                   QFileDialog::AcceptMode mode,
+                   const QString &suggestedName = QString())
 {
-    const QStringList chosen = askForFiles(parent, caption, filter, mode);
+    const QStringList chosen = askForFiles(parent, caption, filter, mode, suggestedName);
     return chosen.isEmpty() ? QString() : chosen.first();
 }
 
@@ -525,8 +542,12 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     setWindowTitle(tr("PhotoRust"));
     resize(1400, 900);
     // Photoshop lets panels stack into tabbed groups and nest side by side.
+    // GroupedDragging is what lets a panel be dragged out of its tab group by
+    // its tab and float on its own, the way every CS6 panel does. Without it a
+    // tabbed panel can only be undocked by its title bar, and dragging the tab
+    // just reorders it within the group.
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks
-                   | QMainWindow::AllowTabbedDocks);
+                   | QMainWindow::AllowTabbedDocks | QMainWindow::GroupedDragging);
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
 
     // The canvas sits under a tab bar, one tab per open document, as CS6 does.
@@ -630,13 +651,15 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         return canvas ? canvas->colorAtGlobal(globalPos) : QColor();
     });
 
-    // Replace Color reads the same way, but needs the pixel's position too,
-    // for its Localized Color Clusters option.
-    ReplaceColorDialog::setSampler([canvas = QPointer<CanvasView>(m_canvas)](
-                                       const QPoint &globalPos, QColor *color,
-                                       QPoint *docPos) -> bool {
-        return canvas && canvas->sampleAtGlobal(globalPos, color, docPos);
-    });
+    // Replace Color samples through the canvas itself (it is shown
+    // non-modally, so the canvas sees the clicks); it only needs to be able
+    // to put its eyedropper on screen.
+    ReplaceColorDialog::setCursorHook(
+        [canvas = QPointer<CanvasView>(m_canvas)](const QCursor *cursor) {
+            if (canvas) {
+                canvas->setSamplingCursor(cursor);
+            }
+        });
 
     // Keep the tool strip's swatch and the Color panel showing the same pair.
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged,
@@ -1100,22 +1123,327 @@ void MainWindow::createMenus()
     adjustments->addAction(
         command(QStringLiteral("image.replaceColor"), tr("Replace Color..."),
                 [this] { applyAdjustment(QStringLiteral("Replace Color")); }));
+    adjustments->addAction(
+        command(QStringLiteral("image.equalize"), tr("Equalize"),
+                [this] { applyAdjustment(QStringLiteral("Equalize")); }));
 
     image->addSeparator();
+    image->addAction(command(QStringLiteral("image.imageSize"), tr("&Image Size..."),
+                             &MainWindow::showImageSize));
     image->addAction(command(QStringLiteral("image.canvasSize"), tr("&Canvas Size..."),
                              &MainWindow::showCanvasSize));
 
+    // Image Rotation turns the whole document — every layer and the selection
+    // with it — where Edit ▸ Transform turns only the active layer.
+    QMenu *rotation = image->addMenu(tr("Image Rotation"));
+    rotation->addAction(command(QStringLiteral("image.rotate180"), tr("180°"),
+                                [this] { rotateCanvas(180.0); }));
+    rotation->addAction(command(QStringLiteral("image.rotate90cw"), tr("90° Clockwise"),
+                                [this] { rotateCanvas(90.0); }));
+    rotation->addAction(command(QStringLiteral("image.rotate90ccw"),
+                                tr("90° Counter Clockwise"),
+                                [this] { rotateCanvas(270.0); }));
+    rotation->addAction(command(QStringLiteral("image.rotateArbitrary"), tr("Arbitrary..."),
+                                &MainWindow::showArbitraryRotation));
+    rotation->addSeparator();
+    rotation->addAction(command(QStringLiteral("image.flipCanvasHorizontal"),
+                                tr("Flip Canvas Horizontal"),
+                                [this] { flipCanvas(true); }));
+    rotation->addAction(command(QStringLiteral("image.flipCanvasVertical"),
+                                tr("Flip Canvas Vertical"),
+                                [this] { flipCanvas(false); }));
+
+    auto *cropAction = command(QStringLiteral("image.crop"), tr("Crop"),
+                               &MainWindow::cropToSelection);
+    image->addAction(cropAction);
+    image->addAction(command(QStringLiteral("image.trim"), tr("Trim..."),
+                             &MainWindow::showTrim));
+    image->addAction(command(QStringLiteral("image.revealAll"), tr("Reveal All"), [this] {
+        // Nothing hanging off the canvas means nothing to reveal, and the
+        // engine says so rather than costing a history step.
+        if (m_engine && m_engine->revealAll()) {
+            refreshAll();
+        }
+    }));
+
+    image->addSeparator();
+    image->addAction(command(QStringLiteral("image.duplicate"), tr("Duplicate..."),
+                             &MainWindow::showDuplicateImage));
+
+    // Analysis is CS6's second way to the two measuring tools, which otherwise
+    // hide behind the Eyedropper button. It selects them; it does not
+    // duplicate anything they do.
+    image->addSeparator();
+    QMenu *analysis = image->addMenu(tr("Analysis"));
+    const auto measuringTool = [this](EyedropperType variant) {
+        if (m_toolStrip) {
+            m_toolStrip->setActiveTool(ToolId::Eyedropper, static_cast<int>(variant));
+        }
+    };
+    auto *rulerAction = command(QStringLiteral("image.rulerTool"), tr("Ruler Tool"),
+                                [measuringTool] { measuringTool(EyedropperType::Ruler); });
+    rulerAction->setCheckable(true);
+    analysis->addAction(rulerAction);
+    auto *countAction = command(QStringLiteral("image.countTool"), tr("Count Tool"),
+                                [measuringTool] { measuringTool(EyedropperType::Count); });
+    countAction->setCheckable(true);
+    analysis->addAction(countAction);
+
+    connect(image, &QMenu::aboutToShow, this,
+            [this, cropAction, rulerAction, countAction] {
+                // CS6 greys Crop out until there is a selection to crop to.
+                cropAction->setEnabled(m_engine && m_engine->hasSelection());
+
+                // A tick against whichever measuring tool is in hand.
+                const bool eyedropper =
+                    m_toolStrip && m_toolStrip->activeTool() == ToolId::Eyedropper;
+                const int variant = m_toolStrip ? m_toolStrip->activeVariant() : -1;
+                rulerAction->setChecked(
+                    eyedropper && variant == static_cast<int>(EyedropperType::Ruler));
+                countAction->setChecked(
+                    eyedropper && variant == static_cast<int>(EyedropperType::Count));
+            });
+
     // -- Layer --------------------------------------------------------------
     QMenu *layer = menuBar()->addMenu(tr("&Layer"));
-    layer->addAction(command(QStringLiteral("layer.new"), tr("&New Layer"), [this] {
-        m_engine->addLayer();
-        refreshAll();
-    }));
-    layer->addAction(command(QStringLiteral("layer.newViaCopy"), tr("Layer via &Copy"),
-                             [this] {
-                                 m_engine->duplicateLayer(m_engine->getActiveLayerIndex());
-                                 refreshAll();
-                             }));
+
+    QMenu *layerNew = layer->addMenu(tr("&New"));
+    layerNew->addAction(command(QStringLiteral("layer.new"), tr("&Layer..."),
+                                &MainWindow::showNewLayer));
+    auto *fromBackgroundAction =
+        command(QStringLiteral("layer.newFromBackground"), tr("Layer from &Background..."),
+                &MainWindow::showLayerFromBackground);
+    layerNew->addAction(fromBackgroundAction);
+
+    // `layer.newGroup` rather than `layer.group`: this is CS6's Layer ▸ New ▸
+    // Group, which makes an empty one, and the registry hands back the *same*
+    // QAction for an id — sharing it with Layer ▸ Group Layers below would
+    // rename both entries to whichever was registered last.
+    layerNew->addAction(command(QStringLiteral("layer.newGroup"), tr("&Group..."),
+                                [this] { showNewGroup(false); }));
+    auto *groupFromLayersAction =
+        command(QStringLiteral("layer.groupFromLayers"), tr("Group &from Layers..."),
+                [this] { showNewGroup(true); });
+    layerNew->addAction(groupFromLayersAction);
+    connect(layerNew, &QMenu::aboutToShow, this, [this, groupFromLayersAction] {
+        groupFromLayersAction->setEnabled(m_engine
+                                          && m_engine->canGroupLayers(selectedLayerVector()));
+    });
+
+    layerNew->addSeparator();
+    auto *viaCopyAction =
+        command(QStringLiteral("layer.newViaCopy"), tr("Layer Via &Copy"), [this] {
+            if (m_engine && m_engine->layerViaCopy()) {
+                refreshAll();
+            }
+        });
+    layerNew->addAction(viaCopyAction);
+    auto *viaCutAction =
+        command(QStringLiteral("layer.newViaCut"), tr("Layer Via Cu&t"), [this] {
+            if (m_engine && m_engine->layerViaCut()) {
+                refreshAll();
+            }
+        });
+    layerNew->addAction(viaCutAction);
+
+    connect(layerNew, &QMenu::aboutToShow, this,
+            [this, fromBackgroundAction, viaCutAction] {
+                // Nothing to convert without a Background, and nothing to cut
+                // without a selection — CS6 greys both out rather than letting
+                // them do nothing.
+                fromBackgroundAction->setEnabled(m_engine && m_engine->hasBackgroundLayer());
+                viaCutAction->setEnabled(m_engine && m_engine->hasSelection());
+            });
+
+    layer->addAction(command(QStringLiteral("layer.duplicate"), tr("&Duplicate Layer..."),
+                             &MainWindow::showDuplicateLayer));
+
+    QMenu *layerDelete = layer->addMenu(tr("Dele&te"));
+    auto *deleteLayerAction = command(QStringLiteral("layer.delete"), tr("Layer"), [this] {
+        if (m_engine) {
+            m_engine->deleteLayer(m_engine->getActiveLayerIndex());
+            refreshAll();
+        }
+    });
+    layerDelete->addAction(deleteLayerAction);
+    auto *deleteHiddenAction =
+        command(QStringLiteral("layer.deleteHidden"), tr("Hidden Layers"), [this] {
+            if (m_engine && m_engine->deleteHiddenLayers() > 0) {
+                refreshAll();
+            }
+        });
+    layerDelete->addAction(deleteHiddenAction);
+    connect(layerDelete, &QMenu::aboutToShow, this,
+            [this, deleteLayerAction, deleteHiddenAction] {
+                // The engine refuses to leave a document with no layers, so
+                // the last one cannot go. Nothing hidden, likewise nothing to
+                // delete. CS6 greys both out rather than offering a no-op.
+                deleteLayerAction->setEnabled(m_engine && m_engine->getLayerCount() > 1);
+                deleteHiddenAction->setEnabled(m_engine && m_engine->hiddenLayerCount() > 0);
+            });
+
+    layer->addSeparator();
+    layer->addAction(command(QStringLiteral("layer.quickExportPng"),
+                             tr("&Quick Export as PNG"), &MainWindow::quickExportPng));
+    layer->addAction(command(QStringLiteral("layer.exportAs"), tr("&Export As..."),
+                             &MainWindow::exportLayerAs));
+
+    layer->addSeparator();
+    QMenu *newFill = layer->addMenu(tr("New &Fill Layer"));
+    newFill->addAction(command(QStringLiteral("layer.newFillSolid"), tr("Solid Color..."),
+                               &MainWindow::showNewFillLayer));
+    newFill->addAction(command(QStringLiteral("layer.newFillGradient"), tr("Gradient..."),
+                               &MainWindow::showNewGradientFillLayer));
+    newFill->addAction(command(QStringLiteral("layer.newFillPattern"), tr("Pattern..."),
+                               &MainWindow::showNewPatternFillLayer));
+
+    // CS6's list, in its groups. The engine says which of them it can
+    // evaluate as a live layer; the rest are listed and greyed rather than
+    // quietly making something else.
+    QMenu *newAdjustment = layer->addMenu(tr("New &Adjustment Layer"));
+    struct AdjustmentLayerEntry {
+        const char *id;
+        const char *kind;
+    };
+    const AdjustmentLayerEntry adjustmentLayers[] = {
+        {"layer.adjBrightness", "Brightness/Contrast"},
+        {"layer.adjLevels", "Levels"},
+        {"layer.adjCurves", "Curves"},
+        {"layer.adjExposure", "Exposure"},
+        {nullptr, nullptr},
+        {"layer.adjVibrance", "Vibrance"},
+        {"layer.adjHueSaturation", "Hue/Saturation"},
+        {"layer.adjColorBalance", "Color Balance"},
+        {"layer.adjBlackWhite", "Black & White"},
+        {"layer.adjPhotoFilter", "Photo Filter"},
+        {"layer.adjChannelMixer", "Channel Mixer"},
+        {"layer.adjColorLookup", "Color Lookup"},
+        {nullptr, nullptr},
+        {"layer.adjInvert", "Invert"},
+        {"layer.adjPosterize", "Posterize"},
+        {"layer.adjThreshold", "Threshold"},
+        {"layer.adjGradientMap", "Gradient Map"},
+        {"layer.adjSelectiveColor", "Selective Color"},
+    };
+    for (const AdjustmentLayerEntry &entry : adjustmentLayers) {
+        if (!entry.id) {
+            newAdjustment->addSeparator();
+            continue;
+        }
+        const QString kind = QString::fromLatin1(entry.kind);
+        auto *action = command(QString::fromLatin1(entry.id), kind + QStringLiteral("..."),
+                               [this, kind] { showNewAdjustmentLayer(kind); });
+        if (m_engine && !m_engine->supportsAdjustment(kind)) {
+            action->setEnabled(false);
+            action->setToolTip(
+                tr("Not available as a live layer yet — Image ▸ Adjustments has it"));
+        }
+        newAdjustment->addAction(action);
+    }
+
+    layer->addSeparator();
+    QMenu *layerStyle = layer->addMenu(tr("Layer &Style"));
+    {
+        // The effects the engine can draw, in CS6's menu order. Blending
+        // Options, Bevel & Emboss, Satin and Pattern Overlay are in the
+        // dialog's list too, greyed, so the shape of Photoshop's menu is
+        // visible even where the drawing is not built.
+        struct Entry {
+            const char *id;
+            const char *key;
+            QString title;
+        };
+        const Entry entries[] = {
+            {"layer.styleBevel", "bevel", tr("Bevel && Emboss...")},
+            {"layer.styleStroke", "stroke", tr("Stroke...")},
+            {"layer.styleInnerShadow", "innerShadow", tr("Inner Shadow...")},
+            {"layer.styleInnerGlow", "innerGlow", tr("Inner Glow...")},
+            {"layer.styleSatin", "satin", tr("Satin...")},
+            {"layer.styleColorOverlay", "colorOverlay", tr("Color Overlay...")},
+            {"layer.styleGradientOverlay", "gradientOverlay", tr("Gradient Overlay...")},
+            {"layer.stylePatternOverlay", "patternOverlay", tr("Pattern Overlay...")},
+            {"layer.styleOuterGlow", "outerGlow", tr("Outer Glow...")},
+            {"layer.styleDropShadow", "dropShadow", tr("Drop Shadow...")},
+        };
+
+        // The dialog's first page, which is the layer's own blending rather
+        // than an effect — so it opens with an empty key.
+        layerStyle->addAction(command(QStringLiteral("layer.styleBlendingOptions"),
+                                      tr("Blending Options..."),
+                                      [this] { showLayerStyle(QString()); }));
+        layerStyle->addSeparator();
+
+        // Kept with their keys so the menu can tick the ones the active layer
+        // already carries, as CS6 does.
+        QList<QPair<QAction *, QString>> effectActions;
+        for (const Entry &entry : entries) {
+            const QString key = QString::fromLatin1(entry.key);
+            auto *action = command(QString::fromLatin1(entry.id), entry.title,
+                                   [this, key] { showLayerStyle(key); });
+            action->setCheckable(true);
+            layerStyle->addAction(action);
+            effectActions.append({action, key});
+        }
+
+        layerStyle->addSeparator();
+        auto *copyStyle =
+            command(QStringLiteral("layer.copyStyle"), tr("Copy Layer Style"), [this] {
+                if (m_engine) {
+                    m_engine->copyLayerStyle(m_engine->getActiveLayerIndex());
+                }
+            });
+        auto *pasteStyle =
+            command(QStringLiteral("layer.pasteStyle"), tr("Paste Layer Style"), [this] {
+                if (m_engine && m_engine->pasteLayerStyle(m_engine->getActiveLayerIndex())) {
+                    refreshAll();
+                }
+            });
+        auto *clearStyle =
+            command(QStringLiteral("layer.clearStyle"), tr("Clear Layer Style"), [this] {
+                if (m_engine && m_engine->clearLayerEffects(m_engine->getActiveLayerIndex())) {
+                    refreshAll();
+                }
+            });
+        layerStyle->addAction(copyStyle);
+        layerStyle->addAction(pasteStyle);
+        layerStyle->addAction(clearStyle);
+
+        layerStyle->addSeparator();
+        auto *hideEffects =
+            command(QStringLiteral("layer.hideAllEffects"), tr("Hide All Effects"), [this] {
+                if (m_engine) {
+                    m_engine->hideAllEffects(!m_engine->effectsAreHidden());
+                    refreshAll();
+                }
+            });
+        layerStyle->addAction(hideEffects);
+
+        connect(layerStyle, &QMenu::aboutToShow, this,
+                [this, copyStyle, pasteStyle, clearStyle, hideEffects, effectActions] {
+                    const int index = m_engine ? m_engine->getActiveLayerIndex() : -1;
+                    const bool hasStyle = m_engine && m_engine->layerHasEffects(index);
+
+                    // A tick against every effect switched on for this layer —
+                    // the same state the dialog's checkboxes show.
+                    for (const auto &[action, key] : effectActions) {
+                        action->setChecked(
+                            m_engine
+                            && m_engine->layerEffectValue(index, key + QStringLiteral(".on"))
+                                   >= 0.5f);
+                    }
+                    copyStyle->setEnabled(hasStyle);
+                    clearStyle->setEnabled(hasStyle);
+                    pasteStyle->setEnabled(m_engine && m_engine->hasCopiedLayerStyle());
+
+                    const bool anyStyle = m_engine && m_engine->anyLayerHasEffects();
+                    hideEffects->setEnabled(anyStyle);
+                    // One entry that swaps its wording, as CS6 does.
+                    hideEffects->setText(m_engine && m_engine->effectsAreHidden()
+                                             ? tr("Show All Effects")
+                                             : tr("Hide All Effects"));
+                });
+    }
+
     layer->addSeparator();
     layer->addAction(command(QStringLiteral("layer.createClippingMask"),
                              tr("Create &Clipping Mask"), [this] {
@@ -1125,20 +1453,55 @@ void MainWindow::createMenus()
                                  refreshAll();
                              }));
     layer->addSeparator();
-    layer->addAction(command(QStringLiteral("layer.mergeDown"), tr("&Merge Down"), [this] {
-        m_engine->mergeLayerDown(m_engine->getActiveLayerIndex());
-        refreshAll();
-    }));
-    layer->addAction(command(QStringLiteral("layer.mergeVisible"), tr("&Flatten Image"),
-                             [this] {
-                                 m_engine->flattenImage();
-                                 refreshAll();
-                             }));
+    // CS6's Group / Ungroup / Hide block.
+    auto *groupAction = command(QStringLiteral("layer.group"), tr("&Group Layers"),
+                                &MainWindow::groupSelectedLayers);
+    layer->addAction(groupAction);
+    auto *ungroupAction = command(QStringLiteral("layer.ungroup"), tr("&Ungroup Layers"),
+                                  &MainWindow::ungroupSelectedLayers);
+    layer->addAction(ungroupAction);
+    auto *hideLayersAction = command(QStringLiteral("layer.hide"), tr("&Hide Layers"),
+                                     &MainWindow::toggleSelectedLayersVisible);
+    layer->addAction(hideLayersAction);
+    layer->setToolTipsVisible(true);
+
     layer->addSeparator();
-    layer->addAction(command(QStringLiteral("layer.delete"), tr("&Delete Layer"), [this] {
-        m_engine->deleteLayer(m_engine->getActiveLayerIndex());
-        refreshAll();
-    }));
+    auto *mergeDownAction =
+        command(QStringLiteral("layer.mergeDown"), tr("&Merge Down"), [this] {
+            m_engine->mergeLayerDown(m_engine->getActiveLayerIndex());
+            refreshAll();
+        });
+    layer->addAction(mergeDownAction);
+    auto *flattenAction =
+        command(QStringLiteral("layer.mergeVisible"), tr("&Flatten Image"), [this] {
+            m_engine->flattenImage();
+            refreshAll();
+        });
+    layer->addAction(flattenAction);
+
+    connect(layer, &QMenu::aboutToShow, this,
+            [this, mergeDownAction, flattenAction, hideLayersAction, groupAction,
+             ungroupAction] {
+        // One entry that swaps its wording, as CS6 does: it offers to show the
+        // selection back only once all of it is hidden.
+        hideLayersAction->setText(selectedLayersAreHidden() ? tr("&Show Layers")
+                                                            : tr("&Hide Layers"));
+        groupAction->setEnabled(m_engine
+                                && m_engine->canGroupLayers(selectedLayerVector()));
+        // Ungroup takes the folder or anything in it, so it lights up for
+        // either — which is what CS6 does.
+        const int active = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        ungroupAction->setEnabled(m_engine && active >= 0
+                                  && (m_engine->layerIsGroup(active)
+                                      || m_engine->layerGroupIndex(active) >= 0));
+        const int count = m_engine ? m_engine->getLayerCount() : 0;
+        // Merge Down needs something underneath: the bottom layer has nothing
+        // to merge into, and a single layer is always the bottom one. The
+        // panel's row menu greys its own entry on the same test.
+        mergeDownAction->setEnabled(count > 1 && active >= 0 && active < count - 1);
+        // Flattening one layer would only rewrite it as itself.
+        flattenAction->setEnabled(count > 1);
+    });
 
     // -- Select -------------------------------------------------------------
     QMenu *select = menuBar()->addMenu(tr("&Select"));
@@ -1425,6 +1788,18 @@ void MainWindow::createOptionsBar()
 
 void MainWindow::populateOptionsBar(ToolId tool, int variant)
 {
+    // Building the bar sets every control, and each of those emits its change
+    // signal. Nothing here is the user changing anything, so the handlers must
+    // not act on it — a type layer would be re-rendered, and re-recorded in the
+    // History panel, just for being selected.
+    const bool wasBuilding = m_buildingOptionsBar;
+    m_buildingOptionsBar = true;
+    struct Guard {
+        bool *flag;
+        bool restore;
+        ~Guard() { *flag = restore; }
+    } guard{&m_buildingOptionsBar, wasBuilding};
+
     m_optionsBar->clear();
     // These point into the widgets we just deleted.
     m_brushOpacity = nullptr;
@@ -3140,6 +3515,53 @@ void MainWindow::pushTypeOptions()
     resolved.setPointSizeF(m_typeFont.pointSizeF());
     m_canvas->setTypeOptions(resolved, m_typeStyle, m_typeColor, m_typeAlignment,
                              m_typeAntialias);
+
+    // With a type layer selected and no edit in progress, the bar restyles
+    // that layer — Photoshop does not make you click into the text and select
+    // it first. The canvas refuses when the layer is not type, or when an edit
+    // is running and owns the setting instead.
+    if (!m_buildingOptionsBar && !m_canvas->isTyping() && m_engine
+        && m_canvas->restyleTypeLayer(m_engine->getActiveLayerIndex())) {
+        refreshAll();
+    }
+}
+
+/// The alignment a stored type record's code stands for — CS6's 0, 1, 2.
+static Qt::Alignment typeAlignmentFor(int code)
+{
+    switch (code) {
+    case 1:
+        return Qt::AlignHCenter;
+    case 2:
+        return Qt::AlignRight;
+    default:
+        return Qt::AlignLeft;
+    }
+}
+
+void MainWindow::syncTypeBarToActiveLayer()
+{
+    if (!m_engine || !m_canvas || m_canvas->isTyping() || m_activeTool != ToolId::Type) {
+        return;
+    }
+    const int index = m_engine->getActiveLayerIndex();
+    if (index == m_typeBarLayer) {
+        return;
+    }
+    m_typeBarLayer = index;
+    if (m_engine->layerTextRunCount(index) <= 0) {
+        return;
+    }
+    // Show what the selected layer is set in, before the bar is used to change
+    // it: otherwise touching the size alone would also impose whatever family
+    // and colour the bar happened to be left on.
+    adoptTypeStyle(m_engine->layerTextRunFamily(index, 0),
+                   m_engine->layerTextRunStyle(index, 0),
+                   m_engine->layerTextRunSize(index, 0),
+                   m_engine->layerTextRunColor(index, 0),
+                   typeAlignmentFor(m_engine->layerTextAlign(index)),
+                   m_engine->layerTextAntialias(index),
+                   m_engine->layerTextVertical(index));
 }
 
 void MainWindow::adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
@@ -4220,11 +4642,14 @@ void MainWindow::createDocks()
     QDockWidget *swatchesDock =
         addPanel(tr("Swatches"), swatchesPlaceholder, Qt::RightDockWidgetArea);
 
-    // CS6 tabs Info in with Properties; we have no Properties panel, so it
-    // joins the Color/Swatches group in the same corner of the dock area.
     m_infoPanel = new InfoPanel(m_engine, this);
     m_infoDock = addPanel(tr("Info"), m_infoPanel, Qt::RightDockWidgetArea,
                           QStringLiteral("window.info"));
+
+    // CS6 tabs Properties in with Color and Swatches, in that corner.
+    m_propertiesPanel = new PropertiesPanel(m_engine, this);
+    m_propertiesDock = addPanel(tr("Properties"), m_propertiesPanel,
+                                Qt::RightDockWidgetArea);
 
     m_historyPanel = new HistoryPanel(m_engine, this);
     QDockWidget *historyDock = addPanel(tr("History"), m_historyPanel,
@@ -4248,6 +4673,9 @@ void MainWindow::createDocks()
         if (m_infoDock) {
             tabifyDockWidget(swatchesDock, m_infoDock);
         }
+        if (m_propertiesDock) {
+            tabifyDockWidget(m_infoDock ? m_infoDock : swatchesDock, m_propertiesDock);
+        }
         colorDock->raise();
     }
     tabifyDockWidget(layersDock, channelsDock);
@@ -4256,6 +4684,15 @@ void MainWindow::createDocks()
 
     resizeDocks({historyDock, layersDock}, {220, 380}, Qt::Vertical);
 
+    connect(m_layersPanel, &LayersPanel::editLayerStyle, this,
+            [this](int layerIndex, const QString &effectKey) {
+                if (m_engine) {
+                    m_engine->setActiveLayer(layerIndex);
+                }
+                // An empty key is the "Effects" heading, which opens the dialog
+                // wherever it was last.
+                showLayerStyle(effectKey);
+            });
     connect(m_layersPanel, &LayersPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
     connect(m_historyPanel, &HistoryPanel::documentChanged,
@@ -4264,6 +4701,8 @@ void MainWindow::createDocks()
             this, &MainWindow::onDocumentChanged);
     connect(m_channelsPanel, &ChannelsPanel::channelMaskChanged,
             m_canvas, &CanvasView::setChannelMask);
+    connect(m_propertiesPanel, &PropertiesPanel::documentChanged,
+            this, &MainWindow::onDocumentChanged);
 }
 
 void MainWindow::createStatusBar()
@@ -4356,6 +4795,12 @@ void MainWindow::connectEngine()
     // re-reads. No panel pushes state at another panel.
     connect(m_engine, &Engine::canvasChanged, m_canvas, &CanvasView::refresh);
     connect(m_engine, &Engine::layersChanged, m_layersPanel, &LayersPanel::refresh);
+    // Selecting a layer goes through the engine, so this covers both a change
+    // to the layer and a change of which layer the panel is showing.
+    connect(m_engine, &Engine::layersChanged, m_propertiesPanel,
+            &PropertiesPanel::refresh);
+    connect(m_engine, &Engine::documentsChanged, m_propertiesPanel,
+            &PropertiesPanel::refresh);
     connect(m_engine, &Engine::canvasChanged, m_channelsPanel, &ChannelsPanel::refresh);
     connect(m_engine, &Engine::historyChanged, m_historyPanel, &HistoryPanel::refresh);
     connect(m_engine, &Engine::selectionChanged, m_canvas, &CanvasView::refreshSelection);
@@ -4612,8 +5057,41 @@ void MainWindow::exportAs()
     if (composite.isNull())
         return;
 
-    const QString docName = m_engine->getDocumentTitle();
-    ExportAsDialog dialog(composite, docName, this);
+    exportImageAs(composite, m_engine->getDocumentTitle());
+}
+
+void MainWindow::exportLayerAs()
+{
+    if (!m_engine)
+        return;
+
+    const int index = m_engine->getActiveLayerIndex();
+    const QImage layer = m_engine->layerImage(index);
+    if (layer.isNull())
+        return;
+
+    // Photoshop exports the layer's *content*, not its buffer: a layer may
+    // hold a canvas-sized buffer with a few strokes in it, and exporting the
+    // empty margin with it would be a surprise. The bounds are in document
+    // space, so they come back to the layer's own by its offset.
+    const QRect bounds = m_engine->layerContentBounds(index);
+    QImage image = layer;
+    if (!bounds.isEmpty()) {
+        image = layer.copy(bounds.translated(-m_engine->layerOffsetX(index),
+                                             -m_engine->layerOffsetY(index)));
+    }
+    if (image.isNull()) {
+        QMessageBox::information(this, tr("Export As"),
+                                 tr("This layer has nothing in it to export."));
+        return;
+    }
+
+    exportImageAs(image, m_engine->layerName(index));
+}
+
+void MainWindow::exportImageAs(const QImage &image, const QString &name)
+{
+    ExportAsDialog dialog(image, name, this);
     if (dialog.exec() != QDialog::Accepted)
         return;
 
@@ -4864,34 +5342,427 @@ void MainWindow::findReplaceText()
     refreshAll();
 }
 
+void MainWindow::showImageSize()
+{
+    ImageSizeDialog dialog(m_engine, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    // Resolution is print metadata and changes no pixels, so it is applied
+    // whether or not the image itself was resampled.
+    m_engine->setImageResolution(float(dialog.resultResolution()));
+
+    const int mode = dialog.resampleMode();
+    if (mode >= 0
+        && (dialog.resultWidth() != m_engine->getCanvasWidth()
+            || dialog.resultHeight() != m_engine->getCanvasHeight())) {
+        m_engine->resampleImage(dialog.resultWidth(), dialog.resultHeight(), mode);
+    }
+    refreshAll();
+}
+
 void MainWindow::showCanvasSize()
 {
-    QDialog dialog(this);
-    dialog.setWindowTitle(tr("Canvas Size"));
-    auto *form = new QFormLayout(&dialog);
+    CanvasSizeDialog dialog(m_engine, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    const QColor fill = dialog.extensionColor();
+    m_engine->resizeCanvasAnchored(dialog.resultWidth(), dialog.resultHeight(),
+                                   dialog.anchorX(), dialog.anchorY(),
+                                   fill.red(), fill.green(), fill.blue(),
+                                   fill.isValid() ? fill.alpha() : 0);
+    refreshAll();
+}
 
-    auto *width = new QSpinBox(&dialog);
-    width->setRange(1, 30000);
-    width->setValue(m_engine->getCanvasWidth());
-    width->setSuffix(tr(" px"));
-    form->addRow(tr("Width:"), width);
+void MainWindow::rotateCanvas(double degrees)
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->rotateCanvas(float(degrees));
+    refreshAll();
+}
 
-    auto *height = new QSpinBox(&dialog);
-    height->setRange(1, 30000);
-    height->setValue(m_engine->getCanvasHeight());
-    height->setSuffix(tr(" px"));
-    form->addRow(tr("Height:"), height);
+void MainWindow::flipCanvas(bool horizontal)
+{
+    if (!m_engine) {
+        return;
+    }
+    m_engine->flipCanvas(horizontal);
+    refreshAll();
+}
 
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
-                                         &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    form->addRow(buttons);
+void MainWindow::showArbitraryRotation()
+{
+    RotateCanvasDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    rotateCanvas(dialog.degreesClockwise());
+}
 
-    if (dialog.exec() == QDialog::Accepted) {
-        m_engine->resizeCanvas(width->value(), height->value());
+void MainWindow::cropToSelection()
+{
+    if (!m_engine || !m_engine->hasSelection()) {
+        return;
+    }
+    // A selection of any shape crops to its bounding box, as in CS6 — the
+    // canvas is a rectangle whatever the marquee was drawn with.
+    const rust::Vec<::std::int32_t> bounds = m_engine->selectionBounds();
+    if (bounds.size() < 4 || bounds[2] < 1 || bounds[3] < 1) {
+        return;
+    }
+    // Pixels outside the new canvas are kept rather than deleted, the same
+    // choice Canvas Size makes: enlarging the canvas again brings them back.
+    // The Crop tool's "Delete Cropped Pixels" is what discards them.
+    m_engine->cropTo(bounds[0], bounds[1], bounds[2], bounds[3], false);
+    refreshAll();
+}
+
+void MainWindow::showTrim()
+{
+    if (!m_engine) {
+        return;
+    }
+    TrimDialog dialog(m_engine, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    // A trim that finds nothing to cut reports false and leaves the document
+    // — and its history — alone, so there is nothing to refresh.
+    if (m_engine->trimImage(dialog.basis(), dialog.trimTop(), dialog.trimBottom(),
+                            dialog.trimLeft(), dialog.trimRight())) {
         refreshAll();
     }
+}
+
+void MainWindow::showNewLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    NewLayerDialog dialog(m_engine, false, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_engine->addLayerConfigured(dialog.layerName(), dialog.blendMode(),
+                                 dialog.opacityPercent(), dialog.useClippingMask(),
+                                 dialog.labelColor());
+    refreshAll();
+}
+
+void MainWindow::showLayerFromBackground()
+{
+    if (!m_engine || !m_engine->hasBackgroundLayer()) {
+        return;
+    }
+    NewLayerDialog dialog(m_engine, true, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    // Name, mode and opacity go over together: the conversion is one step in
+    // the History panel, not three.
+    if (m_engine->layerFromBackground(dialog.layerName(), dialog.blendMode(),
+                                      dialog.opacityPercent())) {
+        refreshAll();
+    }
+}
+
+void MainWindow::showLayerStyle(const QString &effect)
+{
+    if (!m_engine) {
+        return;
+    }
+    // The dialog writes into the engine live and commits on OK, so there is
+    // nothing to apply here — only the repaint either outcome needs.
+    LayerStyleDialog dialog(m_engine, m_engine->getActiveLayerIndex(), effect, this);
+    dialog.exec();
+    refreshAll();
+}
+
+void MainWindow::showNewFillLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    // CS6 asks twice: first what the layer is called and how it blends, then
+    // what colour it is.
+    NewLayerDialog dialog(m_engine, false, this);
+    dialog.setWindowTitle(tr("New Layer"));
+    dialog.presetName(m_engine->suggestedLayerName(QStringLiteral("Color Fill")));
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const QColor color = ColorPickerDialog::getColor(m_engine->foregroundColor(), this,
+                                                     tr("Pick a Solid Color"));
+    if (!color.isValid()) {
+        return;
+    }
+
+    m_engine->addFillLayer(dialog.layerName(), color.red(), color.green(), color.blue(),
+                           dialog.blendMode(), dialog.opacityPercent(),
+                           dialog.useClippingMask(), dialog.labelColor());
+    refreshAll();
+}
+
+void MainWindow::showNewAdjustmentLayer(const QString &kind)
+{
+    if (!m_engine) {
+        return;
+    }
+    NewLayerDialog dialog(m_engine, false, this);
+    dialog.setWindowTitle(tr("New Layer"));
+    dialog.presetName(m_engine->suggestedLayerName(kind));
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    if (!m_engine->addAdjustmentLayerConfigured(kind, dialog.layerName(), dialog.blendMode(),
+                                                dialog.opacityPercent(),
+                                                dialog.useClippingMask(),
+                                                dialog.labelColor())) {
+        return;
+    }
+    refreshAll();
+
+    // CS6 brings Properties forward on a new adjustment layer, which is where
+    // its settings are — the layer arrives at its defaults and is expected to
+    // be adjusted straight away.
+    if (m_propertiesDock) {
+        m_propertiesDock->show();
+        m_propertiesDock->raise();
+    }
+
+    // Curves is the one adjustment with a curve to draw, so its dialog opens
+    // on the new layer — editing what the layer carries rather than the pixels
+    // beneath it.
+    if (kind == QLatin1String("Curves")) {
+        CurvesDialog curves(m_engine, m_engine->getActiveLayerIndex(), this);
+        curves.exec();
+        refreshAll();
+    }
+}
+
+void MainWindow::showNewGradientFillLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    NewLayerDialog naming(m_engine, false, this);
+    naming.setWindowTitle(tr("New Layer"));
+    naming.presetName(m_engine->suggestedLayerName(QStringLiteral("Gradient Fill")));
+    if (naming.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    // CS6 makes the layer and *then* asks what it should pour, so the canvas
+    // shows the fill while it is being chosen. Nothing reaches the History
+    // panel unless the dialog is accepted.
+    m_engine->beginFillLayerPreview(naming.layerName(), 1, naming.blendMode(),
+                                    naming.opacityPercent(), naming.useClippingMask(),
+                                    naming.labelColor());
+    refreshAll();
+
+    GradientFillDialog fill(m_engine, this);
+    const bool keep = fill.exec() == QDialog::Accepted;
+    m_engine->endFillLayerPreview(keep);
+    refreshAll();
+}
+
+void MainWindow::showNewPatternFillLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    NewLayerDialog naming(m_engine, false, this);
+    naming.setWindowTitle(tr("New Layer"));
+    naming.presetName(m_engine->suggestedLayerName(QStringLiteral("Pattern Fill")));
+    if (naming.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    m_engine->beginFillLayerPreview(naming.layerName(), 2, naming.blendMode(),
+                                    naming.opacityPercent(), naming.useClippingMask(),
+                                    naming.labelColor());
+    refreshAll();
+
+    PatternFillDialog fill(m_engine, this);
+    const bool keep = fill.exec() == QDialog::Accepted;
+    m_engine->endFillLayerPreview(keep);
+    refreshAll();
+}
+
+void MainWindow::showDuplicateLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    const int index = m_engine->getActiveLayerIndex();
+    DuplicateLayerDialog dialog(m_engine, index, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    if (m_engine->duplicateLayerAs(index, dialog.copyName(), dialog.destination(),
+                                   dialog.newDocumentName())) {
+        refreshAll();
+    }
+}
+
+QList<int> MainWindow::selectedLayerIndices() const
+{
+    QList<int> indices = m_layersPanel ? m_layersPanel->selectedIndices() : QList<int>{};
+    if (indices.isEmpty() && m_engine) {
+        const int active = m_engine->getActiveLayerIndex();
+        if (active >= 0) {
+            indices.append(active);
+        }
+    }
+    return indices;
+}
+
+QVector<int> MainWindow::selectedLayerVector() const
+{
+    const QList<int> indices = selectedLayerIndices();
+    return QVector<int>(indices.begin(), indices.end());
+}
+
+void MainWindow::showNewGroup(bool fromSelection)
+{
+    if (!m_engine) {
+        return;
+    }
+    NewLayerDialog dialog(m_engine, false, this);
+    dialog.setWindowTitle(fromSelection ? tr("New Group from Layers") : tr("New Group"));
+    dialog.presetName(m_engine->suggestedLayerName(QStringLiteral("Group")));
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    if (fromSelection) {
+        const QVector<int> indices = selectedLayerVector();
+        if (indices.isEmpty() || !m_engine->groupLayers(indices)) {
+            return;
+        }
+        // `groupLayers` leaves the new folder active, so the dialog's settings
+        // land on it through the ordinary per-layer calls.
+        m_engine->setLayerName(m_engine->getActiveLayerIndex(), dialog.layerName());
+    } else {
+        m_engine->addLayerGroup(dialog.layerName());
+    }
+
+    const int group = m_engine->getActiveLayerIndex();
+    m_engine->setLayerBlendMode(group, dialog.blendMode());
+    m_engine->setLayerOpacity(group, dialog.opacityPercent());
+    m_engine->setLayerLabel(group, dialog.labelColor());
+    refreshAll();
+}
+
+void MainWindow::groupSelectedLayers()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QVector<int> indices = selectedLayerVector();
+    if (indices.isEmpty() || !m_engine->groupLayers(indices)) {
+        return;
+    }
+    refreshAll();
+}
+
+void MainWindow::ungroupSelectedLayers()
+{
+    if (!m_engine) {
+        return;
+    }
+    if (m_engine->ungroupLayers(m_engine->getActiveLayerIndex())) {
+        refreshAll();
+    }
+}
+
+bool MainWindow::selectedLayersAreHidden() const
+{
+    if (!m_engine) {
+        return false;
+    }
+    const QList<int> indices = selectedLayerIndices();
+    if (indices.isEmpty()) {
+        return false;
+    }
+    for (int index : indices) {
+        if (m_engine->layerVisible(index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MainWindow::toggleSelectedLayersVisible()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QList<int> indices = selectedLayerIndices();
+    if (indices.isEmpty()) {
+        return;
+    }
+    // CS6 hides what is showing: with a mixed selection the entry reads Hide,
+    // and hides the lot. Only when every one of them is already hidden does it
+    // offer to bring them back.
+    const bool hide = !selectedLayersAreHidden();
+    for (int index : indices) {
+        m_engine->setLayerVisible(index, !hide);
+    }
+    refreshAll();
+}
+
+void MainWindow::quickExportPng()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QImage composite = m_engine->compositeImage();
+    if (composite.isNull()) {
+        return;
+    }
+
+    // Quick Export asks nothing but where to put it: no format, no quality, no
+    // preview. That is the whole point of it next to Export As.
+    QString suggested = m_engine->documentName();
+    const int dot = suggested.lastIndexOf(QLatin1Char('.'));
+    if (dot > 0) {
+        suggested.truncate(dot);
+    }
+    const QString path = askForFile(this, tr("Quick Export as PNG"), tr("PNG (*.png)"),
+                                    QFileDialog::AcceptSave, suggested + QStringLiteral(".png"));
+    if (path.isEmpty()) {
+        return;
+    }
+
+    if (composite.save(path, "PNG")) {
+        statusBar()->showMessage(tr("Exported to %1").arg(path), 4000);
+    } else {
+        QMessageBox::warning(this, tr("Quick Export as PNG"),
+                             tr("Could not write \"%1\".").arg(path));
+    }
+}
+
+void MainWindow::showDuplicateImage()
+{
+    if (!m_engine) {
+        return;
+    }
+    DuplicateImageDialog dialog(m_engine, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    // The copy opens in its own tab and becomes the active document; the tab
+    // bar follows the engine's `documentsChanged`.
+    m_engine->duplicateDocument(dialog.copyName(), dialog.mergedOnly());
+    refreshAll();
+    fitOnScreen();
 }
 
 void MainWindow::applyAdjustment(const QString &name)
@@ -5036,13 +5907,41 @@ void MainWindow::applyAdjustment(const QString &name)
         }
         refreshAll();
         return;
+    } else if (name == QLatin1String("Equalize")) {
+        // No dialog, like Desaturate and Invert.
+        m_engine->applyEqualize();
+        refreshAll();
+        return;
     } else if (name == QLatin1String("Replace Color")) {
-        ReplaceColorDialog dlg(m_engine, this);
-        if (dlg.exec() != QDialog::Accepted) {
-            refreshAll();
+        // Shown non-modally, unlike every other adjustment dialog.
+        //
+        // Its eyedropper has to see clicks on the canvas, and Qt delivers no
+        // mouse events whatsoever to a window a modal dialog has blocked — so
+        // a modal version cannot sample the image at all, however it filters
+        // events. The canvas goes into colour-sampling mode for the dialog's
+        // lifetime, which stops the active tool from painting on the image
+        // while the user is picking from it.
+        if (m_replaceColorDialog) {
+            m_replaceColorDialog->raise();
+            m_replaceColorDialog->activateWindow();
             return;
         }
-        refreshAll();
+        auto *dlg = new ReplaceColorDialog(m_engine, this);
+        m_replaceColorDialog = dlg;
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        if (m_canvas) {
+            m_canvas->setColorSampling(true);
+            connect(m_canvas, &CanvasView::colorSampled,
+                    dlg, &ReplaceColorDialog::addSample);
+        }
+        connect(dlg, &QDialog::finished, this, [this] {
+            if (m_canvas) {
+                m_canvas->setColorSampling(false);
+            }
+            m_replaceColorDialog = nullptr;
+            refreshAll();
+        });
+        dlg->show();
         return;
     } else if (name == QLatin1String("Gradient Map")) {
         GradientMapDialog dlg(m_engine, this);
@@ -5201,6 +6100,8 @@ void MainWindow::onDocumentChanged()
 {
     m_canvas->refresh();
     updateWindowTitle();
+    // Selecting a different type layer re-points the Type options bar at it.
+    syncTypeBarToActiveLayer();
 }
 
 void MainWindow::onCursorMoved(const QPointF &pos)
@@ -5261,6 +6162,7 @@ void MainWindow::refreshAll()
     m_canvas->refresh();
     m_layersPanel->refresh();
     m_historyPanel->refresh();
+    m_propertiesPanel->refresh();
     updateWindowTitle();
 
     m_statusDocSize->setText(tr("%1 × %2 px")

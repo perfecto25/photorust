@@ -23,6 +23,22 @@ private:
     int m_hueShift = 0;
 };
 
+/// One entry of CS6's Preset menu. Hue is in degrees, the other two in
+/// percent — the numbers as the controls show them, not as the engine takes
+/// them.
+struct HueSatPreset {
+    const char *name;
+    int hue;
+    int saturation;
+    int lightness;
+    bool colorize;
+};
+
+/// The preset list, shared with the Properties panel so the two offer the same
+/// menu. "Default" is first and "Custom" is not in here: it is what the combo
+/// shows once the sliders no longer match any preset.
+const QList<HueSatPreset> &hueSaturationPresets();
+
 class HueSaturationDialog : public QDialog
 {
     Q_OBJECT

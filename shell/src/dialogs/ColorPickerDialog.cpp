@@ -16,6 +16,7 @@
 #include <QCursor>
 #include <QGuiApplication>
 #include <QSpinBox>
+#include <QApplication>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -677,17 +678,37 @@ void ColorPickerDialog::updateHoverSampling()
     }
 
     const QPoint pos = QCursor::pos();
-    const bool outside = !frameGeometry().contains(pos);
 
-    if (outside == m_sampling) {
-        // Already in the right state; just keep reading while outside.
+    // Only take the mouse while the pointer is genuinely over the image.
+    //
+    // A mouse grab is system-wide, so grabbing merely because the pointer
+    // left the dialog swallowed every click meant for another application and
+    // made the whole desktop look frozen. `topLevelAt` returns null when the
+    // window under the pointer belongs to somebody else.
+    // Geometry rather than `QApplication::topLevelAt`, which can report
+    // nothing over a window this modal dialog has blocked — and then the
+    // eyedropper would never engage at all.
+    bool ownWindow = false;
+    const auto windows = QApplication::topLevelWidgets();
+    for (const QWidget *w : windows) {
+        if (w->isVisible() && w->frameGeometry().contains(pos)) {
+            ownWindow = true;
+            break;
+        }
+    }
+    const bool overImage = ownWindow && !overSelf(pos) && g_sampler(pos).isValid();
+
+    if (overImage == m_sampling) {
+        // Already in the right state; keep reading while over the image —
+        // unless a click has latched a colour, in which case the pointer is
+        // only moving over the image, not choosing from it.
         if (m_sampling) {
-            showCursorFor(sampleAt(pos));
+            showCursorFor(m_latched ? g_sampler(pos).isValid() : sampleAt(pos));
         }
         return;
     }
 
-    if (outside) {
+    if (overImage) {
         // A drag that began inside the dialog — sliding out of the colour
         // field's edge, say — belongs to the control it started on. Taking the
         // mouse mid-drag would cut that gesture off, so sampling waits until
@@ -698,9 +719,7 @@ void ColorPickerDialog::updateHoverSampling()
         m_sampling = true;
         // The dialog is modal, so the canvas cannot see the pointer at all:
         // holding the mouse is what lets the dialog read where it is and catch
-        // a click on the image. The cursor is *not* taken with the grab,
-        // because it has to change as the pointer crosses on and off the
-        // canvas — see `showCursorFor`.
+        // a click on the image.
         grabMouse();
         QGuiApplication::setOverrideCursor(Qt::ArrowCursor);
         m_cursorOverridden = true;
@@ -710,6 +729,30 @@ void ColorPickerDialog::updateHoverSampling()
         releaseMouse();
         clearCursorOverride();
     }
+}
+
+bool ColorPickerDialog::overSelf(const QPoint &pos) const
+{
+    // Everything this dialog occupies on screen, *including its title bar*.
+    //
+    // `QWidget::frameGeometry` reports the client area alone until the window
+    // manager has decorated the window, and on some it never widens. The title
+    // bar then counts as "over the image": the eyedropper engages there and
+    // takes a system-wide mouse grab, so the press that should have started a
+    // window drag never reaches the window manager and the dialog cannot be
+    // moved. Asking the window handle as well is what closes that gap.
+    QRect self = frameGeometry();
+    if (self.top() >= geometry().top()) {
+        // No decoration reported, so the title bar is not in that rect. It sits
+        // directly above the client area, so a band there is excluded rather
+        // than nothing at all — bounded, and only over this dialog. Unioning
+        // whatever the window handle reports instead was worse: on a platform
+        // that over-reports, the exclusion swallowed the canvas and the
+        // eyedropper stopped working anywhere.
+        constexpr int kTitleBand = 48;
+        self.setTop(self.top() - kTitleBand);
+    }
+    return self.contains(pos);
 }
 
 void ColorPickerDialog::showCursorFor(bool overImage)
@@ -763,13 +806,45 @@ void ColorPickerDialog::mouseMoveEvent(QMouseEvent *event)
     QDialog::mouseMoveEvent(event);
 }
 
+void ColorPickerDialog::mousePressEvent(QMouseEvent *event)
+{
+    const QPoint pos = event->globalPosition().toPoint();
+
+    // A press that lands on the dialog rather than on the image is not a
+    // sample — it is someone reaching for the window. Let go of the mouse so
+    // the press reaches whatever it was aimed at, the title bar included.
+    if (m_sampling && overSelf(pos)) {
+        m_sampling = false;
+        m_latched = false;
+        releaseMouse();
+        clearCursorOverride();
+        event->ignore();
+        return;
+    }
+
+    if (m_sampling) {
+        // A click on the image holds that colour: the pointer can then travel
+        // back to the dialog — over anything at all on the way — without the
+        // colour following it. Clicking again lets go and the eyedropper reads
+        // live once more.
+        m_latched = !m_latched;
+        if (m_latched) {
+            sampleAt(pos);
+        }
+        showCursorFor(true);
+        event->accept();
+        return;
+    }
+    QDialog::mousePressEvent(event);
+}
+
 void ColorPickerDialog::mouseReleaseEvent(QMouseEvent *event)
 {
     if (m_sampling) {
-        // A click on the image takes what is under it — the same thing hovering
-        // already did, so this only has to make sure the colour is the one the
-        // user clicked on rather than one poll behind.
-        showCursorFor(sampleAt(event->globalPosition().toPoint()));
+        // The press has already decided what the colour is — and whether it is
+        // being held — so the release only refreshes the cursor.
+        const QPoint pos = event->globalPosition().toPoint();
+        showCursorFor(m_latched ? g_sampler(pos).isValid() : sampleAt(pos));
         event->accept();
         return;
     }
@@ -779,6 +854,8 @@ void ColorPickerDialog::mouseReleaseEvent(QMouseEvent *event)
 void ColorPickerDialog::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
+    // A fresh picker reads live until something is clicked.
+    m_latched = false;
     if (!g_sampler) {
         return;
     }

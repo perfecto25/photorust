@@ -54,7 +54,14 @@ class CurvesDialog : public QDialog
     Q_OBJECT
 public:
     explicit CurvesDialog(Engine *engine, QWidget *parent = nullptr);
+    /// Edit a Curves *adjustment layer* rather than the pixels themselves: the
+    /// curve is stored on the layer, so it stays editable and applies through
+    /// the layer's mask. `layerIndex` is the panel index of that layer.
+    CurvesDialog(Engine *engine, int layerIndex, QWidget *parent);
     ~CurvesDialog() override;
+
+    void accept() override;
+    void reject() override;
 
 private:
     void applyPreview();
@@ -63,6 +70,10 @@ private:
     void applyPreset(int index);
 
     Engine *m_engine = nullptr;
+    /// -1 when the dialog edits pixels; otherwise the adjustment layer it is
+    /// editing, which changes what a preview means: no undo, no commit until
+    /// the dialog is accepted.
+    int m_adjustmentLayer = -1;
     bool m_previewApplied = false;
     bool m_applyingPreset = false;
     QImage m_originalImage;

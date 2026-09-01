@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QStringList>
 #include <QIcon>
 #include <QPixmap>
 
@@ -16,6 +17,15 @@
 /// 15px, a lock badge 12px, a footer button 20px. So the API hands back pixmaps
 /// at a requested size, and the panel — which paints its own rows — blits them.
 namespace LayerIcons {
+
+/// CS6's layer row colours, in menu order: None, then Red through Gray.
+///
+/// Shared by the New Layer dialog, which offers them, and the Layers panel,
+/// which paints them — one list, so the swatch in the menu is the tint on the
+/// row.
+QStringList labelNames();
+/// The colour for a label index, or an invalid colour for "None".
+QColor labelColor(int label);
 
 enum class Glyph {
     /// Visibility, in the row's left column. CS6 draws the eye only when the
@@ -57,6 +67,13 @@ enum class Glyph {
     Group,
     NewLayer,
     Delete,
+
+    // -- the Properties panel's footer --
+    /// Clip the adjustment to the layer below: a square with the arrow CS6
+    /// bends down into it.
+    ClipToLayer,
+    /// Put an adjustment back to its defaults: the circular arrow.
+    Reset,
 };
 
 /// Artwork for `glyph`, tinted `color`, at `size` logical pixels square.

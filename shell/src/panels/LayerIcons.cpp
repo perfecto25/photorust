@@ -1,5 +1,7 @@
 #include "LayerIcons.h"
 
+#include <QObject>
+
 #include "../tools/ToolIcons.h"
 
 #include <QGuiApplication>
@@ -138,6 +140,20 @@ QString bodyFor(LayerIcons::Glyph glyph)
                   <path d="M8 5.8V4.2h4v1.6"/>
                   <path d="M5.4 5.8 6.4 16.8h7.2L14.6 5.8"/>
                   <path d="M8.2 8.4V14.2M10 8.4V14.2M11.8 8.4V14.2"/>)SVG";
+
+    // The clipping badge: a square for the layer below, and the elbow arrow
+    // CS6 points down into it.
+    case Glyph::ClipToLayer:
+        return R"SVG(<rect x="7.2" y="9.6" width="9.2" height="7.2" fill="none" stroke="COLOR"
+                  stroke-width="1.3"/>
+                  <path d="M11.8 3.6V7.2"/>
+                  <path fill="COLOR" stroke="none" d="M11.8 9.8 9.4 6.2h4.8z"/>)SVG";
+
+    // Three quarters of a circle with an arrowhead on the open end.
+    case Glyph::Reset:
+        return R"SVG(<path d="M15.4 7.6a6.4 6.4 0 1 0 1 3.4" fill="none" stroke="COLOR"
+                  stroke-width="1.4"/>
+                  <path fill="COLOR" stroke="none" d="M16.8 3.6 16.2 8.8 11.4 7.4z"/>)SVG";
     }
     return {};
 }
@@ -168,4 +184,28 @@ QPixmap LayerIcons::pixmap(Glyph glyph, const QColor &color, int size)
 QIcon LayerIcons::icon(Glyph glyph, const QColor &color, int size)
 {
     return QIcon(pixmap(glyph, color, size));
+}
+
+QStringList LayerIcons::labelNames()
+{
+    return {QObject::tr("None"),   QObject::tr("Red"),    QObject::tr("Orange"),
+            QObject::tr("Yellow"), QObject::tr("Green"),  QObject::tr("Blue"),
+            QObject::tr("Violet"), QObject::tr("Gray")};
+}
+
+QColor LayerIcons::labelColor(int label)
+{
+    // Photoshop's own seven, sampled from its panel.
+    static const QColor colors[] = {
+        QColor(),                  // None
+        QColor(0xb5, 0x53, 0x4f), // Red
+        QColor(0xc0, 0x7d, 0x3e), // Orange
+        QColor(0xb5, 0xa8, 0x3e), // Yellow
+        QColor(0x5b, 0x8f, 0x54), // Green
+        QColor(0x4c, 0x6b, 0xa8), // Blue
+        QColor(0x7a, 0x5c, 0xa8), // Violet
+        QColor(0x77, 0x77, 0x77), // Gray
+    };
+    const int count = int(sizeof(colors) / sizeof(colors[0]));
+    return label > 0 && label < count ? colors[label] : QColor();
 }

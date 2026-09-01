@@ -33,6 +33,130 @@ pub enum LayerKind {
     Adjustment(crate::filters::Adjustment),
     /// A uniform colour fill covering the whole canvas.
     SolidColor(Rgba8),
+    /// A gradient, evaluated per pixel so it stays re-angleable.
+    Gradient(crate::fill::GradientFill),
+    /// A repeated tile, likewise.
+    Pattern(crate::fill::PatternFill),
+    /// A folder holding the layers beneath it — CS6's layer group.
+    ///
+    /// The group carries no pixels of its own. Its members are the run of
+    /// layers immediately below it in the stack whose `parent` names it, and
+    /// the compositor renders them into a buffer before blending that buffer
+    /// with the group's own blend mode, opacity and mask.
+    Group,
+}
+
+impl LayerKind {
+    /// Whether the compositor pours this rather than reading pixels.
+    pub fn is_fill(&self) -> bool {
+        matches!(
+            self,
+            LayerKind::SolidColor(_) | LayerKind::Gradient(_) | LayerKind::Pattern(_)
+        )
+    }
+}
+
+/// CS6's **Blend If**: a per-pixel gate on where a layer shows.
+///
+/// Two ranges, read off the layer's own pixel and off what is beneath it. A
+/// pixel outside a range is hidden; the two halves of each handle are what
+/// makes the boundary a ramp rather than a cliff — Photoshop splits them with
+/// Alt, and so does this.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlendIf {
+    /// 0 = Gray (luminance), 1 = Red, 2 = Green, 3 = Blue.
+    pub channel: u8,
+    /// The layer's own range: where the dark handle starts and finishes fading
+    /// in, then where the light handle starts and finishes fading out.
+    pub this_layer: [u8; 4],
+    /// The same, read off the backdrop.
+    pub underlying: [u8; 4],
+}
+
+impl Default for BlendIf {
+    /// Wide open: nothing is gated.
+    fn default() -> Self {
+        Self {
+            channel: 0,
+            this_layer: [0, 0, 255, 255],
+            underlying: [0, 0, 255, 255],
+        }
+    }
+}
+
+impl BlendIf {
+    /// Whether the ranges are still wide open, which is the common case and
+    /// worth not paying for.
+    pub fn is_open(&self) -> bool {
+        self.this_layer == [0, 0, 255, 255] && self.underlying == [0, 0, 255, 255]
+    }
+
+    /// How much of a pixel survives the gate, `0.0..=1.0`.
+    pub fn coverage(&self, source: [f32; 3], backdrop: [f32; 3]) -> f32 {
+        if self.is_open() {
+            return 1.0;
+        }
+        gate(self.this_layer, self.value_of(source)) * gate(self.underlying, self.value_of(backdrop))
+    }
+
+    /// The channel this gate reads, from a straight-alpha RGB triple in
+    /// `0.0..=1.0`.
+    fn value_of(&self, rgb: [f32; 3]) -> f32 {
+        match self.channel {
+            1 => rgb[0],
+            2 => rgb[1],
+            3 => rgb[2],
+            // Rec.601 luminance, the same grey the rest of the engine uses.
+            _ => 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2],
+        }
+    }
+}
+
+/// One range's contribution: in fully between the inner handles, ramping over
+/// the gap when the two halves have been split apart.
+fn gate(range: [u8; 4], value: f32) -> f32 {
+    let v = value.clamp(0.0, 1.0) * 255.0;
+    let [dark_start, dark_end, light_start, light_end] =
+        [range[0] as f32, range[1] as f32, range[2] as f32, range[3] as f32];
+
+    // The "in" tests come first, and deliberately: with a handle unsplit at 0
+    // its two halves sit on the same value, and a pixel of exactly 0 has to
+    // count as inside the range — otherwise a wide-open Blend If would hide
+    // every black pixel in the document. The same at 255 for the light handle.
+    let rising = if v >= dark_end {
+        1.0
+    } else if v <= dark_start {
+        0.0
+    } else {
+        (v - dark_start) / (dark_end - dark_start).max(1e-3)
+    };
+    let falling = if v <= light_start {
+        1.0
+    } else if v >= light_end {
+        0.0
+    } else {
+        1.0 - (v - light_start) / (light_end - light_start).max(1e-3)
+    };
+    rising.min(falling)
+}
+
+/// Everything the Layer Style dialog can change, as one value.
+///
+/// The dialog edits live and undoes on cancel. Remembering each setting as it
+/// is touched sounds equivalent and is not: it only puts back what the dialog
+/// remembered to record, and one control writing a value the bookkeeping did
+/// not know about leaves that value behind. Taking the lot on the way in and
+/// putting the lot back is not something a new control can defeat.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleState {
+    pub effects: crate::effects::LayerEffects,
+    pub blend_mode: BlendMode,
+    pub opacity: f32,
+    pub fill_opacity: f32,
+    pub channels: [bool; 3],
+    pub blend_if: BlendIf,
+    pub transparency_shapes: bool,
+    pub mask_hides_effects: bool,
 }
 
 /// How a type layer's lines sit about its origin: left, centre or right for
@@ -130,6 +254,10 @@ pub struct Layer {
     /// Stored in the alpha channel of a `Pixmap` for buffer reuse.
     pub mask: Option<Pixmap>,
     pub mask_enabled: bool,
+    /// Whether the mask travels with the layer — CS6's chain between the two
+    /// thumbnails. Recorded and shown; nothing here moves a mask on its own
+    /// yet, since the mask shares the layer's origin.
+    pub mask_linked: bool,
 
     pub blend_mode: BlendMode,
     /// Master opacity, `0.0..=1.0`.
@@ -155,6 +283,40 @@ pub struct Layer {
     /// Set on a type layer: what its pixels were rendered from. `None` on
     /// every other layer.
     pub text: Option<TextContent>,
+
+    /// Layer Style — drop shadow, stroke and the rest. Drawn by the compositor
+    /// around the layer's own pixels; see [`crate::effects`].
+    pub effects: crate::effects::LayerEffects,
+
+    /// The row colour CS6 lets you tag a layer with: 0 for none, then Red,
+    /// Orange, Yellow, Green, Blue, Violet, Gray. Nothing about the image
+    /// depends on it — it is there to find a layer by in a tall stack.
+    pub label: u8,
+
+    /// Which colour channels the layer contributes to — CS6's Advanced
+    /// Blending R/G/B. A channel switched off leaves the backdrop's own value
+    /// showing through.
+    pub channels: [bool; 3],
+    /// Where the layer is allowed to show at all.
+    pub blend_if: BlendIf,
+    /// Whether the layer's transparency shapes its effects. Off, an overlay
+    /// fills the layer's whole rectangle instead of following its content.
+    pub transparency_shapes: bool,
+    /// Whether the layer mask hides the effects as well as the pixels. Off,
+    /// the effects are drawn from the unmasked shape, as CS6 does by default.
+    pub mask_hides_effects: bool,
+
+    /// The group this layer belongs to, if any.
+    ///
+    /// Membership is by id rather than by nesting the layers themselves: the
+    /// stack stays one flat, ordered list, so every index-based operation in
+    /// the engine and every panel index keeps working. What makes it a tree is
+    /// that a group's members are the contiguous run directly beneath it —
+    /// [`LayerStack::group_members`] is the only place that rule is written
+    /// down, and everything that moves layers has to preserve it.
+    pub parent: Option<LayerId>,
+    /// Whether a group is open in the panel. Meaningless on anything else.
+    pub expanded: bool,
 }
 
 impl Layer {
@@ -168,6 +330,7 @@ impl Layer {
             offset: (0, 0),
             mask: None,
             mask_enabled: true,
+            mask_linked: true,
             blend_mode: BlendMode::Normal,
             opacity: 1.0,
             fill_opacity: 1.0,
@@ -177,7 +340,28 @@ impl Layer {
             lock_pixels: false,
             lock_position: false,
             text: None,
+            effects: crate::effects::LayerEffects::default(),
+            label: 0,
+            channels: [true; 3],
+            blend_if: BlendIf::default(),
+            transparency_shapes: true,
+            mask_hides_effects: true,
+            parent: None,
+            expanded: true,
         }
+    }
+
+    /// An empty group — Layer ▸ Group Layers, before anything is put in it.
+    pub fn new_group(id: LayerId, name: impl Into<String>) -> Self {
+        Self {
+            kind: LayerKind::Group,
+            ..Layer::new_raster(id, name, 0, 0)
+        }
+    }
+
+    /// Whether this layer is a group folder rather than something with pixels.
+    pub fn is_group(&self) -> bool {
+        matches!(self.kind, LayerKind::Group)
     }
 
     /// A raster layer pre-filled with `color` — this is what "Background" is.
@@ -227,6 +411,31 @@ impl Layer {
     }
 
     /// Effective alpha multiplier: master opacity times fill opacity.
+    /// The style settings as one value, for an edit that may be cancelled.
+    pub fn style_state(&self) -> StyleState {
+        StyleState {
+            effects: self.effects,
+            blend_mode: self.blend_mode,
+            opacity: self.opacity,
+            fill_opacity: self.fill_opacity,
+            channels: self.channels,
+            blend_if: self.blend_if,
+            transparency_shapes: self.transparency_shapes,
+            mask_hides_effects: self.mask_hides_effects,
+        }
+    }
+
+    pub fn set_style_state(&mut self, state: StyleState) {
+        self.effects = state.effects;
+        self.blend_mode = state.blend_mode;
+        self.opacity = state.opacity;
+        self.fill_opacity = state.fill_opacity;
+        self.channels = state.channels;
+        self.blend_if = state.blend_if;
+        self.transparency_shapes = state.transparency_shapes;
+        self.mask_hides_effects = state.mask_hides_effects;
+    }
+
     pub fn effective_alpha(&self) -> f32 {
         (self.opacity * self.fill_opacity).clamp(0.0, 1.0)
     }
@@ -353,9 +562,50 @@ impl LayerStack {
     }
 
     /// Insert at a specific stack position, clamped to the valid range.
-    pub fn insert(&mut self, index: usize, layer: Layer) {
+    ///
+    /// A layer landing among a group's members joins that group. Doing it here
+    /// rather than at the nine places that add a layer means a new layer, a
+    /// duplicate, a Layer Via Copy and everything after them all end up inside
+    /// the group the user was working in — and, more importantly, that the
+    /// members either side of it cannot be cut off from their folder, which is
+    /// what [`LayerStack::group_members`] would see if a stranger were left
+    /// sitting between them.
+    ///
+    /// A layer that already names a parent is taken at its word, which is what
+    /// lets a group be assembled a member at a time.
+    pub fn insert(&mut self, index: usize, mut layer: Layer) {
         let index = index.min(self.layers.len());
+        if layer.parent.is_none() && !layer.is_group() {
+            layer.parent = self.group_at_position(index);
+        }
         self.layers.insert(index, layer);
+    }
+
+    /// The group whose run of members encloses a stack position, if any.
+    ///
+    /// A position is inside a group when the layer that would sit above it
+    /// belongs to that group (or is the folder itself) *and* so does the one
+    /// below. Anywhere else is outside — including directly beneath the
+    /// folder, which is the gap a layer is dropped into to leave a group.
+    pub fn group_at_position(&self, position: usize) -> Option<LayerId> {
+        let layer_above = self.layers.get(position)?;
+        let above = if layer_above.is_group() {
+            // The gap directly beneath an *empty* folder is the only way into
+            // one: with no members there is no pair of them to land between.
+            // The same gap under a group that has members is the top of its
+            // run, which is inside it too, so this costs nothing.
+            if self.group_members(position).is_empty() {
+                return Some(layer_above.id);
+            }
+            layer_above.id
+        } else {
+            layer_above.parent?
+        };
+        let below = position
+            .checked_sub(1)
+            .and_then(|i| self.layers.get(i))
+            .and_then(|l| l.parent);
+        (below == Some(above)).then_some(above)
     }
 
     pub fn remove(&mut self, index: usize) -> Option<Layer> {
@@ -368,6 +618,50 @@ impl LayerStack {
 
     pub fn remove_by_id(&mut self, id: LayerId) -> Option<Layer> {
         self.index_of(id).and_then(|i| self.remove(i))
+    }
+
+    /// The stack positions of a group's members: the run directly beneath it.
+    ///
+    /// Beneath, because the stack runs bottom-up while the panel runs top-down
+    /// — a group's members sit at lower indices than the folder itself, which
+    /// is what puts them *under* it on screen.
+    ///
+    /// A layer claiming a group it is not adjacent to is not a member. That
+    /// cannot happen through the editing operations, all of which keep the run
+    /// contiguous, and answering by adjacency rather than by scanning the whole
+    /// stack means a stray `parent` degrades to a loose layer rather than to a
+    /// group whose contents are somewhere else entirely.
+    pub fn group_members(&self, group_index: usize) -> std::ops::Range<usize> {
+        let Some(group) = self.layers.get(group_index) else {
+            return 0..0;
+        };
+        if !group.is_group() {
+            return group_index..group_index;
+        }
+        let mut first = group_index;
+        while first > 0 && self.layers[first - 1].parent == Some(group.id) {
+            first -= 1;
+        }
+        first..group_index
+    }
+
+    /// The group a layer belongs to, as a stack position.
+    pub fn group_of(&self, index: usize) -> Option<usize> {
+        let parent = self.layers.get(index)?.parent?;
+        self.index_of(parent)
+    }
+
+    /// A group and its members as one run, for the operations that have to
+    /// move or delete them together. For anything else, just that layer.
+    pub fn run_at(&self, index: usize) -> std::ops::Range<usize> {
+        match self.layers.get(index) {
+            Some(layer) if layer.is_group() => {
+                let members = self.group_members(index);
+                members.start..index + 1
+            }
+            Some(_) => index..index + 1,
+            None => 0..0,
+        }
     }
 
     /// Move the layer at `from` to position `to`. No-op if either is invalid.

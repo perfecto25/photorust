@@ -12,6 +12,9 @@ set(SHELL_SOURCES
     src/canvas/CanvasView.cpp
     src/canvas/CanvasView.h
 
+    src/dialogs/AngleDial.h
+    src/dialogs/CanvasSizeDialog.cpp
+    src/dialogs/CanvasSizeDialog.h
     src/dialogs/ChannelMixerDialog.cpp
     src/dialogs/ChannelMixerDialog.h
     src/dialogs/ColorBalanceDialog.cpp
@@ -20,12 +23,18 @@ set(SHELL_SOURCES
     src/dialogs/ColorPickerDialog.h
     src/dialogs/ColorSettingsDialog.cpp
     src/dialogs/ColorSettingsDialog.h
+    src/dialogs/DuplicateImageDialog.cpp
+    src/dialogs/DuplicateImageDialog.h
+    src/dialogs/DuplicateLayerDialog.cpp
+    src/dialogs/DuplicateLayerDialog.h
     src/dialogs/ExposureDialog.cpp
     src/dialogs/ExposureDialog.h
     src/dialogs/ExportAsDialog.cpp
     src/dialogs/ExportAsDialog.h
     src/dialogs/FillDialog.cpp
     src/dialogs/FillDialog.h
+    src/dialogs/FillLayerDialog.cpp
+    src/dialogs/FillLayerDialog.h
     src/dialogs/GradientEditorDialog.cpp
     src/dialogs/GradientEditorDialog.h
     src/dialogs/GradientMapDialog.cpp
@@ -44,6 +53,8 @@ set(SHELL_SOURCES
     src/dialogs/BrightnessContrastDialog.h
     src/dialogs/HueSaturationDialog.cpp
     src/dialogs/HueSaturationDialog.h
+    src/dialogs/ImageSizeDialog.cpp
+    src/dialogs/ImageSizeDialog.h
     src/dialogs/IndexedColorDialog.cpp
     src/dialogs/IndexedColorDialog.h
     src/dialogs/PhotoFilterDialog.cpp
@@ -52,16 +63,22 @@ set(SHELL_SOURCES
     src/dialogs/PosterizeDialog.h
     src/dialogs/CurvesDialog.cpp
     src/dialogs/CurvesDialog.h
+    src/dialogs/LayerStyleDialog.cpp
+    src/dialogs/LayerStyleDialog.h
     src/dialogs/LevelsDialog.cpp
     src/dialogs/LevelsDialog.h
     src/dialogs/KeyboardShortcutsDialog.cpp
     src/dialogs/KeyboardShortcutsDialog.h
     src/dialogs/NewDocumentDialog.cpp
     src/dialogs/NewDocumentDialog.h
+    src/dialogs/NewLayerDialog.cpp
+    src/dialogs/NewLayerDialog.h
     src/dialogs/PrintDialog.cpp
     src/dialogs/PrintDialog.h
     src/dialogs/ReplaceColorDialog.cpp
     src/dialogs/ReplaceColorDialog.h
+    src/dialogs/RotateCanvasDialog.cpp
+    src/dialogs/RotateCanvasDialog.h
     src/dialogs/SaveForWebDialog.cpp
     src/dialogs/SaveForWebDialog.h
     src/dialogs/SelectiveColorDialog.cpp
@@ -72,6 +89,8 @@ set(SHELL_SOURCES
     src/dialogs/StrokeDialog.h
     src/dialogs/ThresholdDialog.cpp
     src/dialogs/ThresholdDialog.h
+    src/dialogs/TrimDialog.cpp
+    src/dialogs/TrimDialog.h
     src/dialogs/VibranceDialog.cpp
     src/dialogs/VibranceDialog.h
 
@@ -93,6 +112,8 @@ set(SHELL_SOURCES
     src/panels/PathIcons.h
     src/panels/PathsPanel.cpp
     src/panels/PathsPanel.h
+    src/panels/PropertiesPanel.cpp
+    src/panels/PropertiesPanel.h
     src/panels/PanelHeader.cpp
     src/panels/PanelHeader.h
 

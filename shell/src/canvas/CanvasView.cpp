@@ -2426,8 +2426,41 @@ const QCursor &rotateViewCursor()
 
 } // namespace
 
+void CanvasView::setColorSampling(bool on)
+{
+    if (m_colorSampling == on) {
+        return;
+    }
+    m_colorSampling = on;
+    if (!on) {
+        setSamplingCursor(nullptr);
+    }
+}
+
+void CanvasView::setSamplingCursor(const QCursor *cursor)
+{
+    if (cursor) {
+        m_samplingCursor = true;
+        // Kept so it can be re-applied: the pointer leaving and re-entering
+        // the canvas would otherwise lose it.
+        m_samplingCursorValue = *cursor;
+        setCursor(m_samplingCursorValue);
+    } else if (m_samplingCursor) {
+        m_samplingCursor = false;
+        updateCursor();
+    }
+}
+
 void CanvasView::updateCursor()
 {
+    // An external sampler — Replace Color's eyedropper — owns the pointer
+    // while it is active, so the tool's own cursor must not take it back.
+    // Re-applied rather than merely skipped, because this also runs from
+    // `enterEvent`, where the cursor has to be put back after `leaveEvent`.
+    if (m_samplingCursor) {
+        setCursor(m_samplingCursorValue);
+        return;
+    }
     const ToolId effective = m_spacePanOverride ? ToolId::Hand : m_tool;
     switch (effective) {
     case ToolId::Hand:
@@ -2752,6 +2785,18 @@ void CanvasView::paintSelection(QPainter &painter)
 
 void CanvasView::mousePressEvent(QMouseEvent *event)
 {
+    // While a colour sampler owns the canvas — Replace Color's eyedropper —
+    // clicks pick a colour instead of reaching the active tool. Without this
+    // the Brush would paint on the image the user is trying to sample.
+    if (m_colorSampling && event->button() == Qt::LeftButton) {
+        QColor color;
+        QPoint doc;
+        if (sampleAtGlobal(event->globalPosition().toPoint(), &color, &doc)) {
+            emit colorSampled(doc, color);
+        }
+        event->accept();
+        return;
+    }
     setFocus(Qt::MouseFocusReason);
     m_lastMousePos = event->position();
     const QPointF doc = widgetToDocument(event->position());
@@ -3243,6 +3288,15 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
     const QPointF pos = event->position();
     const QPointF doc = widgetToDocument(pos);
     emit cursorMoved(doc);
+
+    // While a colour sampler owns the canvas the active tool must not run its
+    // hover logic: several of those paths call `setCursor` directly, which
+    // would replace the eyedropper as soon as the pointer moved. The readout
+    // above still fires, so the Info panel keeps tracking the pointer.
+    if (m_colorSampling) {
+        event->accept();
+        return;
+    }
 
     if (m_panning) {
         // The pan is in the upright frame the document is laid out in, so a
@@ -3838,6 +3892,11 @@ void CanvasView::mouseDoubleClickEvent(QMouseEvent *event)
 
 void CanvasView::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (m_colorSampling) {
+        event->accept();
+        return;
+    }
+
     const QPointF doc = widgetToDocument(event->position());
 
     if (m_panning) {
@@ -4346,7 +4405,11 @@ void CanvasView::enterEvent(QEnterEvent *event)
 void CanvasView::leaveEvent(QEvent *event)
 {
     QWidget::leaveEvent(event);
-    unsetCursor();
+    // Clearing the cursor while a sampler owns it would drop the eyedropper
+    // the moment the pointer crossed onto the dialog.
+    if (!m_samplingCursor) {
+        unsetCursor();
+    }
     emit cursorLeft();
 }
 
@@ -5347,6 +5410,80 @@ void CanvasView::commitTypeEdit()
     m_typeRuns.clear();
     m_typeText.clear();
     update();
+}
+
+bool CanvasView::restyleTypeLayer(int layerIndex)
+{
+    // Not while something is being typed: the edit in progress owns this state,
+    // and the options bar already restyles the selected characters there.
+    if (!m_engine || m_typing || layerIndex < 0) {
+        return false;
+    }
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    if (runCount <= 0) {
+        return false;
+    }
+
+    // The same read the editor does when it reopens a layer — the text has to
+    // come back run by run or its character formatting would be lost on the way
+    // in, before this even gets to change it.
+    const QString savedText = m_typeText;
+    const QList<TypeRun> savedRuns = m_typeRuns;
+    const QPointF savedOrigin = m_typeOrigin;
+    const bool savedVertical = m_typeVertical;
+
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeFontCache.clear();
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        // Every run takes the bar's setting: with no characters selected,
+        // Photoshop's bar applies to the whole layer.
+        run.family = m_typeFont.family();
+        run.style = m_typeStyleName;
+        run.size = m_typeFont.pointSizeF();
+        run.color = m_typeColor;
+        m_typeRuns.append(run);
+        m_typeText += text;
+    }
+
+    m_typeOrigin = QPointF(m_engine->layerTextOriginX(layerIndex),
+                           m_engine->layerTextOriginY(layerIndex));
+    // Orientation belongs to the text; the rest is what the bar now says.
+    m_typeVertical = m_engine->layerTextVertical(layerIndex);
+
+    const int pad = 2;
+    const QRect pixelBounds = typeBounds().toAlignedRect().adjusted(-pad, -pad, pad, pad);
+    QImage image(qMax(1, pixelBounds.width()), qMax(1, pixelBounds.height()),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+    renderTypeToImage(image, pixelBounds.topLeft());
+
+    m_engine->beginTextRuns();
+    int at = 0;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        m_engine->addTextRun(m_typeText.mid(at, run.length), run.family, run.style,
+                             float(run.size), run.color);
+        at += run.length;
+    }
+    const QString name = m_engine->layerName(layerIndex);
+    const bool updated = m_engine->updateTextLayer(
+        layerIndex, image, pixelBounds.left(), pixelBounds.top(), name,
+        typeAlignCode(m_typeAlignment), m_typeAntialias, m_typeVertical,
+        float(m_typeOrigin.x()), float(m_typeOrigin.y()));
+
+    // Put back whatever the editor had; this borrowed its state rather than
+    // starting an edit of its own.
+    m_typeText = savedText;
+    m_typeRuns = savedRuns;
+    m_typeOrigin = savedOrigin;
+    m_typeVertical = savedVertical;
+    m_typeFontCache.clear();
+
+    update();
+    return updated;
 }
 
 void CanvasView::cancelTypeEdit()

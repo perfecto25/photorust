@@ -20,7 +20,7 @@ use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::document::{ColorSample, Document, ImageMode, PasteMode, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
-use crate::layer::{LayerId, LayerKind, TextAlign, TextContent, TextRun};
+use crate::layer::{LayerId, LayerKind, LayerStack, TextAlign, TextContent, TextRun};
 use crate::mixer::MixerOptions;
 use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
 use crate::erase::BackgroundEraseOptions;
@@ -68,6 +68,9 @@ pub mod ffi {
         /// Carries lasso vertices in. Qt's own container, so the shell builds
         /// it directly and nothing is copied into a Rust `Vec` on the way.
         type QVector_f32 = cxx_qt_lib::QVector<f32>;
+        /// Carries a set of layer indices in — what the Layers panel has
+        /// selected, for the commands that act on more than the active layer.
+        type QVector_i32 = cxx_qt_lib::QVector<i32>;
     }
 
     unsafe extern "RustQt" {
@@ -147,6 +150,25 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "newDocument"]
         fn new_document(self: Pin<&mut Engine>, width: i32, height: i32, fill: i32);
+
+        /// Copy the active document into a new tab — Image ▸ Duplicate.
+        ///
+        /// `merged` is CS6's "Duplicate Merged Layers Only". An empty `name`
+        /// falls back to [`Engine::documentCopyName`].
+        #[qinvokable]
+        #[cxx_name = "duplicateDocument"]
+        fn duplicate_document(self: Pin<&mut Engine>, name: &QString, merged: bool);
+
+        /// The name Duplicate Image offers for a copy of the active document.
+        #[qinvokable]
+        #[cxx_name = "documentCopyName"]
+        fn document_copy_name(self: &Engine) -> QString;
+
+        /// The active document's name, without the mode suffix or the
+        /// modified marker `documentTitle` carries.
+        #[qinvokable]
+        #[cxx_name = "documentName"]
+        fn document_name(self: &Engine) -> QString;
 
         /// Open an image file. Returns false if it could not be read.
         #[qinvokable]
@@ -253,10 +275,55 @@ pub mod ffi {
         #[cxx_name = "setBitDepth"]
         fn set_bit_depth(self: Pin<&mut Engine>, depth: i32);
 
+        /// Scale the whole image. `mode` is the CS6 Resample menu index.
+        #[qinvokable]
+        #[cxx_name = "resampleImage"]
+        fn resample_image_bridge(self: Pin<&mut Engine>, width: i32, height: i32, mode: i32);
+
+        /// Uncompressed size in bytes, as Image Size reports it — colour
+        /// channels only, so an RGB/8 image is three bytes per pixel and not
+        /// the four the engine holds in memory.
+        #[qinvokable]
+        #[cxx_name = "imageDataBytes"]
+        fn image_data_bytes_bridge(self: &Engine) -> i64;
+
+        /// Print resolution in pixels per inch; changes no pixels.
+        #[qinvokable]
+        #[cxx_name = "imageResolution"]
+        fn image_resolution(self: &Engine) -> f32;
+
+        #[qinvokable]
+        #[cxx_name = "setImageResolution"]
+        fn set_image_resolution(self: Pin<&mut Engine>, dpi: f32);
+
+        /// Resize the canvas, anchoring the existing image in the new one.
+        ///
+        /// `anchor_x`/`anchor_y` are 0..2 (left/centre/right, top/centre/
+        /// bottom). `fill_a` of 0 leaves the new area transparent instead of
+        /// pouring the extension colour into the Background layer.
+        #[qinvokable]
+        #[cxx_name = "resizeCanvasAnchored"]
+        fn resize_canvas_anchored_bridge(self: Pin<&mut Engine>, width: i32, height: i32, anchor_x: i32, anchor_y: i32, fill_r: i32, fill_g: i32, fill_b: i32, fill_a: i32);
+
         /// Resize the canvas without scaling the content.
         #[qinvokable]
         #[cxx_name = "resizeCanvas"]
         fn resize_canvas(self: Pin<&mut Engine>, width: i32, height: i32);
+
+        /// Turn the whole document clockwise — Image ▸ Image Rotation.
+        ///
+        /// 90, 180 and 270 only permute pixels. Any other angle resamples and
+        /// grows the canvas to the bounding box of the turned image, filling
+        /// the new corners of the Background layer with the background colour,
+        /// as CS6 does.
+        #[qinvokable]
+        #[cxx_name = "rotateCanvas"]
+        fn rotate_canvas(self: Pin<&mut Engine>, degrees: f32);
+
+        /// Mirror the whole document — Flip Canvas Horizontal/Vertical.
+        #[qinvokable]
+        #[cxx_name = "flipCanvas"]
+        fn flip_canvas(self: Pin<&mut Engine>, horizontal: bool);
 
         /// Straighten a quadrilateral into a rectangle and crop to it — the
         /// Perspective Crop tool.
@@ -283,6 +350,34 @@ pub mod ffi {
             height: i32,
             delete_cropped: bool,
         );
+
+        /// Trim uniform border off the edges — Image ▸ Trim.
+        ///
+        /// `basis` is the dialog's radio order: 0 transparent pixels, 1 the
+        /// top-left pixel's colour, 2 the bottom-right's. Returns false when
+        /// there was nothing to trim, having changed nothing.
+        #[qinvokable]
+        #[cxx_name = "trimImage"]
+        fn trim_image(
+            self: Pin<&mut Engine>,
+            basis: i32,
+            top: bool,
+            bottom: bool,
+            left: bool,
+            right: bool,
+        ) -> bool;
+
+        /// Whether the flattened image has any transparency, which is what
+        /// decides if Trim's "Transparent Pixels" is offered.
+        #[qinvokable]
+        #[cxx_name = "imageHasTransparency"]
+        fn image_has_transparency(self: &Engine) -> bool;
+
+        /// Grow the canvas until no layer hangs off it — Image ▸ Reveal All.
+        /// Returns false when everything was on the canvas already.
+        #[qinvokable]
+        #[cxx_name = "revealAll"]
+        fn reveal_all(self: Pin<&mut Engine>) -> bool;
     }
 
     // -- annotations -----------------------------------------------------------
@@ -674,6 +769,16 @@ pub mod ffi {
         #[cxx_name = "layerKind"]
         fn layer_kind(self: &Engine, index: i32) -> i32;
 
+        /// What the layer is, spelled out: "Pixel", "Type", "Solid Color",
+        /// "Gradient", "Pattern", or the adjustment's own name.
+        ///
+        /// [`Engine::layer_kind`] answers the same question in the three
+        /// categories the Layers panel filters on, which is too coarse to
+        /// print — it cannot tell a Solid Color fill from ordinary pixels.
+        #[qinvokable]
+        #[cxx_name = "layerKindName"]
+        fn layer_kind_name(self: &Engine, index: i32) -> QString;
+
         /// The layer's Lock Transparent Pixels flag.
         #[qinvokable]
         #[cxx_name = "layerLockTransparency"]
@@ -794,18 +899,488 @@ pub mod ffi {
         #[cxx_name = "setLayerClipping"]
         fn set_layer_clipping(self: Pin<&mut Engine>, index: i32, clipping: bool);
 
+        // -- layer style ----------------------------------------------------
+        //
+        // Seven effects with some forty settings between them, reached one
+        // named number at a time rather than through forty calls or a second
+        // parser in C++. `core/src/effects.rs` owns what the names mean.
+
+        /// One layer-effect setting, e.g. "dropShadow.size". Colours are
+        /// packed as 0xRRGGBB, booleans as 0 or 1, blend modes as their
+        /// discriminant.
+        #[qinvokable]
+        #[cxx_name = "layerEffectValue"]
+        fn layer_effect_value(self: &Engine, index: i32, key: &QString) -> f32;
+
+        /// Set one, **without** adding a history step: the dialog writes these
+        /// continuously for its live preview. `commitLayerEffects` closes the
+        /// run off as a single undo.
+        #[qinvokable]
+        #[cxx_name = "setLayerEffectValue"]
+        fn set_layer_effect_value(
+            self: Pin<&mut Engine>,
+            index: i32,
+            key: &QString,
+            value: f32,
+        ) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "commitLayerEffects"]
+        fn commit_layer_effects(self: Pin<&mut Engine>);
+
+        /// Remember a layer's whole style, so a cancelled edit can be undone
+        /// in one move — the Layer Style dialog writes live and has no history
+        /// entry to step back to.
+        #[qinvokable]
+        #[cxx_name = "beginLayerStyleEdit"]
+        fn begin_layer_style_edit(self: Pin<&mut Engine>, index: i32);
+
+        /// Put back what `beginLayerStyleEdit` remembered. False when there is
+        /// nothing outstanding.
+        #[qinvokable]
+        #[cxx_name = "cancelLayerStyleEdit"]
+        fn cancel_layer_style_edit(self: Pin<&mut Engine>) -> bool;
+
+        /// Whether a layer has any style on it — what greys out Clear Layer
+        /// Style and Copy Layer Style, and what puts the `fx` on its row.
+        #[qinvokable]
+        #[cxx_name = "layerHasEffects"]
+        fn layer_has_effects(self: &Engine, index: i32) -> bool;
+
+        /// The effects *on* a layer, newline separated, in the order CS6 lists
+        /// them. Includes effects the user has switched off: those keep their
+        /// row in the panel with the eye closed, as in CS6, and the caller
+        /// asks `layerEffectValue(index, "stroke.on")` for the eye's state.
+        #[qinvokable]
+        #[cxx_name = "layerEffectNames"]
+        fn layer_effect_names(self: &Engine, index: i32) -> QString;
+
+        #[qinvokable]
+        #[cxx_name = "clearLayerEffects"]
+        fn clear_layer_effects(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Copy Layer Style: remembers the layer's style engine-side, so the
+        /// shell does not have to carry forty numbers around.
+        #[qinvokable]
+        #[cxx_name = "copyLayerStyle"]
+        fn copy_layer_style(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "pasteLayerStyle"]
+        fn paste_layer_style(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Whether a style has been copied and is waiting to be pasted.
+        #[qinvokable]
+        #[cxx_name = "hasCopiedLayerStyle"]
+        fn has_copied_layer_style(self: &Engine) -> bool;
+
+        /// Hide All Effects / Show All Effects, across every layer.
+        #[qinvokable]
+        #[cxx_name = "hideAllEffects"]
+        fn hide_all_effects(self: Pin<&mut Engine>, hidden: bool);
+
+        #[qinvokable]
+        #[cxx_name = "effectsAreHidden"]
+        fn effects_are_hidden(self: &Engine) -> bool;
+
+        /// Whether any layer has a style, hidden or not.
+        #[qinvokable]
+        #[cxx_name = "anyLayerHasEffects"]
+        fn any_layer_has_effects(self: &Engine) -> bool;
+
         #[qinvokable]
         #[cxx_name = "addLayer"]
         fn add_layer(self: Pin<&mut Engine>);
+
+        /// New Layer with everything CS6's dialog asks for, as one history
+        /// step. An empty `name` takes the next "Layer N".
+        #[qinvokable]
+        #[cxx_name = "addLayerConfigured"]
+        fn add_layer_configured(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        );
+
+        /// A solid-colour fill layer — Layer ▸ New Fill Layer ▸ Solid Color.
+        /// An empty `name` takes the next "Color Fill N".
+        #[qinvokable]
+        #[cxx_name = "addFillLayer"]
+        fn add_fill_layer(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            r: i32,
+            g: i32,
+            b: i32,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        );
+
+        /// The row colour a layer is tagged with: 0 for none, then Red,
+        /// Orange, Yellow, Green, Blue, Violet, Gray.
+        #[qinvokable]
+        #[cxx_name = "layerLabel"]
+        fn layer_label(self: &Engine, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "setLayerLabel"]
+        fn set_layer_label(self: Pin<&mut Engine>, index: i32, label: i32);
+
+        /// Whether a layer's mask travels with it — the chain between the two
+        /// thumbnails on its row.
+        #[qinvokable]
+        #[cxx_name = "layerMaskLinked"]
+        fn layer_mask_linked(self: &Engine, index: i32) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "setLayerMaskLinked"]
+        fn set_layer_mask_linked(self: Pin<&mut Engine>, index: i32, linked: bool);
+
+        /// The mask's own thumbnail, for the second square on the row.
+        #[qinvokable]
+        #[cxx_name = "layerMaskThumbnail"]
+        fn layer_mask_thumbnail(self: &Engine, index: i32, size: i32) -> QImage;
+
+        /// A gradient fill layer — Layer ▸ New Fill Layer ▸ Gradient.
+        ///
+        /// `preset` names one of `gradientPresetNames`; `shape` is the
+        /// Gradient tool's own order (linear, radial, angle, reflected,
+        /// diamond) and `scale` is a percentage.
+        #[qinvokable]
+        #[cxx_name = "addGradientFillLayer"]
+        fn add_gradient_fill_layer(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            preset: &QString,
+            shape: i32,
+            angle: f32,
+            scale: i32,
+            reverse: bool,
+            dither: bool,
+            align: bool,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        );
+
+        /// A pattern fill layer — Layer ▸ New Fill Layer ▸ Pattern.
+        #[qinvokable]
+        #[cxx_name = "addPatternFillLayer"]
+        fn add_pattern_fill_layer(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            pattern: i32,
+            scale: i32,
+            link: bool,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        );
+
+        // -- previewed fill layers ------------------------------------------
+        //
+        // CS6 creates a fill layer and *then* opens its dialog, so the canvas
+        // shows the fill while it is being chosen. Nothing reaches the History
+        // panel until the dialog is accepted: `beginFillLayerPreview` adds the
+        // layer uncommitted, the two update calls change what it pours, and
+        // `endFillLayerPreview` either commits it or takes it away again.
+
+        /// `kind` is 1 for a gradient, 2 for a pattern. Returns the panel index
+        /// of the new layer, or -1.
+        #[qinvokable]
+        #[cxx_name = "beginFillLayerPreview"]
+        fn begin_fill_layer_preview(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            kind: i32,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        ) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "updateGradientFillPreview"]
+        fn update_gradient_fill_preview(
+            self: Pin<&mut Engine>,
+            preset: &QString,
+            shape: i32,
+            angle: f32,
+            scale: i32,
+            reverse: bool,
+            dither: bool,
+            align: bool,
+        );
+
+        #[qinvokable]
+        #[cxx_name = "updatePatternFillPreview"]
+        fn update_pattern_fill_preview(
+            self: Pin<&mut Engine>,
+            pattern: i32,
+            scale: i32,
+            link: bool,
+        );
+
+        /// `keep` commits the layer; otherwise it is removed and the document
+        /// is as it was.
+        #[qinvokable]
+        #[cxx_name = "endFillLayerPreview"]
+        fn end_fill_layer_preview(self: Pin<&mut Engine>, keep: bool);
+
+        /// The name a new layer would be given, so a dialog can open with it.
+        #[qinvokable]
+        #[cxx_name = "suggestedLayerName"]
+        fn suggested_layer_name(self: &Engine, base: &QString) -> QString;
+
+        /// Turn the Background into an ordinary layer — Layer ▸ New ▸ Layer
+        /// From Background. False when there is no Background.
+        #[qinvokable]
+        #[cxx_name = "layerFromBackground"]
+        fn layer_from_background(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            mode: i32,
+            opacity: i32,
+        ) -> bool;
+
+        /// Whether the bottom layer is a Background, which is what decides
+        /// if Layer From Background is offered.
+        #[qinvokable]
+        #[cxx_name = "hasBackgroundLayer"]
+        fn has_background_layer(self: &Engine) -> bool;
+
+        /// Copy the selection into a layer of its own — Layer Via Copy. With
+        /// no selection it duplicates the layer, as Ctrl+J does in CS6.
+        #[qinvokable]
+        #[cxx_name = "layerViaCopy"]
+        fn layer_via_copy(self: Pin<&mut Engine>) -> bool;
+
+        /// Move the selection into a layer of its own — Layer Via Cut. False
+        /// with no selection, or on a layer locked against editing.
+        #[qinvokable]
+        #[cxx_name = "layerViaCut"]
+        fn layer_via_cut(self: Pin<&mut Engine>) -> bool;
 
         /// Add an adjustment layer by menu name, e.g. "Levels".
         #[qinvokable]
         #[cxx_name = "addAdjustmentLayer"]
         fn add_adjustment_layer(self: Pin<&mut Engine>, kind: &QString);
 
+        /// The same with everything CS6's New Layer dialog collects. False for
+        /// a name the engine has no adjustment for, having added nothing —
+        /// better than quietly making a different one.
+        #[qinvokable]
+        #[cxx_name = "addAdjustmentLayerConfigured"]
+        fn add_adjustment_layer_configured(
+            self: Pin<&mut Engine>,
+            kind: &QString,
+            name: &QString,
+            mode: i32,
+            opacity: i32,
+            clipping: bool,
+            label: i32,
+        ) -> bool;
+
+        // -- editing an adjustment layer ------------------------------------
+        //
+        // A Curves layer carries its curve rather than baking it into pixels,
+        // so its dialog edits the layer and previews on the canvas. Nothing
+        // reaches the History panel until it is accepted.
+
+        /// Remember an adjustment layer's setting, for putting back if the
+        /// edit is cancelled.
+        #[qinvokable]
+        #[cxx_name = "beginAdjustmentEdit"]
+        fn begin_adjustment_edit(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Set a Curves layer's table. `lut` is 256 values; `channel` is
+        /// 0 = RGB, 1 = R, 2 = G, 3 = B. Uncommitted.
+        #[qinvokable]
+        #[cxx_name = "setLayerCurves"]
+        fn set_layer_curves(self: Pin<&mut Engine>, lut: &[u8], channel: i32);
+
+        /// `keep` commits the edit; otherwise the setting goes back.
+        #[qinvokable]
+        #[cxx_name = "endAdjustmentEdit"]
+        fn end_adjustment_edit(self: Pin<&mut Engine>, keep: bool);
+
+        /// What kind of adjustment a layer carries, by the name the menu uses
+        /// ("Hue/Saturation", "Curves", …). Empty for a layer that is not an
+        /// adjustment layer — which is how the Properties panel picks the page
+        /// to show.
+        #[qinvokable]
+        #[cxx_name = "layerAdjustmentName"]
+        fn layer_adjustment_name(self: &Engine, index: i32) -> QString;
+
+        /// Read one named parameter off an adjustment layer.
+        ///
+        /// Keys are the ones the Properties panel edits: `hue`, `saturation`,
+        /// `lightness`, `range`, `colorize`. `fallback` comes back for a layer
+        /// that has no such parameter, so the caller does not need to check
+        /// twice.
+        #[qinvokable]
+        #[cxx_name = "layerAdjustmentValue"]
+        fn layer_adjustment_value(
+            self: &Engine,
+            index: i32,
+            key: &QString,
+            fallback: f32,
+        ) -> f32;
+
+        /// Write one named parameter, on the layer an edit was begun on.
+        /// Uncommitted, like [`Engine::set_layer_curves`] — the canvas updates,
+        /// the History panel does not until the edit ends.
+        #[qinvokable]
+        #[cxx_name = "setLayerAdjustmentValue"]
+        fn set_layer_adjustment_value(
+            self: Pin<&mut Engine>,
+            key: &QString,
+            value: f32,
+        ) -> bool;
+
+        /// Put the layer being edited back to its adjustment's defaults —
+        /// the Properties panel's reset button. Uncommitted.
+        #[qinvokable]
+        #[cxx_name = "resetLayerAdjustment"]
+        fn reset_layer_adjustment(self: Pin<&mut Engine>) -> bool;
+
+        /// Point a Gradient Map layer at one of `gradientPresetNames`.
+        /// Uncommitted.
+        #[qinvokable]
+        #[cxx_name = "setLayerGradientMap"]
+        fn set_layer_gradient_map(
+            self: Pin<&mut Engine>,
+            name: &QString,
+            reverse: bool,
+        ) -> bool;
+
+        /// The ramp a Gradient Map layer actually carries, as a strip.
+        ///
+        /// Read from the layer rather than from the preset it was made with,
+        /// because the ramp is baked: once set, the preset's name is no longer
+        /// part of the layer, and only the ramp itself can be trusted.
+        #[qinvokable]
+        #[cxx_name = "layerGradientMapPreview"]
+        fn layer_gradient_map_preview(
+            self: &Engine,
+            index: i32,
+            width: i32,
+            height: i32,
+        ) -> QImage;
+
+        /// The Color Lookup looks, newline-separated and in menu order.
+        #[qinvokable]
+        #[cxx_name = "colorLookupPresetNames"]
+        fn color_lookup_preset_names(self: &Engine) -> QString;
+
+        /// Point a Color Lookup layer at one of them. Uncommitted.
+        #[qinvokable]
+        #[cxx_name = "setLayerColorLookup"]
+        fn set_layer_color_lookup(self: Pin<&mut Engine>, name: &QString) -> bool;
+
+        /// Which look a Color Lookup layer is carrying, found by comparing its
+        /// tables against each preset's. Empty if it matches none.
+        #[qinvokable]
+        #[cxx_name = "layerColorLookupPreset"]
+        fn layer_color_lookup_preset(self: &Engine, index: i32) -> QString;
+
+        /// Whether the engine can evaluate an adjustment of that name as a
+        /// live layer — what greys out the entries it cannot.
+        #[qinvokable]
+        #[cxx_name = "supportsAdjustment"]
+        fn supports_adjustment(self: &Engine, kind: &QString) -> bool;
+
+        // -- groups ---------------------------------------------------------
+
+        /// Put the layers at these panel indices into a new group —
+        /// Layer ▸ Group Layers. False if they cannot be grouped, having
+        /// changed nothing.
+        #[qinvokable]
+        #[cxx_name = "groupLayers"]
+        fn group_layers(self: Pin<&mut Engine>, indices: &QVector_i32) -> bool;
+
+        /// A new, empty group above the active layer — the folder button at
+        /// the foot of the Layers panel. Layers go in by being dragged in.
+        #[qinvokable]
+        #[cxx_name = "addLayerGroup"]
+        fn add_layer_group(self: Pin<&mut Engine>, name: &QString);
+
+        /// Whether that selection *could* be grouped, for greying the menu
+        /// entry. Asks the same questions the command does.
+        #[qinvokable]
+        #[cxx_name = "canGroupLayers"]
+        fn can_group_layers(self: &Engine, indices: &QVector_i32) -> bool;
+
+        /// Take a group apart — Layer ▸ Ungroup Layers. The layer at `index`
+        /// may be the folder or anything inside it, as CS6 accepts both.
+        #[qinvokable]
+        #[cxx_name = "ungroupLayers"]
+        fn ungroup_layers(self: Pin<&mut Engine>, index: i32) -> bool;
+
+        /// Drop a layer onto a group folder: it lands at the top of that
+        /// group's contents. Both are panel indices.
+        #[qinvokable]
+        #[cxx_name = "moveLayerIntoGroup"]
+        fn move_layer_into_group(self: Pin<&mut Engine>, index: i32, group: i32) -> bool;
+
+        /// Whether the layer is a group folder.
+        #[qinvokable]
+        #[cxx_name = "layerIsGroup"]
+        fn layer_is_group(self: &Engine, index: i32) -> bool;
+
+        /// The panel index of the group a layer is in, or -1 for a loose one.
+        #[qinvokable]
+        #[cxx_name = "layerGroupIndex"]
+        fn layer_group_index(self: &Engine, index: i32) -> i32;
+
+        /// Whether a group is open in the panel.
+        #[qinvokable]
+        #[cxx_name = "layerGroupExpanded"]
+        fn layer_group_expanded(self: &Engine, index: i32) -> bool;
+
+        /// Open or close it. Not an edit, so nothing reaches the History panel.
+        #[qinvokable]
+        #[cxx_name = "setLayerGroupExpanded"]
+        fn set_layer_group_expanded(self: Pin<&mut Engine>, index: i32, expanded: bool);
+
         #[qinvokable]
         #[cxx_name = "duplicateLayer"]
         fn duplicate_layer(self: Pin<&mut Engine>, index: i32);
+
+        /// Duplicate a layer under a name of the caller's choosing, and
+        /// possibly somewhere else — Layer ▸ Duplicate Layer.
+        ///
+        /// `destination` is a document tab index, or -1 for a new document
+        /// named `documentName`. Duplicating into another document leaves the
+        /// active one untouched and does not switch tabs, as CS6 does.
+        #[qinvokable]
+        #[cxx_name = "duplicateLayerAs"]
+        fn duplicate_layer_as(
+            self: Pin<&mut Engine>,
+            index: i32,
+            name: &QString,
+            destination: i32,
+            document_name: &QString,
+        ) -> bool;
+
+        /// Delete every hidden layer — Layer ▸ Delete ▸ Hidden Layers.
+        /// Returns how many went.
+        #[qinvokable]
+        #[cxx_name = "deleteHiddenLayers"]
+        fn delete_hidden_layers(self: Pin<&mut Engine>) -> i32;
+
+        /// How many layers are hidden, which is what decides whether Delete
+        /// Hidden Layers is offered.
+        #[qinvokable]
+        #[cxx_name = "hiddenLayerCount"]
+        fn hidden_layer_count(self: &Engine) -> i32;
 
         #[qinvokable]
         #[cxx_name = "deleteLayer"]
@@ -1898,6 +2473,12 @@ pub mod ffi {
         #[cxx_name = "applySelectiveColor"]
         fn apply_selective_color_bridge(self: Pin<&mut Engine>, data: &QString, relative: bool);
 
+        /// Equalize: spread the brightness values present across the full
+        /// range. Confined to the selection when there is one.
+        #[qinvokable]
+        #[cxx_name = "applyEqualize"]
+        fn apply_equalize_bridge(self: Pin<&mut Engine>);
+
         /// Replace Color: shift a sampled colour range in HSL.
         ///
         /// `samples` is semicolon-separated entries of "x,y,r,g,b" — the
@@ -2028,6 +2609,15 @@ pub struct EngineRust {
     /// names the way Photoshop's do.
     next_untitled: u32,
     brush: Brush,
+    /// The style Copy Layer Style put aside, waiting for a Paste.
+    copied_style: Option<crate::effects::LayerEffects>,
+    /// The layer being edited by the Layer Style dialog and the state it had
+    /// when the dialog opened, for putting back if the edit is cancelled.
+    style_edit: Option<(LayerId, crate::layer::StyleState)>,
+    /// The fill layer a New Fill Layer dialog is previewing, uncommitted.
+    fill_preview: Option<LayerId>,
+    /// The adjustment layer a dialog is editing, and what it did before.
+    adjustment_edit: Option<(LayerId, Adjustment)>,
     foreground: Rgba8,
     background: Rgba8,
     erasing: bool,
@@ -2133,6 +2723,10 @@ impl Default for EngineRust {
             active: 0,
             next_untitled: 2,
             brush: Brush::default(),
+            copied_style: None,
+            style_edit: None,
+            fill_preview: None,
+            adjustment_edit: None,
             foreground: Rgba8::BLACK,
             background: Rgba8::WHITE,
             erasing: false,
@@ -3294,6 +3888,29 @@ impl ffi::Engine {
         self.as_mut().documents_changed();
     }
 
+    fn duplicate_document(mut self: core::pin::Pin<&mut Self>, name: &QString, merged: bool) {
+        let requested = name.to_string();
+        let title = if requested.trim().is_empty() {
+            self.doc.copy_name()
+        } else {
+            requested
+        };
+        let copy = self.doc.duplicate(&title, merged);
+        self.as_mut().add_document(copy);
+        // The copy is a different document, with its own layer count and size.
+        // Without this the properties still describe the one it was made from,
+        // and the Layers panel draws a row per layer the *original* had.
+        self.sync();
+    }
+
+    fn document_copy_name(&self) -> QString {
+        QString::from(self.doc.copy_name().as_str())
+    }
+
+    fn document_name(&self) -> QString {
+        QString::from(self.doc.base_name().as_str())
+    }
+
     fn document_count(&self) -> i32 {
         self.tab_count() as i32
     }
@@ -3409,6 +4026,61 @@ impl ffi::Engine {
         self.sync();
     }
 
+    fn resample_image_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        mode: i32,
+    ) {
+        let w = width.max(1) as u32;
+        let h = height.max(1) as u32;
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .resample_image(w, h, crate::resample::Resample::from_i32(mode));
+        self.sync();
+    }
+
+    fn image_data_bytes_bridge(&self) -> i64 {
+        self.doc.image_data_bytes() as i64
+    }
+
+    fn image_resolution(&self) -> f32 {
+        self.doc.resolution()
+    }
+
+    fn set_image_resolution(mut self: core::pin::Pin<&mut Self>, dpi: f32) {
+        self.as_mut().rust_mut().doc.set_resolution(dpi);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resize_canvas_anchored_bridge(
+        mut self: core::pin::Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        anchor_x: i32,
+        anchor_y: i32,
+        fill_r: i32,
+        fill_g: i32,
+        fill_b: i32,
+        fill_a: i32,
+    ) {
+        let clamp = |v: i32| v.clamp(0, 255) as u8;
+        let extension = if fill_a <= 0 {
+            None
+        } else {
+            Some(Rgba8::new(clamp(fill_r), clamp(fill_g), clamp(fill_b), clamp(fill_a)))
+        };
+        self.as_mut().rust_mut().doc.resize_canvas_anchored(
+            width.max(1) as u32,
+            height.max(1) as u32,
+            anchor_x.clamp(0, 2) as u8,
+            anchor_y.clamp(0, 2) as u8,
+            extension,
+        );
+        self.sync();
+    }
+
     fn resize_canvas(mut self: core::pin::Pin<&mut Self>, width: i32, height: i32) {
         let w = width.clamp(1, 30_000) as u32;
         let h = height.clamp(1, 30_000) as u32;
@@ -3449,6 +4121,38 @@ impl ffi::Engine {
         // selection re-trace the crop needs because the ants moved with the
         // canvas.
         self.sync();
+    }
+
+    fn trim_image(
+        mut self: core::pin::Pin<&mut Self>,
+        basis: i32,
+        top: bool,
+        bottom: bool,
+        left: bool,
+        right: bool,
+    ) -> bool {
+        let edges = crate::document::TrimEdges { top, bottom, left, right };
+        let trimmed = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .trim(crate::document::TrimBasis::from_i32(basis), edges);
+        if trimmed {
+            self.sync();
+        }
+        trimmed
+    }
+
+    fn image_has_transparency(&self) -> bool {
+        self.doc.has_transparency()
+    }
+
+    fn reveal_all(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let revealed = self.as_mut().rust_mut().doc.reveal_all();
+        if revealed {
+            self.sync();
+        }
+        revealed
     }
 
     // -- layers -------------------------------------------------------------
@@ -3518,6 +4222,27 @@ impl ffi::Engine {
             })
     }
 
+    fn layer_kind_name(&self, index: i32) -> QString {
+        let Some(layer) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+        else {
+            return QString::from("");
+        };
+        let name = match &layer.kind {
+            LayerKind::Adjustment(adjustment) => adjustment.name(),
+            LayerKind::SolidColor(_) => "Solid Color",
+            LayerKind::Gradient(_) => "Gradient",
+            LayerKind::Pattern(_) => "Pattern",
+            LayerKind::Group => "Group",
+            // As in `layer_kind`: a type layer is raster underneath, so what
+            // makes it type is the text record beside the pixels.
+            LayerKind::Raster if layer.text.is_some() => "Type",
+            LayerKind::Raster => "Pixel",
+        };
+        QString::from(name)
+    }
+
     fn layer_lock_transparency(&self, index: i32) -> bool {
         self.layer_id_at(index)
             .and_then(|id| self.doc.layers().by_id(id))
@@ -3567,15 +4292,24 @@ impl ffi::Engine {
         // a colour the compositor pours through the layer's mask. So the
         // thumbnail is built the same way, or the panel would show a shape
         // layer as an empty row.
+        // A fill layer has no pixels: its thumbnail is drawn the same way the
+        // compositor draws the layer, or the panel would show an empty row.
         let solid = match layer.kind {
             LayerKind::SolidColor(color) => Some(color),
             _ => None,
         };
+        let evaluated = matches!(
+            layer.kind,
+            LayerKind::Gradient(_) | LayerKind::Pattern(_) | LayerKind::Adjustment(_)
+        );
 
-        let (sw, sh) = match (solid, layer.mask.as_ref()) {
-            (Some(_), Some(mask)) => (mask.width(), mask.height()),
-            (Some(_), None) => (self.doc.width(), self.doc.height()),
-            _ => (layer.pixels.width(), layer.pixels.height()),
+        let (sw, sh) = if solid.is_some() || evaluated {
+            match layer.mask.as_ref() {
+                Some(mask) => (mask.width(), mask.height()),
+                None => (self.doc.width(), self.doc.height()),
+            }
+        } else {
+            (layer.pixels.width(), layer.pixels.height())
         };
         if sw == 0 || sh == 0 {
             return QImage::default();
@@ -3586,6 +4320,17 @@ impl ffi::Engine {
         let tw = ((sw as f32 * scale).round() as u32).max(1);
         let th = ((sh as f32 * scale).round() as u32).max(1);
 
+        // Built once rather than per pixel: a two-stop ramp and a procedural
+        // tile are both far more expensive than the sample they serve.
+        let ramp = match &layer.kind {
+            LayerKind::Gradient(fill) => fill.ramp(),
+            _ => crate::gradient::Gradient::two_stop(Rgba8::BLACK, Rgba8::WHITE),
+        };
+        let tile = match &layer.kind {
+            LayerKind::Pattern(fill) => crate::pattern::tile(fill.pattern as usize),
+            _ => None,
+        };
+
         let mut thumb = Pixmap::new(tw, th);
         for y in 0..th {
             for x in 0..tw {
@@ -3593,20 +4338,50 @@ impl ffi::Engine {
                 // allocating an intermediate mip chain on every panel repaint.
                 let sx = (x as f32 / scale) as i32;
                 let sy = (y as f32 / scale) as i32;
-                let px = match solid {
-                    Some(color) => {
-                        let coverage = layer
-                            .mask
-                            .as_ref()
-                            .map_or(255, |mask| mask.get(sx, sy).a);
+                let coverage = layer.mask.as_ref().map_or(255, |mask| mask.get(sx, sy).a);
+                let px = match (&layer.kind, solid) {
+                    (_, Some(color)) => Rgba8::new(
+                        color.r,
+                        color.g,
+                        color.b,
+                        ((color.a as u32 * coverage as u32) / 255) as u8,
+                    ),
+                    (LayerKind::Gradient(fill), _) => {
+                        // The thumbnail is the whole layer shrunk, so the ramp
+                        // is evaluated over the source rectangle and sampled at
+                        // the same place the pixels would have been read from.
+                        let c = fill.sample(&ramp, sx, sy, Rect::from_size(sw, sh));
+                        Rgba8::new(c.r, c.g, c.b, ((c.a as u32 * coverage as u32) / 255) as u8)
+                    }
+                    (LayerKind::Adjustment(adjustment), _) => {
+                        // An adjustment layer has nothing of its own to show,
+                        // so the thumbnail shows what it *does*: a grey ramp
+                        // put through it. CS6 draws a per-adjustment icon
+                        // instead; this at least tells a steep curve from a
+                        // flat one.
+                        let t = if tw > 1 { x as f32 / (tw - 1) as f32 } else { 0.0 };
+                        let out = adjustment.apply_rgb([t, t, t]);
+                        let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                         Rgba8::new(
-                            color.r,
-                            color.g,
-                            color.b,
-                            ((color.a as u32 * coverage as u32) / 255) as u8,
+                            channel(out[0]),
+                            channel(out[1]),
+                            channel(out[2]),
+                            coverage,
                         )
                     }
-                    None => layer.pixels.get(sx, sy),
+                    (LayerKind::Pattern(fill), _) => match tile.as_ref() {
+                        Some(tile) => {
+                            let c = fill.color_at(tile, sx, sy, layer.offset);
+                            Rgba8::new(
+                                c.r,
+                                c.g,
+                                c.b,
+                                ((c.a as u32 * coverage as u32) / 255) as u8,
+                            )
+                        }
+                        None => Rgba8::TRANSPARENT,
+                    },
+                    _ => layer.pixels.get(sx, sy),
                 };
                 thumb.set(x as i32, y as i32, px);
             }
@@ -3691,6 +4466,29 @@ impl ffi::Engine {
             layer.offset = (x, y);
         }
         self.as_mut().rust_mut().doc.commit("Free Transform");
+        self.sync();
+    }
+
+    fn rotate_canvas(mut self: core::pin::Pin<&mut Self>, degrees: f32) {
+        // The Background layer cannot hold transparency, so the corners an
+        // off-axis turn opens up take the background colour. At a right angle
+        // there are no new corners and the fill is never reached.
+        let fill = self.background;
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .rotate_canvas_arbitrary(degrees, Some(fill));
+        self.sync();
+    }
+
+    fn flip_canvas(mut self: core::pin::Pin<&mut Self>, horizontal: bool) {
+        use crate::metadata::Orientation;
+        let how = if horizontal {
+            Orientation::FlipHorizontal
+        } else {
+            Orientation::FlipVertical
+        };
+        self.as_mut().rust_mut().doc.rotate_canvas(how);
         self.sync();
     }
 
@@ -3825,6 +4623,754 @@ impl ffi::Engine {
         self.sync();
     }
 
+    fn layer_effect_value(&self, index: i32, key: &QString) -> f32 {
+        let Some(id) = self.layer_id_at(index) else {
+            return 0.0;
+        };
+        self.doc.layer_effect_value(id, &key.to_string())
+    }
+
+    fn set_layer_effect_value(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        key: &QString,
+        value: f32,
+    ) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let key = key.to_string();
+        let set = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_effect_value(id, &key, value);
+        if set {
+            // The canvas repaints, but nothing lands in the History panel —
+            // that waits for `commitLayerEffects`.
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+        }
+        set
+    }
+
+    fn commit_layer_effects(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().style_edit = None;
+        self.as_mut().rust_mut().doc.commit_layer_effects();
+        self.sync();
+    }
+
+    fn begin_layer_style_edit(mut self: core::pin::Pin<&mut Self>, index: i32) {
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        let Some(state) = self.doc.layer_style_state(id) else {
+            return;
+        };
+        self.as_mut().rust_mut().style_edit = Some((id, state));
+    }
+
+    fn cancel_layer_style_edit(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let Some((id, state)) = self.style_edit else {
+            return false;
+        };
+        self.as_mut().rust_mut().style_edit = None;
+        let restored = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_style_state(id, state);
+        if restored {
+            // No commit: a cancelled edit leaves nothing in the History panel,
+            // so the canvas and the panels are told directly.
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+        }
+        restored
+    }
+
+    fn layer_has_effects(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layer_effects(id))
+            .is_some_and(|fx| fx.any_present())
+    }
+
+    fn layer_effect_names(&self, index: i32) -> QString {
+        let Some(fx) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layer_effects(id))
+        else {
+            return QString::default();
+        };
+        // CS6's order down the Layers panel, which is the order the dialog
+        // lists them in too.
+        let listed = [
+            (fx.bevel.present, "Bevel & Emboss"),
+            (fx.stroke.present, "Stroke"),
+            (fx.inner_shadow.present, "Inner Shadow"),
+            (fx.inner_glow.present, "Inner Glow"),
+            (fx.satin.present, "Satin"),
+            (fx.color_overlay.present, "Color Overlay"),
+            (fx.gradient_overlay.present, "Gradient Overlay"),
+            (fx.pattern_overlay.present, "Pattern Overlay"),
+            (fx.outer_glow.present, "Outer Glow"),
+            (fx.drop_shadow.present, "Drop Shadow"),
+        ];
+        let names: Vec<&str> = listed
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| *name)
+            .collect();
+        QString::from(names.join("\n").as_str())
+    }
+
+    fn clear_layer_effects(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let cleared = self.as_mut().rust_mut().doc.clear_layer_effects(id);
+        if cleared {
+            self.sync();
+        }
+        cleared
+    }
+
+    fn copy_layer_style(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let Some(style) = self.doc.layer_effects(id) else {
+            return false;
+        };
+        if !style.any_present() {
+            return false;
+        }
+        self.as_mut().rust_mut().copied_style = Some(style);
+        true
+    }
+
+    fn paste_layer_style(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let Some(style) = self.copied_style else {
+            return false;
+        };
+        let pasted = self.as_mut().rust_mut().doc.set_layer_effects(id, style);
+        if pasted {
+            self.sync();
+        }
+        pasted
+    }
+
+    fn has_copied_layer_style(&self) -> bool {
+        self.copied_style.is_some()
+    }
+
+    fn hide_all_effects(mut self: core::pin::Pin<&mut Self>, hidden: bool) {
+        self.as_mut().rust_mut().doc.hide_all_effects(hidden);
+        self.sync();
+    }
+
+    fn effects_are_hidden(&self) -> bool {
+        self.doc
+            .layers()
+            .as_slice()
+            .iter()
+            .any(|l| l.effects.any_present() && l.effects.hidden)
+    }
+
+    fn any_layer_has_effects(&self) -> bool {
+        self.doc.any_layer_has_effects()
+    }
+
+    fn add_layer_configured(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        self.as_mut().rust_mut().doc.add_layer_configured(
+            name,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.sync();
+    }
+
+    fn add_fill_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        r: i32,
+        g: i32,
+        b: i32,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        let clamp = |v: i32| v.clamp(0, 255) as u8;
+        self.as_mut().rust_mut().doc.add_fill_layer(
+            name,
+            Rgba8::opaque(clamp(r), clamp(g), clamp(b)),
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.sync();
+    }
+
+    fn layer_mask_linked(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .is_some_and(|id| self.doc.layer_mask_linked(id))
+    }
+
+    fn set_layer_mask_linked(mut self: core::pin::Pin<&mut Self>, index: i32, linked: bool) {
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        if self.as_mut().rust_mut().doc.set_layer_mask_linked(id, linked) {
+            self.sync();
+        }
+    }
+
+    fn layer_mask_thumbnail(&self, index: i32, size: i32) -> QImage {
+        let size = size.clamp(1, 512);
+        let Some(mask) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .and_then(|l| l.mask.as_ref())
+        else {
+            return QImage::default();
+        };
+        let (sw, sh) = (mask.width(), mask.height());
+        if sw == 0 || sh == 0 {
+            return QImage::default();
+        }
+
+        let scale = (size as f32 / sw as f32).min(size as f32 / sh as f32);
+        let tw = ((sw as f32 * scale).round() as u32).max(1);
+        let th = ((sh as f32 * scale).round() as u32).max(1);
+
+        let mut thumb = Pixmap::new(tw, th);
+        for y in 0..th {
+            for x in 0..tw {
+                let sx = (x as f32 / scale) as i32;
+                let sy = (y as f32 / scale) as i32;
+                // A mask is greyscale kept in the alpha channel, so the
+                // thumbnail shows that level as a shade rather than as
+                // transparency.
+                let level = mask.get(sx, sy).a;
+                thumb.set(x as i32, y as i32, Rgba8::opaque(level, level, level));
+            }
+        }
+        pixmap_to_qimage(thumb)
+    }
+
+    fn layer_label(&self, index: i32) -> i32 {
+        self.layer_id_at(index)
+            .map_or(0, |id| self.doc.layer_label(id) as i32)
+    }
+
+    fn set_layer_label(mut self: core::pin::Pin<&mut Self>, index: i32, label: i32) {
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_label(id, label.clamp(0, 7) as u8)
+        {
+            self.sync();
+        }
+    }
+
+    fn add_gradient_fill_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        preset: &QString,
+        shape: i32,
+        angle: f32,
+        scale: i32,
+        reverse: bool,
+        dither: bool,
+        align: bool,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        let fill = crate::fill::GradientFill {
+            gradient: gradient::preset(&preset.to_string(), self.foreground, self.background)
+                .unwrap_or_else(|| {
+                    crate::gradient::Gradient::two_stop(self.foreground, self.background)
+                }),
+            shape: crate::gradient::GradientType::from_i32(shape),
+            angle,
+            scale: scale.clamp(1, 1000) as f32 / 100.0,
+            reverse,
+            dither,
+            align_with_layer: align,
+        };
+        self.as_mut().rust_mut().doc.add_gradient_fill_layer(
+            name,
+            fill,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.sync();
+    }
+
+    fn add_pattern_fill_layer(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        pattern: i32,
+        scale: i32,
+        link: bool,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        let fill = crate::fill::PatternFill {
+            pattern: pattern.max(0) as u32,
+            scale: scale.clamp(10, 1000) as f32 / 100.0,
+            link_with_layer: link,
+        };
+        self.as_mut().rust_mut().doc.add_pattern_fill_layer(
+            name,
+            fill,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.sync();
+    }
+
+    fn begin_fill_layer_preview(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        kind: i32,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) -> i32 {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        let kind = match kind {
+            2 => LayerKind::Pattern(crate::fill::PatternFill::default()),
+            _ => LayerKind::Gradient(crate::fill::GradientFill::default()),
+        };
+        let id = self.as_mut().rust_mut().doc.begin_fill_layer(
+            name,
+            kind,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.as_mut().rust_mut().fill_preview = Some(id);
+        // Not `sync`: that would raise `historyChanged`, and there is nothing
+        // in the history to show yet.
+        self.as_mut().layers_changed();
+        self.as_mut().canvas_changed();
+        self.panel_index_of(id) as i32
+    }
+
+    fn update_gradient_fill_preview(
+        mut self: core::pin::Pin<&mut Self>,
+        preset: &QString,
+        shape: i32,
+        angle: f32,
+        scale: i32,
+        reverse: bool,
+        dither: bool,
+        align: bool,
+    ) {
+        let Some(id) = self.fill_preview else {
+            return;
+        };
+        let fill = crate::fill::GradientFill {
+            gradient: gradient::preset(&preset.to_string(), self.foreground, self.background)
+                .unwrap_or_else(|| {
+                    crate::gradient::Gradient::two_stop(self.foreground, self.background)
+                }),
+            shape: crate::gradient::GradientType::from_i32(shape),
+            angle,
+            scale: scale.clamp(1, 1000) as f32 / 100.0,
+            reverse,
+            dither,
+            align_with_layer: align,
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_fill(id, LayerKind::Gradient(fill));
+        self.as_mut().layers_changed();
+        self.as_mut().canvas_changed();
+    }
+
+    fn update_pattern_fill_preview(
+        mut self: core::pin::Pin<&mut Self>,
+        pattern: i32,
+        scale: i32,
+        link: bool,
+    ) {
+        let Some(id) = self.fill_preview else {
+            return;
+        };
+        let fill = crate::fill::PatternFill {
+            pattern: pattern.max(0) as u32,
+            scale: scale.clamp(10, 1000) as f32 / 100.0,
+            link_with_layer: link,
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_fill(id, LayerKind::Pattern(fill));
+        self.as_mut().layers_changed();
+        self.as_mut().canvas_changed();
+    }
+
+    fn end_fill_layer_preview(mut self: core::pin::Pin<&mut Self>, keep: bool) {
+        let Some(id) = self.fill_preview else {
+            return;
+        };
+        self.as_mut().rust_mut().fill_preview = None;
+        if keep {
+            self.as_mut().rust_mut().doc.commit_fill_layer(id);
+        } else {
+            self.as_mut().rust_mut().doc.discard_layer(id);
+        }
+        self.sync();
+    }
+
+    fn suggested_layer_name(&self, base: &QString) -> QString {
+        QString::from(self.doc.suggested_layer_name(&base.to_string()).as_str())
+    }
+
+    fn layer_from_background(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        mode: i32,
+        opacity: i32,
+    ) -> bool {
+        let name = name.to_string();
+        let name = if name.trim().is_empty() {
+            "Layer 0".to_string()
+        } else {
+            name
+        };
+        let converted = self.as_mut().rust_mut().doc.layer_from_background(
+            &name,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+        );
+        if converted {
+            self.sync();
+        }
+        converted
+    }
+
+    fn has_background_layer(&self) -> bool {
+        self.doc.has_background()
+    }
+
+    fn layer_via_copy(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let made = self.as_mut().rust_mut().doc.layer_via_copy().is_some();
+        if made {
+            self.sync();
+        }
+        made
+    }
+
+    fn layer_via_cut(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let made = self.as_mut().rust_mut().doc.layer_via_cut().is_some();
+        if made {
+            self.sync();
+        }
+        made
+    }
+
+    fn add_adjustment_layer_configured(
+        mut self: core::pin::Pin<&mut Self>,
+        kind: &QString,
+        name: &QString,
+        mode: i32,
+        opacity: i32,
+        clipping: bool,
+        label: i32,
+    ) -> bool {
+        let Some(adjustment) = Adjustment::default_for(&kind.to_string()) else {
+            return false;
+        };
+        let name = name.to_string();
+        let name = if name.trim().is_empty() { None } else { Some(name) };
+        self.as_mut().rust_mut().doc.add_adjustment_layer_configured(
+            name,
+            adjustment,
+            BlendMode::from_i32(mode),
+            opacity.clamp(0, 100) as f32 / 100.0,
+            clipping,
+            label.clamp(0, 7) as u8,
+        );
+        self.sync();
+        true
+    }
+
+    fn begin_adjustment_edit(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let Some(adjustment) = self.doc.layer_adjustment(id) else {
+            return false;
+        };
+        self.as_mut().rust_mut().adjustment_edit = Some((id, adjustment));
+        true
+    }
+
+    fn set_layer_curves(mut self: core::pin::Pin<&mut Self>, lut: &[u8], channel: i32) {
+        let Some((id, _)) = self.adjustment_edit else {
+            return;
+        };
+        if lut.len() < 256 {
+            return;
+        }
+        let mut table = [0u8; 256];
+        table.copy_from_slice(&lut[..256]);
+        let adjustment = Adjustment::Curves {
+            lut: table,
+            channel: channel.clamp(0, 3) as u8,
+        };
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_adjustment(id, adjustment)
+        {
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+        }
+    }
+
+    fn layer_adjustment_name(&self, index: i32) -> QString {
+        let name = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layer_adjustment(id))
+            .map_or("", |a| a.name());
+        QString::from(name)
+    }
+
+    fn layer_adjustment_value(&self, index: i32, key: &QString, fallback: f32) -> f32 {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layer_adjustment(id))
+            .and_then(|a| a.value(&key.to_string()))
+            .unwrap_or(fallback)
+    }
+
+    fn set_layer_adjustment_value(
+        mut self: core::pin::Pin<&mut Self>,
+        key: &QString,
+        value: f32,
+    ) -> bool {
+        let Some((id, _)) = self.adjustment_edit else {
+            return false;
+        };
+        let Some(mut adjustment) = self.doc.layer_adjustment(id) else {
+            return false;
+        };
+        if !adjustment.set_value(&key.to_string(), value) {
+            return false;
+        }
+        if !self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_adjustment(id, adjustment)
+        {
+            return false;
+        }
+        self.as_mut().layers_changed();
+        self.as_mut().canvas_changed();
+        true
+    }
+
+    fn reset_layer_adjustment(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let Some((id, _)) = self.adjustment_edit else {
+            return false;
+        };
+        let Some(current) = self.doc.layer_adjustment(id) else {
+            return false;
+        };
+        // Colorize is Hue/Saturation with its box ticked, so resetting one puts
+        // the box back rather than leaving a Colorize layer at "no colour".
+        let name = match current {
+            Adjustment::Colorize { .. } => "Hue/Saturation",
+            other => other.name(),
+        };
+        let Some(defaults) = Adjustment::default_for(name) else {
+            return false;
+        };
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_adjustment(id, defaults)
+        {
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+            return true;
+        }
+        false
+    }
+
+    fn set_layer_gradient_map(
+        mut self: core::pin::Pin<&mut Self>,
+        name: &QString,
+        reverse: bool,
+    ) -> bool {
+        let Some((id, _)) = self.adjustment_edit else {
+            return false;
+        };
+        let fg = self.as_ref().rust().foreground;
+        let bg = self.as_ref().rust().background;
+        let Some(gradient) = crate::gradient::preset(&name.to_string(), fg, bg) else {
+            return false;
+        };
+        let gradient = if reverse { gradient.reversed() } else { gradient };
+
+        // Baked to 256 samples here, so the compositor never has to walk the
+        // stop list per pixel.
+        let mut ramp = [[0u8; 3]; 256];
+        for (level, stop) in ramp.iter_mut().enumerate() {
+            let color = gradient.sample(level as f32 / 255.0);
+            *stop = [color.r, color.g, color.b];
+        }
+
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_adjustment(id, Adjustment::GradientMap { ramp })
+        {
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+            return true;
+        }
+        false
+    }
+
+    fn layer_gradient_map_preview(&self, index: i32, width: i32, height: i32) -> QImage {
+        let Some(Adjustment::GradientMap { ramp }) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layer_adjustment(id))
+        else {
+            return QImage::default();
+        };
+
+        let width = width.clamp(1, 4096) as u32;
+        let height = height.clamp(1, 4096) as u32;
+        let mut strip = Pixmap::new(width, height);
+        for x in 0..width {
+            // Sampled at the pixel's centre, as `Gradient::preview` does, so
+            // the strip and the ramp agree at both ends.
+            let t = if width <= 1 {
+                0.0
+            } else {
+                (x as f32 + 0.5) / width as f32
+            };
+            let stop = ramp[((t * 255.0).round() as usize).min(255)];
+            let color = Rgba8::opaque(stop[0], stop[1], stop[2]);
+            for y in 0..height {
+                strip.set(x as i32, y as i32, color);
+            }
+        }
+        pixmap_to_qimage(strip)
+    }
+
+    fn color_lookup_preset_names(&self) -> QString {
+        QString::from(
+            crate::filters::adjust::COLOR_LOOKUP_PRESETS
+                .join("\n")
+                .as_str(),
+        )
+    }
+
+    fn set_layer_color_lookup(mut self: core::pin::Pin<&mut Self>, name: &QString) -> bool {
+        let Some((id, _)) = self.adjustment_edit else {
+            return false;
+        };
+        let Some(tables) = crate::filters::adjust::color_lookup_tables(&name.to_string())
+        else {
+            return false;
+        };
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_layer_adjustment(id, Adjustment::ColorLookup { tables })
+        {
+            self.as_mut().layers_changed();
+            self.as_mut().canvas_changed();
+            return true;
+        }
+        false
+    }
+
+    fn layer_color_lookup_preset(&self, index: i32) -> QString {
+        let Some(Adjustment::ColorLookup { tables }) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layer_adjustment(id))
+        else {
+            return QString::from("");
+        };
+        for name in crate::filters::adjust::COLOR_LOOKUP_PRESETS {
+            if crate::filters::adjust::color_lookup_tables(name) == Some(tables) {
+                return QString::from(name);
+            }
+        }
+        QString::from("")
+    }
+
+    fn end_adjustment_edit(mut self: core::pin::Pin<&mut Self>, keep: bool) {
+        let Some((id, before)) = self.adjustment_edit else {
+            return;
+        };
+        self.as_mut().rust_mut().adjustment_edit = None;
+        if keep {
+            let label = self
+                .doc
+                .layer_adjustment(id)
+                .map_or("Adjustment", |a| a.name());
+            self.as_mut().rust_mut().doc.commit(label);
+        } else {
+            self.as_mut().rust_mut().doc.set_layer_adjustment(id, before);
+        }
+        self.sync();
+    }
+
+    fn supports_adjustment(&self, kind: &QString) -> bool {
+        Adjustment::default_for(&kind.to_string()).is_some()
+    }
+
     fn add_adjustment_layer(mut self: core::pin::Pin<&mut Self>, kind: &QString) {
         let name = kind.to_string();
         let adjustment = Adjustment::default_for(&name).unwrap_or_default();
@@ -3835,11 +5381,225 @@ impl ffi::Engine {
         self.sync();
     }
 
+    /// The layer ids behind a set of panel indices, in stack order.
+    fn layer_ids_at(&self, indices: &ffi::QVector_i32) -> Vec<LayerId> {
+        let mut ids: Vec<LayerId> = (0..indices.len())
+            .filter_map(|i| indices.get(i).copied())
+            .filter_map(|index| self.layer_id_at(index))
+            .collect();
+        ids.dedup();
+        ids
+    }
+
+    fn group_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
+        let ids = self.layer_ids_at(indices);
+        if ids.is_empty() {
+            return false;
+        }
+        let made = self.as_mut().rust_mut().doc.group_layers(&ids).is_some();
+        if made {
+            self.sync();
+        }
+        made
+    }
+
+    fn add_layer_group(mut self: core::pin::Pin<&mut Self>, name: &QString) {
+        let name = name.to_string();
+        let name = (!name.trim().is_empty()).then_some(name);
+        self.as_mut().rust_mut().doc.add_group(name);
+        self.sync();
+    }
+
+    fn can_group_layers(&self, indices: &ffi::QVector_i32) -> bool {
+        let ids = self.layer_ids_at(indices);
+        if ids.is_empty() {
+            return false;
+        }
+        // The same two refusals `Document::group_layers` makes: a group cannot
+        // go inside a group, and neither can anything already in one.
+        ids.iter().all(|id| {
+            self.doc
+                .layers()
+                .by_id(*id)
+                .is_some_and(|l| !l.is_group() && l.parent.is_none())
+        })
+    }
+
+    fn ungroup_layers(mut self: core::pin::Pin<&mut Self>, index: i32) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        // CS6 ungroups from a member as readily as from the folder itself.
+        let group = match self.doc.layers().by_id(id) {
+            Some(layer) if layer.is_group() => id,
+            Some(layer) => match layer.parent {
+                Some(parent) => parent,
+                None => return false,
+            },
+            None => return false,
+        };
+        let done = self.as_mut().rust_mut().doc.ungroup_layers(group);
+        if done {
+            self.sync();
+        }
+        done
+    }
+
+    fn move_layer_into_group(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        group: i32,
+    ) -> bool {
+        let (Some(id), Some(group_id)) = (self.layer_id_at(index), self.layer_id_at(group))
+        else {
+            return false;
+        };
+        let moved = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .move_layer_into_group(id, group_id);
+        if moved {
+            self.sync();
+        }
+        moved
+    }
+
+    fn layer_is_group(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|layer| layer.is_group())
+    }
+
+    fn layer_group_index(&self, index: i32) -> i32 {
+        let Some(parent) = self
+            .layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .and_then(|layer| layer.parent)
+        else {
+            return -1;
+        };
+        let count = self.doc.layer_count();
+        match self.doc.layers().index_of(parent) {
+            // Back from stack order into panel order.
+            Some(stack_index) => (count - 1 - stack_index) as i32,
+            None => -1,
+        }
+    }
+
+    fn layer_group_expanded(&self, index: i32) -> bool {
+        self.layer_id_at(index)
+            .and_then(|id| self.doc.layers().by_id(id))
+            .is_some_and(|layer| layer.expanded)
+    }
+
+    fn set_layer_group_expanded(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        expanded: bool,
+    ) {
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        if self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .set_group_expanded(id, expanded)
+        {
+            self.as_mut().layers_changed();
+        }
+    }
+
     fn duplicate_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
             self.as_mut().rust_mut().doc.duplicate_layer(id);
             self.sync();
         }
+    }
+
+    fn duplicate_layer_as(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        name: &QString,
+        destination: i32,
+        document_name: &QString,
+    ) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let Some(mut layer) = self.doc.layer_copy(id) else {
+            return false;
+        };
+        let requested = name.to_string();
+        layer.name = if requested.trim().is_empty() {
+            format!("{} copy", layer.name)
+        } else {
+            requested
+        };
+
+        // Same document: straight in above the active layer.
+        if destination >= 0 && destination as usize == self.active {
+            self.as_mut().rust_mut().doc.insert_layer(layer);
+            self.sync();
+            return true;
+        }
+
+        if destination < 0 {
+            // A new document the size of the one the layer came from, holding
+            // just that layer.
+            let (w, h) = self.doc.size();
+            let mut stack = LayerStack::new();
+            stack.push(layer);
+            let mut doc = Document::from_layers(stack, w, h);
+            doc.untitled_number = self.next_untitled;
+            self.as_mut().rust_mut().next_untitled += 1;
+            let title = document_name.to_string();
+            if !title.trim().is_empty() {
+                doc.title = Some(title);
+            }
+            self.as_mut().add_document(doc);
+            self.sync();
+            return true;
+        }
+
+        // Another open document. It waits on the shelf, so it is edited in
+        // place: the active document, and the tab the user is on, do not
+        // change.
+        let destination = destination as usize;
+        if destination >= self.tab_count() {
+            return false;
+        }
+        // The shelf is the tab order with the active document taken out, so
+        // anything past it shifts down by one.
+        let shelf_index = if destination < self.active {
+            destination
+        } else {
+            destination - 1
+        };
+        let mut rust = self.as_mut().rust_mut();
+        let Some(target) = rust.shelf.get_mut(shelf_index) else {
+            return false;
+        };
+        target.insert_layer(layer);
+        true
+    }
+
+    fn delete_hidden_layers(mut self: core::pin::Pin<&mut Self>) -> i32 {
+        let removed = self.as_mut().rust_mut().doc.delete_hidden_layers();
+        if removed > 0 {
+            self.sync();
+        }
+        removed as i32
+    }
+
+    fn hidden_layer_count(&self) -> i32 {
+        self.doc
+            .layers()
+            .as_slice()
+            .iter()
+            .filter(|l| !l.visible)
+            .count() as i32
     }
 
     fn delete_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
@@ -5174,8 +6934,9 @@ impl ffi::Engine {
     }
 
     fn pick_color(&self, x: i32, y: i32) -> QColor {
-        let px = self.doc.composite().get(x, y);
-        rgba_to_qcolor(px)
+        // One pixel, not the whole canvas: this is called on every pointer
+        // move by the Info panel and by the eyedropper in the colour dialogs.
+        rgba_to_qcolor(self.doc.composite_pixel(x, y))
     }
 
     // -- selection ----------------------------------------------------------
@@ -5435,6 +7196,7 @@ impl ffi::Engine {
                 hue: p1,
                 saturation: p2,
                 lightness: p3,
+                range: 0,
             },
             "Levels" => Adjustment::Levels {
                 in_black: p1,
@@ -5605,6 +7367,11 @@ impl ffi::Engine {
             }
         }
         self.as_mut().rust_mut().doc.apply_selective_color(&adj, relative);
+        self.sync();
+    }
+
+    fn apply_equalize_bridge(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().doc.apply_equalize();
         self.sync();
     }
 

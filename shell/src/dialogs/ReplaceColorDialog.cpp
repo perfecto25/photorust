@@ -3,6 +3,9 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 #include "tools/ToolIcons.h"
 
+#include <QApplication>
+#include <QDateTime>
+#include <QDebug>
 #include <QButtonGroup>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -16,7 +19,6 @@
 #include <QRadioButton>
 #include <QSlider>
 #include <QSpinBox>
-#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -25,29 +27,49 @@
 namespace {
 
 /// Where the eyedropper reads from. One per application — see `setSampler`.
-ReplaceColorDialog::Sampler g_sampler;
+ReplaceColorDialog::CursorHook g_cursorHook;
 
 /// The size of the mask thumbnail, matching CS6's proportions.
 constexpr int kMaskBox = 200;
 
-const QCursor &eyedropperCursor()
+/// The dropper cursor, badged like CS6's: bare for Sample, "+" for Add to
+/// Sample and "-" for Subtract, so the active mode is visible on the image
+/// rather than only in the dialog.
+QCursor eyedropperCursor(char badge)
 {
-    static const QCursor cursor = [] {
-        const QPixmap pale = ToolIcons::icon(ToolId::Eyedropper, Qt::white).pixmap(22, 22);
-        const QPixmap dark =
-            ToolIcons::icon(ToolId::Eyedropper, QColor(0, 0, 0, 190)).pixmap(22, 22);
+    const QPixmap pale = ToolIcons::icon(ToolId::Eyedropper, Qt::white).pixmap(22, 22);
+    const QPixmap dark =
+        ToolIcons::icon(ToolId::Eyedropper, QColor(0, 0, 0, 190)).pixmap(22, 22);
 
-        QPixmap art(pale.size());
-        art.setDevicePixelRatio(pale.devicePixelRatio());
-        art.fill(Qt::transparent);
-        QPainter painter(&art);
-        painter.drawPixmap(QPointF(1, 1), dark);
-        painter.drawPixmap(QPointF(0, 0), pale);
-        painter.end();
-        // The tip of the dropper is the bottom-left of the glyph.
-        return QCursor(art, 0, 21);
-    }();
-    return cursor;
+    QPixmap art(pale.size());
+    art.setDevicePixelRatio(pale.devicePixelRatio());
+    art.fill(Qt::transparent);
+    QPainter painter(&art);
+    painter.drawPixmap(QPointF(1, 1), dark);
+    painter.drawPixmap(QPointF(0, 0), pale);
+    if (badge != '\0') {
+        // Bottom-right of the glyph, drawn dark-on-light so it reads over
+        // both a bright and a dark image.
+        QFont font = painter.font();
+        font.setPixelSize(11);
+        font.setBold(true);
+        painter.setFont(font);
+        const QRect box(art.width() - 10, art.height() - 12, 10, 12);
+        painter.setPen(QColor(0, 0, 0, 200));
+        painter.drawText(box.translated(1, 1), Qt::AlignCenter, QChar(badge));
+        painter.setPen(Qt::white);
+        painter.drawText(box, Qt::AlignCenter, QChar(badge));
+    }
+    painter.end();
+    // The tip of the dropper is the bottom-left of the glyph.
+    //
+    // Derived from the rendered pixmap rather than hard-coded: `pixmap()`
+    // returns the icon's own size (20px), not the 22 asked for, and a hotspot
+    // outside the bitmap produces an invalid cursor — which is why the
+    // eyedropper silently failed to appear at all.
+    // x=3 matches the Color Picker's dropper, whose hotspot has always been
+    // correct; y is derived so it can never fall outside the bitmap again.
+    return QCursor(art, 3, art.height() - 1);
 }
 
 /// A flat swatch showing a colour, framed so white reads against the dialog.
@@ -91,9 +113,9 @@ ReplaceColorDialog::~ReplaceColorDialog()
     revertPreview();
 }
 
-void ReplaceColorDialog::setSampler(Sampler sampler)
+void ReplaceColorDialog::setCursorHook(CursorHook hook)
 {
-    g_sampler = std::move(sampler);
+    g_cursorHook = std::move(hook);
 }
 
 void ReplaceColorDialog::buildUi()
@@ -125,11 +147,11 @@ void ReplaceColorDialog::buildUi()
     m_subButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
     connect(m_pickButton, &QToolButton::clicked, this,
-            [this] { m_pickMode = PickMode::Replace; });
+            [this] { m_pickMode = PickMode::Replace; refreshSamplingCursor(); });
     connect(m_addButton, &QToolButton::clicked, this,
-            [this] { m_pickMode = PickMode::Add; });
+            [this] { m_pickMode = PickMode::Add; refreshSamplingCursor(); });
     connect(m_subButton, &QToolButton::clicked, this,
-            [this] { m_pickMode = PickMode::Subtract; });
+            [this] { m_pickMode = PickMode::Subtract; refreshSamplingCursor(); });
 
     topRow->addStretch();
     topRow->addWidget(new QLabel(tr("Color:")));
@@ -175,7 +197,7 @@ void ReplaceColorDialog::buildUi()
     modeRow->addWidget(m_showSelection);
     modeRow->addWidget(m_showImage);
     modeRow->addStretch();
-    connect(m_showSelection, &QRadioButton::toggled, this, [this] { refreshMask(); });
+    connect(m_showSelection, &QRadioButton::toggled, this, [this] { applyChange(true); });
     left->addLayout(modeRow);
 
     // --- Replacement ------------------------------------------------------
@@ -194,7 +216,9 @@ void ReplaceColorDialog::buildUi()
         grid->addWidget(spin, row, 2);
         connect(slider, &QSlider::valueChanged, spin, &QSpinBox::setValue);
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), slider, &QSlider::setValue);
-        connect(slider, &QSlider::valueChanged, this, &ReplaceColorDialog::onValueChanged);
+        // The mask depends only on the samples and Fuzziness, so moving these
+        // must not pay to recompute it.
+        connect(slider, &QSlider::valueChanged, this, [this] { applyChange(false); });
     };
     makeRow(0, tr("Hue:"), -180, 180, m_hueSlider, m_hueSpin);
     makeRow(1, tr("Saturation:"), -100, 100, m_satSlider, m_satSpin);
@@ -263,10 +287,23 @@ QString ReplaceColorDialog::samplesString() const
 
 void ReplaceColorDialog::onValueChanged()
 {
+    applyChange(true);
+}
+
+void ReplaceColorDialog::applyChange(bool maskDirty)
+{
     if (m_loading) {
         return;
     }
-    refreshMask();
+    // Roll the preview back once, up front, so both the mask and the fresh
+    // preview see the original image. Doing it here rather than inside each
+    // step is what keeps a slider drag to one undo and one apply — every
+    // apply costs a full-image pass and a history snapshot, so doing it twice
+    // per event was the whole reason this dialog felt slow.
+    revertPreview();
+    if (maskDirty) {
+        refreshMask();
+    }
     refreshSwatches();
     if (m_preview->isChecked()) {
         applyPreview();
@@ -279,13 +316,9 @@ void ReplaceColorDialog::refreshMask()
         return;
     }
 
-    // The thumbnail has to show the document as it was before the preview
-    // was applied, so the mask is taken with the preview rolled back.
-    const bool wasApplied = m_previewApplied;
-    if (wasApplied) {
-        revertPreview();
-    }
-
+    // The caller has already rolled the preview back, so the engine is
+    // holding the original image and the mask describes what the user
+    // actually selected rather than the result of the last preview.
     QImage image;
     if (m_showImage && m_showImage->isChecked()) {
         image = m_engine->layerThumbnail(m_engine->property("activeLayerIndex").toInt(),
@@ -301,10 +334,6 @@ void ReplaceColorDialog::refreshMask()
             m_maskLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     } else {
         m_maskLabel->clear();
-    }
-
-    if (wasApplied && m_preview->isChecked()) {
-        applyPreview();
     }
 }
 
@@ -369,14 +398,8 @@ void ReplaceColorDialog::revertPreview()
 
 // ---------------------------------------------------------------- sampling ---
 
-void ReplaceColorDialog::takeSampleAt(const QPoint &globalPos)
+void ReplaceColorDialog::applySample(const QPoint &doc, const QColor &color)
 {
-    QColor color;
-    QPoint doc;
-    if (!g_sampler || !g_sampler(globalPos, &color, &doc)) {
-        return;
-    }
-
     switch (m_pickMode) {
     case PickMode::Replace:
         m_samples.clear();
@@ -405,114 +428,60 @@ void ReplaceColorDialog::takeSampleAt(const QPoint &globalPos)
     onValueChanged();
 }
 
-void ReplaceColorDialog::updateHoverSampling()
+void ReplaceColorDialog::addSample(const QPoint &documentPos, const QColor &color)
 {
-    if (!g_sampler) {
-        return;
-    }
-
-    const QPoint pos = QCursor::pos();
-    const bool outside = !frameGeometry().contains(pos);
-
-    if (outside == m_sampling) {
-        if (m_sampling) {
-            showCursorFor(g_sampler(pos, nullptr, nullptr));
-        }
-        return;
-    }
-
-    if (outside) {
-        // A drag that began inside the dialog — sliding off the end of a
-        // slider, say — belongs to the control it started on. Taking the mouse
-        // mid-drag would cut that gesture off, so sampling waits for the
-        // button to come up.
-        if (QGuiApplication::mouseButtons() != Qt::NoButton) {
-            return;
-        }
-        m_sampling = true;
-        // The dialog is modal, so the canvas cannot see the pointer at all:
-        // holding the mouse is what lets the dialog catch a click on the
-        // image. The cursor is not taken with the grab, because it has to
-        // change as the pointer crosses on and off the canvas.
-        grabMouse();
-        QGuiApplication::setOverrideCursor(Qt::ArrowCursor);
-        m_cursorOverridden = true;
-        showCursorFor(g_sampler(pos, nullptr, nullptr));
-    } else {
-        m_sampling = false;
-        releaseMouse();
-        clearCursorOverride();
-    }
+    // Arrives from the canvas, which is in colour-sampling mode for as long
+    // as this dialog is open.
+    applySample(documentPos, color);
 }
 
-void ReplaceColorDialog::showCursorFor(bool overImage)
+void ReplaceColorDialog::refreshSamplingCursor()
 {
-    if (!m_cursorOverridden) {
+    if (!m_cursorOverridden || !g_cursorHook) {
         return;
     }
-    // The eyedropper belongs to the image and stops at its edge: over the
-    // panels or another window there is nothing to sample.
-    QGuiApplication::changeOverrideCursor(overImage ? eyedropperCursor()
-                                                    : QCursor(Qt::ArrowCursor));
+    char badge = '\0';
+    if (m_pickMode == PickMode::Add) {
+        badge = '+';
+    } else if (m_pickMode == PickMode::Subtract) {
+        badge = '-';
+    }
+    const QCursor cursor = eyedropperCursor(badge);
+    g_cursorHook(&cursor);
 }
 
 void ReplaceColorDialog::clearCursorOverride()
 {
     if (m_cursorOverridden) {
-        QGuiApplication::restoreOverrideCursor();
         m_cursorOverridden = false;
+        if (g_cursorHook) {
+            g_cursorHook(nullptr);
+        }
     }
-}
-
-void ReplaceColorDialog::mouseMoveEvent(QMouseEvent *event)
-{
-    updateHoverSampling();
-    if (m_sampling) {
-        event->accept();
-        return;
-    }
-    QDialog::mouseMoveEvent(event);
-}
-
-void ReplaceColorDialog::mouseReleaseEvent(QMouseEvent *event)
-{
-    if (m_sampling) {
-        // Unlike the Color Picker, which follows the pointer, a sample is only
-        // taken on a click: the list is cumulative, so hovering must not keep
-        // adding to it.
-        takeSampleAt(event->globalPosition().toPoint());
-        event->accept();
-        return;
-    }
-    QDialog::mouseReleaseEvent(event);
 }
 
 void ReplaceColorDialog::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
-    if (!g_sampler) {
+    if (!g_cursorHook) {
         return;
     }
-    if (!m_hoverTimer) {
-        m_hoverTimer = new QTimer(this);
-        m_hoverTimer->setInterval(30);
-        connect(m_hoverTimer, &QTimer::timeout, this,
-                &ReplaceColorDialog::updateHoverSampling);
-    }
-    m_hoverTimer->start();
+    // The eyedropper is shown for as long as the dialog is open, exactly as
+    // Photoshop does — the pointer is over the canvas or it is over the
+    // dialog, and the dialog's own widgets keep their cursors regardless.
+    //
+    // An earlier version polled the pointer and switched the cursor only when
+    // it was over the image. That had three conditions to get right and, when
+    // one of them silently failed, the eyedropper simply never appeared.
+    // There is nothing here to get wrong.
+    m_cursorOverridden = true;
+    refreshSamplingCursor();
 }
 
 void ReplaceColorDialog::hideEvent(QHideEvent *event)
 {
-    if (m_hoverTimer) {
-        m_hoverTimer->stop();
-    }
-    if (m_sampling) {
-        m_sampling = false;
-        // Neither the grab nor the cursor may outlive the dialog, or the
-        // application is left with a mouse it cannot use.
-        releaseMouse();
-    }
+    // The cursor must not outlive the dialog, or the application is left
+    // showing an eyedropper with nothing to sample.
     clearCursorOverride();
     QDialog::hideEvent(event);
 }

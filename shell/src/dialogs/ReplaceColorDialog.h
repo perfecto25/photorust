@@ -2,6 +2,7 @@
 
 #include <QCheckBox>
 #include <QColor>
+#include <QCursor>
 #include <QDialog>
 #include <QPoint>
 #include <QVector>
@@ -13,7 +14,6 @@ class QLabel;
 class QRadioButton;
 class QSlider;
 class QSpinBox;
-class QTimer;
 class QToolButton;
 
 /// Photoshop's Image > Adjustments > Replace Color.
@@ -29,21 +29,20 @@ public:
     explicit ReplaceColorDialog(Engine *engine, QWidget *parent = nullptr);
     ~ReplaceColorDialog() override;
 
-    /// How the eyedropper reads the image: given a point on screen, report
-    /// the colour there and which document pixel it came from, or return
-    /// false if the point is not over the image.
+    /// Shows the eyedropper over the canvas, or restores the tool's cursor
+    /// when passed nullptr.
     ///
-    /// Application-wide for the same reason ColorPickerDialog's is: there is
-    /// one canvas, and threading it through the Image menu would mean
-    /// teaching the menu about the canvas.
-    using Sampler = std::function<bool(const QPoint &globalPos, QColor *color, QPoint *docPos)>;
-    static void setSampler(Sampler sampler);
+    /// Set on the canvas widget rather than through an application override
+    /// cursor: this dialog is modal, and the override route did not reliably
+    /// take effect over the blocked main window.
+    using CursorHook = std::function<void(const QCursor *)>;
+    static void setCursorHook(CursorHook hook);
+
+public slots:
+    /// Take a colour the canvas reported while sampling was on.
+    void addSample(const QPoint &documentPos, const QColor &color);
 
 protected:
-    // While the pointer is off the dialog it holds the mouse, so these arrive
-    // wherever it is — including over the canvas behind the dialog.
-    void mouseMoveEvent(QMouseEvent *event) override;
-    void mouseReleaseEvent(QMouseEvent *event) override;
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
 
@@ -61,18 +60,25 @@ private:
     void applyPreview();
     void revertPreview();
     void onValueChanged();
+    /// One revert, optionally a mask rebuild, then one apply.
+    /// `maskDirty` is false for the Hue/Saturation/Lightness sliders, which
+    /// change the result but not which pixels are selected.
+    void applyChange(bool maskDirty);
     void refreshMask();
     void refreshSwatches();
 
     /// Serialise the samples as "x,y,r,g,b;..." for the bridge.
     QString samplesString() const;
 
-    // Eyedropper plumbing, mirroring ColorPickerDialog: the dialog is modal,
-    // so it has to hold the mouse to see clicks land on the canvas.
-    void updateHoverSampling();
-    void showCursorFor(bool overImage);
+    // Eyedropper plumbing. Unlike ColorPickerDialog this never grabs the
+    // mouse: grabbing froze other applications and stopped the window manager
+    // from moving this dialog.
+    /// Re-apply the dropper cursor for the current pick mode, so switching
+    /// between Sample / Add / Subtract updates the badge without the pointer
+    /// having to leave the image and come back.
+    void refreshSamplingCursor();
     void clearCursorOverride();
-    void takeSampleAt(const QPoint &globalPos);
+    void applySample(const QPoint &documentPos, const QColor &color);
 
     Engine *m_engine = nullptr;
     bool m_previewApplied = false;
@@ -104,7 +110,5 @@ private:
     QLabel *m_resultSwatch = nullptr;
     QCheckBox *m_preview = nullptr;
 
-    QTimer *m_hoverTimer = nullptr;
-    bool m_sampling = false;
     bool m_cursorOverridden = false;
 };

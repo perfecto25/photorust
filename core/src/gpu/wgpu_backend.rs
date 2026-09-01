@@ -112,7 +112,17 @@ fn pack_stack(stack: &LayerStack) -> Option<PackedStack> {
                 KIND_SOLID,
                 u32::from(c.r) | (u32::from(c.g) << 8) | (u32::from(c.b) << 16) | (u32::from(c.a) << 24),
             ),
-            LayerKind::Adjustment(_) => return None,
+            // An adjustment recolours the backdrop, and the two evaluated
+            // fills need per-pixel work the shader has no description of.
+            // Either sends the whole stack back to the CPU, which is the
+            // fallback this returns.
+            // A group is a second accumulator: its members composite into a
+            // buffer of their own before that buffer is blended. The shader
+            // has one backdrop, so this goes back to the CPU too.
+            LayerKind::Adjustment(_)
+            | LayerKind::Gradient(_)
+            | LayerKind::Pattern(_)
+            | LayerKind::Group => return None,
         };
 
         let visible = !layer.is_invisible();

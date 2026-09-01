@@ -51,14 +51,6 @@ void SpectrumBar::paintEvent(QPaintEvent *)
 // Presets
 // ---------------------------------------------------------------------------
 
-struct HueSatPreset {
-    const char *name;
-    int hue;
-    int saturation;
-    int lightness;
-    bool colorize;
-};
-
 static const HueSatPreset kPresets[] = {
     {"Default",                    0,    0,   0, false},
     {"Cyanotype",                215,   25,   0, true},
@@ -72,6 +64,12 @@ static const HueSatPreset kPresets[] = {
 };
 
 static constexpr int kPresetCount = static_cast<int>(std::size(kPresets));
+
+const QList<HueSatPreset> &hueSaturationPresets()
+{
+    static const QList<HueSatPreset> list(std::begin(kPresets), std::end(kPresets));
+    return list;
+}
 
 // ---------------------------------------------------------------------------
 // HueSaturationDialog

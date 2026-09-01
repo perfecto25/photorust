@@ -12,6 +12,7 @@
 
 use crate::blend::{blend_rgb, BlendMode};
 use crate::buffer::{Pixmap, Rect, Rgba8};
+use crate::effects::{self, RenderedEffect};
 use crate::layer::{Layer, LayerKind, LayerStack};
 use rayon::prelude::*;
 
@@ -47,6 +48,14 @@ pub fn composite_region(
     }
 
     let layers = stack.as_slice();
+    // Layer effects are rendered once for the whole region rather than per
+    // row: a drop shadow is a blur, and a blur cannot be computed a scanline
+    // at a time. Layers without a style cost nothing here.
+    let effects = render_effects(layers, width, height, region);
+    // A pattern fill's tile is generated procedurally, so it is made once here
+    // rather than per pixel.
+    let tiles = fill_tiles(layers);
+    let canvas = Rect::from_size(width, height);
     let stride = out.stride();
     let y0 = region.y as usize;
     let y1 = region.bottom() as usize;
@@ -56,7 +65,7 @@ pub fn composite_region(
         .enumerate()
         .filter(|(y, _)| *y >= y0 && *y < y1)
         .for_each(|(y, row)| {
-            composite_row(layers, y as i32, region, row);
+            composite_row(layers, &effects, &tiles, canvas, y as i32, region, row);
         });
 
     CompositeResult {
@@ -65,14 +74,112 @@ pub fn composite_region(
     }
 }
 
+/// Composite a single pixel.
+///
+/// For the colour pickers and the Info panel, which ask one pixel at a time
+/// while the pointer moves. Compositing the whole canvas for each of those —
+/// which is what calling [`composite`] amounts to — costs the entire stack per
+/// query and makes hovering the image visibly slow.
+pub fn composite_pixel(stack: &LayerStack, width: u32, height: u32, x: i32, y: i32) -> Rgba8 {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 || stack.is_empty() {
+        return Rgba8::TRANSPARENT;
+    }
+    // `composite_row` indexes by absolute x, so the scratch row spans the
+    // canvas even though only one pixel of it is written.
+    let mut row = vec![0u8; width as usize * 4];
+    let region = Rect::new(x, y, 1, 1);
+    let layers = stack.as_slice();
+    let effects = render_effects(layers, width, height, region);
+    let tiles = fill_tiles(layers);
+    composite_row(
+        layers,
+        &effects,
+        &tiles,
+        Rect::from_size(width, height),
+        y,
+        region,
+        &mut row,
+    );
+    let i = x as usize * 4;
+    Rgba8::new(row[i], row[i + 1], row[i + 2], row[i + 3])
+}
+
+/// Render every layer's effects over `region`, one list per layer.
+///
+/// Empty for a layer with no style, which is nearly all of them — the cost
+/// falls only on the layers that asked for it.
+fn render_effects(
+    layers: &[Layer],
+    width: u32,
+    height: u32,
+    region: Rect,
+) -> Vec<Vec<RenderedEffect>> {
+    layers
+        .iter()
+        .map(|layer| {
+            if layer.is_invisible() || !layer.effects.any_enabled() {
+                Vec::new()
+            } else {
+                effects::render(layer, width, height, region)
+            }
+        })
+        .collect()
+}
+
+/// The tile each pattern fill layer draws with, generated once.
+///
+/// `pattern::tile` builds its artwork procedurally; asking for it per pixel
+/// would cost more than the rest of the composite put together.
+fn fill_tiles(layers: &[Layer]) -> Vec<Option<Pixmap>> {
+    layers
+        .iter()
+        .map(|layer| match &layer.kind {
+            LayerKind::Pattern(fill) => crate::pattern::tile(fill.pattern as usize),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Composite one scanline across `region`, writing straight-alpha RGBA8.
-fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
+fn composite_row(
+    layers: &[Layer],
+    effects: &[Vec<RenderedEffect>],
+    tiles: &[Option<Pixmap>],
+    canvas: Rect,
+    y: i32,
+    region: Rect,
+    row: &mut [u8],
+) {
     for x in region.x..region.right() {
         // Backdrop accumulator, straight alpha, normalised.
         let mut back_rgb = [0.0f32; 3];
         let mut back_a = 0.0f32;
 
+        // Open groups, innermost last. A group's members composite into a
+        // buffer of their own, which is then blended in one go when the folder
+        // itself comes round — so the group's opacity and blend mode apply to
+        // the result rather than to each member, and an adjustment inside a
+        // group reaches only what is in the group.
+        let mut groups: Vec<(crate::layer::LayerId, [f32; 3], f32)> = Vec::new();
+
         for (i, layer) in layers.iter().enumerate() {
+            // Entering a group's members: park the backdrop and start a fresh
+            // one for the group to fill.
+            if let Some(parent) = layer.parent {
+                if groups.last().map(|(id, _, _)| *id) != Some(parent) {
+                    groups.push((parent, back_rgb, back_a));
+                    back_rgb = [0.0; 3];
+                    back_a = 0.0;
+                }
+            }
+
+            if layer.is_group() {
+                // The folder closes the run beneath it: take back the parked
+                // backdrop and blend what the members drew into it.
+                close_group(&mut groups, &mut back_rgb, &mut back_a, layer, x, y);
+                continue;
+            }
+
             if layer.is_invisible() {
                 continue;
             }
@@ -86,6 +193,13 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
             };
             if clip <= 0.0 {
                 continue;
+            }
+
+            // Everything a layer's style draws beneath it — drop shadow,
+            // outer glow — goes down before the layer does.
+            let styles = effects.get(i).map_or(&[][..], |v| v.as_slice());
+            for effect in styles.iter().filter(|e| !e.above) {
+                draw_effect(&mut back_rgb, &mut back_a, effect, x, y, clip);
             }
 
             match &layer.kind {
@@ -102,9 +216,27 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
                     }
                     continue;
                 }
-                LayerKind::SolidColor(color) => {
+                LayerKind::SolidColor(_) | LayerKind::Gradient(_) | LayerKind::Pattern(_) => {
+                    // A fill layer has no pixels: its colour is worked out
+                    // here, which is what keeps a gradient re-angleable and a
+                    // pattern re-scaleable after the fact.
+                    let color = match &layer.kind {
+                        LayerKind::SolidColor(color) => *color,
+                        // A fill layer covers the canvas, so aligning to the
+                        // layer and aligning to the document are the same span
+                        // today. The flag is carried for when they are not.
+                        LayerKind::Gradient(fill) => fill.color_at(x, y, canvas),
+                        LayerKind::Pattern(fill) => match tiles.get(i).and_then(Option::as_ref) {
+                            Some(tile) => fill.color_at(tile, x, y, layer.offset),
+                            None => Rgba8::TRANSPARENT,
+                        },
+                        _ => Rgba8::TRANSPARENT,
+                    };
                     let src_a =
                         (color.a as f32 / 255.0) * layer.effective_alpha() * layer.mask_at(x, y) * clip;
+                    if src_a <= 0.0 {
+                        continue;
+                    }
                     let src_rgb = [
                         color.r as f32 / 255.0,
                         color.g as f32 / 255.0,
@@ -119,6 +251,9 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
                     );
                     continue;
                 }
+                // Handled above: a group contributes nothing itself, it closes
+                // the run of members beneath it.
+                LayerKind::Group => continue,
                 LayerKind::Raster => {}
             }
 
@@ -126,6 +261,11 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
                 .pixels
                 .get(x - layer.offset.0, y - layer.offset.1);
             if px.a == 0 {
+                // The layer has nothing here, but its style may: an outside
+                // stroke and a shadow both live where the layer does not.
+                for effect in styles.iter().filter(|e| e.above) {
+                    draw_effect(&mut back_rgb, &mut back_a, effect, x, y, clip);
+                }
                 continue;
             }
 
@@ -149,7 +289,53 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
                 px.g as f32 / 255.0,
                 px.b as f32 / 255.0,
             ];
+
+            // Blend If gates the layer on what it is about to cover: the
+            // backdrop as accumulated so far, which is exactly what CS6 means
+            // by "Underlying Layer".
+            if !layer.blend_if.is_open() {
+                src_a *= layer.blend_if.coverage(src_rgb, back_rgb);
+                if src_a <= 0.0 {
+                    for effect in styles.iter().filter(|e| e.above) {
+                        draw_effect(&mut back_rgb, &mut back_a, effect, x, y, clip);
+                    }
+                    continue;
+                }
+            }
+
+            // A channel switched off in Advanced Blending keeps whatever the
+            // backdrop had, so the blend is computed in full and then those
+            // channels are put back.
+            let unblended = back_rgb;
             blend_over(&mut back_rgb, &mut back_a, src_rgb, src_a, layer.blend_mode);
+            for c in 0..3 {
+                if !layer.channels[c] {
+                    back_rgb[c] = unblended[c];
+                }
+            }
+
+            // ...and what the style draws over it: overlays, inner effects and
+            // the stroke.
+            for effect in styles.iter().filter(|e| e.above) {
+                draw_effect(&mut back_rgb, &mut back_a, effect, x, y, clip);
+            }
+        }
+
+        // A group whose folder is missing — which the editing operations do
+        // not produce, but a malformed document could — would otherwise
+        // silently swallow its members. Flush what is left, innermost first.
+        while !groups.is_empty() {
+            let (_, parent_rgb, parent_a) = groups.pop().expect("checked non-empty");
+            let (member_rgb, member_a) = (back_rgb, back_a);
+            back_rgb = parent_rgb;
+            back_a = parent_a;
+            blend_over(
+                &mut back_rgb,
+                &mut back_a,
+                member_rgb,
+                member_a,
+                BlendMode::Normal,
+            );
         }
 
         // `row` spans the full canvas width, so index by absolute x.
@@ -159,6 +345,84 @@ fn composite_row(layers: &[Layer], y: i32, region: Rect, row: &mut [u8]) {
         row[i + 2] = to_u8(back_rgb[2]);
         row[i + 3] = to_u8(back_a);
     }
+}
+
+/// Blend a finished group into the backdrop its members were parked over.
+///
+/// The group's opacity, mask and blend mode are applied here, to the whole of
+/// what its members drew — which is the difference between a group and simply
+/// leaving the layers loose. Hiding the group discards the buffer.
+///
+/// CS6's default for a new group is Pass Through, where members composite
+/// straight onto the document backdrop and the group cannot have a blend mode
+/// of its own. Groups here are always isolated, which is what CS6 does the
+/// moment a group is given any other mode; the difference shows only when an
+/// adjustment layer is inside the group, where isolation confines it to the
+/// group's own contents.
+#[inline]
+fn close_group(
+    groups: &mut Vec<(crate::layer::LayerId, [f32; 3], f32)>,
+    back_rgb: &mut [f32; 3],
+    back_a: &mut f32,
+    group: &Layer,
+    x: i32,
+    y: i32,
+) {
+    // An empty group parked nothing, so there is nothing to take back.
+    if groups.last().map(|(id, _, _)| *id) != Some(group.id) {
+        return;
+    }
+    let (_, parent_rgb, parent_a) = groups.pop().expect("checked above");
+    let members_rgb = *back_rgb;
+    let members_a = *back_a;
+    *back_rgb = parent_rgb;
+    *back_a = parent_a;
+
+    if group.is_invisible() {
+        return;
+    }
+    let alpha = members_a * group.effective_alpha() * group.mask_at(x, y);
+    if alpha <= 0.0 {
+        return;
+    }
+    blend_over(back_rgb, back_a, members_rgb, alpha, group.blend_mode);
+}
+
+/// Composite one rendered effect pixel onto the backdrop.
+///
+/// Effects carry their own blend mode, so a Multiply shadow darkens what is
+/// under it exactly as the layer's own Multiply would.
+#[inline]
+fn draw_effect(
+    back_rgb: &mut [f32; 3],
+    back_a: &mut f32,
+    effect: &RenderedEffect,
+    x: i32,
+    y: i32,
+    clip: f32,
+) {
+    let px = effect.pixels.get(x, y);
+    if px.a == 0 {
+        return;
+    }
+    let mut src_a = (px.a as f32 / 255.0) * clip;
+    if effect.blend_mode == BlendMode::Dissolve {
+        // Dissolve is not a colour formula, it is a coin toss on coverage —
+        // and it has to be made here rather than left to `blend_over`, exactly
+        // as the layer path does it a few lines above. Without this an effect
+        // set to Dissolve comes out as a smooth wash, which is what every
+        // other mode already looks like.
+        src_a = if dissolve_threshold(x, y) < src_a { 1.0 } else { 0.0 };
+    }
+    if src_a <= 0.0 {
+        return;
+    }
+    let src_rgb = [
+        px.r as f32 / 255.0,
+        px.g as f32 / 255.0,
+        px.b as f32 / 255.0,
+    ];
+    blend_over(back_rgb, back_a, src_rgb, src_a, effect.blend_mode);
 }
 
 /// The general blend-then-composite step, mutating the backdrop in place.
@@ -547,6 +811,37 @@ mod tests {
             for x in 0..4 {
                 assert_eq!(out.get(x, y).a, 255);
             }
+        }
+    }
+
+    #[test]
+    fn composite_pixel_agrees_with_the_full_composite() {
+        // The fast path the colour pickers use must not be a different
+        // renderer — it has to be the same answer, cheaper.
+        let mut stack = LayerStack::new();
+        solid_layer(&mut stack, Rgba8::new(90, 140, 200, 255), 8, 8);
+        let top = solid_layer(&mut stack, Rgba8::new(200, 60, 120, 180), 8, 8);
+        stack.by_id_mut(top).unwrap().blend_mode = BlendMode::Overlay;
+        stack.by_id_mut(top).unwrap().opacity = 0.7;
+
+        let full = composite(&stack, 8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    composite_pixel(&stack, 8, 8, x, y),
+                    full.get(x, y),
+                    "at {x},{y}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composite_pixel_outside_the_canvas_is_transparent() {
+        let mut stack = LayerStack::new();
+        solid_layer(&mut stack, Rgba8::WHITE, 4, 4);
+        for (x, y) in [(-1, 0), (0, -1), (4, 0), (0, 4)] {
+            assert_eq!(composite_pixel(&stack, 4, 4, x, y), Rgba8::TRANSPARENT);
         }
     }
 

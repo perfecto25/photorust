@@ -196,6 +196,7 @@ public:
 protected:
     // While the pointer is off the dialog it holds the mouse, so these arrive
     // wherever it is — including over the canvas behind the dialog.
+    void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void showEvent(QShowEvent *event) override;
@@ -212,6 +213,8 @@ private slots:
     void revertToOriginal();
 
 private:
+    /// Whether a screen point is over this dialog, decorations included.
+    bool overSelf(const QPoint &pos) const;
     void buildUi(const QString &title);
     /// Follow the pointer: take the mouse while it is off the dialog, give it
     /// back when it returns, and sample whatever it is over in between.
@@ -256,6 +259,9 @@ private:
     /// True while the pointer is off the dialog and the mouse is held, which
     /// is when sampling happens.
     bool m_sampling = false;
+    /// A click on the image holds that colour until the next one: the pointer
+    /// can travel back to the dialog without the colour following it.
+    bool m_latched = false;
     /// Polls where the pointer is. The dialog is modal, so nothing else in the
     /// application sees the pointer to tell it — and without the mouse held
     /// there are no move events to go on either.

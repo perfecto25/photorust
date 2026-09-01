@@ -4,11 +4,13 @@
 #include <QFont>
 #include <QLabel>
 #include <QMainWindow>
+#include <QPointer>
 #include <QStringList>
 
 #include "tools/ToolId.h"
 
 class CanvasView;
+class ReplaceColorDialog;
 class ChannelsPanel;
 class ColorPanel;
 class CommandRegistry;
@@ -18,6 +20,7 @@ class HistoryPanel;
 class InfoPanel;
 class LayersPanel;
 class PathsPanel;
+class PropertiesPanel;
 class ToolStrip;
 class QLineEdit;
 class QComboBox;
@@ -59,6 +62,8 @@ private slots:
     void exportSlices();
     /// File ▸ Export ▸ Export As.
     void exportAs();
+    /// Layer ▸ Export As: the same dialog on the active layer alone.
+    void exportLayerAs();
     /// File ▸ Export ▸ Save for Web (Legacy).
     void saveForWeb();
     /// File ▸ Print.
@@ -94,7 +99,53 @@ private slots:
     void transformFlipVertical();
 
     // -- Image --
+    void showImageSize();
     void showCanvasSize();
+    /// Turn the whole document clockwise by `degrees` — Image Rotation.
+    void rotateCanvas(double degrees);
+    void flipCanvas(bool horizontal);
+    void showArbitraryRotation();
+    /// Crop the document to the selection's bounding box — Image ▸ Crop.
+    void cropToSelection();
+    void showTrim();
+    void showDuplicateImage();
+
+    // -- Layer --
+    void showNewLayer();
+    void showLayerFromBackground();
+    void showDuplicateLayer();
+    /// Layer ▸ New Fill Layer ▸ Solid Color.
+    void showNewFillLayer();
+    void showNewGradientFillLayer();
+    /// Layer ▸ New Adjustment Layer ▸ …
+    void showNewAdjustmentLayer(const QString &kind);
+    void showNewPatternFillLayer();
+    /// Open Layer Style on one effect's page — Layer ▸ Layer Style ▸ …
+    void showLayerStyle(const QString &effect);
+    /// Layer ▸ New ▸ Group… and Group from Layers…, which are one dialog:
+    /// `fromSelection` decides whether the group arrives empty or around what
+    /// the Layers panel has selected.
+    void showNewGroup(bool fromSelection);
+    /// Layer ▸ Group Layers — the panel's selection into a new group.
+    void groupSelectedLayers();
+    /// Layer ▸ Ungroup Layers, from the folder or from anything inside it.
+    void ungroupSelectedLayers();
+    /// The Layers panel's selection as the engine wants it.
+    QVector<int> selectedLayerVector() const;
+    /// Layer ▸ Hide Layers, and the Show Layers it becomes.
+    ///
+    /// Acts on the Layers panel's selection, so hiding several at once is one
+    /// keystroke — which is why it lives here rather than on the engine, whose
+    /// idea of "the layer" is the single active one.
+    void toggleSelectedLayersVisible();
+    /// Whether every selected layer is hidden, which is what flips the menu
+    /// entry's wording.
+    bool selectedLayersAreHidden() const;
+    /// The Layers panel's selection, or the active layer when nothing is
+    /// selected.
+    QList<int> selectedLayerIndices() const;
+    /// Write the flattened image straight out as a PNG, asking only where.
+    void quickExportPng();
     void applyAdjustment(const QString &name);
 
     // -- Filter --
@@ -139,6 +190,10 @@ private:
     /// Keeps every menu entry going through the keymap.
     template <typename Slot>
     QAction *command(const QString &id, const QString &text, Slot slot);
+
+    /// The Export As dialog on one image, whether that is the whole document
+    /// or a single layer.
+    void exportImageAs(const QImage &image, const QString &name);
 
     /// The work behind Copy and Copy Merged.
     bool copyToClipboard(bool merged);
@@ -318,6 +373,8 @@ private:
     void pushTypeOptions();
     /// Take on the type of text the Type tool just reopened, and rebuild the
     /// options bar so it describes that text.
+    /// Show the selected type layer's own formatting in the options bar.
+    void syncTypeBarToActiveLayer();
     void adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
                         const QColor &color, Qt::Alignment alignment, bool antialias,
                         bool vertical);
@@ -343,6 +400,9 @@ private:
     CommandRegistry *m_registry = nullptr;
 
     CanvasView *m_canvas = nullptr;
+    /// The Replace Color dialog while it is open; non-modal, so only one at a
+    /// time and the canvas needs telling when it goes.
+    QPointer<ReplaceColorDialog> m_replaceColorDialog;
     ToolStrip *m_toolStrip = nullptr;
     QDockWidget *m_toolsDock = nullptr;
     QToolBar *m_optionsBar = nullptr;
@@ -356,6 +416,9 @@ private:
     HistoryPanel *m_historyPanel = nullptr;
     InfoPanel *m_infoPanel = nullptr;
     QDockWidget *m_infoDock = nullptr;
+    PropertiesPanel *m_propertiesPanel = nullptr;
+    /// Held so a new adjustment layer can raise it, as CS6 does.
+    QDockWidget *m_propertiesDock = nullptr;
 
     // Options-bar widgets for the brush family. Recreated per tool, so these
     // are only valid while a painting tool is active.
@@ -473,6 +536,12 @@ private:
     /// After that the user's own choice persists, the same as every other
     /// tool option here.
     bool m_typeColorInitialized = false;
+
+    /// True while `populateOptionsBar` is building: the controls it sets emit
+    /// change signals that are not the user changing anything.
+    bool m_buildingOptionsBar = false;
+    /// The layer the Type options bar was last synced to.
+    int m_typeBarLayer = -1;
     /// Paint Bucket options, which persist across tool switches.
     int m_bucketMode = 0;
     int m_bucketOpacity = BucketDefaults::kOpacity;

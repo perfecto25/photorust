@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QCursor>
 #include <QFont>
 #include <QHash>
 #include <QImage>
@@ -268,6 +269,24 @@ public:
     /// colour was picked from. Returns false when the point is off the image.
     bool sampleAtGlobal(const QPoint &globalPos, QColor *color, QPoint *docPos) const;
 
+    /// Show `cursor` over the canvas while an external sampler owns the
+    /// pointer; pass nullptr to give the active tool its cursor back.
+    ///
+    /// Replace Color's eyedropper needs this because it is a modal dialog:
+    /// an application override cursor proved unreliable there, whereas a
+    /// cursor set on this widget is displayed by the window system whether or
+    /// not the widget is accepting events.
+    void setSamplingCursor(const QCursor *cursor);
+
+    /// Route clicks to `colorSampled` instead of the active tool.
+    ///
+    /// Needed because Qt delivers no mouse events at all to a modally blocked
+    /// window, so a modal dialog cannot see a click on the canvas however it
+    /// filters. The dialog that wants to sample is shown non-modally and puts
+    /// the canvas into this mode instead.
+    void setColorSampling(bool on);
+    bool isColorSampling() const { return m_colorSampling; }
+
     /// Convert a widget point to document space.
     QPointF widgetToDocument(const QPointF &pos) const;
     /// A movement measured on screen, turned back into the frame the pan is
@@ -290,6 +309,14 @@ public:
     /// here, so changing any of these while text is being composed restyles the
     /// whole thing, not just what is typed from here on the way real Photoshop
     /// would with nothing selected.
+    /// Re-set an existing type layer in the options bar's current font,
+    /// without opening it for editing.
+    ///
+    /// Photoshop restyles a selected type layer straight from the bar — you do
+    /// not have to click into the text and select it first. Returns false when
+    /// the layer is not type, or an edit is already in progress.
+    bool restyleTypeLayer(int layerIndex);
+
     void setTypeOptions(const QFont &font, const QString &styleName, const QColor &color,
                         Qt::Alignment alignment, bool antialias);
     /// True while the Type tool has an edit in progress.
@@ -330,6 +357,9 @@ public:
     void cancelTypeEdit();
 
 signals:
+    /// A colour was picked while `setColorSampling` was on, with the document
+    /// pixel it came from.
+    void colorSampled(const QPoint &documentPos, const QColor &color);
     /// Emitted as the cursor moves, for the status bar and Info panel.
     void cursorMoved(const QPointF &documentPos);
     /// The cursor left the canvas, so readouts of what is under it should
@@ -900,6 +930,11 @@ private:
 
     // -- annotations --
     EyedropperType m_eyedropperType = EyedropperType::Eyedropper;
+    /// An external sampler is showing its own cursor over the canvas.
+    bool m_samplingCursor = false;
+    QCursor m_samplingCursorValue;
+    /// Clicks pick a colour rather than reaching the active tool.
+    bool m_colorSampling = false;
     /// CS6's default healing type.
     HealType m_healType = HealType::ContentAware;
     HealingType m_healingType = HealingType::SpotHealing;

@@ -280,7 +280,11 @@ pub fn draw(
 }
 
 /// Where `(px, py)` falls along the ramp, `0.0..=1.0` before clamping.
-fn position_at(
+/// Where a pixel falls on the ramp, `0.0..=1.0` before clamping.
+///
+/// Shared with the Gradient Overlay layer effect, so the five shapes are
+/// described once and cannot drift between the tool and the style.
+pub(crate) fn position_at(
     kind: GradientType,
     px: f32,
     py: f32,
@@ -319,7 +323,7 @@ fn position_at(
 ///
 /// Deterministic because the preview and the commit must agree, and because undo
 /// then redo must reproduce the same fill rather than a differently speckled one.
-fn dither(x: i32, y: i32) -> f32 {
+pub(crate) fn dither(x: i32, y: i32) -> f32 {
     // An integer hash: cheap, and with no visible structure at the scale of one
     // pixel — an ordered matrix would leave its own pattern in the ramp.
     let mut h = (x as u32).wrapping_mul(0x9E37_79B9) ^ (y as u32).wrapping_mul(0x85EB_CA6B);

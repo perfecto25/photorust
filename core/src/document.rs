@@ -9,10 +9,13 @@ use crate::blend::BlendMode;
 use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::compositor;
+use crate::fill::{GradientFill, PatternFill};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{self, HealMode, MoveOptions, Transfer};
 use crate::history::History;
-use crate::layer::{Layer, LayerId, LayerKind, LayerStack, TextContent};
+use crate::layer::{Layer, LayerId, LayerKind, LayerStack, StyleState, TextContent};
+use crate::effects::LayerEffects;
+use crate::metadata::Orientation;
 use crate::perspective;
 use crate::mixer::{MixerBrush, MixerOptions, Sampled};
 use crate::replace::{ColorReplacer, ReplaceOptions, ReplaceSampling};
@@ -25,10 +28,226 @@ use crate::bucket::{self, BucketOptions, FloodMask};
 use crate::wand;
 use crate::gradient::{self, Gradient, GradientOptions};
 use crate::stamp::{self, CloneSampling, CloneStroke};
+use crate::resample::Resample;
 use crate::selection::{Selection, SelectionOp};
 use crate::path::PathSet;
 use crate::pattern;
 use crate::slice::{Slice, SliceSet};
+
+/// Per-pixel selection coverage for an edit confined to the active layer.
+///
+/// Adjustments walk the layer's pixels flat, so this maps a buffer index back
+/// into document space — through the layer's offset, since a layer may sit
+/// anywhere on or off the canvas — and asks the selection about it.
+struct SelectionMask<'a> {
+    selection: Option<&'a Selection>,
+    width: u32,
+    offset: (i32, i32),
+}
+
+impl SelectionMask<'_> {
+    /// 1.0 when there is no selection, otherwise the coverage at that pixel.
+    #[inline]
+    fn coverage(&self, index: usize) -> f32 {
+        let Some(selection) = self.selection else {
+            return 1.0;
+        };
+        let x = (index as u32 % self.width) as i32 + self.offset.0;
+        let y = (index as u32 / self.width) as i32 + self.offset.1;
+        selection.coverage_at(x, y)
+    }
+}
+
+/// The selection to confine an edit to, or `None` when the whole layer is
+/// fair game.
+///
+/// A free function taking the field rather than a method on `Document`: a
+/// method would borrow all of `self`, which then collides with the mutable
+/// borrow of `self.stack` the caller needs to reach the layer.
+fn active_selection(selection: &Selection) -> Option<&Selection> {
+    if selection.is_empty() {
+        None
+    } else {
+        Some(selection)
+    }
+}
+
+/// Rec. 601 luminance as an 8-bit level, matching the weights used
+/// throughout the engine.
+#[inline]
+fn luma8(r: u8, g: u8, b: u8) -> u8 {
+    let l = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+    l.round().clamp(0.0, 255.0) as u8
+}
+
+/// One Blending Options setting, by name.
+///
+/// General and Advanced Blending are the layer's own properties rather than an
+/// effect's, so they are read straight off it.
+fn blending_value(layer: &Layer, field: &str) -> f32 {
+    match field {
+        "mode" => layer.blend_mode as i32 as f32,
+        "opacity" => layer.opacity,
+        "fillOpacity" => layer.fill_opacity,
+        "channelR" => f32::from(u8::from(layer.channels[0])),
+        "channelG" => f32::from(u8::from(layer.channels[1])),
+        "channelB" => f32::from(u8::from(layer.channels[2])),
+        "transparencyShapes" => f32::from(u8::from(layer.transparency_shapes)),
+        "maskHidesEffects" => f32::from(u8::from(layer.mask_hides_effects)),
+        "blendIfChannel" => layer.blend_if.channel as f32,
+        "thisDarkStart" => layer.blend_if.this_layer[0] as f32,
+        "thisDarkEnd" => layer.blend_if.this_layer[1] as f32,
+        "thisLightStart" => layer.blend_if.this_layer[2] as f32,
+        "thisLightEnd" => layer.blend_if.this_layer[3] as f32,
+        "underDarkStart" => layer.blend_if.underlying[0] as f32,
+        "underDarkEnd" => layer.blend_if.underlying[1] as f32,
+        "underLightStart" => layer.blend_if.underlying[2] as f32,
+        "underLightEnd" => layer.blend_if.underlying[3] as f32,
+        _ => 0.0,
+    }
+}
+
+fn set_blending_value(layer: &mut Layer, field: &str, value: f32) -> bool {
+    let on = value >= 0.5;
+    let level = || value.round().clamp(0.0, 255.0) as u8;
+    match field {
+        "mode" => layer.blend_mode = BlendMode::from_i32(value.round() as i32),
+        "opacity" => layer.opacity = value.clamp(0.0, 1.0),
+        "fillOpacity" => layer.fill_opacity = value.clamp(0.0, 1.0),
+        "channelR" => layer.channels[0] = on,
+        "channelG" => layer.channels[1] = on,
+        "channelB" => layer.channels[2] = on,
+        "transparencyShapes" => layer.transparency_shapes = on,
+        "maskHidesEffects" => layer.mask_hides_effects = on,
+        "blendIfChannel" => layer.blend_if.channel = value.round().clamp(0.0, 3.0) as u8,
+        "thisDarkStart" => layer.blend_if.this_layer[0] = level(),
+        "thisDarkEnd" => layer.blend_if.this_layer[1] = level(),
+        "thisLightStart" => layer.blend_if.this_layer[2] = level(),
+        "thisLightEnd" => layer.blend_if.this_layer[3] = level(),
+        "underDarkStart" => layer.blend_if.underlying[0] = level(),
+        "underDarkEnd" => layer.blend_if.underlying[1] = level(),
+        "underLightStart" => layer.blend_if.underlying[2] = level(),
+        "underLightEnd" => layer.blend_if.underlying[3] = level(),
+        _ => return false,
+    }
+    true
+}
+
+/// The part of `pixels` that is not fully transparent, in the pixmap's own
+/// coordinates, or `None` when nothing in it would show.
+fn opaque_bounds(pixels: &Pixmap) -> Option<Rect> {
+    let (w, h) = (pixels.width() as i32, pixels.height() as i32);
+    let (mut min_x, mut min_y) = (w, h);
+    let (mut max_x, mut max_y) = (-1, -1);
+    for y in 0..h {
+        for x in 0..w {
+            if pixels.get(x, y).a == 0 {
+                continue;
+            }
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if max_x < min_x {
+        return None;
+    }
+    Some(Rect::new(
+        min_x,
+        min_y,
+        (max_x - min_x + 1) as u32,
+        (max_y - min_y + 1) as u32,
+    ))
+}
+
+/// `top` composited over `bottom`, both in straight alpha.
+fn over(top: Rgba8, bottom: Rgba8) -> Rgba8 {
+    let at = top.a as f32 / 255.0;
+    let ab = bottom.a as f32 / 255.0;
+    let out_a = at + ab * (1.0 - at);
+    if out_a <= 0.0 {
+        return Rgba8::TRANSPARENT;
+    }
+    let mix = |t: u8, b: u8| {
+        let v = (t as f32 * at + b as f32 * ab * (1.0 - at)) / out_a;
+        v.round().clamp(0.0, 255.0) as u8
+    };
+    Rgba8::new(
+        mix(top.r, bottom.r),
+        mix(top.g, bottom.g),
+        mix(top.b, bottom.b),
+        (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Selection coverage at a document-space point, or 1.0 with no selection.
+///
+/// For the adjustments that already walk the image by coordinate rather than
+/// by flat index, where [`SelectionMask`] would only get in the way.
+#[inline]
+fn coverage_at(selection: Option<&Selection>, x: i32, y: i32) -> f32 {
+    selection.map_or(1.0, |s| s.coverage_at(x, y))
+}
+
+/// Fade a just-adjusted pixel back toward what it was, by the selection.
+///
+/// Called at the end of a loop body that has already written `px` however it
+/// likes. Letting each adjustment compute its result unchanged and then
+/// restoring the unselected part is far less invasive than rewriting a dozen
+/// different write sites, and it cannot get an adjustment's own maths wrong.
+///
+/// A no-op at full coverage, so an unselected document is untouched.
+#[inline]
+fn restore_unselected(px: &mut [u8], original: [u8; 3], coverage: f32) {
+    if coverage >= 1.0 {
+        return;
+    }
+    for c in 0..3 {
+        let was = original[c] as f32;
+        let now = px[c] as f32;
+        px[c] = (was + (now - was) * coverage).clamp(0.0, 255.0).round() as u8;
+    }
+}
+
+/// Write an adjusted colour, faded by the selection's coverage.
+///
+/// At full coverage the value is written straight through, so an unselected
+/// document gets bit-for-bit what it got before this blending existed. Partial
+/// coverage is what makes a feathered selection fade the adjustment in rather
+/// than showing a hard edge at the marquee.
+#[inline]
+fn write_adjusted(px: &mut [u8], out: [f32; 3], coverage: f32) {
+    if coverage >= 1.0 {
+        px[0] = (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        px[1] = (out[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        px[2] = (out[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        return;
+    }
+    for c in 0..3 {
+        let orig = px[c] as f32 / 255.0;
+        let v = orig + (out[c].clamp(0.0, 1.0) - orig) * coverage;
+        px[c] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+}
+
+/// As [`write_adjusted`], for adjustments that already work in 8-bit — a
+/// lookup table, say — where converting to float and back would only add
+/// rounding error.
+#[inline]
+fn write_adjusted_u8(px: &mut [u8], out: [u8; 3], coverage: f32) {
+    if coverage >= 1.0 {
+        px[0] = out[0];
+        px[1] = out[1];
+        px[2] = out[2];
+        return;
+    }
+    for c in 0..3 {
+        let orig = px[c] as f32;
+        let v = orig + (out[c] as f32 - orig) * coverage;
+        px[c] = v.clamp(0.0, 255.0).round() as u8;
+    }
+}
 
 /// One colour picked with Replace Color's eyedropper: the RGB that was read
 /// and the pixel it came from. The position is only consulted when Localized
@@ -53,6 +272,41 @@ pub struct PatchOptions {
     pub destination: bool,
     /// Transfer texture only, keeping the patched area's own colour.
     pub transparent: bool,
+}
+
+/// What Trim treats as border — CS6's "Based On".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimBasis {
+    Transparent,
+    TopLeft,
+    BottomRight,
+}
+
+impl TrimBasis {
+    /// From the dialog's radio order.
+    pub fn from_i32(v: i32) -> TrimBasis {
+        match v {
+            1 => TrimBasis::TopLeft,
+            2 => TrimBasis::BottomRight,
+            _ => TrimBasis::Transparent,
+        }
+    }
+}
+
+/// Which edges Trim is allowed to cut — CS6's "Trim Away".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrimEdges {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Default for TrimEdges {
+    /// All four, as the dialog opens.
+    fn default() -> Self {
+        Self { top: true, bottom: true, left: true, right: true }
+    }
 }
 
 /// The image's color mode, matching Photoshop's Image > Mode submenu.
@@ -114,6 +368,9 @@ impl ImageMode {
 pub struct Document {
     width: u32,
     height: u32,
+    /// Pixels per inch. Print metadata only — it never changes a pixel, but
+    /// it is what turns a pixel count into the inches Image Size shows.
+    resolution: f32,
     color_mode: ImageMode,
     bit_depth: u8,
     stack: LayerStack,
@@ -183,6 +440,10 @@ pub struct Document {
 
     /// File path, once saved.
     pub path: Option<String>,
+    /// A name given to a document that is not a file — what Duplicate Image's
+    /// "As:" box sets. A path, once there is one, wins: saving a duplicate
+    /// under some other name should rename its tab.
+    pub title: Option<String>,
     /// Which "Untitled-N" this is, for a document that has never been saved.
     /// Photoshop numbers them from 1 upward across the session.
     pub untitled_number: u32,
@@ -369,6 +630,7 @@ impl Document {
             width,
             height,
             color_mode: ImageMode::Rgb,
+            resolution: 72.0,
             bit_depth: 8,
             stack,
             selection: Selection::new(width, height),
@@ -391,6 +653,7 @@ impl Document {
             retouch_last: None,
             clone: None,
             path: None,
+            title: None,
             untitled_number: 1,
             dirty: false,
             quick_mask: false,
@@ -433,6 +696,7 @@ impl Document {
             width,
             height,
             color_mode: ImageMode::Rgb,
+            resolution: 72.0,
             bit_depth: 8,
             stack,
             selection: Selection::new(width, height),
@@ -455,6 +719,7 @@ impl Document {
             retouch_last: None,
             clone: None,
             path: None,
+            title: None,
             untitled_number: 1,
             dirty: false,
             quick_mask: false,
@@ -475,6 +740,7 @@ impl Document {
             width,
             height,
             color_mode: ImageMode::Rgb,
+            resolution: 72.0,
             bit_depth: 8,
             stack,
             selection: Selection::new(width, height),
@@ -497,6 +763,7 @@ impl Document {
             retouch_last: None,
             clone: None,
             path: None,
+            title: None,
             untitled_number: 1,
             dirty: false,
             quick_mask: false,
@@ -703,14 +970,91 @@ impl Document {
         self.dirty = false;
     }
 
+    /// What the document is called, with no mode suffix or modified marker.
+    ///
+    /// The file name once it has one, otherwise the name it was given, and
+    /// otherwise the "Untitled-N" it was born with.
+    pub fn base_name(&self) -> String {
+        if let Some(file) = self.path.as_deref().and_then(|p| p.rsplit('/').next()) {
+            return file.to_string();
+        }
+        if let Some(title) = self.title.as_deref() {
+            return title.to_string();
+        }
+        format!("Untitled-{}", self.untitled_number)
+    }
+
+    /// What Duplicate Image offers as the copy's name.
+    ///
+    /// Photoshop drops the extension and adds " copy", and counts on from
+    /// there when the name is already a copy: `horse.jpg` becomes
+    /// `horse copy`, which becomes `horse copy 2`, then `horse copy 3`.
+    pub fn copy_name(&self) -> String {
+        let base = self.base_name();
+        // Only a real extension, not any dot that happens to be in the name.
+        let stem = match base.rsplit_once('.') {
+            Some((stem, ext))
+                if !stem.is_empty()
+                    && (1..=4).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                stem
+            }
+            _ => base.as_str(),
+        };
+
+        if let Some(head) = stem.strip_suffix(" copy") {
+            return format!("{head} copy 2");
+        }
+        if let Some((head, tail)) = stem.rsplit_once(' ') {
+            if let (Ok(n), Some(head)) = (tail.parse::<u32>(), head.strip_suffix(" copy")) {
+                return format!("{head} copy {}", n.saturating_add(1));
+            }
+        }
+        format!("{stem} copy")
+    }
+
+    /// Copy the document into one of its own — Image ▸ Duplicate.
+    ///
+    /// `merged` is CS6's "Duplicate Merged Layers Only": the copy gets a single
+    /// layer holding the flattened image rather than the whole stack.
+    ///
+    /// The copy's history starts here. Undo in a duplicate must not step back
+    /// into edits that were made before it existed.
+    pub fn duplicate(&self, title: &str, merged: bool) -> Document {
+        let stack = if merged {
+            let mut flat = LayerStack::new();
+            let id = flat.allocate_id();
+            let mut layer = Layer::new_raster(id, "Background", self.width, self.height);
+            layer.pixels = self.composite();
+            flat.push(layer);
+            flat
+        } else {
+            self.stack.clone()
+        };
+
+        let mut copy = Document::from_layers(stack, self.width, self.height);
+        copy.resolution = self.resolution;
+        copy.color_mode = self.color_mode;
+        copy.bit_depth = self.bit_depth;
+        copy.selection = self.selection.clone();
+        copy.paths = self.paths.clone();
+        copy.slices = self.slices.clone();
+        copy.annotations = self.annotations.clone();
+        if !merged {
+            copy.active_layer = self.active_layer;
+        }
+        copy.title = Some(title.to_string());
+        // A duplicate is not the file it came from, and it has never been
+        // saved.
+        copy.path = None;
+        copy.dirty = true;
+        copy
+    }
+
     /// Title-bar text: file name (or "Untitled") plus a modified marker.
     pub fn display_name(&self) -> String {
-        let untitled = format!("Untitled-{}", self.untitled_number);
-        let base = self
-            .path
-            .as_deref()
-            .and_then(|p| p.rsplit('/').next())
-            .unwrap_or(&untitled);
+        let base = self.base_name();
         let mode_label = match self.color_mode {
             ImageMode::Rgb => "RGB",
             ImageMode::Grayscale => "Gray",
@@ -769,14 +1113,357 @@ impl Document {
 
     /// Add a transparent layer above the active one and select it.
     pub fn add_layer(&mut self, name: Option<String>) -> LayerId {
+        self.add_layer_configured(name, BlendMode::Normal, 1.0, false, 0)
+    }
+
+    /// New Layer with the properties CS6's dialog collects, as one step.
+    ///
+    /// Setting them afterwards through the panel would work, but would leave
+    /// the user four entries in the History panel for one action.
+    pub fn add_layer_configured(
+        &mut self,
+        name: Option<String>,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
         let id = self.stack.allocate_id();
         let name = name.unwrap_or_else(|| self.stack.suggest_name());
-        let layer = Layer::new_raster(id, name, self.width, self.height);
+        let mut layer = Layer::new_raster(id, name, self.width, self.height);
+        layer.blend_mode = blend;
+        layer.opacity = opacity.clamp(0.0, 1.0);
+        layer.clipping = clipping;
+        layer.label = label;
 
         let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
         self.stack.insert(at, layer);
         self.active_layer = id;
         self.commit("New Layer");
+        id
+    }
+
+    /// A fill layer: a colour with no pixels of its own, poured by the
+    /// compositor — Layer ▸ New Fill Layer ▸ Solid Color.
+    ///
+    /// Unlike painting a colour onto a raster layer, this stays editable: the
+    /// colour is the layer, so changing it later re-renders rather than
+    /// repaints. It is the same [`LayerKind::SolidColor`] a shape layer uses,
+    /// without the mask that cuts the shape out.
+    pub fn add_fill_layer(
+        &mut self,
+        name: Option<String>,
+        color: Rgba8,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
+        let id = self.stack.allocate_id();
+        let name = name.unwrap_or_else(|| self.stack.suggest_shape_name("Color Fill"));
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.kind = LayerKind::SolidColor(color);
+        layer.blend_mode = blend;
+        layer.opacity = opacity.clamp(0.0, 1.0);
+        layer.clipping = clipping;
+        layer.label = label;
+        // A fill layer arrives with a mask, as it does in CS6: the colour is
+        // the whole canvas, so the mask is the only thing that can shape it.
+        // Canvas-sized, not layer-sized — a fill layer has no pixels of its
+        // own for `add_reveal_all_mask` to take a size from.
+        let mut mask = Pixmap::new(self.width, self.height);
+        mask.fill(Rgba8::WHITE);
+        layer.mask = Some(mask);
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("Color Fill Layer");
+        id
+    }
+
+    /// A gradient fill layer — Layer ▸ New Fill Layer ▸ Gradient.
+    pub fn add_gradient_fill_layer(
+        &mut self,
+        name: Option<String>,
+        fill: GradientFill,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
+        let name = name.unwrap_or_else(|| self.stack.suggest_shape_name("Gradient Fill"));
+        self.insert_fill_layer(name, LayerKind::Gradient(fill), blend, opacity, clipping,
+                               label, "Gradient Fill Layer")
+    }
+
+    /// A pattern fill layer — Layer ▸ New Fill Layer ▸ Pattern.
+    pub fn add_pattern_fill_layer(
+        &mut self,
+        name: Option<String>,
+        fill: PatternFill,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
+        let name = name.unwrap_or_else(|| self.stack.suggest_shape_name("Pattern Fill"));
+        self.insert_fill_layer(name, LayerKind::Pattern(fill), blend, opacity, clipping,
+                               label, "Pattern Fill Layer")
+    }
+
+    /// Add a fill layer **without committing**, for a dialog that previews on
+    /// the canvas before the user has agreed to it.
+    ///
+    /// Nothing reaches the History panel until [`Document::commit_fill_layer`];
+    /// a cancelled dialog calls [`Document::discard_layer`] and the document is
+    /// as it was.
+    pub fn begin_fill_layer(
+        &mut self,
+        name: Option<String>,
+        kind: LayerKind,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
+        let base = match kind {
+            LayerKind::Gradient(_) => "Gradient Fill",
+            LayerKind::Pattern(_) => "Pattern Fill",
+            _ => "Color Fill",
+        };
+        let name = name.unwrap_or_else(|| self.stack.suggest_shape_name(base));
+        self.build_fill_layer(name, kind, blend, opacity, clipping, label)
+    }
+
+    /// Replace what a fill layer pours, without committing.
+    pub fn set_layer_fill(&mut self, id: LayerId, kind: LayerKind) -> bool {
+        match self.stack.by_id_mut(id) {
+            Some(layer) => {
+                layer.kind = kind;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Close off a previewed fill layer as one history step.
+    pub fn commit_fill_layer(&mut self, id: LayerId) {
+        let label = match self.stack.by_id(id).map(|l| &l.kind) {
+            Some(LayerKind::Gradient(_)) => "Gradient Fill Layer",
+            Some(LayerKind::Pattern(_)) => "Pattern Fill Layer",
+            _ => "Color Fill Layer",
+        };
+        self.commit(label);
+    }
+
+    /// Remove a layer without committing — the way out of a cancelled preview.
+    pub fn discard_layer(&mut self, id: LayerId) -> bool {
+        let Some(index) = self.stack.index_of(id) else {
+            return false;
+        };
+        self.stack.remove(index);
+        if self.active_layer == id {
+            let next = index.min(self.stack.len().saturating_sub(1));
+            self.active_layer = self
+                .stack
+                .get(next)
+                .map_or(LayerId::NONE, |l| l.id);
+        }
+        true
+    }
+
+    /// What the three fill layers have in common: no pixels, a canvas-sized
+    /// mask, and a place above the active layer.
+    fn insert_fill_layer(
+        &mut self,
+        name: String,
+        kind: LayerKind,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+        label_for_history: &str,
+    ) -> LayerId {
+        let id = self.build_fill_layer(name, kind, blend, opacity, clipping, label);
+        self.commit(label_for_history);
+        id
+    }
+
+    /// The layer itself, uncommitted.
+    fn build_fill_layer(
+        &mut self,
+        name: String,
+        kind: LayerKind,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.kind = kind;
+        layer.blend_mode = blend;
+        layer.opacity = opacity.clamp(0.0, 1.0);
+        layer.clipping = clipping;
+        layer.label = label;
+
+        let mut mask = Pixmap::new(self.width, self.height);
+        mask.fill(Rgba8::WHITE);
+        layer.mask = Some(mask);
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        id
+    }
+
+    /// Change what an adjustment layer does, **without committing** — the way
+    /// a dialog previews a curve on the canvas before it is agreed to.
+    pub fn set_layer_adjustment(&mut self, id: LayerId, adjustment: Adjustment) -> bool {
+        match self.stack.by_id_mut(id) {
+            Some(layer) if matches!(layer.kind, LayerKind::Adjustment(_)) => {
+                layer.kind = LayerKind::Adjustment(adjustment);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What an adjustment layer currently does.
+    pub fn layer_adjustment(&self, id: LayerId) -> Option<Adjustment> {
+        match self.stack.by_id(id).map(|l| &l.kind) {
+            Some(LayerKind::Adjustment(adjustment)) => Some(*adjustment),
+            _ => None,
+        }
+    }
+
+    /// The next free "<base> N", for a dialog that wants to open with the name
+    /// the layer would be given anyway.
+    pub fn suggested_layer_name(&self, base: &str) -> String {
+        self.stack.suggest_shape_name(base)
+    }
+
+    /// Whether a layer's mask travels with it.
+    pub fn layer_mask_linked(&self, id: LayerId) -> bool {
+        self.stack.by_id(id).is_some_and(|l| l.mask_linked)
+    }
+
+    pub fn set_layer_mask_linked(&mut self, id: LayerId, linked: bool) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if layer.mask_linked == linked {
+            return false;
+        }
+        layer.mask_linked = linked;
+        self.commit(if linked { "Link Mask" } else { "Unlink Mask" });
+        true
+    }
+
+    /// Tag a layer with one of CS6's row colours, or 0 for none.
+    pub fn set_layer_label(&mut self, id: LayerId, label: u8) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if layer.label == label {
+            return false;
+        }
+        layer.label = label;
+        self.commit("Layer Color");
+        true
+    }
+
+    pub fn layer_label(&self, id: LayerId) -> u8 {
+        self.stack.by_id(id).map_or(0, |l| l.label)
+    }
+
+    /// Whether the bottom layer is a Background.
+    ///
+    /// A Background is the bottom layer named "Background" — the same test the
+    /// canvas operations use when they need something to pour a fill into.
+    pub fn has_background(&self) -> bool {
+        self.stack
+            .get(0)
+            .is_some_and(|l| l.name == "Background" && matches!(l.kind, LayerKind::Raster))
+    }
+
+    /// Turn the Background into an ordinary layer — Layer ▸ New ▸ Layer From
+    /// Background.
+    ///
+    /// The Background is not a kind of layer here, it is a layer with that
+    /// name in the bottom slot: it is what Canvas Size fills, what Image
+    /// Rotation fills, and what the panel prints in italics. Renaming it is
+    /// therefore all it takes to make it ordinary — and its locks come off,
+    /// since a Background is locked in Photoshop and a layer is not.
+    ///
+    /// Returns false when there is no Background to convert.
+    pub fn layer_from_background(&mut self, name: &str, blend: BlendMode, opacity: f32) -> bool {
+        if !self.has_background() {
+            return false;
+        }
+        let Some(layer) = self.stack.get_mut(0) else {
+            return false;
+        };
+        layer.name = name.to_string();
+        layer.blend_mode = blend;
+        layer.opacity = opacity.clamp(0.0, 1.0);
+        layer.lock_transparency = false;
+        layer.lock_pixels = false;
+        layer.lock_position = false;
+        let id = layer.id;
+        self.active_layer = id;
+        self.commit("Layer From Background");
+        true
+    }
+
+    /// Copy the selection into a layer of its own — Layer ▸ New ▸ Layer Via
+    /// Copy.
+    ///
+    /// With nothing selected this duplicates the whole layer, which is what
+    /// Photoshop's Ctrl+J does.
+    pub fn layer_via_copy(&mut self) -> Option<LayerId> {
+        if self.selection.is_empty() {
+            return self.duplicate_layer(self.active_layer);
+        }
+        let (pixels, offset) = self.copy_selection(false)?;
+        Some(self.insert_pixels_as_layer(pixels, offset, "Layer Via Copy"))
+    }
+
+    /// Move the selection into a layer of its own — Layer ▸ New ▸ Layer Via
+    /// Cut. The pixels leave the layer they came from.
+    ///
+    /// Returns `None` with no selection, since there is nothing to cut, and on
+    /// a pixel-locked layer, which may not be edited.
+    pub fn layer_via_cut(&mut self) -> Option<LayerId> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        if self.active_layer().is_some_and(|l| l.lock_pixels) {
+            return None;
+        }
+        let (pixels, offset) = self.copy_selection(false)?;
+        self.erase_selected_pixels();
+        Some(self.insert_pixels_as_layer(pixels, offset, "Layer Via Cut"))
+    }
+
+    /// Put `pixels` in a new layer above the active one and commit as `label`.
+    fn insert_pixels_as_layer(
+        &mut self,
+        pixels: Pixmap,
+        offset: (i32, i32),
+        label: &str,
+    ) -> LayerId {
+        let id = self.stack.allocate_id();
+        let name = self.stack.suggest_name();
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.pixels = pixels;
+        layer.offset = offset;
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit(label);
         id
     }
 
@@ -861,8 +1548,38 @@ impl Document {
 
     /// Add an adjustment layer above the active one.
     pub fn add_adjustment_layer(&mut self, adjustment: Adjustment) -> LayerId {
+        self.add_adjustment_layer_configured(None, adjustment, BlendMode::Normal, 1.0, false, 0)
+    }
+
+    /// An adjustment layer with everything CS6's New Layer dialog collects.
+    ///
+    /// Like a fill layer it carries a canvas-sized mask: an adjustment applies
+    /// through its mask, which is how a curve is confined to part of an image
+    /// without touching a pixel.
+    pub fn add_adjustment_layer_configured(
+        &mut self,
+        name: Option<String>,
+        adjustment: Adjustment,
+        blend: BlendMode,
+        opacity: f32,
+        clipping: bool,
+        label: u8,
+    ) -> LayerId {
         let id = self.stack.allocate_id();
-        let layer = Layer::new_adjustment(id, adjustment.name(), adjustment);
+        let default_name = self.stack.suggest_shape_name(adjustment.name());
+        let mut layer = Layer::new_adjustment(
+            id,
+            name.unwrap_or(default_name),
+            adjustment,
+        );
+        layer.blend_mode = blend;
+        layer.opacity = opacity.clamp(0.0, 1.0);
+        layer.clipping = clipping;
+        layer.label = label;
+
+        let mut mask = Pixmap::new(self.width, self.height);
+        mask.fill(Rgba8::WHITE);
+        layer.mask = Some(mask);
 
         let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
         self.stack.insert(at, layer);
@@ -1019,6 +1736,176 @@ impl Document {
         Some(new_id)
     }
 
+    // -- layer style --------------------------------------------------------
+
+    /// One layer-effect setting, by name. See [`crate::effects`] for the names.
+    ///
+    /// Keys under `blending.` are the layer's own — Blending Options is a page
+    /// of the same dialog, and giving it a second bridge call for the sake of
+    /// tidiness would only mean two ways to ask the same question.
+    pub fn layer_effect_value(&self, id: LayerId, key: &str) -> f32 {
+        let Some(layer) = self.stack.by_id(id) else {
+            return 0.0;
+        };
+        if let Some(field) = key.strip_prefix("blending.") {
+            return blending_value(layer, field);
+        }
+        layer.effects.value(key)
+    }
+
+    /// Set one layer-effect setting **without committing**.
+    ///
+    /// The dialog writes dozens of these as the user drags a slider; one
+    /// history step for the lot is what [`Document::commit_layer_effects`] is
+    /// for. Cancelling means writing the old values back and never committing.
+    pub fn set_layer_effect_value(&mut self, id: LayerId, key: &str, value: f32) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if let Some(field) = key.strip_prefix("blending.") {
+            return set_blending_value(layer, field, value);
+        }
+        layer.effects.set_value(key, value)
+    }
+
+    /// Close off a run of effect edits as one history step.
+    pub fn commit_layer_effects(&mut self) {
+        self.commit("Layer Style");
+    }
+
+    /// Everything the Layer Style dialog can change, for an edit that may be
+    /// cancelled.
+    pub fn layer_style_state(&self, id: LayerId) -> Option<StyleState> {
+        self.stack.by_id(id).map(|l| l.style_state())
+    }
+
+    /// Put it all back, without committing — a cancelled edit never happened.
+    pub fn set_layer_style_state(&mut self, id: LayerId, state: StyleState) -> bool {
+        match self.stack.by_id_mut(id) {
+            Some(layer) => {
+                layer.set_style_state(state);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn layer_effects(&self, id: LayerId) -> Option<LayerEffects> {
+        self.stack.by_id(id).map(|l| l.effects)
+    }
+
+    /// Put a whole style on a layer — Paste Layer Style.
+    pub fn set_layer_effects(&mut self, id: LayerId, effects: LayerEffects) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        layer.effects = effects;
+        self.commit("Paste Layer Style");
+        true
+    }
+
+    /// Clear Layer Style. False when the layer had none to clear.
+    pub fn clear_layer_effects(&mut self, id: LayerId) -> bool {
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if !layer.effects.any_present() {
+            return false;
+        }
+        layer.effects = LayerEffects::default();
+        self.commit("Clear Layer Style");
+        true
+    }
+
+    /// Hide All Effects / Show All Effects. Applies to every layer, as CS6's
+    /// menu entry does, and keeps every setting.
+    pub fn hide_all_effects(&mut self, hidden: bool) {
+        let mut changed = false;
+        for layer in self.stack.iter_mut() {
+            if layer.effects.hidden != hidden {
+                layer.effects.hidden = hidden;
+                changed = true;
+            }
+        }
+        if changed {
+            self.commit(if hidden { "Hide All Effects" } else { "Show All Effects" });
+        }
+    }
+
+    /// Whether any layer has a style at all — what decides if Hide All Effects
+    /// is worth offering.
+    pub fn any_layer_has_effects(&self) -> bool {
+        self.stack
+            .as_slice()
+            .iter()
+            .any(|l| l.effects.any_present())
+    }
+
+    /// A standalone copy of a layer, for putting somewhere else — including in
+    /// another document, which is what Duplicate Layer's Destination offers.
+    ///
+    /// The copy keeps the original's id, which is only meaningful inside the
+    /// stack it came from; [`Document::insert_layer`] issues a fresh one.
+    pub fn layer_copy(&self, id: LayerId) -> Option<Layer> {
+        self.stack.by_id(id).cloned()
+    }
+
+    /// Put `layer` above the active one, under an id of this document's own.
+    ///
+    /// Ids are handed out per stack, so a layer arriving from another document
+    /// carries one that may already be taken here.
+    pub fn insert_layer(&mut self, mut layer: Layer) -> LayerId {
+        let id = self.stack.allocate_id();
+        layer.id = id;
+
+        let at = self.active_index().map_or(self.stack.len(), |i| i + 1);
+        self.stack.insert(at, layer);
+        self.active_layer = id;
+        self.commit("Duplicate Layer");
+        id
+    }
+
+    /// Delete every hidden layer — Layer ▸ Delete ▸ Hidden Layers.
+    ///
+    /// Returns how many went. Fully locked layers are kept, for the reason
+    /// [`Document::delete_layer`] keeps them, and so is the last layer
+    /// standing: a document with no layers at all is a state nothing else here
+    /// expects.
+    pub fn delete_hidden_layers(&mut self) -> usize {
+        let doomed: Vec<LayerId> = self
+            .stack
+            .as_slice()
+            .iter()
+            .filter(|l| !l.visible && !l.is_fully_locked())
+            .map(|l| l.id)
+            .collect();
+
+        let mut removed = 0;
+        for id in doomed {
+            if self.stack.len() <= 1 {
+                break;
+            }
+            if let Some(index) = self.stack.index_of(id) {
+                self.stack.remove(index);
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            return 0;
+        }
+
+        // The active layer may have been one of them.
+        if self.stack.by_id(self.active_layer).is_none() {
+            self.active_layer = self
+                .stack
+                .as_slice()
+                .last()
+                .map_or(LayerId::NONE, |l| l.id);
+        }
+        self.commit("Delete Hidden Layers");
+        removed
+    }
+
     /// Delete a layer. Refuses to remove the last remaining one, or a fully
     /// locked one — Photoshop will not throw away a layer you have locked
     /// against being touched.
@@ -1032,26 +1919,259 @@ impl Document {
         if self.stack.get(index).is_some_and(Layer::is_fully_locked) {
             return false;
         }
-        self.stack.remove(index);
+        // Deleting a group takes its contents with it, as CS6's Delete Group
+        // does — leaving them behind would drop them into whatever the group
+        // was sitting on, which is not what anyone means by deleting a folder.
+        let run = self.stack.run_at(index);
+        if run.len() >= self.stack.len() {
+            return false;
+        }
+        for position in run.clone().rev() {
+            self.stack.remove(position);
+        }
 
-        if self.active_layer == id {
+        if !self.stack.iter().any(|l| l.id == self.active_layer) {
             // Select the layer that took its place, or the new top.
-            let next = index.min(self.stack.len().saturating_sub(1));
+            let next = run.start.min(self.stack.len().saturating_sub(1));
             self.active_layer = self.stack.get(next).map_or(LayerId::NONE, |l| l.id);
         }
         self.commit("Delete Layer");
         true
     }
 
+    /// A new, empty group above the active layer — the folder button at the
+    /// foot of the Layers panel, and Layer ▸ New ▸ Group.
+    ///
+    /// Empty because that is what CS6's button makes; layers go in afterwards
+    /// by being dragged into it. Grouping a selection in one step is
+    /// [`Document::group_layers`].
+    pub fn add_group(&mut self, name: Option<String>) -> LayerId {
+        let id = self.stack.allocate_id();
+        let name = name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| self.stack.suggest_shape_name("Group"));
+        let group = Layer::new_group(id, name);
+
+        // Above the active layer, as every other New Layer does — except that
+        // a folder cannot land inside another folder, so an active layer that
+        // is in a group puts the new one above that whole group.
+        let at = match self.active_index() {
+            Some(index) => {
+                match self.stack.group_of(index) {
+                    Some(group_index) => group_index + 1,
+                    None => index + 1,
+                }
+            }
+            None => self.stack.len(),
+        };
+        self.stack.insert(at, group);
+        self.active_layer = id;
+        self.commit("New Group");
+        id
+    }
+
+    /// Put layers into a new group — Layer ▸ Group Layers.
+    ///
+    /// The members are gathered together directly beneath a new folder, which
+    /// takes the place of the topmost of them, keeping their order. Returns the
+    /// group, or `None` if there was nothing groupable in `ids`.
+    ///
+    /// Groups cannot yet be nested, so a selection containing one is refused
+    /// rather than half-grouped.
+    pub fn group_layers(&mut self, ids: &[LayerId]) -> Option<LayerId> {
+        let mut positions: Vec<usize> = ids
+            .iter()
+            .filter_map(|id| self.stack.index_of(*id))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        if positions.is_empty() {
+            return None;
+        }
+        if positions
+            .iter()
+            .any(|i| self.stack.get(*i).is_some_and(|l| l.is_group() || l.parent.is_some()))
+        {
+            return None;
+        }
+
+        // Lift the members out top-down so the remaining positions stay valid,
+        // then put them back in stack order under the folder.
+        let mut members: Vec<Layer> = Vec::with_capacity(positions.len());
+        for position in positions.iter().rev() {
+            if let Some(layer) = self.stack.remove(*position) {
+                members.push(layer);
+            }
+        }
+        members.reverse();
+
+        let id = self.stack.allocate_id();
+        let name = self.stack.suggest_shape_name("Group");
+        let mut group = Layer::new_group(id, name);
+        // A group takes the canvas-sized mask slot of an ordinary layer, so it
+        // needs the document's own dimensions to make one later.
+        group.offset = (0, 0);
+        for member in members.iter_mut() {
+            member.parent = Some(id);
+        }
+
+        // The folder lands where the topmost member was, which is where CS6
+        // leaves it — the group appears in the row the selection occupied.
+        let at = positions
+            .last()
+            .copied()
+            .unwrap_or(self.stack.len())
+            .saturating_sub(positions.len() - 1)
+            .min(self.stack.len());
+        for (offset, member) in members.into_iter().enumerate() {
+            self.stack.insert(at + offset, member);
+        }
+        self.stack.insert(at + positions.len(), group);
+
+        self.active_layer = id;
+        self.commit("Group Layers");
+        Some(id)
+    }
+
+    /// Put a layer into a group by naming the group rather than a position —
+    /// what dropping onto the folder in the Layers panel means.
+    ///
+    /// It lands at the top of the group's contents, which is where CS6 puts a
+    /// layer dropped on a folder. False if the layer is a group (they do not
+    /// nest) or is already in this one.
+    pub fn move_layer_into_group(&mut self, id: LayerId, group: LayerId) -> bool {
+        if id == group {
+            return false;
+        }
+        let Some(from) = self.stack.index_of(id) else {
+            return false;
+        };
+        if self.stack.index_of(group).is_none() {
+            return false;
+        }
+        match self.stack.get(from) {
+            Some(layer) if layer.is_group() => return false,
+            Some(layer) if layer.parent == Some(group) => return false,
+            Some(_) => {}
+            None => return false,
+        }
+
+        let Some(mut layer) = self.stack.remove(from) else {
+            return false;
+        };
+        layer.parent = Some(group);
+        // Re-read the folder: taking the layer out may have shifted it.
+        let Some(group_index) = self.stack.index_of(group) else {
+            return false;
+        };
+        self.stack.insert(group_index, layer);
+        // Open the folder, so a layer dropped into a closed one is not simply
+        // gone as far as the panel shows.
+        if let Some(folder) = self.stack.get_mut(group_index + 1) {
+            folder.expanded = true;
+        }
+        self.commit("Move Layer Into Group");
+        true
+    }
+
+    /// Take a group apart, leaving its members where they were —
+    /// Layer ▸ Ungroup Layers. False if `id` is not a group.
+    pub fn ungroup_layers(&mut self, id: LayerId) -> bool {
+        let Some(index) = self.stack.index_of(id) else {
+            return false;
+        };
+        if !self.stack.get(index).is_some_and(Layer::is_group) {
+            return false;
+        }
+        let members = self.stack.group_members(index);
+        for position in members.clone() {
+            if let Some(layer) = self.stack.get_mut(position) {
+                layer.parent = None;
+            }
+        }
+        self.stack.remove(index);
+
+        if self.active_layer == id {
+            // The topmost member, or whatever is now in the folder's row.
+            let next = members.end.min(self.stack.len().saturating_sub(1));
+            self.active_layer = self.stack.get(next).map_or(LayerId::NONE, |l| l.id);
+        }
+        self.commit("Ungroup Layers");
+        true
+    }
+
+    /// Open or close a group in the panel. Not an edit — no history entry.
+    pub fn set_group_expanded(&mut self, id: LayerId, expanded: bool) -> bool {
+        match self.stack.by_id_mut(id) {
+            Some(layer) if layer.is_group() => {
+                layer.expanded = expanded;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Move a layer to a new stack position.
+    ///
+    /// A group travels with its members, and a layer dropped among a group's
+    /// members joins that group — which is how a layer gets into a group by
+    /// dragging, since there is nothing else to distinguish "into the folder"
+    /// from "past it".
     pub fn reorder_layer(&mut self, id: LayerId, to: usize) -> bool {
         let Some(from) = self.stack.index_of(id) else {
             return false;
         };
-        if to >= self.stack.len() || from == to {
+        if to >= self.stack.len() {
             return false;
         }
-        self.stack.reorder(from, to);
+
+        let run = self.stack.run_at(from);
+        if run.len() > 1 && from == to {
+            // A group cannot change what it belongs to, so standing still
+            // really is nothing.
+            return false;
+        }
+        if run.len() > 1 {
+            // Moving a group: lift the whole run and put it back in one piece.
+            //
+            // `to` is where the layer itself is to end up — for a single layer
+            // that is just `insert(to)`. A group's layer *is* its folder, which
+            // is the last of the run, so the run starts far enough below `to`
+            // for the folder to land on it.
+            let lifted: Vec<Layer> = run.clone().rev().filter_map(|i| self.stack.remove(i)).collect();
+            let mut lifted: Vec<Layer> = lifted.into_iter().rev().collect();
+            let at = (to + 1).saturating_sub(run.len()).min(self.stack.len());
+            // A group cannot go inside another group, so it lands outside.
+            for layer in lifted.iter_mut() {
+                if layer.is_group() {
+                    layer.parent = None;
+                }
+            }
+            for (offset, layer) in lifted.into_iter().enumerate() {
+                self.stack.insert(at + offset, layer);
+            }
+            self.commit("Reorder Layer");
+            return true;
+        }
+
+        // Lifted and put back rather than shuffled in place, so membership is
+        // decided by where it lands — `LayerStack::insert` is the one place
+        // that rule lives.
+        let before = self.stack.get(from).and_then(|l| l.parent);
+        let Some(mut layer) = self.stack.remove(from) else {
+            return false;
+        };
+        layer.parent = None;
+        self.stack.insert(to, layer);
+
+        // Landing on the slot it started from is not always a no-op: the row
+        // directly beneath a folder is both "just below the group" and "inside
+        // it", so dropping a layer where it already sits is how it joins an
+        // empty group. Only a move that changes neither position nor group is
+        // nothing.
+        if from == to && before == self.stack.get(to).and_then(|l| l.parent) {
+            return false;
+        }
         self.commit("Reorder Layer");
         true
     }
@@ -1069,6 +2189,14 @@ impl Document {
         }
         let locked = |i: usize| self.stack.get(i).is_some_and(Layer::is_fully_locked);
         if locked(index) || locked(index - 1) {
+            return false;
+        }
+        // Merging a group is CS6's Merge Group, which flattens the folder's
+        // contents into one layer — a different operation from merging two
+        // layers, and not built. Refused rather than merging the empty folder
+        // into whatever is beneath it and quietly losing its contents.
+        let is_group = |i: usize| self.stack.get(i).is_some_and(Layer::is_group);
+        if is_group(index) || is_group(index - 1) {
             return false;
         }
 
@@ -3133,6 +4261,15 @@ impl Document {
     }
 
     pub fn clear_selection_pixels(&mut self) {
+        if self.erase_selected_pixels() {
+            self.commit("Clear");
+        }
+    }
+
+    /// Erase the selected pixels of the active layer without committing, so a
+    /// caller that is doing more than one thing — Layer Via Cut — lands as one
+    /// history step. False when the layer refuses to be edited.
+    fn erase_selected_pixels(&mut self) -> bool {
         let selection_empty = self.selection.is_empty();
         let selection = if selection_empty {
             None
@@ -3143,7 +4280,7 @@ impl Document {
 
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels {
-                return;
+                return false;
             }
             let offset = layer.offset;
             let (w, h) = (layer.pixels.width(), layer.pixels.height());
@@ -3162,7 +4299,7 @@ impl Document {
                 }
             }
         }
-        self.commit("Clear");
+        true
     }
 
     // -- filters ------------------------------------------------------------
@@ -3243,6 +4380,7 @@ impl Document {
         out_black: f32,
         out_white: f32,
     ) {
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
@@ -3250,14 +4388,25 @@ impl Document {
             }
             let span = (in_white - in_black).max(1e-6);
             let inv_gamma = 1.0 / gamma.max(1e-6);
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let v = px[channel] as f32 / 255.0;
                 let n = ((v - in_black) / span).clamp(0.0, 1.0).powf(inv_gamma);
                 let out = (out_black + n * (out_white - out_black)).clamp(0.0, 1.0);
                 px[channel] = (out * 255.0 + 0.5) as u8;
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Levels");
@@ -3265,26 +4414,143 @@ impl Document {
 
     /// Apply a 256-entry LUT curve to the active layer.
     /// channel: 0 = all RGB, 1 = R only, 2 = G only, 3 = B only.
-    pub fn apply_curves_lut(&mut self, lut: &[u8], channel: i32) {
+    /// Photoshop's Image > Adjustments > Equalize.
+    ///
+    /// Redistributes *brightness* so the values present spread evenly across
+    /// the range: the darkest pixel becomes black, the lightest white, and the
+    /// middle tones space out by how many pixels share each level.
+    ///
+    /// Brightness here is Rec. 601 luminance, and the mapping is applied by
+    /// scaling all three channels by the same factor, so hue survives.
+    ///
+    /// Luminance rather than `max(r, g, b)` because blue only contributes
+    /// 0.114 of it. Under Value, a blue sky sits near the top of the
+    /// histogram and equalization stretches it to near-white; under
+    /// luminance it sits mid-range and comes back a deeper blue, which is
+    /// what Photoshop produces. It also spreads a photograph's pixels over
+    /// far more buckets, so the mapping is gentler and does not posterise
+    /// large flat areas into visible bands.
+    ///
+    /// It deliberately does **not** equalize each channel against its own
+    /// histogram. That is what GIMP does, and it neutralises colour casts by
+    /// stretching each channel separately — which wrecks the colour of a
+    /// photograph rather than re-spreading its tones.
+    ///
+    /// A strongly boosted, saturated colour can drive its dominant channel
+    /// past 255 and clamp there. That is deliberate rather than a flaw: it is
+    /// what makes Equalize deepen saturated areas, and it is visible in
+    /// Photoshop's own output.
+    ///
+    /// A selection confines it: only the selected pixels contribute to the
+    /// histogram, and only they are remapped.
+    pub fn apply_equalize(&mut self) {
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+
+            // Pass one: how many pixels sit at each brightness. Transparent
+            // and unselected pixels are excluded, so they neither skew the
+            // mapping nor get remapped by it.
+            let mut histogram = [0u32; 256];
+            let mut total = 0u32;
+            for (i, px) in layer.pixels.as_bytes().chunks_exact(4).enumerate() {
+                if px[3] == 0 || mask.coverage(i) <= 0.0 {
+                    continue;
+                }
+                total += 1;
+                histogram[luma8(px[0], px[1], px[2]) as usize] += 1;
+            }
+            if total == 0 {
+                return;
+            }
+
+            // Pass two: the cumulative distribution becomes the mapping.
+            // Subtracting the first non-empty bucket pins the darkest value
+            // present to 0 rather than leaving it part-way up.
+            let first = histogram.iter().find(|&&n| n > 0).copied().unwrap_or(0);
+            let span = total.saturating_sub(first);
+            let mut lut = [0u8; 256];
+            let mut cumulative = 0u32;
+            for v in 0..256 {
+                cumulative += histogram[v];
+                lut[v] = if span == 0 {
+                    // Every selected pixel shares one brightness; there is no
+                    // range to spread, so leave it rather than slamming the
+                    // image to black or white.
+                    v as u8
+                } else {
+                    let scaled = (cumulative.saturating_sub(first) as f32 / span as f32) * 255.0;
+                    scaled.clamp(0.0, 255.0).round() as u8
+                };
+            }
+
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
-                match channel {
-                    1 => px[0] = lut[px[0] as usize],
-                    2 => px[1] = lut[px[1] as usize],
-                    3 => px[2] = lut[px[2] as usize],
-                    _ => {
-                        px[0] = lut[px[0] as usize];
-                        px[1] = lut[px[1] as usize];
-                        px[2] = lut[px[2] as usize];
-                    }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
                 }
+                let value = luma8(px[0], px[1], px[2]);
+                let mapped = lut[value as usize];
+                let out = if value == 0 {
+                    // No luminance to scale, and no hue worth preserving, so
+                    // it simply takes the mapped brightness as a grey.
+                    [mapped, mapped, mapped]
+                } else {
+                    let scale = mapped as f32 / value as f32;
+                    [
+                        (px[0] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+                        (px[1] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+                        (px[2] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+                    ]
+                };
+                write_adjusted_u8(px, out, coverage);
+            }
+        }
+        self.commit("Equalize");
+    }
+
+    pub fn apply_curves_lut(&mut self, lut: &[u8], channel: i32) {
+        let selection = active_selection(&self.selection);
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
+                if px[3] == 0 {
+                    continue;
+                }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let out = match channel {
+                    1 => [lut[px[0] as usize], px[1], px[2]],
+                    2 => [px[0], lut[px[1] as usize], px[2]],
+                    3 => [px[0], px[1], lut[px[2] as usize]],
+                    _ => [
+                        lut[px[0] as usize],
+                        lut[px[1] as usize],
+                        lut[px[2] as usize],
+                    ],
+                };
+                write_adjusted_u8(px, out, coverage);
             }
         }
         self.commit("Curves");
@@ -3313,15 +4579,26 @@ impl Document {
         // Centres at 0°, 60°, 120°, 180°, 240°, 300° (in 0..1 space)
         let centres: [f32; 6] = [0.0, 1.0/6.0, 2.0/6.0, 3.0/6.0, 4.0/6.0, 5.0/6.0];
 
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let r = px[0] as f32 / 255.0;
                 let g = px[1] as f32 / 255.0;
                 let b = px[2] as f32 / 255.0;
@@ -3371,6 +4648,7 @@ impl Document {
                     px[1] = v;
                     px[2] = v;
                 }
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Black & White");
@@ -3389,15 +4667,26 @@ impl Document {
         use crate::filters::adjust::rgb_to_hsl;
 
         let d = (density / 100.0).clamp(0.0, 1.0);
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let orig_r = px[0] as f32 / 255.0;
                 let orig_g = px[1] as f32 / 255.0;
                 let orig_b = px[2] as f32 / 255.0;
@@ -3420,6 +4709,7 @@ impl Document {
                 px[0] = (nr.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 px[1] = (ng.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 px[2] = (nb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Photo Filter");
@@ -3438,15 +4728,26 @@ impl Document {
         constants: &[f32; 3],
         monochrome: bool,
     ) {
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let r = px[0] as f32 / 255.0;
                 let g = px[1] as f32 / 255.0;
                 let b = px[2] as f32 / 255.0;
@@ -3478,6 +4779,7 @@ impl Document {
                     px[1] = (ng.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                     px[2] = (nb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Channel Mixer");
@@ -3490,6 +4792,7 @@ impl Document {
         gradient: &crate::gradient::Gradient,
         dither: bool,
     ) {
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
@@ -3502,10 +4805,20 @@ impl Document {
 
             let mut rng_state: u32 = 0x12345678;
 
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let lum = (0.299 * px[0] as f32
                          + 0.587 * px[1] as f32
                          + 0.114 * px[2] as f32)
@@ -3538,6 +4851,7 @@ impl Document {
                     px[1] = c.g;
                     px[2] = c.b;
                 }
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Gradient Map");
@@ -3554,15 +4868,26 @@ impl Document {
         adjustments: &[[f32; 4]; 9],
         relative: bool,
     ) {
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let r = px[0] as f32 / 255.0;
                 let g = px[1] as f32 / 255.0;
                 let b = px[2] as f32 / 255.0;
@@ -3577,7 +4902,7 @@ impl Document {
 
                 // Determine how much this pixel belongs to each color range.
                 // Photoshop uses the dominant hue and the secondary overlaps.
-                let ranges = Self::selective_color_weights(r, g, b, max, min);
+                let ranges = crate::filters::adjust::selective_color_weights(r, g, b, max, min);
 
                 for (range_idx, weight) in ranges.iter().enumerate() {
                     if *weight <= 0.0 {
@@ -3609,70 +4934,12 @@ impl Document {
                 px[0] = ((1.0 - c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
                 px[1] = ((1.0 - m.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
                 px[2] = ((1.0 - y.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Selective Color");
     }
 
-    fn selective_color_weights(r: f32, g: f32, b: f32, max: f32, min: f32) -> [f32; 9] {
-        // Ranges: 0=Reds, 1=Yellows, 2=Greens, 3=Cyans, 4=Blues, 5=Magentas,
-        //         6=Whites, 7=Neutrals, 8=Blacks
-        let mut w = [0.0f32; 9];
-
-        // Chromatic ranges — weight by how dominant the hue is
-        let chroma = max - min;
-        if chroma > 0.0 {
-            // Reds: R dominant, hue near 0° or 360°
-            if r >= g && r >= b {
-                // Red is max
-                if g >= b {
-                    // hue 0–60° (red–yellow)
-                    let red_w = (chroma * (1.0 - (g - b) / chroma)).min(chroma);
-                    w[0] = red_w;   // Reds
-                    w[1] = chroma - red_w; // Yellows
-                } else {
-                    // hue 300–360° (magenta–red)
-                    let red_w = (chroma * (1.0 - (b - g) / chroma)).min(chroma);
-                    w[0] = red_w;   // Reds
-                    w[5] = chroma - red_w; // Magentas
-                }
-            } else if g >= r && g >= b {
-                // Green is max
-                if r >= b {
-                    // hue 60–120° (yellow–green)
-                    let grn_w = (chroma * (1.0 - (r - b) / chroma)).min(chroma);
-                    w[2] = grn_w;   // Greens
-                    w[1] = chroma - grn_w; // Yellows
-                } else {
-                    // hue 120–180° (green–cyan)
-                    let grn_w = (chroma * (1.0 - (b - r) / chroma)).min(chroma);
-                    w[2] = grn_w;   // Greens
-                    w[3] = chroma - grn_w; // Cyans
-                }
-            } else {
-                // Blue is max
-                if g >= r {
-                    // hue 180–240° (cyan–blue)
-                    let blu_w = (chroma * (1.0 - (g - r) / chroma)).min(chroma);
-                    w[4] = blu_w;   // Blues
-                    w[3] = chroma - blu_w; // Cyans
-                } else {
-                    // hue 240–300° (blue–magenta)
-                    let blu_w = (chroma * (1.0 - (r - g) / chroma)).min(chroma);
-                    w[4] = blu_w;   // Blues
-                    w[5] = chroma - blu_w; // Magentas
-                }
-            }
-        }
-
-        // Tonal ranges — Whites, Neutrals, Blacks
-        // These use the min-of-RGB approach that Photoshop uses.
-        w[6] = min;                         // Whites
-        w[8] = 1.0 - max;                   // Blacks
-        w[7] = 1.0 - (w[6] + w[8] + chroma).min(1.0); // Neutrals
-
-        w
-    }
 
     /// CS6-style Shadows/Highlights.
     ///
@@ -3709,15 +4976,26 @@ impl Document {
             shadow_delta - highlight_delta
         });
 
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let r = px[0] as f32 / 255.0;
                 let g = px[1] as f32 / 255.0;
                 let b = px[2] as f32 / 255.0;
@@ -3735,6 +5013,7 @@ impl Document {
                 px[0] = ((r + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 px[1] = ((g + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 px[2] = ((b + delta).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Shadows/Highlights");
@@ -3771,6 +5050,7 @@ impl Document {
         use crate::filters::convolve::gaussian_blur_accelerated;
         use crate::filters::adjust::rgb_to_hsl;
 
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
@@ -3836,6 +5116,7 @@ impl Document {
                 }
             };
 
+            let (ox, oy) = layer.offset;
             for y in 0..h as i32 {
                 for x in 0..w as i32 {
                     let px_idx = (y as u32 * w + x as u32) as usize * 4;
@@ -3843,6 +5124,11 @@ impl Document {
                     if bytes[px_idx + 3] == 0 {
                         continue;
                     }
+                    let coverage = coverage_at(selection, x + ox, y + oy);
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let original = [bytes[px_idx], bytes[px_idx + 1], bytes[px_idx + 2]];
 
                     let r = bytes[px_idx] as f32 / 255.0;
                     let g = bytes[px_idx + 1] as f32 / 255.0;
@@ -3946,6 +5232,7 @@ impl Document {
                     bytes[px_idx]     = (nr * 255.0 + 0.5) as u8;
                     bytes[px_idx + 1] = (ng * 255.0 + 0.5) as u8;
                     bytes[px_idx + 2] = (nb * 255.0 + 0.5) as u8;
+                    restore_unselected(&mut bytes[px_idx..px_idx + 3], original, coverage);
                 }
             }
         }
@@ -4069,6 +5356,7 @@ impl Document {
         let sat_amt = saturation.clamp(-100.0, 100.0) / 100.0;
         let light_amt = lightness.clamp(-100.0, 100.0) / 100.0;
 
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
@@ -4076,6 +5364,7 @@ impl Document {
             }
             let (w, h) = (layer.pixels.width(), layer.pixels.height());
             let sigma_sq = Self::replace_color_sigma_sq(w, h);
+            let (ox, oy) = layer.offset;
 
             let bytes = layer.pixels.as_bytes_mut();
             for (i, px) in bytes.chunks_exact_mut(4).enumerate() {
@@ -4084,9 +5373,12 @@ impl Document {
                 }
                 let x = (i as u32 % w) as i32;
                 let y = (i as u32 / w) as i32;
+                // The selection simply scales the colour-match weight: both
+                // already feather the same way, so one multiply confines the
+                // edit without a second blending step.
                 let weight = Self::replace_color_weight(
                     px[0], px[1], px[2], x, y, samples, fuzziness, localized, sigma_sq,
-                );
+                ) * coverage_at(selection, x + ox, y + oy);
                 if weight <= 0.0 {
                     continue;
                 }
@@ -4141,15 +5433,26 @@ impl Document {
         let mg = magenta_green / 256.0;
         let yb = yellow_blue / 256.0;
 
+        let selection = active_selection(&self.selection);
         let id = self.active_layer;
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
+            let mask = SelectionMask {
+                selection,
+                width: layer.pixels.width(),
+                offset: layer.offset,
+            };
+            for (i, px) in layer.pixels.as_bytes_mut().chunks_exact_mut(4).enumerate() {
                 if px[3] == 0 {
                     continue;
                 }
+                let coverage = mask.coverage(i);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let original = [px[0], px[1], px[2]];
                 let r = px[0] as f32 / 255.0;
                 let g = px[1] as f32 / 255.0;
                 let b = px[2] as f32 / 255.0;
@@ -4199,6 +5502,7 @@ impl Document {
                     px[1] = (ng * 255.0 + 0.5) as u8;
                     px[2] = (nb * 255.0 + 0.5) as u8;
                 }
+                restore_unselected(px, original, coverage);
             }
         }
         self.commit("Color Balance");
@@ -4207,6 +5511,11 @@ impl Document {
     /// Apply hue/saturation/lightness only to pixels whose hue falls in a
     /// specific colour range (channel 0=Master, 1=Reds, 2=Yellows, 3=Greens,
     /// 4=Cyans, 5=Blues, 6=Magentas).
+    ///
+    /// The range is carried by the adjustment itself, so this is the same
+    /// transform a Hue/Saturation layer evaluates — baked into pixels instead
+    /// of left editable. Keeping one definition is what stops the dialog and
+    /// the layer from disagreeing about where "Reds" ends.
     pub fn apply_hue_saturation_range(
         &mut self,
         hue_shift: f32,
@@ -4214,86 +5523,379 @@ impl Document {
         lightness: f32,
         channel: i32,
     ) {
-        use crate::filters::adjust::{rgb_to_hsl, hsl_to_rgb};
-
-        if channel == 0 {
-            let adj = crate::filters::adjust::Adjustment::HueSaturation {
-                hue: hue_shift,
-                saturation,
-                lightness,
-            };
-            self.apply_adjustment(adj);
-            return;
-        }
-
-        // Centre hue (in 0..1) and half-widths for each range.
-        // Inner: full effect. Outer: feather zone.
-        let (center, inner_half, outer_half) = match channel {
-            1 => (0.0_f32, 15.0 / 360.0, 45.0 / 360.0),   // Reds
-            2 => (60.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0),  // Yellows
-            3 => (120.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Greens
-            4 => (180.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Cyans
-            5 => (240.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Blues
-            6 => (300.0 / 360.0, 15.0 / 360.0, 45.0 / 360.0), // Magentas
-            _ => return,
-        };
-
-        let id = self.active_layer;
-        if let Some(layer) = self.stack.by_id_mut(id) {
-            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
-                return;
-            }
-            for px in layer.pixels.as_bytes_mut().chunks_exact_mut(4) {
-                if px[3] == 0 {
-                    continue;
-                }
-                let c = [
-                    px[0] as f32 / 255.0,
-                    px[1] as f32 / 255.0,
-                    px[2] as f32 / 255.0,
-                ];
-                let (h, s, l) = rgb_to_hsl(c);
-
-                // Hue distance on the circle
-                let mut dist = (h - center).abs();
-                if dist > 0.5 {
-                    dist = 1.0 - dist;
-                }
-
-                let weight = if dist <= inner_half {
-                    1.0
-                } else if dist <= outer_half {
-                    1.0 - (dist - inner_half) / (outer_half - inner_half)
-                } else {
-                    0.0
-                };
-
-                if weight < 1e-6 {
-                    continue;
-                }
-
-                let new_h = (h + hue_shift * weight).rem_euclid(1.0);
-                let new_s = if saturation >= 0.0 {
-                    s + (1.0 - s) * saturation.min(1.0) * weight
-                } else {
-                    s * (1.0 + saturation.max(-1.0) * weight)
-                };
-                let new_l = if lightness >= 0.0 {
-                    l + (1.0 - l) * lightness.min(1.0) * weight
-                } else {
-                    l * (1.0 + lightness.max(-1.0) * weight)
-                };
-
-                let out = hsl_to_rgb(new_h, new_s.clamp(0.0, 1.0), new_l.clamp(0.0, 1.0));
-                px[0] = (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                px[1] = (out[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                px[2] = (out[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-        }
-        self.commit("Hue/Saturation");
+        self.apply_adjustment(crate::filters::adjust::Adjustment::HueSaturation {
+            hue: hue_shift,
+            saturation,
+            lightness,
+            range: channel.clamp(0, 6) as u8,
+        });
     }
 
     // -- canvas -------------------------------------------------------------
+
+    /// Channels the colour mode stores, as Photoshop counts them.
+    ///
+    /// Not the four the engine keeps in memory: an RGB image has three
+    /// channels and its alpha is not one of them unless the user adds an
+    /// alpha channel. This is what Image Size reports, so counting our
+    /// internal RGBA would overstate every figure by a third.
+    pub fn channel_count(&self) -> u32 {
+        match self.color_mode {
+            ImageMode::Bitmap | ImageMode::Grayscale | ImageMode::Duotone
+            | ImageMode::Indexed | ImageMode::Multichannel => 1,
+            ImageMode::Rgb | ImageMode::Lab => 3,
+            ImageMode::Cmyk => 4,
+        }
+    }
+
+    /// Uncompressed size in bytes, the figure Image Size shows.
+    ///
+    /// `width * height * channels * bytes-per-channel`, except Bitmap mode,
+    /// which is one bit per pixel.
+    pub fn image_data_bytes(&self) -> u64 {
+        let pixels = self.width as u64 * self.height as u64;
+        if self.color_mode == ImageMode::Bitmap {
+            return pixels.div_ceil(8);
+        }
+        let bytes_per_channel = (self.bit_depth as u64).div_ceil(8).max(1);
+        pixels * self.channel_count() as u64 * bytes_per_channel
+    }
+
+    /// Pixels per inch, as shown by Image ▸ Image Size.
+    pub fn resolution(&self) -> f32 {
+        self.resolution
+    }
+
+    /// Set the print resolution. Does not touch a single pixel — changing it
+    /// alone is Photoshop's "resample off" case, where the image simply prints
+    /// at a different size.
+    pub fn set_resolution(&mut self, dpi: f32) {
+        self.resolution = dpi.clamp(1.0, 30_000.0);
+    }
+
+    /// Scale the whole document to a new pixel size.
+    ///
+    /// Every layer is resampled by the same factor rather than stretched to
+    /// the canvas: a layer smaller than the canvas, or offset from it, keeps
+    /// its relative size and position. Masks and the selection scale with
+    /// them, so a feathered edge survives the resize.
+    pub fn resample_image(&mut self, width: u32, height: u32, mode: Resample) {
+        let width = width.max(1);
+        let height = height.max(1);
+        if width == self.width && height == self.height {
+            return;
+        }
+
+        let fx = width as f32 / self.width as f32;
+        let fy = height as f32 / self.height as f32;
+
+        for layer in self.stack.iter_mut() {
+            let (lw, lh) = (layer.pixels.width(), layer.pixels.height());
+            let nw = ((lw as f32 * fx).round() as u32).max(1);
+            let nh = ((lh as f32 * fy).round() as u32).max(1);
+            layer.pixels = crate::resample::resample(&layer.pixels, nw, nh, mode);
+
+            if let Some(mask) = layer.mask.as_ref() {
+                let (mw, mh) = (mask.width(), mask.height());
+                let nmw = ((mw as f32 * fx).round() as u32).max(1);
+                let nmh = ((mh as f32 * fy).round() as u32).max(1);
+                layer.mask = Some(crate::resample::resample(mask, nmw, nmh, mode));
+            }
+
+            layer.offset = (
+                (layer.offset.0 as f32 * fx).round() as i32,
+                (layer.offset.1 as f32 * fy).round() as i32,
+            );
+        }
+
+        if !self.selection.is_empty() {
+            let scaled = crate::resample::resample_coverage(
+                self.selection.as_bytes(),
+                self.width,
+                self.height,
+                width,
+                height,
+            );
+            if let Some(sel) = Selection::from_coverage(width, height, scaled) {
+                self.selection = sel;
+            } else {
+                self.selection = Selection::new(width, height);
+            }
+        } else {
+            self.selection = Selection::new(width, height);
+        }
+
+        self.width = width;
+        self.height = height;
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(width, height);
+        }
+        self.commit("Image Size");
+    }
+
+    /// Resize the canvas without scaling layer content, anchoring the
+    /// existing image somewhere in the new one.
+    ///
+    /// `anchor_x` and `anchor_y` are 0, 1 or 2 — left/centre/right and
+    /// top/centre/bottom — matching the nine-square grid in the dialog. Every
+    /// layer shifts by the same amount, so their positions relative to each
+    /// other never change.
+    ///
+    /// `extension` is the colour poured into the newly exposed area of the
+    /// Background layer, as CS6's "Canvas extension color" does. Other layers
+    /// gain transparency there, and `None` leaves even the Background
+    /// transparent — which is what a document without one already does.
+    pub fn resize_canvas_anchored(
+        &mut self,
+        width: u32,
+        height: u32,
+        anchor_x: u8,
+        anchor_y: u8,
+        extension: Option<Rgba8>,
+    ) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let (old_w, old_h) = (self.width, self.height);
+        if width == old_w && height == old_h {
+            return;
+        }
+
+        // Integer halves: an odd difference leans to the top-left, the same
+        // way Photoshop rounds it.
+        let dx = (width as i32 - old_w as i32) * anchor_x.min(2) as i32 / 2;
+        let dy = (height as i32 - old_h as i32) * anchor_y.min(2) as i32 / 2;
+
+        for layer in self.stack.iter_mut() {
+            layer.offset = (layer.offset.0 + dx, layer.offset.1 + dy);
+        }
+
+        // The selection moves with the image rather than staying put, so a
+        // marquee still surrounds what it surrounded before.
+        if self.selection.is_empty() {
+            self.selection = Selection::new(width, height);
+        } else {
+            let mut coverage = vec![0u8; (width as usize) * (height as usize)];
+            for y in 0..height {
+                for x in 0..width {
+                    let c = self.selection.coverage_at(x as i32 - dx, y as i32 - dy);
+                    coverage[(y * width + x) as usize] = (c * 255.0 + 0.5) as u8;
+                }
+            }
+            self.selection = Selection::from_coverage(width, height, coverage)
+                .unwrap_or_else(|| Selection::new(width, height));
+        }
+
+        self.width = width;
+        self.height = height;
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(width, height);
+        }
+
+        // The Background layer keeps covering the whole canvas, with the new
+        // area filled. Every other layer simply hangs where it was moved to.
+        if let Some(color) = extension {
+            if let Some(layer) = self.stack.get_mut(0) {
+                if layer.name == "Background" && matches!(layer.kind, LayerKind::Raster) {
+                    let mut grown = Pixmap::filled(width, height, color);
+                    let (ox, oy) = layer.offset;
+                    for y in 0..layer.pixels.height() as i32 {
+                        for x in 0..layer.pixels.width() as i32 {
+                            let px = layer.pixels.get(x, y);
+                            if px.a != 0 {
+                                grown.set(x + ox, y + oy, px);
+                            }
+                        }
+                    }
+                    layer.pixels = grown;
+                    layer.offset = (0, 0);
+                }
+            }
+        }
+
+        self.commit("Canvas Size");
+    }
+
+    /// Turn or mirror the whole document — Image ▸ Image Rotation.
+    ///
+    /// Unlike Edit ▸ Transform, which works on the active layer alone, this
+    /// takes every layer, every mask and the selection with it, and swaps the
+    /// canvas dimensions on a quarter turn. Nothing is resampled: at a right
+    /// angle the pixels are only permuted, so an image can be turned and
+    /// turned back without losing anything.
+    pub fn rotate_canvas(&mut self, how: Orientation) {
+        if matches!(how, Orientation::Upright) {
+            return;
+        }
+
+        let (w, h) = (self.width as i32, self.height as i32);
+        for layer in self.stack.iter_mut() {
+            let (ox, oy) = layer.offset;
+            let lw = layer.pixels.width() as i32;
+            let lh = layer.pixels.height() as i32;
+            layer.pixels = layer.pixels.transformed(how);
+            if let Some(mask) = layer.mask.as_mut() {
+                *mask = mask.transformed(how);
+            }
+            // Where the layer's rectangle lands, given the canvas it sits in.
+            // A layer hanging off the edge stays off the edge, on the side the
+            // turn carries it to.
+            layer.offset = match how {
+                Orientation::Rotate90Cw => (h - oy - lh, ox),
+                Orientation::Rotate90Ccw => (oy, w - ox - lw),
+                Orientation::Rotate180 => (w - ox - lw, h - oy - lh),
+                Orientation::FlipHorizontal => (w - ox - lw, oy),
+                Orientation::FlipVertical => (ox, h - oy - lh),
+                // Transpose and Transverse are EXIF's, not the menu's.
+                _ => (ox, oy),
+            };
+        }
+
+        let (new_w, new_h) = if how.swaps_axes() {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+
+        // The selection is part of the image as far as the user is concerned,
+        // so it turns with it and still surrounds what it surrounded.
+        if self.selection.is_empty() {
+            self.selection = Selection::new(new_w, new_h);
+        } else {
+            let mut coverage = vec![0u8; (new_w as usize) * (new_h as usize)];
+            for ny in 0..new_h as i32 {
+                for nx in 0..new_w as i32 {
+                    let (sx, sy) = match how {
+                        Orientation::Rotate90Cw => (ny, h - 1 - nx),
+                        Orientation::Rotate90Ccw => (w - 1 - ny, nx),
+                        Orientation::Rotate180 => (w - 1 - nx, h - 1 - ny),
+                        Orientation::FlipHorizontal => (w - 1 - nx, ny),
+                        Orientation::FlipVertical => (nx, h - 1 - ny),
+                        _ => (nx, ny),
+                    };
+                    let c = self.selection.coverage_at(sx, sy);
+                    coverage[(ny as u32 * new_w + nx as u32) as usize] = (c * 255.0 + 0.5) as u8;
+                }
+            }
+            self.selection = Selection::from_coverage(new_w, new_h, coverage)
+                .unwrap_or_else(|| Selection::new(new_w, new_h));
+        }
+
+        self.width = new_w;
+        self.height = new_h;
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(new_w, new_h);
+        }
+
+        self.commit(match how {
+            Orientation::Rotate90Cw => "Rotate 90\u{b0} CW",
+            Orientation::Rotate90Ccw => "Rotate 90\u{b0} CCW",
+            Orientation::Rotate180 => "Rotate 180\u{b0}",
+            Orientation::FlipHorizontal => "Flip Canvas Horizontal",
+            Orientation::FlipVertical => "Flip Canvas Vertical",
+            _ => "Rotate Canvas",
+        });
+    }
+
+    /// Turn the whole document by any angle — Image ▸ Image Rotation ▸
+    /// Arbitrary.
+    ///
+    /// The canvas grows to the bounding box of the turned rectangle, so no
+    /// corner is cut off. `fill` is poured into the new area of the Background
+    /// layer, as CS6 pours in the background colour; every other layer simply
+    /// gains transparency there.
+    ///
+    /// Right angles are handed to [`Document::rotate_canvas`], which permutes
+    /// rather than resamples — turning by 90° twice must not soften an image.
+    pub fn rotate_canvas_arbitrary(&mut self, degrees: f32, fill: Option<Rgba8>) {
+        let degrees = degrees.rem_euclid(360.0);
+        match degrees {
+            d if d == 0.0 => return,
+            d if d == 90.0 => return self.rotate_canvas(Orientation::Rotate90Cw),
+            d if d == 180.0 => return self.rotate_canvas(Orientation::Rotate180),
+            d if d == 270.0 => return self.rotate_canvas(Orientation::Rotate90Ccw),
+            _ => {}
+        }
+
+        let (w, h) = (self.width, self.height);
+        let (new_w, new_h) = crate::rotate::rotated_bounds(w, h, degrees);
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let (ncx, ncy) = (new_w as f32 / 2.0, new_h as f32 / 2.0);
+
+        for layer in self.stack.iter_mut() {
+            // Turning a layer about its own centre and then moving that centre
+            // to where the canvas turn sends it is the same rigid motion as
+            // turning the layer about the canvas centre — and it keeps every
+            // layer's buffer as small as its own content.
+            let mx = layer.offset.0 as f32 + layer.pixels.width() as f32 / 2.0 - cx;
+            let my = layer.offset.1 as f32 + layer.pixels.height() as f32 / 2.0 - cy;
+            let nmx = mx * cos - my * sin + ncx;
+            let nmy = mx * sin + my * cos + ncy;
+
+            layer.pixels = crate::rotate::rotate(&layer.pixels, degrees);
+            if let Some(mask) = layer.mask.as_mut() {
+                *mask = crate::rotate::rotate(mask, degrees);
+            }
+            // Layers land on whole pixels, so one may sit up to half a pixel
+            // from where an exact turn would put it. Only visible as
+            // misregistration between layers, and only off a right angle.
+            layer.offset = (
+                (nmx - layer.pixels.width() as f32 / 2.0).round() as i32,
+                (nmy - layer.pixels.height() as f32 / 2.0).round() as i32,
+            );
+        }
+
+        if self.selection.is_empty() {
+            self.selection = Selection::new(new_w, new_h);
+        } else {
+            let mut coverage = vec![0u8; (new_w as usize) * (new_h as usize)];
+            for ny in 0..new_h {
+                for nx in 0..new_w {
+                    let dx = nx as f32 + 0.5 - ncx;
+                    let dy = ny as f32 + 0.5 - ncy;
+                    let sx = (dx * cos + dy * sin + cx).floor() as i32;
+                    let sy = (-dx * sin + dy * cos + cy).floor() as i32;
+                    let c = self.selection.coverage_at(sx, sy);
+                    coverage[(ny * new_w + nx) as usize] = (c * 255.0 + 0.5) as u8;
+                }
+            }
+            self.selection = Selection::from_coverage(new_w, new_h, coverage)
+                .unwrap_or_else(|| Selection::new(new_w, new_h));
+        }
+
+        self.width = new_w;
+        self.height = new_h;
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(new_w, new_h);
+        }
+
+        // The Background layer has no transparency in Photoshop, so the
+        // corners the turn opened up are filled rather than left clear.
+        if let Some(color) = fill {
+            if let Some(layer) = self.stack.get_mut(0) {
+                if layer.name == "Background" && matches!(layer.kind, LayerKind::Raster) {
+                    let mut filled = Pixmap::filled(new_w, new_h, color);
+                    let (ox, oy) = layer.offset;
+                    for y in 0..layer.pixels.height() as i32 {
+                        for x in 0..layer.pixels.width() as i32 {
+                            let px = layer.pixels.get(x, y);
+                            if px.a == 0 {
+                                continue;
+                            }
+                            // Over, not a copy: the turned edge is antialiased,
+                            // and a copy would leave it jagged against the fill.
+                            let dst = filled.get(x + ox, y + oy);
+                            filled.set(x + ox, y + oy, over(px, dst));
+                        }
+                    }
+                    layer.pixels = filled;
+                    layer.offset = (0, 0);
+                }
+            }
+        }
+
+        self.commit("Rotate Canvas");
+    }
 
     /// Resize the canvas without scaling layer content.
     pub fn resize_canvas(&mut self, width: u32, height: u32) {
@@ -4316,6 +5918,14 @@ impl Document {
     ///
     /// A rect that misses the canvas entirely, or has no area, is ignored.
     pub fn crop(&mut self, rect: Rect, delete_cropped: bool) {
+        self.crop_labeled(rect, delete_cropped, "Crop");
+    }
+
+    /// [`Document::crop`], under a name of the caller's choosing.
+    ///
+    /// Trim is a crop by another route, and the history panel should say which
+    /// one the user reached for.
+    fn crop_labeled(&mut self, rect: Rect, delete_cropped: bool, label: &str) {
         let rect = rect.intersect(&Rect::from_size(self.width, self.height));
         if rect.is_empty() {
             return;
@@ -4369,7 +5979,148 @@ impl Document {
         if let Some(s) = self.stroke.as_mut() {
             s.resize(rect.width, rect.height);
         }
-        self.commit("Crop");
+        self.commit(label);
+    }
+
+    /// Trim uniform border away from the edges — Image ▸ Trim.
+    ///
+    /// The border is judged on the flattened image: either the pixels that are
+    /// transparent, or those matching the colour in one of the two corners.
+    /// Only the edges named in `edges` are cut, so a border can be taken off
+    /// three sides and left on the fourth.
+    ///
+    /// Returns false when there is nothing to do — no edge chosen, an image
+    /// that is entirely border, or one already trimmed.
+    ///
+    /// Not a GPU candidate (CLAUDE.md §7 step 2): the work is a reduction down
+    /// to four integers that the CPU needs straight back to size the crop, and
+    /// it runs once per dialog rather than in any hot path.
+    pub fn trim(&mut self, basis: TrimBasis, edges: TrimEdges) -> bool {
+        if !(edges.top || edges.bottom || edges.left || edges.right) {
+            return false;
+        }
+        let composite = self.composite();
+        let (w, h) = (composite.width() as i32, composite.height() as i32);
+        if w < 1 || h < 1 {
+            return false;
+        }
+
+        // What counts as border. Matching is exact — Photoshop's Trim has no
+        // tolerance, and a nearly-white edge is not a white edge.
+        let border = match basis {
+            TrimBasis::Transparent => Rgba8::TRANSPARENT,
+            TrimBasis::TopLeft => composite.get(0, 0),
+            TrimBasis::BottomRight => composite.get(w - 1, h - 1),
+        };
+        let is_border = |px: Rgba8| match basis {
+            // Colour is meaningless where there is no alpha, so transparency
+            // is judged on alpha alone.
+            TrimBasis::Transparent => px.a == 0,
+            _ => px == border,
+        };
+
+        let (mut min_x, mut min_y) = (w, h);
+        let (mut max_x, mut max_y) = (-1, -1);
+        for y in 0..h {
+            for x in 0..w {
+                if is_border(composite.get(x, y)) {
+                    continue;
+                }
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        if max_x < min_x {
+            // Every pixel is border. Trimming would leave nothing, so CS6
+            // refuses rather than emptying the document.
+            return false;
+        }
+
+        let x0 = if edges.left { min_x } else { 0 };
+        let y0 = if edges.top { min_y } else { 0 };
+        let x1 = if edges.right { max_x } else { w - 1 };
+        let y1 = if edges.bottom { max_y } else { h - 1 };
+        if (x0, y0, x1, y1) == (0, 0, w - 1, h - 1) {
+            return false;
+        }
+
+        self.crop_labeled(
+            Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32),
+            false,
+            "Trim",
+        );
+        true
+    }
+
+    /// Grow the canvas until nothing hangs off it — Image ▸ Reveal All.
+    ///
+    /// The inverse of a crop that kept its pixels: layers are allowed to sit
+    /// partly or wholly outside the canvas, and this enlarges the canvas to the
+    /// union of everything they hold, shifting the whole document so the new
+    /// origin is the top-left of that union.
+    ///
+    /// A layer is measured by the pixels it actually has, not by the size of
+    /// its buffer — a mostly-empty layer dragged off the edge should not grow
+    /// the canvas by the width of the emptiness.
+    ///
+    /// Returns false when everything is already on the canvas.
+    pub fn reveal_all(&mut self) -> bool {
+        let canvas = Rect::from_size(self.width, self.height);
+        let mut union = canvas;
+        for layer in self.stack.iter() {
+            if let Some(bounds) = opaque_bounds(&layer.pixels) {
+                union = union.union(&Rect::new(
+                    layer.offset.0 + bounds.x,
+                    layer.offset.1 + bounds.y,
+                    bounds.width,
+                    bounds.height,
+                ));
+            }
+        }
+        if union == canvas {
+            return false;
+        }
+
+        let (dx, dy) = (-union.x, -union.y);
+        for layer in self.stack.iter_mut() {
+            layer.offset = (layer.offset.0 + dx, layer.offset.1 + dy);
+        }
+
+        // The selection moves with the image, as it does through Canvas Size.
+        let (new_w, new_h) = (union.width, union.height);
+        if self.selection.is_empty() {
+            self.selection = Selection::new(new_w, new_h);
+        } else {
+            let mut coverage = vec![0u8; (new_w as usize) * (new_h as usize)];
+            for y in 0..new_h {
+                for x in 0..new_w {
+                    let c = self.selection.coverage_at(x as i32 - dx, y as i32 - dy);
+                    coverage[(y * new_w + x) as usize] = (c * 255.0 + 0.5) as u8;
+                }
+            }
+            self.selection = Selection::from_coverage(new_w, new_h, coverage)
+                .unwrap_or_else(|| Selection::new(new_w, new_h));
+        }
+
+        self.width = new_w;
+        self.height = new_h;
+        if let Some(s) = self.stroke.as_mut() {
+            s.resize(new_w, new_h);
+        }
+
+        self.commit("Reveal All");
+        true
+    }
+
+    /// Whether the flattened image has any transparency at all.
+    ///
+    /// CS6 greys out Trim's "Transparent Pixels" when there is none to trim.
+    pub fn has_transparency(&self) -> bool {
+        let composite = self.composite();
+        (0..composite.height() as i32)
+            .any(|y| (0..composite.width() as i32).any(|x| composite.get(x, y).a != 255))
     }
 
     /// Straighten a quadrilateral into a rectangle and crop to it — the
@@ -4643,6 +6394,15 @@ impl Document {
     /// the single hottest path in the engine.
     pub fn composite(&self) -> Pixmap {
         crate::gpu::shared().composite(&self.stack, self.width, self.height)
+    }
+
+    /// The composited colour of one pixel.
+    ///
+    /// Used by the colour pickers and the Info panel, which query per pointer
+    /// move; going through `composite()` for those would blend the whole stack
+    /// for every query.
+    pub fn composite_pixel(&self, x: i32, y: i32) -> Rgba8 {
+        compositor::composite_pixel(&self.stack, self.width, self.height, x, y)
     }
 
     /// Composite only `region`.
@@ -5243,6 +7003,242 @@ mod tests {
         let mut d = doc();
         d.apply_adjustment(Adjustment::Invert);
         assert!(d.layers().get(0).unwrap().pixels.get(8, 8).r < 5);
+    }
+
+    /// Every dialog-driven adjustment must respect a selection.
+    ///
+    /// These go through their own engine methods rather than
+    /// `apply_adjustment`, so each one had to be taught the selection
+    /// separately — and each could regress separately.
+    fn assert_confined<F: Fn(&mut Document)>(label: &str, apply: F) {
+        let mut d = Document::new(16, 16, Rgba8::new(120, 90, 200, 255));
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 8, height: 16 },
+            SelectionOp::Replace,
+            0,
+        );
+        apply(&mut d);
+
+        let pixels = &d.layers().get(0).unwrap().pixels;
+        assert_eq!(
+            pixels.get(12, 8),
+            Rgba8::new(120, 90, 200, 255),
+            "{label} changed pixels outside the selection",
+        );
+        assert_ne!(
+            pixels.get(4, 8),
+            Rgba8::new(120, 90, 200, 255),
+            "{label} did not change pixels inside the selection",
+        );
+    }
+
+    #[test]
+    fn equalize_stretches_a_narrow_range_to_the_full_one() {
+        // The point of Equalize: values bunched in the middle end up spanning
+        // black to white.
+        let mut d = Document::new(4, 1, Rgba8::WHITE);
+        {
+            let px = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            for (x, v) in [(0, 100u8), (1, 110), (2, 120), (3, 130)] {
+                px.set(x, 0, Rgba8::new(v, v, v, 255));
+            }
+        }
+        d.apply_equalize();
+
+        let px = &d.layers().get(0).unwrap().pixels;
+        assert_eq!(px.get(0, 0).r, 0, "darkest value should map to black");
+        assert_eq!(px.get(3, 0).r, 255, "lightest value should map to white");
+        // Still in order.
+        assert!(px.get(1, 0).r > px.get(0, 0).r && px.get(2, 0).r < px.get(3, 0).r);
+    }
+
+    #[test]
+    fn equalize_leaves_a_flat_image_alone() {
+        // One value everywhere: there is no range to spread, and slamming it
+        // to black or white would be worse than doing nothing.
+        let mut d = Document::new(4, 4, Rgba8::new(90, 90, 90, 255));
+        d.apply_equalize();
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(d.layers().get(0).unwrap().pixels.get(x, y).r, 90);
+            }
+        }
+    }
+
+    #[test]
+    fn equalize_preserves_hue() {
+        // The property that matters, and the one an earlier per-channel
+        // implementation got wrong: brightness is redistributed, colour is
+        // not. A blue pixel comes back brighter and still blue.
+        //
+        // Channel *ordering* rather than exact ratios, because a strong boost
+        // clamps the dominant channel at 255 — which is what deepens
+        // saturated areas, and is what Photoshop does too.
+        let mut d = Document::new(2, 1, Rgba8::WHITE);
+        {
+            let px = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            px.set(0, 0, Rgba8::new(10, 20, 30, 255));
+            px.set(1, 0, Rgba8::new(50, 100, 150, 255));
+        }
+        d.apply_equalize();
+
+        let out = d.layers().get(0).unwrap().pixels.get(1, 0);
+        assert!(out.b >= out.g && out.g > out.r, "hue was not preserved: {out:?}");
+        assert!(out.r != out.g || out.g != out.b, "went grey: {out:?}");
+    }
+
+    #[test]
+    fn equalize_uses_luminance_not_max_channel() {
+        // A blue sky is the case that made this matter. Under `max(r,g,b)` it
+        // sits near the top of the histogram and equalization pushes it to
+        // near-white; under luminance — where blue counts for 0.114 — it sits
+        // mid-range and stays blue.
+        //
+        // Here the blue pixel is far brighter by Value (200) than by
+        // luminance (~96), while the grey is the opposite way round. If the
+        // histogram were built on Value, the blue would map above the grey.
+        // Three levels, so the blue is not the darkest — with only two, the
+        // darker one maps to pure black by definition and there is no cast
+        // left to check.
+        let mut d = Document::new(3, 1, Rgba8::WHITE);
+        {
+            let px = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            px.set(0, 0, Rgba8::new(5, 5, 5, 255));
+            px.set(1, 0, Rgba8::new(40, 90, 200, 255));
+            px.set(2, 0, Rgba8::new(140, 140, 140, 255));
+        }
+        d.apply_equalize();
+
+        let px = &d.layers().get(0).unwrap().pixels;
+        let blue = px.get(1, 0);
+        let grey = px.get(2, 0);
+        assert!(
+            luma8(blue.r, blue.g, blue.b) < luma8(grey.r, grey.g, grey.b),
+            "blue {blue:?} should stay darker than grey {grey:?}",
+        );
+        assert!(blue.b > blue.r, "blue lost its cast: {blue:?}");
+    }
+
+    #[test]
+    fn equalize_ignores_transparent_pixels() {
+        // A transparent pixel must neither skew the histogram nor be recoloured.
+        let mut d = Document::new(3, 1, Rgba8::WHITE);
+        {
+            let px = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            px.set(0, 0, Rgba8::new(60, 60, 60, 255));
+            px.set(1, 0, Rgba8::new(200, 200, 200, 255));
+            px.set(2, 0, Rgba8::new(0, 0, 0, 0));
+        }
+        d.apply_equalize();
+
+        let px = &d.layers().get(0).unwrap().pixels;
+        assert_eq!(px.get(0, 0).r, 0);
+        assert_eq!(px.get(1, 0).r, 255);
+        assert_eq!(px.get(2, 0), Rgba8::new(0, 0, 0, 0), "transparent pixel changed");
+    }
+
+    #[test]
+    fn a_selection_confines_equalize() {
+        // Not `assert_confined`, which uses a flat image: Equalize correctly
+        // does nothing to one, so that helper cannot tell "confined" from
+        // "did nothing at all". This needs a range to spread.
+        let mut d = Document::new(4, 1, Rgba8::WHITE);
+        {
+            let px = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            for (x, v) in [(0, 100u8), (1, 110), (2, 200), (3, 210)] {
+                px.set(x, 0, Rgba8::new(v, v, v, 255));
+            }
+        }
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 2, height: 1 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.apply_equalize();
+
+        let px = &d.layers().get(0).unwrap().pixels;
+        // Inside: the two selected values spread to the full range, which also
+        // shows the histogram was built from the selection alone — against the
+        // whole image these two would stay in the lower half.
+        assert_eq!(px.get(0, 0).r, 0);
+        assert_eq!(px.get(1, 0).r, 255);
+        // Outside: untouched.
+        assert_eq!(px.get(2, 0).r, 200);
+        assert_eq!(px.get(3, 0).r, 210);
+    }
+
+    #[test]
+    fn a_selection_confines_curves() {
+        // A LUT that darkens everything, so the effect is unmistakable.
+        let lut: Vec<u8> = (0..=255u16).map(|v| (v / 3) as u8).collect();
+        assert_confined("Curves", |d| d.apply_curves_lut(&lut, 0));
+    }
+
+    #[test]
+    fn a_selection_confines_color_balance() {
+        assert_confined("Color Balance", |d| {
+            d.apply_color_balance(80.0, -60.0, 40.0, 1, false)
+        });
+    }
+
+    #[test]
+    fn a_selection_confines_black_and_white() {
+        assert_confined("Black & White", |d| {
+            d.apply_black_and_white(40.0, 60.0, 40.0, 60.0, 20.0, 80.0, false, 0.0, 0.0)
+        });
+    }
+
+    #[test]
+    fn a_selection_confines_photo_filter() {
+        assert_confined("Photo Filter", |d| {
+            d.apply_photo_filter(1.0, 0.2, 0.0, 80.0, false)
+        });
+    }
+
+    #[test]
+    fn a_selection_confines_channel_mixer() {
+        assert_confined("Channel Mixer", |d| {
+            d.apply_channel_mixer(
+                &[0.0, 100.0, 0.0, 0.0, 0.0, 100.0, 100.0, 0.0, 0.0],
+                &[0.0, 0.0, 0.0],
+                false,
+            )
+        });
+    }
+
+    #[test]
+    fn a_selection_confines_shadows_highlights() {
+        assert_confined("Shadows/Highlights", |d| {
+            d.apply_shadows_highlights(100.0, 100.0)
+        });
+    }
+
+    #[test]
+    fn a_selection_confines_hdr_toning() {
+        assert_confined("HDR Toning", |d| {
+            d.apply_hdr_toning(25.0, 1.67, 1.26, 0.0, 46.0, -50.0, -50.0, 30.0, 10.0)
+        });
+    }
+
+    #[test]
+    fn a_feathered_selection_fades_an_adjustment_in() {
+        // The point of blending by coverage rather than thresholding it: the
+        // edge of the marquee must not be a hard line.
+        let lut: Vec<u8> = (0..=255u16).map(|_| 0u8).collect();
+        let mut d = Document::new(64, 16, Rgba8::WHITE);
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 32, height: 16 },
+            SelectionOp::Replace,
+            6,
+        );
+        d.apply_curves_lut(&lut, 0);
+
+        let pixels = &d.layers().get(0).unwrap().pixels;
+        let edge = pixels.get(32, 8).r;
+        assert!(
+            edge > 0 && edge < 255,
+            "feathered edge should be partial, got {edge}",
+        );
     }
 
     #[test]
@@ -6540,6 +8536,1538 @@ mod tests {
         d.redo();
         assert_eq!(d.size(), (16, 16), "redo did not re-apply the crop");
         assert_eq!(d.selection().width(), 16);
+    }
+
+    #[test]
+    fn image_size_counts_colour_channels_not_stored_alpha() {
+        // Photoshop reports an RGB/8 image as three bytes per pixel. The
+        // engine stores four — the alpha it composites with — and counting
+        // that would overstate every figure by a third: 1000x652 would read
+        // 2.49M instead of 1.87M.
+        let d = Document::new(1000, 652, Rgba8::WHITE);
+        assert_eq!(d.channel_count(), 3);
+        assert_eq!(d.image_data_bytes(), 1000 * 652 * 3);
+
+        let megabytes = d.image_data_bytes() as f64 / (1024.0 * 1024.0);
+        assert!((megabytes - 1.87).abs() < 0.01, "got {megabytes:.2}M");
+    }
+
+    #[test]
+    fn image_size_follows_the_colour_mode() {
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        d.set_color_mode(ImageMode::Grayscale);
+        assert_eq!(d.image_data_bytes(), 100, "grayscale is one channel");
+
+        d.set_color_mode(ImageMode::Cmyk);
+        assert_eq!(d.image_data_bytes(), 400, "CMYK is four");
+
+        d.set_color_mode(ImageMode::Bitmap);
+        // One bit per pixel, rounded up to whole bytes.
+        assert_eq!(d.image_data_bytes(), 13);
+    }
+
+    #[test]
+    fn resampling_scales_the_canvas_and_its_layers() {
+        let mut d = Document::new(16, 16, Rgba8::new(200, 100, 50, 255));
+        d.resample_image(8, 8, Resample::Bilinear);
+
+        assert_eq!((d.width(), d.height()), (8, 8));
+        let layer = d.layers().get(0).unwrap();
+        assert_eq!((layer.pixels.width(), layer.pixels.height()), (8, 8));
+        // A flat colour must survive the scale unchanged.
+        assert_eq!(layer.pixels.get(4, 4), Rgba8::new(200, 100, 50, 255));
+    }
+
+    #[test]
+    fn resampling_moves_layers_by_the_same_factor() {
+        // A layer smaller than the canvas, and offset from it, keeps its
+        // relative size and position rather than being stretched to fit.
+        let mut d = Document::new(100, 100, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_filled(id, "l", 20, 20, Rgba8::new(0, 0, 255, 255));
+        l.offset = (40, 40);
+        d.layers_mut_raw().push(l);
+
+        d.resample_image(50, 50, Resample::Nearest);
+
+        let layer = d.layers().get(1).unwrap();
+        assert_eq!((layer.pixels.width(), layer.pixels.height()), (10, 10));
+        assert_eq!(layer.offset, (20, 20));
+    }
+
+    #[test]
+    fn resampling_scales_the_selection() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 20, height: 40 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.resample_image(20, 20, Resample::Bilinear);
+
+        assert!(!d.selection().is_empty(), "selection was lost");
+        // The left half is still selected, the right half still is not.
+        assert!(d.selection().coverage_at(4, 10) > 0.5);
+        assert!(d.selection().coverage_at(15, 10) < 0.5);
+    }
+
+    #[test]
+    fn resampling_to_the_same_size_is_a_no_op() {
+        let mut d = Document::new(8, 8, Rgba8::new(10, 20, 30, 255));
+        let before = d.layers().get(0).unwrap().pixels.as_bytes().to_vec();
+        d.resample_image(8, 8, Resample::Bicubic);
+        assert_eq!(d.layers().get(0).unwrap().pixels.as_bytes(), before.as_slice());
+    }
+
+    #[test]
+    fn resolution_is_clamped_and_changes_no_pixels() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        let before = d.layers().get(0).unwrap().pixels.as_bytes().to_vec();
+        assert_eq!(d.resolution(), 72.0);
+
+        d.set_resolution(300.0);
+        assert_eq!(d.resolution(), 300.0);
+        d.set_resolution(0.0);
+        assert!(d.resolution() >= 1.0, "resolution must stay usable");
+
+        assert_eq!(
+            d.layers().get(0).unwrap().pixels.as_bytes(),
+            before.as_slice(),
+            "resolution is print metadata and must not touch pixels",
+        );
+    }
+
+    #[test]
+    fn anchoring_top_left_leaves_the_image_where_it_was() {
+        let mut d = Document::new(10, 10, Rgba8::new(200, 0, 0, 255));
+        d.resize_canvas_anchored(20, 20, 0, 0, None);
+
+        assert_eq!((d.width(), d.height()), (20, 20));
+        // Anchored top-left, so the content keeps the origin.
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+    }
+
+    #[test]
+    fn anchoring_centre_splits_the_growth_evenly() {
+        let mut d = Document::new(10, 10, Rgba8::new(200, 0, 0, 255));
+        d.resize_canvas_anchored(20, 30, 1, 1, None);
+        assert_eq!(d.layers().get(0).unwrap().offset, (5, 10));
+    }
+
+    #[test]
+    fn anchoring_bottom_right_pushes_the_image_across() {
+        let mut d = Document::new(10, 10, Rgba8::new(200, 0, 0, 255));
+        d.resize_canvas_anchored(20, 20, 2, 2, None);
+        assert_eq!(d.layers().get(0).unwrap().offset, (10, 10));
+    }
+
+    #[test]
+    fn every_layer_shifts_by_the_same_amount() {
+        // Layers must not move relative to each other, or a composition comes
+        // apart when the canvas grows.
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_filled(id, "l", 4, 4, Rgba8::new(0, 0, 255, 255));
+        l.offset = (3, 3);
+        d.layers_mut_raw().push(l);
+
+        d.resize_canvas_anchored(20, 20, 1, 1, None);
+        assert_eq!(d.layers().get(0).unwrap().offset, (5, 5));
+        assert_eq!(d.layers().get(1).unwrap().offset, (8, 8));
+    }
+
+    #[test]
+    fn the_extension_colour_fills_new_area_on_the_background() {
+        let mut d = Document::new(10, 10, Rgba8::new(200, 0, 0, 255));
+        let fill = Rgba8::new(0, 255, 0, 255);
+        d.resize_canvas_anchored(20, 20, 1, 1, Some(fill));
+
+        let bg = &d.layers().get(0).unwrap().pixels;
+        assert_eq!((bg.width(), bg.height()), (20, 20));
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+        // Original content sits in the middle, the new margin takes the fill.
+        assert_eq!(bg.get(10, 10), Rgba8::new(200, 0, 0, 255));
+        assert_eq!(bg.get(1, 1), fill);
+        assert_eq!(bg.get(18, 18), fill);
+    }
+
+    #[test]
+    fn no_extension_colour_leaves_new_area_transparent() {
+        let mut d = Document::new(10, 10, Rgba8::new(200, 0, 0, 255));
+        d.resize_canvas_anchored(20, 20, 1, 1, None);
+        // The background is not grown, so the new area is simply uncovered.
+        let composite = d.composite();
+        assert_eq!(composite.get(1, 1).a, 0);
+        assert_eq!(composite.get(10, 10), Rgba8::new(200, 0, 0, 255));
+    }
+
+    #[test]
+    fn the_selection_moves_with_the_image() {
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 4, height: 10 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.resize_canvas_anchored(20, 10, 1, 0, None);
+
+        // Shifted right by 5 with the content, rather than staying at the edge.
+        assert!(d.selection().coverage_at(6, 5) > 0.5, "selection did not follow");
+        assert!(d.selection().coverage_at(1, 5) < 0.5, "selection stayed put");
+    }
+
+    #[test]
+    fn shrinking_the_canvas_crops_without_scaling() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.resize_canvas_anchored(10, 10, 1, 1, None);
+
+        assert_eq!((d.width(), d.height()), (10, 10));
+        // Content is not resampled: the layer keeps its pixels and simply
+        // hangs off the smaller canvas.
+        let layer = d.layers().get(0).unwrap();
+        assert_eq!((layer.pixels.width(), layer.pixels.height()), (20, 20));
+        assert_eq!(layer.offset, (-5, -5));
+    }
+
+    /// A `w` x `h` document of `border`, with a `rect` of content in it.
+    fn bordered(w: u32, h: u32, border: Rgba8, rect: Rect, content: Rgba8) -> Document {
+        let mut d = Document::new(w, h, border);
+        let pixels = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                pixels.set(x, y, content);
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn trim_cuts_the_border_off_every_edge() {
+        let mut d = bordered(
+            20,
+            20,
+            Rgba8::WHITE,
+            Rect { x: 4, y: 6, width: 10, height: 8 },
+            Rgba8::new(200, 0, 0, 255),
+        );
+
+        assert!(d.trim(TrimBasis::TopLeft, TrimEdges::default()));
+
+        assert_eq!((d.width(), d.height()), (10, 8));
+        let composite = d.composite();
+        assert_eq!(composite.get(0, 0), Rgba8::new(200, 0, 0, 255));
+        assert_eq!(composite.get(9, 7), Rgba8::new(200, 0, 0, 255));
+    }
+
+    #[test]
+    fn trim_leaves_the_edges_that_are_not_ticked() {
+        let mut d = bordered(
+            20,
+            20,
+            Rgba8::WHITE,
+            Rect { x: 4, y: 6, width: 10, height: 8 },
+            Rgba8::new(200, 0, 0, 255),
+        );
+
+        // Top and left only: the border stays on the other two sides.
+        let edges = TrimEdges { top: true, bottom: false, left: true, right: false };
+        assert!(d.trim(TrimBasis::TopLeft, edges));
+
+        assert_eq!((d.width(), d.height()), (16, 14));
+        assert_eq!(d.composite().get(0, 0), Rgba8::new(200, 0, 0, 255));
+        assert_eq!(d.composite().get(15, 13), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn trim_on_transparency_ignores_what_colour_the_border_is() {
+        // Transparent pixels of assorted colours: judged on alpha alone, or a
+        // cleared area that is not transparent *black* would survive.
+        let mut d = Document::new(12, 12, Rgba8::TRANSPARENT);
+        {
+            let pixels = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            for y in 0..12i32 {
+                for x in 0..12i32 {
+                    pixels.set(x, y, Rgba8::new(x as u8 * 20, y as u8 * 20, 0, 0));
+                }
+            }
+            for y in 3..9i32 {
+                for x in 2..7i32 {
+                    pixels.set(x, y, Rgba8::new(0, 0, 255, 255));
+                }
+            }
+        }
+
+        assert!(d.trim(TrimBasis::Transparent, TrimEdges::default()));
+        assert_eq!((d.width(), d.height()), (5, 6));
+    }
+
+    #[test]
+    fn trim_uses_the_corner_the_basis_names() {
+        // Two different borders: white down the left, black down the right.
+        // Which corner is read decides which one is cut.
+        let mut d = Document::new(9, 4, Rgba8::WHITE);
+        {
+            let pixels = &mut d.layers_mut_raw().get_mut(0).unwrap().pixels;
+            for y in 0..4i32 {
+                for x in 6..9i32 {
+                    pixels.set(x, y, Rgba8::BLACK);
+                }
+            }
+        }
+
+        assert!(d.trim(TrimBasis::BottomRight, TrimEdges::default()));
+        // The black is gone, the white is content as far as Trim can tell.
+        assert_eq!((d.width(), d.height()), (6, 4));
+        assert_eq!(d.composite().get(0, 0), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn trim_refuses_an_image_that_is_all_border() {
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        assert!(!d.trim(TrimBasis::TopLeft, TrimEdges::default()));
+        assert_eq!((d.width(), d.height()), (8, 8), "must not empty the document");
+    }
+
+    #[test]
+    fn trim_with_no_edges_ticked_does_nothing() {
+        let mut d = bordered(
+            20,
+            20,
+            Rgba8::WHITE,
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            Rgba8::BLACK,
+        );
+        let edges = TrimEdges { top: false, bottom: false, left: false, right: false };
+        assert!(!d.trim(TrimBasis::TopLeft, edges));
+        assert_eq!((d.width(), d.height()), (20, 20));
+    }
+
+    #[test]
+    fn trimming_an_already_trimmed_image_costs_no_history() {
+        let mut d = bordered(
+            20,
+            20,
+            Rgba8::WHITE,
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            Rgba8::BLACK,
+        );
+        assert!(d.trim(TrimBasis::TopLeft, TrimEdges::default()));
+        // Nothing left to cut, so no second undo step for the user to step back
+        // through.
+        assert!(!d.trim(TrimBasis::TopLeft, TrimEdges::default()));
+    }
+
+    #[test]
+    fn a_blend_if_range_hides_the_layer_where_it_falls_outside() {
+        // A mid-grey layer over a black backdrop, gated on the layer's own
+        // brightness: raise the dark handle past the layer's value and it
+        // stops showing.
+        let mut d = Document::new(8, 8, Rgba8::BLACK);
+        let id = d.layers_mut_raw().allocate_id();
+        d.layers_mut_raw()
+            .push(Layer::new_filled(id, "grey", 8, 8, Rgba8::opaque(120, 120, 120)));
+        d.set_active_layer(id);
+
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(120, 120, 120));
+
+        d.set_layer_effect_value(id, "blending.thisDarkStart", 200.0);
+        d.set_layer_effect_value(id, "blending.thisDarkEnd", 200.0);
+        d.commit_layer_effects();
+        assert_eq!(d.composite().get(4, 4), Rgba8::BLACK, "the layer should be gated out");
+
+        // ...and a split handle fades rather than cuts.
+        d.set_layer_effect_value(id, "blending.thisDarkStart", 60.0);
+        d.set_layer_effect_value(id, "blending.thisDarkEnd", 200.0);
+        d.commit_layer_effects();
+        let faded = d.composite().get(4, 4).r;
+        assert!(faded > 0 && faded < 120, "expected a partial fade, got {faded}");
+    }
+
+    #[test]
+    fn blend_if_reads_the_backdrop_for_the_underlying_range() {
+        // White layer over a black backdrop, gated on what is beneath it.
+        let mut d = Document::new(8, 8, Rgba8::BLACK);
+        let id = d.layers_mut_raw().allocate_id();
+        d.layers_mut_raw()
+            .push(Layer::new_filled(id, "white", 8, 8, Rgba8::WHITE));
+        d.set_active_layer(id);
+
+        d.set_layer_effect_value(id, "blending.underDarkStart", 100.0);
+        d.set_layer_effect_value(id, "blending.underDarkEnd", 100.0);
+        d.commit_layer_effects();
+        assert_eq!(
+            d.composite().get(4, 4),
+            Rgba8::BLACK,
+            "the backdrop is too dark for the layer to show over it"
+        );
+    }
+
+    #[test]
+    fn a_switched_off_channel_keeps_the_backdrop() {
+        let mut d = Document::new(8, 8, Rgba8::BLACK);
+        let id = d.layers_mut_raw().allocate_id();
+        d.layers_mut_raw()
+            .push(Layer::new_filled(id, "white", 8, 8, Rgba8::WHITE));
+        d.set_active_layer(id);
+
+        d.set_layer_effect_value(id, "blending.channelR", 0.0);
+        d.commit_layer_effects();
+
+        // Red stays with the backdrop; green and blue take the layer's.
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(0, 255, 255));
+    }
+
+    #[test]
+    fn a_style_snapshot_puts_everything_back() {
+        // What a cancelled Layer Style edit relies on: whatever the dialog
+        // touched — effects, blending, Blend If — one value restores the lot.
+        let mut d = doc();
+        let id = d.active_layer_id();
+        let before = d.layer_style_state(id).unwrap();
+
+        for (key, value) in [
+            ("bevel.on", 1.0),
+            ("stroke.on", 1.0),
+            ("stroke.size", 12.0),
+            ("blending.opacity", 0.25),
+            ("blending.channelR", 0.0),
+            ("blending.thisDarkStart", 90.0),
+        ] {
+            d.set_layer_effect_value(id, key, value);
+        }
+        assert!(d.any_layer_has_effects());
+
+        assert!(d.set_layer_style_state(id, before));
+
+        // Every one of them, including the "is it on the layer at all" flags
+        // that outlive an effect being switched off.
+        assert!(!d.any_layer_has_effects(), "the style survived the restore");
+        assert_eq!(d.layer_effect_value(id, "bevel.present"), 0.0);
+        assert_eq!(d.layer_effect_value(id, "stroke.size"), 3.0);
+        assert_eq!(d.layer_effect_value(id, "blending.opacity"), 1.0);
+        assert_eq!(d.layer_effect_value(id, "blending.channelR"), 1.0);
+        assert_eq!(d.layer_effect_value(id, "blending.thisDarkStart"), 0.0);
+    }
+
+    #[test]
+    fn effect_edits_wait_for_a_commit_before_reaching_history() {
+        let mut d = doc();
+        let id = d.active_layer_id();
+
+        // The Layer Style dialog writes continuously as sliders move; each of
+        // those must not become an undo step of its own.
+        assert!(d.set_layer_effect_value(id, "dropShadow.on", 1.0));
+        assert!(d.set_layer_effect_value(id, "dropShadow.size", 12.0));
+        assert_eq!(d.layer_effect_value(id, "dropShadow.size"), 12.0);
+        assert!(!d.undo(), "an uncommitted edit left a history step behind");
+
+        d.commit_layer_effects();
+        assert!(d.undo(), "the committed edit is not undoable");
+        assert_eq!(d.layer_effect_value(id, "dropShadow.on"), 0.0);
+    }
+
+    #[test]
+    fn a_style_can_be_copied_from_one_layer_to_another() {
+        let mut d = doc();
+        let first = d.active_layer_id();
+        d.set_layer_effect_value(first, "stroke.on", 1.0);
+        d.set_layer_effect_value(first, "stroke.size", 7.0);
+        d.commit_layer_effects();
+
+        let second = d.add_layer(None);
+        let style = d.layer_effects(first).unwrap();
+        assert!(d.set_layer_effects(second, style));
+
+        assert_eq!(d.layer_effect_value(second, "stroke.size"), 7.0);
+        // ...and the layer it came from keeps it.
+        assert_eq!(d.layer_effect_value(first, "stroke.size"), 7.0);
+    }
+
+    #[test]
+    fn an_effect_switched_off_still_belongs_to_the_layer() {
+        let mut d = doc();
+        let id = d.active_layer_id();
+        d.set_layer_effect_value(id, "stroke.on", 1.0);
+        d.commit_layer_effects();
+
+        // The panel's eye switches it off; the row — and the `fx` on the layer
+        // — stay, and only Clear Layer Style takes them away.
+        d.set_layer_effect_value(id, "stroke.on", 0.0);
+        d.commit_layer_effects();
+        assert_eq!(d.layer_effect_value(id, "stroke.on"), 0.0);
+        assert!(d.any_layer_has_effects(), "the style left the layer with the effect");
+
+        assert!(d.clear_layer_effects(id));
+        assert!(!d.any_layer_has_effects());
+    }
+
+    #[test]
+    fn clearing_a_style_needs_one_to_clear() {
+        let mut d = doc();
+        let id = d.active_layer_id();
+        assert!(!d.clear_layer_effects(id), "there was no style to clear");
+
+        d.set_layer_effect_value(id, "outerGlow.on", 1.0);
+        d.commit_layer_effects();
+        assert!(d.clear_layer_effects(id));
+        assert_eq!(d.layer_effect_value(id, "outerGlow.on"), 0.0);
+    }
+
+    #[test]
+    fn hiding_effects_keeps_them() {
+        let mut d = doc();
+        let id = d.active_layer_id();
+        d.set_layer_effect_value(id, "dropShadow.on", 1.0);
+        d.set_layer_effect_value(id, "dropShadow.size", 9.0);
+        d.commit_layer_effects();
+
+        d.hide_all_effects(true);
+        assert_eq!(d.layer_effect_value(id, "hidden"), 1.0);
+        // The settings are still there to come back to.
+        assert_eq!(d.layer_effect_value(id, "dropShadow.size"), 9.0);
+        assert!(d.any_layer_has_effects());
+
+        d.hide_all_effects(false);
+        assert_eq!(d.layer_effect_value(id, "hidden"), 0.0);
+    }
+
+    #[test]
+    fn a_drop_shadow_darkens_the_canvas_beside_its_layer() {
+        // The compositor has to draw effects outside the layer that owns them,
+        // which is the whole reason they are rendered into canvas space.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut square = Layer::new_filled(id, "square", 10, 10, Rgba8::new(0, 0, 255, 255));
+        square.offset = (12, 12);
+        d.layers_mut_raw().push(square);
+        d.set_active_layer(id);
+
+        let before = d.composite().get(24, 24);
+        d.set_layer_effect_value(id, "dropShadow.on", 1.0);
+        d.set_layer_effect_value(id, "dropShadow.size", 4.0);
+        d.set_layer_effect_value(id, "dropShadow.distance", 4.0);
+        d.commit_layer_effects();
+        let after = d.composite().get(24, 24);
+
+        assert!(
+            after.r < before.r,
+            "the shadow did not reach the canvas beside the layer: {before:?} -> {after:?}"
+        );
+        // The layer itself is untouched by its own shadow.
+        assert_eq!(d.composite().get(16, 16), Rgba8::new(0, 0, 255, 255));
+    }
+
+    #[test]
+    fn a_stroke_shows_on_a_layer_that_fills_the_canvas() {
+        // The usual document is one photograph covering the whole canvas. An
+        // outside stroke on that falls off the edge and shows nothing, which
+        // is why the default sits inside.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        let id = d.active_layer_id();
+        d.set_layer_effect_value(id, "stroke.on", 1.0);
+        d.commit_layer_effects();
+
+        let composite = d.composite();
+        assert_eq!(
+            composite.get(1, 20),
+            Rgba8::opaque(255, 0, 0),
+            "no stroke along the edge of the canvas"
+        );
+        assert_eq!(composite.get(20, 20), Rgba8::WHITE, "a stroke is not a fill");
+    }
+
+    #[test]
+    fn a_layer_copy_can_be_inserted_into_another_document() {
+        let mut source = Document::new(8, 8, Rgba8::WHITE);
+        let id = source.layers_mut_raw().allocate_id();
+        source
+            .layers_mut_raw()
+            .push(Layer::new_filled(id, "Sky", 4, 4, Rgba8::new(0, 0, 255, 255)));
+
+        let mut copy = source.layer_copy(id).expect("layer should copy");
+        copy.name = "Sky copy".to_string();
+
+        // The target already uses the id the copy is carrying — two documents
+        // number their layers independently, so this is the ordinary case, not
+        // a contrived one.
+        let mut target = Document::new(8, 8, Rgba8::BLACK);
+        let taken = target.add_layer(Some("in the way".to_string()));
+        assert_eq!(taken, id, "the two documents should have collided");
+
+        let new_id = target.insert_layer(copy);
+
+        assert_eq!(target.layer_count(), 3);
+        assert_eq!(target.layers().get(2).unwrap().name, "Sky copy");
+        // Ids belong to the stack that issued them, so the arriving layer gets
+        // one of the target's rather than keeping the source's — otherwise
+        // every lookup by id would find whichever came first.
+        assert_ne!(new_id, taken);
+        assert_eq!(target.layers().by_id(taken).unwrap().name, "in the way");
+        assert_eq!(target.layers().by_id(new_id).unwrap().name, "Sky copy");
+        // The source is untouched by any of it.
+        assert_eq!(source.layer_count(), 2);
+    }
+
+    #[test]
+    fn delete_hidden_layers_takes_only_the_hidden_ones() {
+        let mut d = doc();
+        for name in ["a", "b", "c"] {
+            let id = d.layers_mut_raw().allocate_id();
+            d.layers_mut_raw()
+                .push(Layer::new_filled(id, name, 4, 4, Rgba8::WHITE));
+        }
+        d.layers_mut_raw().get_mut(1).unwrap().visible = false;
+        d.layers_mut_raw().get_mut(3).unwrap().visible = false;
+
+        assert_eq!(d.delete_hidden_layers(), 2);
+        assert_eq!(d.layer_count(), 2);
+        assert!(d.layers().as_slice().iter().all(|l| l.visible));
+    }
+
+    #[test]
+    fn delete_hidden_layers_keeps_a_locked_one() {
+        let mut d = doc();
+        let id = d.layers_mut_raw().allocate_id();
+        let mut locked = Layer::new_filled(id, "locked", 4, 4, Rgba8::WHITE);
+        locked.visible = false;
+        locked.lock_transparency = true;
+        locked.lock_pixels = true;
+        locked.lock_position = true;
+        d.layers_mut_raw().push(locked);
+
+        assert_eq!(d.delete_hidden_layers(), 0);
+        assert_eq!(d.layer_count(), 2, "a fully locked layer is not thrown away");
+    }
+
+    #[test]
+    fn delete_hidden_layers_leaves_one_standing() {
+        let mut d = doc();
+        d.layers_mut_raw().get_mut(0).unwrap().visible = false;
+
+        // Hiding the only layer and deleting hidden layers must not empty the
+        // document.
+        assert_eq!(d.delete_hidden_layers(), 0);
+        assert_eq!(d.layer_count(), 1);
+    }
+
+    #[test]
+    fn deleting_the_active_layer_moves_the_selection_to_a_survivor() {
+        let mut d = doc();
+        let id = d.layers_mut_raw().allocate_id();
+        let mut hidden = Layer::new_filled(id, "hidden", 4, 4, Rgba8::WHITE);
+        hidden.visible = false;
+        d.layers_mut_raw().push(hidden);
+        d.set_active_layer(id);
+
+        assert_eq!(d.delete_hidden_layers(), 1);
+        // The active layer went with it, so something else has to be active.
+        assert!(d.layers().by_id(d.active_layer_id()).is_some());
+    }
+
+    #[test]
+    fn a_fill_layer_covers_the_canvas_without_holding_pixels() {
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        let red = Rgba8::opaque(220, 30, 40);
+        let id = d.add_fill_layer(None, red, BlendMode::Normal, 1.0, false, 0);
+
+        let layer = d.layers().by_id(id).unwrap();
+        assert_eq!(layer.name, "Color Fill 1");
+        assert!(matches!(layer.kind, LayerKind::SolidColor(c) if c == red));
+        // The colour *is* the layer; there are no pixels to carry it.
+        assert!(layer.pixels.is_empty());
+        assert_eq!(d.composite().get(4, 4), red);
+    }
+
+    #[test]
+    fn a_fill_layer_arrives_with_a_mask_that_covers_the_canvas() {
+        // The colour is the whole canvas, so the mask is the only thing that
+        // can shape it — and a layer-sized one would be empty, since a fill
+        // layer has no pixels to take a size from.
+        let mut d = Document::new(10, 6, Rgba8::WHITE);
+        let id = d.add_fill_layer(None, Rgba8::BLACK, BlendMode::Normal, 1.0, false, 0);
+
+        let mask = d.layers().by_id(id).unwrap().mask.as_ref().expect("no mask");
+        assert_eq!((mask.width(), mask.height()), (10, 6));
+        assert_eq!(mask.get(9, 5).a, 255, "the mask should reveal everything");
+        assert_eq!(d.composite().get(9, 5), Rgba8::BLACK);
+        assert!(d.layer_mask_linked(id), "a new mask is linked to its layer");
+    }
+
+    #[test]
+    fn an_adjustment_layer_arrives_with_a_mask_and_recolours_what_is_under_it() {
+        let mut d = Document::new(8, 8, Rgba8::opaque(200, 100, 50));
+        let id = d.add_adjustment_layer_configured(
+            None,
+            Adjustment::Invert,
+            BlendMode::Normal,
+            1.0,
+            false,
+            0,
+        );
+
+        let layer = d.layers().by_id(id).unwrap();
+        assert_eq!(layer.name, "Invert 1");
+        // An adjustment applies *through* its mask, which is how a curve is
+        // confined to part of an image without touching a pixel.
+        let mask = layer.mask.as_ref().expect("no mask");
+        assert_eq!((mask.width(), mask.height()), (8, 8));
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(55, 155, 205));
+    }
+
+    #[test]
+    fn a_hue_saturation_layer_can_be_re_ranged_after_it_is_made() {
+        // Red on the left, blue on the right.
+        let mut d = Document::new(8, 8, Rgba8::opaque(255, 0, 0));
+        {
+            let layer = d.active_layer_mut().expect("no layer");
+            for y in 0..8 {
+                for x in 4..8 {
+                    layer.pixels.set(x, y, Rgba8::opaque(0, 0, 255));
+                }
+            }
+        }
+        let id = d.add_adjustment_layer(Adjustment::default_for("Hue/Saturation").unwrap());
+        // Defaults change nothing, which is what a freshly added layer should
+        // do.
+        assert_eq!(d.composite().get(1, 4), Rgba8::opaque(255, 0, 0));
+
+        // What the Properties panel does: read the setting, change one named
+        // parameter, put it back.
+        let mut adjustment = d.layer_adjustment(id).expect("not an adjustment layer");
+        assert!(adjustment.set_value("range", 1.0)); // Reds
+        assert!(adjustment.set_value("hue", 1.0 / 3.0));
+        assert!(d.set_layer_adjustment(id, adjustment));
+
+        assert_eq!(d.composite().get(1, 4), Rgba8::opaque(0, 255, 0), "red should turn green");
+        assert_eq!(d.composite().get(6, 4), Rgba8::opaque(0, 0, 255), "blue is out of range");
+    }
+
+    /// A document with a red layer and a green one over a white background.
+    fn stacked() -> (Document, LayerId, LayerId) {
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        let mut add = |d: &mut Document, name: &str, color: Rgba8| {
+            let id = d.add_layer(Some(name.to_string()));
+            if let Some(layer) = d.layers_mut_raw().by_id_mut(id) {
+                layer.pixels.fill(color);
+            }
+            id
+        };
+        let red = add(&mut d, "Red", Rgba8::opaque(255, 0, 0));
+        let green = add(&mut d, "Green", Rgba8::opaque(0, 255, 0));
+        (d, red, green)
+    }
+
+    #[test]
+    fn grouping_gathers_the_layers_under_a_folder() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).expect("nothing grouped");
+
+        // Four rows: background, the two members, then the folder above them.
+        assert_eq!(d.layers().len(), 4);
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(index, 3, "the folder sits above its members");
+        let members = d.layers().group_members(index);
+        assert_eq!(members, 1..3);
+        assert_eq!(d.layers().get(1).unwrap().id, red, "member order is kept");
+        assert_eq!(d.layers().get(2).unwrap().id, green);
+        assert!(d.layers().by_id(red).unwrap().parent == Some(group));
+
+        // Grouping changes what is composited into what, not the result.
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(0, 255, 0));
+    }
+
+    #[test]
+    fn a_group_applies_its_opacity_to_the_whole_of_what_is_inside_it() {
+        let (mut d, red, green) = stacked();
+        // Half-covering green over red: inside a group at 50%, the group's
+        // opacity applies to the *result* of the two, not to each in turn —
+        // which is the difference between a group and two loose layers.
+        let group = d.group_layers(&[red, green]).unwrap();
+        d.set_layer_opacity(group, 0.5);
+
+        // Green over red is green; half of that over white is a pale green.
+        let out = d.composite().get(4, 4);
+        assert_eq!(out, Rgba8::opaque(128, 255, 128));
+    }
+
+    #[test]
+    fn hiding_a_group_hides_everything_in_it() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        d.set_layer_visible(group, false);
+        assert_eq!(d.composite().get(4, 4), Rgba8::WHITE, "the group is hidden");
+
+        d.set_layer_visible(group, true);
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(0, 255, 0));
+    }
+
+    #[test]
+    fn an_adjustment_inside_a_group_reaches_only_the_group() {
+        // The member covers the left half only, so the right half is backdrop
+        // the adjustment must not touch — which is the whole point of the
+        // group being isolated, and what an unisolated one would get wrong.
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        let green = d.add_layer(Some("Green".to_string()));
+        if let Some(layer) = d.layers_mut_raw().by_id_mut(green) {
+            for y in 0..8 {
+                for x in 0..4 {
+                    layer.pixels.set(x, y, Rgba8::opaque(0, 255, 0));
+                }
+            }
+        }
+        let group = d.group_layers(&[green]).expect("nothing grouped");
+
+        d.set_active_layer(green);
+        let invert = d.add_adjustment_layer(Adjustment::Invert);
+        // It lands above the member and below the folder, which puts it in the
+        // group.
+        if let Some(layer) = d.layers_mut_raw().by_id_mut(invert) {
+            layer.parent = Some(group);
+        }
+
+        assert_eq!(
+            d.composite().get(1, 4),
+            Rgba8::opaque(255, 0, 255),
+            "green inside the group should inverted to magenta"
+        );
+        assert_eq!(
+            d.composite().get(6, 4),
+            Rgba8::WHITE,
+            "the backdrop is outside the group and must be left alone"
+        );
+    }
+
+    #[test]
+    fn ungrouping_leaves_the_layers_where_they_were() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        assert!(d.ungroup_layers(group));
+
+        assert_eq!(d.layers().len(), 3);
+        assert!(d.layers().by_id(group).is_none(), "the folder is gone");
+        assert_eq!(d.layers().get(1).unwrap().id, red);
+        assert_eq!(d.layers().get(2).unwrap().id, green);
+        assert!(d.layers().by_id(red).unwrap().parent.is_none());
+        assert_eq!(d.composite().get(4, 4), Rgba8::opaque(0, 255, 0));
+    }
+
+    #[test]
+    fn deleting_a_group_takes_its_contents_with_it() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        assert!(d.delete_layer(group));
+
+        // Only the background is left — a folder deleted on its own would have
+        // dropped its members loose onto the canvas.
+        assert_eq!(d.layers().len(), 1);
+        assert_eq!(d.composite().get(4, 4), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn groups_cannot_be_nested_yet() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        // Neither the folder nor anything already in it can be grouped again.
+        assert!(d.group_layers(&[group]).is_none());
+        assert!(d.group_layers(&[red]).is_none());
+    }
+
+    #[test]
+    fn a_layer_added_inside_a_group_joins_it() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+
+        // Adding above a member puts the new layer between two members, so it
+        // has to join the group — left loose it would cut the run in half and
+        // strand the member above it.
+        d.set_active_layer(red);
+        let added = d.add_layer(Some("Inside".to_string()));
+        assert_eq!(d.layers().by_id(added).unwrap().parent, Some(group));
+
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(d.layers().group_members(index).len(), 3);
+    }
+
+    #[test]
+    fn a_layer_moved_out_of_a_group_leaves_it() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        // To the very top, above the folder — outside it.
+        assert!(d.reorder_layer(green, d.layers().len() - 1));
+
+        assert!(d.layers().by_id(green).unwrap().parent.is_none());
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(d.layers().group_members(index), 1..2, "only red is left inside");
+    }
+
+    #[test]
+    fn an_empty_group_can_be_dragged_into() {
+        let (mut d, _red, green) = stacked();
+        d.set_active_layer(green);
+        let group = d.add_group(None);
+        assert!(d.layers().by_id(group).unwrap().is_group());
+        assert_eq!(
+            d.layers().group_members(d.layers().index_of(group).unwrap()).len(),
+            0,
+            "the button makes an empty folder, as CS6's does"
+        );
+
+        // The gap directly beneath the folder is the way in — with no members
+        // there is no pair of them to be dropped between. The destination is
+        // read after the layer is lifted out, as everywhere else here, and
+        // green is below the folder, so taking it out drops the folder a place.
+        let folder = d.layers().index_of(group).unwrap();
+        assert!(d.reorder_layer(green, folder - 1));
+        assert_eq!(d.layers().by_id(green).unwrap().parent, Some(group));
+        assert_eq!(
+            d.layers().group_members(d.layers().index_of(group).unwrap()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dropping_onto_a_folder_puts_the_layer_inside_it() {
+        let (mut d, red, green) = stacked();
+        d.set_active_layer(green);
+        let group = d.add_group(None);
+        d.set_group_expanded(group, false);
+
+        // Naming the folder rather than a position, which is what dropping on
+        // the row means — the panel has no gap to point at when the group is
+        // closed.
+        assert!(d.move_layer_into_group(green, group));
+        assert_eq!(d.layers().by_id(green).unwrap().parent, Some(group));
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(d.layers().group_members(index).len(), 1);
+        assert!(
+            d.layers().by_id(group).unwrap().expanded,
+            "the folder opens, or the layer would appear to have vanished"
+        );
+
+        // Dropping it in again is nothing, so no second history entry.
+        let entries = d.history().len();
+        assert!(!d.move_layer_into_group(green, group));
+        assert_eq!(d.history().len(), entries);
+
+        // Red is still loose, and can be dropped in beside it.
+        assert!(d.move_layer_into_group(red, group));
+        assert_eq!(
+            d.layers().group_members(d.layers().index_of(group).unwrap()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_group_cannot_be_dropped_into_a_group() {
+        let (mut d, red, green) = stacked();
+        let inner = d.group_layers(&[green]).unwrap();
+        d.set_active_layer(red);
+        let outer = d.add_group(None);
+        assert!(!d.move_layer_into_group(inner, outer));
+        assert!(d.layers().by_id(inner).unwrap().parent.is_none());
+    }
+
+    #[test]
+    fn a_new_group_never_lands_inside_another() {
+        let (mut d, red, green) = stacked();
+        let inner = d.group_layers(&[red, green]).unwrap();
+        // With a member active, the new folder goes above the whole group
+        // rather than into it — groups cannot nest.
+        d.set_active_layer(red);
+        let outer = d.add_group(None);
+        assert!(d.layers().by_id(outer).unwrap().parent.is_none());
+        assert!(
+            d.layers().index_of(outer).unwrap() > d.layers().index_of(inner).unwrap(),
+            "the new folder sits above the existing group"
+        );
+    }
+
+    #[test]
+    fn merging_a_group_down_is_refused() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        let before = d.layers().len();
+        // Merging the folder into the background would drop its contents.
+        assert!(!d.merge_down(group));
+        assert_eq!(d.layers().len(), before);
+    }
+
+    #[test]
+    fn a_group_moves_up_past_the_layer_above_it() {
+        // Background, then a group of two, then a loose layer on top.
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        let top = d.add_layer(Some("Top".to_string()));
+        assert_eq!(d.layers().index_of(top), Some(4));
+
+        // Up one, in panel terms: the folder takes the top layer's place.
+        // `to` names where the folder itself lands, as it does for a layer.
+        assert!(d.reorder_layer(group, 4));
+
+        assert_eq!(d.layers().index_of(group), Some(4), "the folder moved up");
+        assert_eq!(d.layers().index_of(top), Some(1), "and the layer moved down");
+        // Its members came with it and are still its members.
+        let members = d.layers().group_members(4);
+        assert_eq!(members, 2..4);
+        assert_eq!(d.layers().get(2).unwrap().id, red);
+        assert_eq!(d.layers().get(3).unwrap().id, green);
+    }
+
+    #[test]
+    fn a_group_moves_as_one_piece() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        // Send the folder to the bottom: its members go with it, still in
+        // order and still members.
+        assert!(d.reorder_layer(group, 0));
+
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(index, 2, "the folder stays above its own members");
+        assert_eq!(d.layers().group_members(index), 0..2);
+        assert_eq!(d.layers().get(0).unwrap().id, red);
+        assert_eq!(d.layers().get(3).unwrap().name, "Background");
+        // The background is now on top, so it is what shows.
+        assert_eq!(d.composite().get(4, 4), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn an_adjustment_layer_honours_its_opacity() {
+        let mut d = Document::new(8, 8, Rgba8::BLACK);
+        d.add_adjustment_layer_configured(
+            None,
+            Adjustment::Invert,
+            BlendMode::Normal,
+            0.5,
+            false,
+            0,
+        );
+        // Half-strength invert of black is mid-grey.
+        assert_eq!(d.composite().get(4, 4).r, 128);
+    }
+
+    #[test]
+    fn a_gradient_fill_layer_is_evaluated_not_painted() {
+        let mut d = Document::new(100, 40, Rgba8::BLACK);
+        let fill = GradientFill { angle: 0.0, ..GradientFill::default() };
+        let id = d.add_gradient_fill_layer(None, fill, BlendMode::Normal, 1.0, false, 0);
+
+        assert_eq!(d.layers().by_id(id).unwrap().name, "Gradient Fill 1");
+        // No pixels: the ramp is worked out as the layer is composited, which
+        // is what lets it be re-angled afterwards.
+        assert!(d.layers().by_id(id).unwrap().pixels.is_empty());
+
+        let composite = d.composite();
+        assert!(composite.get(2, 20).r < 40, "the dark end");
+        assert!(composite.get(97, 20).r > 200, "the light end");
+    }
+
+    #[test]
+    fn a_pattern_fill_layer_repeats_across_the_canvas() {
+        let mut d = Document::new(160, 160, Rgba8::BLACK);
+        let fill = PatternFill::default();
+        d.add_pattern_fill_layer(None, fill, BlendMode::Normal, 1.0, false, 0);
+
+        let composite = d.composite();
+        // The checkerboard's tile is 64 square, so one tile along is the same
+        // pixel again — and the canvas is not one flat colour.
+        assert_eq!(composite.get(5, 5), composite.get(69, 5));
+        assert_ne!(composite.get(5, 5), composite.get(40, 5));
+    }
+
+    #[test]
+    fn a_fill_layer_honours_its_opacity_and_mode() {
+        let mut d = Document::new(8, 8, Rgba8::BLACK);
+        d.add_fill_layer(None, Rgba8::WHITE, BlendMode::Normal, 0.5, false, 0);
+        assert_eq!(d.composite().get(4, 4).r, 128);
+    }
+
+    #[test]
+    fn fill_layers_are_numbered_in_turn() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        d.add_fill_layer(None, Rgba8::BLACK, BlendMode::Normal, 1.0, false, 0);
+        d.add_fill_layer(None, Rgba8::BLACK, BlendMode::Normal, 1.0, false, 0);
+        assert_eq!(d.layers().get(2).unwrap().name, "Color Fill 2");
+    }
+
+    #[test]
+    fn a_new_layer_takes_the_properties_it_was_given() {
+        let mut d = doc();
+        d.add_layer_configured(Some("Sky".to_string()), BlendMode::Multiply, 0.42, true, 0);
+
+        let layer = d.layers().get(1).unwrap();
+        assert_eq!(layer.name, "Sky");
+        assert_eq!(layer.blend_mode, BlendMode::Multiply);
+        assert!((layer.opacity - 0.42).abs() < 1e-6);
+        assert!(layer.clipping);
+    }
+
+    #[test]
+    fn a_configured_new_layer_is_one_history_step() {
+        let mut d = doc();
+        d.add_layer_configured(Some("Sky".to_string()), BlendMode::Screen, 0.5, false, 0);
+
+        // Setting the four properties one at a time would leave four entries
+        // in the History panel for one action.
+        assert!(d.undo());
+        assert_eq!(d.layer_count(), 1);
+    }
+
+    #[test]
+    fn layer_from_background_renames_and_unlocks_it() {
+        let mut d = doc();
+        assert!(d.has_background());
+        {
+            let bg = d.layers_mut_raw().get_mut(0).unwrap();
+            bg.lock_pixels = true;
+            bg.lock_position = true;
+        }
+
+        assert!(d.layer_from_background("Layer 0", BlendMode::Normal, 1.0));
+
+        let layer = d.layers().get(0).unwrap();
+        assert_eq!(layer.name, "Layer 0");
+        assert!(!layer.lock_pixels, "a layer is not locked the way a Background is");
+        assert!(!layer.lock_position);
+        // ...and it is no longer the thing Canvas Size pours its fill into.
+        assert!(!d.has_background());
+    }
+
+    #[test]
+    fn layer_from_background_is_refused_when_there_is_none() {
+        let mut d = doc();
+        assert!(d.layer_from_background("Layer 0", BlendMode::Normal, 1.0));
+        assert!(!d.layer_from_background("Layer 0 again", BlendMode::Normal, 1.0));
+        assert_eq!(d.layers().get(0).unwrap().name, "Layer 0");
+    }
+
+    #[test]
+    fn layer_via_copy_lifts_the_selection_and_leaves_the_original() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.select_rect(
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            SelectionOp::Replace,
+            0,
+        );
+
+        assert!(d.layer_via_copy().is_some());
+
+        assert_eq!(d.layer_count(), 2);
+        let copy = d.layers().get(1).unwrap();
+        // Only the selected part, and sitting where it was copied from.
+        assert_eq!((copy.pixels.width(), copy.pixels.height()), (6, 6));
+        assert_eq!(copy.offset, (4, 4));
+        // The layer it came from still has its pixels.
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(5, 5).a, 255);
+    }
+
+    #[test]
+    fn layer_via_copy_with_no_selection_duplicates_the_layer() {
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        assert!(d.layer_via_copy().is_some());
+        assert_eq!(d.layer_count(), 2);
+        // The whole layer, as Ctrl+J does in Photoshop with nothing selected.
+        let copy = d.layers().get(1).unwrap();
+        assert_eq!((copy.pixels.width(), copy.pixels.height()), (8, 8));
+    }
+
+    #[test]
+    fn layer_via_cut_takes_the_pixels_with_it() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.select_rect(
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            SelectionOp::Replace,
+            0,
+        );
+
+        assert!(d.layer_via_cut().is_some());
+
+        assert_eq!(d.layer_count(), 2);
+        let cut = d.layers().get(1).unwrap();
+        assert_eq!(cut.pixels.get(0, 0), Rgba8::new(200, 0, 0, 255));
+        // The hole is what makes this a cut rather than a copy.
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(5, 5).a, 0);
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(1, 1).a, 255);
+    }
+
+    #[test]
+    fn layer_via_cut_is_one_history_step() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.select_rect(
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.layer_via_cut();
+
+        // Erasing and adding the layer are one action, so one undo puts the
+        // pixels back.
+        assert!(d.undo());
+        assert_eq!(d.layer_count(), 1);
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(5, 5).a, 255);
+    }
+
+    #[test]
+    fn layer_via_cut_needs_a_selection() {
+        let mut d = Document::new(8, 8, Rgba8::WHITE);
+        assert!(d.layer_via_cut().is_none(), "there is nothing to cut");
+        assert_eq!(d.layer_count(), 1);
+    }
+
+    #[test]
+    fn layer_via_cut_refuses_a_locked_layer() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.select_rect(
+            Rect { x: 4, y: 4, width: 6, height: 6 },
+            SelectionOp::Replace,
+            0,
+        );
+        d.layers_mut_raw().get_mut(0).unwrap().lock_pixels = true;
+
+        assert!(d.layer_via_cut().is_none());
+        assert_eq!(d.layer_count(), 1);
+        assert_eq!(d.layers().get(0).unwrap().pixels.get(5, 5).a, 255);
+    }
+
+    #[test]
+    fn a_duplicate_carries_the_whole_stack() {
+        let mut d = Document::new(6, 4, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        d.layers_mut_raw()
+            .push(Layer::new_filled(id, "l", 2, 2, Rgba8::new(0, 0, 255, 255)));
+        d.set_resolution(300.0);
+
+        let copy = d.duplicate("horse copy", false);
+
+        assert_eq!(copy.size(), (6, 4));
+        assert_eq!(copy.layer_count(), 2);
+        assert_eq!(copy.resolution(), 300.0);
+        assert_eq!(copy.composite().as_bytes(), d.composite().as_bytes());
+    }
+
+    #[test]
+    fn a_merged_duplicate_is_one_flattened_layer() {
+        let mut d = Document::new(6, 4, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_filled(id, "l", 2, 2, Rgba8::new(0, 0, 255, 255));
+        l.offset = (1, 1);
+        d.layers_mut_raw().push(l);
+
+        let copy = d.duplicate("flat", true);
+
+        assert_eq!(copy.layer_count(), 1);
+        // Flattened, not discarded: the upper layer is still visible in it.
+        assert_eq!(copy.composite().as_bytes(), d.composite().as_bytes());
+    }
+
+    #[test]
+    fn a_duplicate_has_its_own_history() {
+        let mut d = Document::new(6, 4, Rgba8::WHITE);
+        d.add_layer(None);
+        d.add_layer(None);
+        assert_eq!(d.layer_count(), 3);
+
+        let mut copy = d.duplicate("copy", false);
+
+        // Undo in the copy must not step back into edits made before it
+        // existed.
+        assert!(!copy.undo(), "the copy inherited the original's history");
+        assert_eq!(copy.layer_count(), 3);
+        // ...and the original is untouched by any of it.
+        assert_eq!(d.layer_count(), 3);
+    }
+
+    #[test]
+    fn a_duplicate_is_not_the_file_it_came_from() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        d.path = Some("/home/user/pictures/horse.jpg".to_string());
+        d.mark_saved();
+
+        let copy = d.duplicate("horse copy", false);
+
+        assert_eq!(copy.path, None, "saving the copy must not overwrite the original");
+        assert_eq!(copy.base_name(), "horse copy");
+        // Unsaved from the moment it exists, so its tab carries the marker.
+        assert!(copy.display_name().contains('*'));
+    }
+
+    #[test]
+    fn editing_a_duplicate_leaves_the_original_alone() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        let before = d.composite().as_bytes().to_vec();
+
+        let mut copy = d.duplicate("copy", false);
+        copy.apply_adjustment(Adjustment::Invert);
+
+        assert_ne!(copy.composite().as_bytes(), before.as_slice());
+        assert_eq!(d.composite().as_bytes(), before.as_slice());
+    }
+
+    #[test]
+    fn the_suggested_copy_name_drops_the_extension_and_counts_on() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        d.path = Some("/tmp/horse-jpg.jpg".to_string());
+        assert_eq!(d.copy_name(), "horse-jpg copy");
+
+        // Duplicating a duplicate numbers it, rather than making
+        // "horse-jpg copy copy".
+        let first = d.duplicate(&d.copy_name(), false);
+        assert_eq!(first.copy_name(), "horse-jpg copy 2");
+        let second = first.duplicate(&first.copy_name(), false);
+        assert_eq!(second.copy_name(), "horse-jpg copy 3");
+    }
+
+    #[test]
+    fn the_suggested_copy_name_keeps_dots_that_are_not_extensions() {
+        let mut d = Document::new(4, 4, Rgba8::WHITE);
+        d.path = Some("/tmp/version 1.2 final".to_string());
+        assert_eq!(d.copy_name(), "version 1.2 final copy");
+    }
+
+    #[test]
+    fn an_unsaved_document_copies_by_its_untitled_name() {
+        let d = Document::new(4, 4, Rgba8::WHITE);
+        assert_eq!(d.copy_name(), "Untitled-1 copy");
+    }
+
+    #[test]
+    fn reveal_all_brings_back_what_a_crop_kept() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        // Cropped without deleting: the pixels are still there, off canvas.
+        d.crop(Rect { x: 5, y: 5, width: 8, height: 8 }, false);
+        assert_eq!((d.width(), d.height()), (8, 8));
+
+        assert!(d.reveal_all());
+
+        assert_eq!((d.width(), d.height()), (20, 20));
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+        assert_eq!(d.composite().get(0, 0), Rgba8::new(200, 0, 0, 255));
+        assert_eq!(d.composite().get(19, 19), Rgba8::new(200, 0, 0, 255));
+    }
+
+    #[test]
+    fn reveal_all_grows_in_every_direction_at_once() {
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_filled(id, "l", 4, 4, Rgba8::BLACK);
+        // Hanging off the top-left corner.
+        l.offset = (-3, -2);
+        d.layers_mut_raw().push(l);
+
+        assert!(d.reveal_all());
+
+        // Three columns and two rows added on the near side; the far side was
+        // already covered by the canvas.
+        assert_eq!((d.width(), d.height()), (13, 12));
+        // Everything shifted together, so the background moved too.
+        assert_eq!(d.layers().get(0).unwrap().offset, (3, 2));
+        assert_eq!(d.layers().get(1).unwrap().offset, (0, 0));
+    }
+
+    #[test]
+    fn reveal_all_measures_pixels_not_buffers() {
+        // A big, nearly empty layer dragged off the edge: only the painted
+        // part should pull the canvas out, or the canvas grows by the width of
+        // the emptiness.
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_raster(id, "l", 40, 40);
+        l.pixels.set(1, 1, Rgba8::BLACK);
+        l.offset = (5, 5);
+        d.layers_mut_raw().push(l);
+
+        // The one painted pixel sits at (6, 6), inside the canvas.
+        assert!(!d.reveal_all(), "an empty margin is not something to reveal");
+        assert_eq!((d.width(), d.height()), (10, 10));
+    }
+
+    #[test]
+    fn reveal_all_does_nothing_when_everything_is_on_the_canvas() {
+        let mut d = Document::new(12, 12, Rgba8::WHITE);
+        assert!(!d.reveal_all());
+        assert_eq!((d.width(), d.height()), (12, 12));
+    }
+
+    #[test]
+    fn reveal_all_takes_the_selection_with_it() {
+        let mut d = Document::new(20, 20, Rgba8::new(200, 0, 0, 255));
+        d.crop(Rect { x: 5, y: 5, width: 8, height: 8 }, false);
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 4, height: 8 },
+            SelectionOp::Replace,
+            0,
+        );
+
+        assert!(d.reveal_all());
+
+        // The canvas grew by 5 on the near side, so the band moved with it.
+        assert!(d.selection().coverage_at(6, 8) > 0.5, "selection did not follow");
+        assert!(d.selection().coverage_at(1, 8) < 0.5, "selection stayed put");
+    }
+
+    #[test]
+    fn transparency_is_reported_from_the_flattened_image() {
+        let opaque = Document::new(4, 4, Rgba8::WHITE);
+        assert!(!opaque.has_transparency());
+
+        let clear = Document::new(4, 4, Rgba8::TRANSPARENT);
+        assert!(clear.has_transparency());
+    }
+
+    #[test]
+    fn a_quarter_turn_swaps_the_canvas_and_moves_the_pixels() {
+        let mut d = Document::new(6, 3, Rgba8::WHITE);
+        // A mark in the top-left corner, to see where it lands.
+        d.layers_mut_raw()
+            .get_mut(0)
+            .unwrap()
+            .pixels
+            .set(0, 0, Rgba8::new(255, 0, 0, 255));
+
+        d.rotate_canvas(Orientation::Rotate90Cw);
+
+        assert_eq!((d.width(), d.height()), (3, 6));
+        // Clockwise sends the top-left corner to the top-right.
+        let composite = d.composite();
+        assert_eq!(composite.get(2, 0), Rgba8::new(255, 0, 0, 255));
+        assert_eq!(composite.get(0, 0), Rgba8::WHITE);
+    }
+
+    #[test]
+    fn turning_a_quarter_and_back_restores_the_image() {
+        // The right angles permute pixels rather than resampling, so this has
+        // to be exact — not merely close.
+        let mut d = Document::new(7, 4, Rgba8::WHITE);
+        for x in 0..7i32 {
+            d.layers_mut_raw()
+                .get_mut(0)
+                .unwrap()
+                .pixels
+                .set(x, 1, Rgba8::new(x as u8 * 30, 10, 20, 255));
+        }
+        let before = d.composite().as_bytes().to_vec();
+
+        d.rotate_canvas(Orientation::Rotate90Cw);
+        d.rotate_canvas(Orientation::Rotate90Ccw);
+
+        assert_eq!((d.width(), d.height()), (7, 4));
+        assert_eq!(d.composite().as_bytes(), before.as_slice());
+    }
+
+    #[test]
+    fn flipping_the_canvas_mirrors_every_layer_together() {
+        let mut d = Document::new(10, 10, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        let mut l = Layer::new_filled(id, "l", 2, 2, Rgba8::new(0, 0, 255, 255));
+        l.offset = (0, 4);
+        d.layers_mut_raw().push(l);
+
+        d.rotate_canvas(Orientation::FlipHorizontal);
+
+        assert_eq!((d.width(), d.height()), (10, 10));
+        // The small layer was against the left edge; it is now against the
+        // right one, and the background stayed where it was.
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+        assert_eq!(d.layers().get(1).unwrap().offset, (8, 4));
+    }
+
+    #[test]
+    fn a_mask_turns_with_the_layer_it_belongs_to() {
+        let mut d = Document::new(6, 3, Rgba8::WHITE);
+        {
+            let layer = d.layers_mut_raw().get_mut(0).unwrap();
+            let mut mask = Pixmap::filled(6, 3, Rgba8::WHITE);
+            mask.set(0, 0, Rgba8::TRANSPARENT);
+            layer.mask = Some(mask);
+        }
+
+        d.rotate_canvas(Orientation::Rotate90Cw);
+
+        let mask = d.layers().get(0).unwrap().mask.as_ref().unwrap();
+        assert_eq!((mask.width(), mask.height()), (3, 6));
+        // A mask that stayed upright would hide the wrong part of the image.
+        assert_eq!(mask.get(2, 0).a, 0);
+        assert_eq!(mask.get(0, 0).a, 255);
+    }
+
+    #[test]
+    fn the_selection_turns_with_the_canvas() {
+        let mut d = Document::new(10, 6, Rgba8::WHITE);
+        d.select_rect(
+            Rect { x: 0, y: 0, width: 10, height: 2 },
+            SelectionOp::Replace,
+            0,
+        );
+
+        d.rotate_canvas(Orientation::Rotate90Cw);
+
+        assert_eq!((d.width(), d.height()), (6, 10));
+        // The band along the top is now a band down the right-hand side.
+        assert!(d.selection().coverage_at(5, 5) > 0.5, "selection did not turn");
+        assert!(d.selection().coverage_at(0, 5) < 0.5, "selection stayed put");
+    }
+
+    #[test]
+    fn an_arbitrary_turn_grows_the_canvas_to_fit_the_corners() {
+        let mut d = Document::new(40, 40, Rgba8::new(200, 0, 0, 255));
+        d.rotate_canvas_arbitrary(45.0, None);
+
+        let diagonal = (40.0f32 * 2.0f32.sqrt()).ceil() as u32;
+        assert_eq!((d.width(), d.height()), (diagonal, diagonal));
+        // The middle is still the image; the corners are new.
+        let composite = d.composite();
+        assert_eq!(
+            composite.get(diagonal as i32 / 2, diagonal as i32 / 2),
+            Rgba8::new(200, 0, 0, 255)
+        );
+        assert_eq!(composite.get(0, 0).a, 0);
+    }
+
+    #[test]
+    fn an_arbitrary_turn_fills_the_new_corners_of_the_background() {
+        let mut d = Document::new(40, 40, Rgba8::new(200, 0, 0, 255));
+        let fill = Rgba8::new(0, 255, 0, 255);
+        d.rotate_canvas_arbitrary(45.0, Some(fill));
+
+        let bg = &d.layers().get(0).unwrap().pixels;
+        assert_eq!((bg.width(), bg.height()), (d.width(), d.height()));
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+        assert_eq!(bg.get(0, 0), fill, "the Background layer cannot be transparent");
+        assert_eq!(
+            bg.get(d.width() as i32 / 2, d.height() as i32 / 2),
+            Rgba8::new(200, 0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn an_arbitrary_right_angle_is_not_resampled() {
+        // 90° typed into the Arbitrary box must be the same lossless turn the
+        // menu item performs, not a resample that happens to land square.
+        let marked = || {
+            let mut d = Document::new(5, 3, Rgba8::WHITE);
+            d.layers_mut_raw()
+                .get_mut(0)
+                .unwrap()
+                .pixels
+                .set(0, 0, Rgba8::new(255, 0, 0, 255));
+            d
+        };
+        let mut d = marked();
+        let mut turned = marked();
+
+        d.rotate_canvas(Orientation::Rotate90Cw);
+        turned.rotate_canvas_arbitrary(90.0, Some(Rgba8::BLACK));
+
+        assert_eq!((turned.width(), turned.height()), (d.width(), d.height()));
+        assert_eq!(turned.composite().as_bytes(), d.composite().as_bytes());
+    }
+
+    #[test]
+    fn a_full_turn_leaves_the_document_alone() {
+        let mut d = Document::new(9, 5, Rgba8::new(30, 60, 90, 255));
+        let before = d.composite().as_bytes().to_vec();
+        d.rotate_canvas_arbitrary(360.0, Some(Rgba8::BLACK));
+        assert_eq!((d.width(), d.height()), (9, 5));
+        assert_eq!(d.composite().as_bytes(), before.as_slice());
     }
 
     #[test]
