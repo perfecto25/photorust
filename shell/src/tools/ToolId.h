@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QObject>
 #include <QString>
 #include <QStringList>
 
@@ -774,6 +775,28 @@ enum class TypeTool {
 namespace TypeDefaults {
 constexpr double kSize = 12.0;
 constexpr bool kAntialias = true;
+
+/// CS6's anti-aliasing methods, in the order its Type ▸ Anti-Alias menu
+/// lists them — the blank entry is that menu's separator.
+///
+/// Only "None" changes what comes out: the other six are each a *way* of
+/// smoothing, and Qt's rasteriser exposes no choice between them. They are
+/// still carried as distinct choices rather than collapsed to a checkbox,
+/// because the menu, the options bar and the Character panel all have to
+/// agree about which one is selected, and because picking "Smooth" and being
+/// shown "Sharp" afterwards is worse than picking one that renders the same.
+inline QStringList antialiasMethods()
+{
+    return {QObject::tr("None"),   QObject::tr("Sharp"),       QObject::tr("Crisp"),
+            QObject::tr("Strong"), QObject::tr("Smooth"),      QString(),
+            QObject::tr("Windows LCD"), QObject::tr("Windows")};
+}
+
+/// The method the Type tool starts on.
+inline QString defaultAntialiasMethod() { return QObject::tr("Sharp"); }
+
+/// Whether a method smooths at all — the one thing the renderer can honour.
+inline bool antialiasOn(const QString &method) { return method != QObject::tr("None"); }
 } // namespace TypeDefaults
 
 /// CS6's defaults for the Pen tool's options bar.

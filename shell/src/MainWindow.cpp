@@ -7,15 +7,18 @@
 #include "dialogs/ChannelMixerDialog.h"
 #include "dialogs/ColorBalanceDialog.h"
 #include "dialogs/ColorPickerDialog.h"
+#include "dialogs/ColorRangeDialog.h"
 #include "dialogs/CurvesDialog.h"
 #include "dialogs/LayerStyleDialog.h"
 #include "dialogs/LevelsDialog.h"
+#include "dialogs/LockLayersDialog.h"
 #include "dialogs/ColorSettingsDialog.h"
 #include "dialogs/DuplicateImageDialog.h"
 #include "dialogs/DuplicateLayerDialog.h"
 #include "dialogs/ExposureDialog.h"
 #include "dialogs/FillDialog.h"
 #include "dialogs/FillLayerDialog.h"
+#include "dialogs/FilterPreviewDialog.h"
 #include "dialogs/GradientMapDialog.h"
 #include "dialogs/HdrToningDialog.h"
 #include "dialogs/ExportAsDialog.h"
@@ -38,14 +41,19 @@
 #include "dialogs/SelectiveColorDialog.h"
 #include "dialogs/ShadowsHighlightsDialog.h"
 #include "dialogs/StrokeDialog.h"
+#include "dialogs/WarpTextDialog.h"
 #include "dialogs/ThresholdDialog.h"
 #include "dialogs/VibranceDialog.h"
 #include "panels/BrushPresetPicker.h"
 #include "panels/ChannelsPanel.h"
+#include "panels/CharacterPanel.h"
 #include "panels/ColorPanel.h"
+#include "panels/GlyphsPanel.h"
 #include "panels/HistoryPanel.h"
 #include "panels/InfoPanel.h"
 #include "panels/LayersPanel.h"
+#include "panels/ParagraphPanel.h"
+#include "panels/ParagraphStylesPanel.h"
 #include "panels/PathsPanel.h"
 #include "panels/PropertiesPanel.h"
 #include "panels/PanelHeader.h"
@@ -55,6 +63,8 @@
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
+#include <QAbstractButton>
+#include <QActionGroup>
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCache>
@@ -62,6 +72,7 @@
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDockWidget>
@@ -84,6 +95,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPrintDialog>
 #include <QPrinter>
 #include <QPrinterInfo>
@@ -308,6 +320,78 @@ QString askForFile(QWidget *parent, const QString &caption, const QString &filte
 {
     const QStringList chosen = askForFiles(parent, caption, filter, mode, suggestedName);
     return chosen.isEmpty() ? QString() : chosen.first();
+}
+
+/// Feed a `QPainterPath`'s contours to the engine as anchors with handles.
+///
+/// Qt states a cubic as "curve to c1, c2, p3" from wherever the pen already
+/// is; the engine stores that same curve as an out-handle on the point being
+/// left and an in-handle on the one being reached. So each curve touches two
+/// anchors, and a contour is collected whole before being sent rather than
+/// streamed — the last element decides what happens to the first point.
+int buildPathFromOutline(Engine *engine, const QPainterPath &outline,
+                                const QString &name)
+{
+    if (!engine || outline.isEmpty()) {
+        return -1;
+    }
+
+    struct Anchor {
+        QPointF at;
+        QPointF in;
+        QPointF out;
+        bool hasIn = false;
+        bool hasOut = false;
+    };
+
+    engine->beginPathBuild();
+
+    QList<Anchor> contour;
+    auto emitContour = [&] {
+        if (contour.size() < 2) {
+            contour.clear();
+            return;
+        }
+        // A glyph contour comes back closed, its last curve landing back on
+        // the first point. That duplicate anchor is folded into the first —
+        // it carries the handle curving the closing segment — rather than
+        // left behind as a zero-length segment.
+        if (QLineF(contour.last().at, contour.first().at).length() < 0.01) {
+            const Anchor last = contour.takeLast();
+            contour.first().in = last.in;
+            contour.first().hasIn = last.hasIn;
+        }
+        engine->pathBuildSubpath(true);
+        for (const Anchor &a : std::as_const(contour)) {
+            engine->pathBuildPoint(float(a.at.x()), float(a.at.y()), a.hasIn, float(a.in.x()),
+                                   float(a.in.y()), a.hasOut, float(a.out.x()),
+                                   float(a.out.y()));
+        }
+        contour.clear();
+    };
+
+    for (int i = 0; i < outline.elementCount(); ++i) {
+        const QPainterPath::Element element = outline.elementAt(i);
+        if (element.isMoveTo()) {
+            emitContour();
+            contour.append(Anchor{QPointF(element.x, element.y), {}, {}, false, false});
+        } else if (element.isLineTo()) {
+            contour.append(Anchor{QPointF(element.x, element.y), {}, {}, false, false});
+        } else if (element.isCurveTo() && i + 2 < outline.elementCount()) {
+            const QPainterPath::Element c2 = outline.elementAt(i + 1);
+            const QPainterPath::Element end = outline.elementAt(i + 2);
+            if (!contour.isEmpty()) {
+                contour.last().out = QPointF(element.x, element.y);
+                contour.last().hasOut = true;
+            }
+            Anchor next{QPointF(end.x, end.y), QPointF(c2.x, c2.y), {}, true, false};
+            contour.append(next);
+            i += 2;
+        }
+    }
+    emitContour();
+
+    return engine->commitBuiltPath(name);
 }
 
 /// Line-art tint for options-bar icons, matching the tool strip.
@@ -542,12 +626,16 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     setWindowTitle(tr("PhotoRust"));
     resize(1400, 900);
     // Photoshop lets panels stack into tabbed groups and nest side by side.
-    // GroupedDragging is what lets a panel be dragged out of its tab group by
-    // its tab and float on its own, the way every CS6 panel does. Without it a
-    // tabbed panel can only be undocked by its title bar, and dragging the tab
-    // just reorders it within the group.
-    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks
-                   | QMainWindow::AllowTabbedDocks | QMainWindow::GroupedDragging);
+    // GroupedDragging would let a single tab be pulled out of its group and
+    // float on its own, but it stays off: on this Qt build it crashes tabbing
+    // two panels together, popping a tab back out of the resulting group, and
+    // dragging a tab out on its own — all via the same internal
+    // `QDockWidgetGroupWindow` it creates (visible, when it does not crash
+    // outright, as a floating window mislabelled with the main window's own
+    // title). Without it, dragging a tab only reorders it within its group
+    // instead of floating it — see `installTabFloatMenu` for how panels still
+    // get popped out on their own without going through that code path.
+    setDockOptions(QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
 
     // The canvas sits under a tab bar, one tab per open document, as CS6 does.
@@ -585,6 +673,9 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     menuBar()->setCornerWidget(brandLabel, Qt::TopRightCorner);
 
     createDocks();
+    // Catches right-clicks on the tab bars Qt builds for tabbed dock groups,
+    // to offer "Float Panel" — see the eventFilter override.
+    qApp->installEventFilter(this);
     createStatusBar();
     connectEngine();
     // Must run after createMenus(), so the tool commands the strip registered
@@ -637,6 +728,11 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
         m_hasTransformed = true;
         if (m_transformAgainAction) m_transformAgainAction->setEnabled(true);
         hideTransformOptionsBar();
+        // Scaling a type layer re-sets its text at a new size, so what the
+        // bar and the panels hold about that layer is now wrong — and the
+        // next restyle would write the pre-transform size straight back over
+        // it. Same layer, so this has to be forced.
+        syncTypeBarToActiveLayer(true);
     });
     connect(m_canvas, &CanvasView::transformCancelled, this,
             &MainWindow::hideTransformOptionsBar);
@@ -654,6 +750,13 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     // Replace Color samples through the canvas itself (it is shown
     // non-modally, so the canvas sees the clicks); it only needs to be able
     // to put its eyedropper on screen.
+    ColorRangeDialog::setCursorHook(
+        [canvas = QPointer<CanvasView>(m_canvas)](const QCursor *cursor) {
+            if (canvas) {
+                canvas->setSamplingCursor(cursor);
+            }
+        });
+
     ReplaceColorDialog::setCursorHook(
         [canvas = QPointer<CanvasView>(m_canvas)](const QCursor *cursor) {
             if (canvas) {
@@ -677,6 +780,122 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
             [this] { refreshGradientSwatch(); });
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged, this,
             [this] { refreshGradientSwatch(); });
+
+    // The Character panel edits the same type state as the Type options bar,
+    // so a change here rebuilds that bar too when it is the one showing —
+    // the same round trip `adoptTypeStyle` makes reopening an existing layer.
+    auto refreshTypeBarIfShown = [this] {
+        if (m_activeTool == ToolId::Type) {
+            populateOptionsBar(ToolId::Type, m_activeVariant);
+        }
+    };
+    connect(m_characterPanel, &CharacterPanel::familyChanged, this,
+            [this, refreshTypeBarIfShown](const QString &family) {
+                m_typeFont.setFamily(family);
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::styleChanged, this,
+            [this, refreshTypeBarIfShown](const QString &style) {
+                m_typeStyle = style;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::sizeChanged, this,
+            [this, refreshTypeBarIfShown](qreal pointSize) {
+                m_typeFont.setPointSizeF(pointSize);
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::colorChanged, this,
+            [this, refreshTypeBarIfShown](const QColor &color) {
+                m_typeColor = color;
+                m_typeColorInitialized = true;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::antialiasChanged, this,
+            [this, refreshTypeBarIfShown](const QString &method) {
+                m_typeAntialiasMode = method;
+                syncAntialiasMenu();
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::horizontalScaleChanged, this,
+            [this, refreshTypeBarIfShown](qreal scale) {
+                m_typeHScale = scale;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_characterPanel, &CharacterPanel::verticalScaleChanged, this,
+            [this, refreshTypeBarIfShown](qreal scale) {
+                m_typeVScale = scale;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_paragraphPanel, &ParagraphPanel::alignmentChanged, this,
+            [this, refreshTypeBarIfShown](Qt::Alignment alignment) {
+                m_typeAlignment = alignment;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_paragraphStylesPanel, &ParagraphStylesPanel::styleApplied, this,
+            [this, refreshTypeBarIfShown](const ParagraphStyle &style) {
+                // A style is the type options, named: applying one sets them
+                // and lets the usual push restyle the selected layer, rather
+                // than reaching into the text a second way.
+                if (!style.family.isEmpty()) {
+                    m_typeFont.setFamily(style.family);
+                }
+                m_typeFont.setPointSizeF(style.size);
+                m_typeStyle = style.style;
+                m_typeColor = style.color;
+                m_typeColorInitialized = true;
+                m_typeHScale = style.hScale;
+                m_typeVScale = style.vScale;
+                m_typeAlignment = style.alignment;
+                pushTypeOptions();
+                refreshTypeBarIfShown();
+            });
+    connect(m_paragraphPanel, &ParagraphPanel::paragraphChanged, this,
+            [this](qreal indentLeft, qreal indentRight, qreal firstLine, qreal spaceBefore,
+                   qreal spaceAfter) {
+                const int layer = m_engine ? m_engine->getActiveLayerIndex() : -1;
+                if (layer < 0 || !m_canvas || m_engine->layerTextRunCount(layer) <= 0) {
+                    return;
+                }
+                if (m_engine->setLayerTextParagraph(layer, float(indentLeft), float(indentRight),
+                                                    float(firstLine), float(spaceBefore),
+                                                    float(spaceAfter))) {
+                    // Indents and spacing move the lines, so the layer has to
+                    // be laid out again rather than merely redrawn.
+                    m_canvas->reflowTypeLayer(layer);
+                    refreshAll();
+                }
+            });
+    connect(m_glyphsPanel, &GlyphsPanel::glyphChosen, this,
+            [this, refreshTypeBarIfShown](const QString &text, const QString &family,
+                                          const QString &style) {
+                // Photoshop wants a live caret before a glyph can land, and
+                // so does `insertTypeText` — say why rather than doing
+                // nothing when there is no edit open.
+                if (!m_canvas || !m_canvas->isTyping()) {
+                    statusBar()->showMessage(
+                        tr("Click in the image with the Type tool before inserting a glyph."),
+                        4000);
+                    return;
+                }
+                // Take the glyph's own font first. The text may be set in a
+                // family that has nothing at this code point, and inserting
+                // it regardless would put an empty box in the document.
+                if (family != m_typeFont.family() || style != m_typeStyle) {
+                    m_typeFont.setFamily(family);
+                    m_typeStyle = style;
+                    pushTypeOptions();
+                    refreshTypeBarIfShown();
+                }
+                m_canvas->insertTypeText(text);
+            });
 
     onToolChanged(ToolId::Brush, 0);
     refreshDocumentTabs();
@@ -1342,6 +1561,14 @@ void MainWindow::createMenus()
     }
 
     layer->addSeparator();
+    // CS6 renames in the panel rather than in a dialog, so this is the same
+    // edit a double-click on the row starts.
+    layer->addAction(command(QStringLiteral("layer.rename"), tr("&Rename Layer..."), [this] {
+        if (m_layersPanel) {
+            m_layersPanel->beginRenameActiveLayer();
+        }
+    }));
+
     QMenu *layerStyle = layer->addMenu(tr("Layer &Style"));
     {
         // The effects the engine can draw, in CS6's menu order. Blending
@@ -1465,6 +1692,56 @@ void MainWindow::createMenus()
     layer->addAction(hideLayersAction);
     layer->setToolTipsVisible(true);
 
+    // CS6's Arrange submenu. The four moves are one command with a direction,
+    // which is also how the engine takes them.
+    QMenu *arrange = layer->addMenu(tr("&Arrange"));
+    struct ArrangeEntry {
+        const char *id;
+        QString text;
+        int op;
+    };
+    const ArrangeEntry arrangeEntries[] = {
+        {"layer.bringToFront", tr("Bring to &Front"), 0},
+        {"layer.bringForward", tr("Bring F&orward"), 1},
+        {"layer.sendBackward", tr("Send Back&ward"), 2},
+        {"layer.sendToBack", tr("Send to &Back"), 3},
+    };
+    QList<QAction *> arrangeActions;
+    for (const ArrangeEntry &entry : arrangeEntries) {
+        const int op = entry.op;
+        auto *action = command(QString::fromLatin1(entry.id), entry.text,
+                               [this, op] { arrangeActiveLayer(op); });
+        arrange->addAction(action);
+        arrangeActions << action;
+    }
+    arrange->addSeparator();
+    auto *reverseAction = command(QStringLiteral("layer.reverse"), tr("&Reverse"),
+                                  &MainWindow::reverseSelectedLayers);
+    arrange->addAction(reverseAction);
+
+    connect(arrange, &QMenu::aboutToShow, this, [this, arrangeActions, reverseAction] {
+        const int active = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        for (int op = 0; op < arrangeActions.size(); ++op) {
+            arrangeActions.at(op)->setEnabled(
+                m_engine && active >= 0 && m_engine->canArrangeLayer(active, op));
+        }
+        // CS6 greys Reverse until there are two layers to swap.
+        reverseAction->setEnabled(selectedLayerIndices().size() >= 2);
+    });
+
+    layer->addSeparator();
+    layer->addAction(command(QStringLiteral("layer.lockLayers"), tr("&Lock Layers..."),
+                             &MainWindow::showLockLayers));
+
+    layer->addSeparator();
+    auto *linkAction = command(QStringLiteral("layer.link"), tr("Lin&k Layers"),
+                               &MainWindow::toggleLinkSelectedLayers);
+    layer->addAction(linkAction);
+    auto *selectLinkedAction =
+        command(QStringLiteral("layer.selectLinked"), tr("Select Link&ed Layers"),
+                &MainWindow::selectLinkedLayers);
+    layer->addAction(selectLinkedAction);
+
     layer->addSeparator();
     auto *mergeDownAction =
         command(QStringLiteral("layer.mergeDown"), tr("&Merge Down"), [this] {
@@ -1481,7 +1758,15 @@ void MainWindow::createMenus()
 
     connect(layer, &QMenu::aboutToShow, this,
             [this, mergeDownAction, flattenAction, hideLayersAction, groupAction,
-             ungroupAction] {
+             ungroupAction, linkAction, selectLinkedAction] {
+        // One entry for both directions, as CS6 does: a selection that is
+        // already linked offers to unlink it.
+        const bool linked = selectedLayersAreLinked();
+        linkAction->setText(linked ? tr("Unlin&k Layers") : tr("Lin&k Layers"));
+        linkAction->setEnabled(linked || selectedLayerIndices().size() >= 2);
+        // Nothing to select unless the active layer is in a set.
+        selectLinkedAction->setEnabled(
+            m_engine && m_engine->layerLinkId(m_engine->getActiveLayerIndex()) != 0);
         // One entry that swaps its wording, as CS6 does: it offers to show the
         // selection back only once all of it is hidden.
         hideLayersAction->setText(selectedLayersAreHidden() ? tr("&Show Layers")
@@ -1503,6 +1788,193 @@ void MainWindow::createMenus()
         flattenAction->setEnabled(count > 1);
     });
 
+    // -- Type -----------------------------------------------------------------
+    QMenu *typeMenu = menuBar()->addMenu(tr("T&ype"));
+    QMenu *typePanels = typeMenu->addMenu(tr("&Panels"));
+    // Brings the panel forward rather than toggling it, the way clicking any
+    // of CS6's own Type ▸ Panels entries does; Window ▸ Character is the
+    // checkable on/off switch for the same dock.
+    typePanels->addAction(tr("&Character Panel"), this, [this] {
+        if (m_characterDock) {
+            m_characterDock->show();
+            m_characterDock->raise();
+        }
+    });
+    typePanels->addAction(tr("&Paragraph Panel"), this, [this] {
+        if (m_paragraphDock) {
+            m_paragraphDock->show();
+            m_paragraphDock->raise();
+        }
+    });
+    typePanels->addSeparator();
+    typePanels->addAction(tr("Paragraph St&yles Panel"), this, [this] {
+        if (m_paragraphStylesDock) {
+            m_paragraphStylesDock->show();
+            m_paragraphStylesDock->raise();
+        }
+    });
+    typePanels->addAction(tr("&Glyphs Panel"), this, [this] {
+        if (m_glyphsDock) {
+            m_glyphsDock->show();
+            m_glyphsDock->raise();
+        }
+    });
+
+    // Anti-Alias. Every entry but None renders the same, because Qt offers no
+    // choice of smoothing — see `TypeDefaults::antialiasMethods` for why they
+    // are all still listed and remembered.
+    QMenu *antialias = typeMenu->addMenu(tr("&Anti-Alias"));
+    m_antialiasGroup = new QActionGroup(this);
+    m_antialiasGroup->setExclusive(true);
+    for (const QString &method : TypeDefaults::antialiasMethods()) {
+        if (method.isEmpty()) {
+            antialias->addSeparator();
+            continue;
+        }
+        QAction *entry = antialias->addAction(method);
+        entry->setCheckable(true);
+        entry->setChecked(method == m_typeAntialiasMode);
+        m_antialiasGroup->addAction(entry);
+        connect(entry, &QAction::triggered, this, [this, method] {
+            m_typeAntialiasMode = method;
+            pushTypeOptions();
+            // The options bar and Character panel both show this, and the bar
+            // is rebuilt from the state rather than updated in place.
+            if (m_activeTool == ToolId::Type) {
+                populateOptionsBar(ToolId::Type, m_activeVariant);
+            }
+        });
+    }
+
+    // Orientation. Unlike the Horizontal and Vertical Type *tools*, which
+    // decide how the next text is entered, these turn the selected layer.
+    QMenu *orientation = typeMenu->addMenu(tr("&Orientation"));
+    auto *orientationGroup = new QActionGroup(this);
+    orientationGroup->setExclusive(true);
+    struct OrientationEntry {
+        QString title;
+        bool vertical;
+        QAction **slot;
+    };
+    const OrientationEntry orientations[] = {
+        {tr("&Horizontal"), false, &m_horizontalAction},
+        {tr("&Vertical"), true, &m_verticalAction},
+    };
+    for (const OrientationEntry &entry : orientations) {
+        QAction *action = orientation->addAction(entry.title);
+        action->setCheckable(true);
+        action->setChecked(entry.vertical == m_typeVertical);
+        orientationGroup->addAction(action);
+        *entry.slot = action;
+        connect(action, &QAction::triggered, this, [this, vertical = entry.vertical] {
+            // The tool follows too, so text typed next goes the same way as
+            // the layer just turned.
+            m_typeVertical = vertical;
+            if (m_canvas) {
+                m_canvas->setTypeVertical(vertical);
+            }
+            const int index = m_engine ? m_engine->getActiveLayerIndex() : -1;
+            if (m_canvas && index >= 0 && m_canvas->setTypeLayerVertical(index, vertical)) {
+                refreshAll();
+            }
+            // The alignment buttons mean top/centre/bottom for vertical type,
+            // so the bar has to be rebuilt rather than merely reticked.
+            if (m_activeTool == ToolId::Type) {
+                populateOptionsBar(ToolId::Type, m_activeVariant);
+            }
+        });
+    }
+
+    typeMenu->addSeparator();
+    QAction *createWorkPath = typeMenu->addAction(tr("Create &Work Path"), this, [this] {
+        const int layer = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        if (!m_canvas || layer < 0 || m_engine->layerTextRunCount(layer) <= 0) {
+            statusBar()->showMessage(tr("Select a type layer to create a work path from."),
+                                     4000);
+            return;
+        }
+        const QPainterPath outline = m_canvas->typeLayerOutline(layer);
+        if (buildPathFromOutline(m_engine, outline, tr("Work Path")) < 0) {
+            statusBar()->showMessage(tr("That type layer has no outlines to trace."), 4000);
+            return;
+        }
+        // The text stays as it is — Photoshop traces the letters, it does not
+        // consume them. The Paths panel is where the result shows up, so it
+        // comes forward rather than leaving the work looking like a no-op.
+        if (m_pathsDock) {
+            m_pathsDock->show();
+            m_pathsDock->raise();
+        }
+        m_canvas->update();
+    });
+    createWorkPath->setStatusTip(tr("Trace the selected type layer's letters as a path"));
+
+    QAction *convertToShape = typeMenu->addAction(tr("Convert to S&hape"), this, [this] {
+        const int layer = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        if (!m_canvas || layer < 0 || m_engine->layerTextRunCount(layer) <= 0) {
+            statusBar()->showMessage(tr("Select a type layer to convert to a shape."), 4000);
+            return;
+        }
+        // Photoshop leaves the outline behind as a path of its own, named
+        // after the layer, as well as making the shape.
+        const QString name = m_engine->layerName(layer);
+        const QPainterPath outline = m_canvas->typeLayerOutline(layer);
+        if (buildPathFromOutline(m_engine, outline, tr("%1 Shape Path").arg(name)) < 0
+            || !m_engine->convertTypeLayerToShape()) {
+            statusBar()->showMessage(tr("That type layer has no outlines to convert."), 4000);
+            return;
+        }
+        refreshAll();
+    });
+    convertToShape->setStatusTip(
+        tr("Replace the selected type layer with a shape cut to its letters"));
+
+    QAction *warpText = typeMenu->addAction(tr("&Warp Text..."), this, [this] {
+        const int layer = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        if (!m_canvas || layer < 0 || m_engine->layerTextRunCount(layer) <= 0) {
+            statusBar()->showMessage(tr("Select a type layer to warp."), 4000);
+            return;
+        }
+        // What it was, so Cancel can put it back — the preview writes to the
+        // layer as the sliders move, the way CS6's does.
+        const TypeWarp before = m_canvas->layerWarp(layer);
+        auto apply = [this, layer](const TypeWarp &warp) {
+            m_engine->setLayerTextWarp(layer, warp.style(), warp.horizontal(),
+                                       float(warp.bend()),
+                                       float(warp.horizontalDistortion()),
+                                       float(warp.verticalDistortion()));
+            // Bending changes the shape of the letters, so the layer has to be
+            // laid out again rather than merely redrawn.
+            m_canvas->reflowTypeLayer(layer);
+            refreshAll();
+        };
+
+        WarpTextDialog dialog(before, this);
+        connect(&dialog, &WarpTextDialog::warpChanged, this, apply);
+        if (dialog.exec() == QDialog::Accepted) {
+            apply(dialog.warp());
+        } else {
+            apply(before);
+        }
+    });
+    warpText->setStatusTip(tr("Bend the selected type layer's letters"));
+
+    QAction *rasterizeType = typeMenu->addAction(tr("&Rasterize Type Layer"), this, [this] {
+        // An open edit owns the layer's pixels — the canvas holds them back
+        // while showing its live overlay — so finish it before the record
+        // goes, or what gets kept is the text as it was before this edit.
+        if (m_canvas && m_canvas->isTyping()) {
+            m_canvas->commitTypeEdit();
+        }
+        if (!m_engine || !m_engine->rasterizeTypeLayer()) {
+            statusBar()->showMessage(tr("Select a type layer to rasterize."), 4000);
+            return;
+        }
+        refreshAll();
+    });
+    rasterizeType->setStatusTip(
+        tr("Turn the selected type layer into ordinary pixels"));
+
     // -- Select -------------------------------------------------------------
     QMenu *select = menuBar()->addMenu(tr("&Select"));
     select->addAction(command(QStringLiteral("select.all"), tr("&All"), [this] {
@@ -1518,22 +1990,106 @@ void MainWindow::createMenus()
         m_canvas->update();
     }));
     select->addSeparator();
-    select->addAction(command(QStringLiteral("select.feather"), tr("&Feather..."), [this] {
-        bool ok = false;
-        const int radius = QInputDialog::getInt(this, tr("Feather Selection"),
-                                                tr("Feather Radius (pixels):"), 5, 0, 250,
-                                                1, &ok);
-        if (ok) {
-            m_engine->featherSelection(radius);
-            m_canvas->update();
+    QAction *findLayers = select->addAction(tr("Find &Layers"), this, [this] {
+        if (!m_layersPanel) {
+            return;
         }
-    }));
+        // The panel is where the search lives, so bring it forward rather
+        // than putting the cursor in a field nobody can see.
+        if (QDockWidget *dock =
+                findChild<QDockWidget *>(tr("Layers") + QStringLiteral("Dock"))) {
+            dock->show();
+            dock->raise();
+        }
+        m_layersPanel->beginFindLayers();
+    });
+    findLayers->setStatusTip(tr("Search the layer list by name or by the words in it"));
+
+    QAction *colorRange = select->addAction(tr("Color &Range..."), this, [this] {
+        if (!m_engine) {
+            return;
+        }
+        if (m_colorRangeDialog) {
+            m_colorRangeDialog->raise();
+            m_colorRangeDialog->activateWindow();
+            return;
+        }
+        // Non-modal, so its eyedropper can reach the canvas: Qt delivers no
+        // mouse events to a window a modal dialog has blocked. The canvas
+        // samples for the dialog's lifetime, which also keeps the active tool
+        // from painting while the user is picking colours off the image.
+        auto *dlg = new ColorRangeDialog(m_engine, this);
+        m_colorRangeDialog = dlg;
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        if (m_canvas) {
+            m_canvas->setColorSampling(true);
+            connect(m_canvas, &CanvasView::colorSampled, dlg, &ColorRangeDialog::takeSample);
+        }
+        connect(dlg, &QDialog::finished, this, [this, dlg](int result) {
+            if (m_canvas) {
+                m_canvas->setColorSampling(false);
+            }
+            if (result == QDialog::Accepted) {
+                m_engine->selectColorRange(dlg->range(), dlg->sampledColor(), dlg->fuzziness(),
+                                           dlg->inverted(), int(SelectionMode::New));
+            }
+            m_colorRangeDialog = nullptr;
+            refreshAll();
+        });
+        dlg->show();
+    });
+    colorRange->setStatusTip(tr("Select everything in the image within a range of colours"));
+
 
     // -- Filter -------------------------------------------------------------
     QMenu *filter = menuBar()->addMenu(tr("Fi&lter"));
+
+    // CS6 puts the last filter run at the top of this menu, named after it and
+    // on Ctrl+F, so that a filter can be repeated on another layer without
+    // walking back down the submenus. It reads "Last Filter" and is greyed out
+    // until something has been run.
+    m_lastFilterAction = command(QStringLiteral("filter.last"), tr("Last Filter"),
+                                 [this] { repeatLastFilter(false); });
+    filter->addAction(m_lastFilterAction);
+    // Its companion, which reopens the dialog on the settings it was last
+    // given rather than running straight off.
+    filter->addAction(command(QStringLiteral("filter.lastDialog"), tr("Last Filter Se&ttings..."),
+                              [this] { repeatLastFilter(true); }));
+    refreshLastFilterAction();
+    filter->addSeparator();
+
+    // CS6's Blur submenu, in its order. The three that are not here — Lens,
+    // Shape and Smart Blur — are listed and disabled rather than left out:
+    // Lens Blur needs a depth map to throw out of focus, Shape Blur needs the
+    // preset shape library to build its kernel from, and Smart Blur needs an
+    // edge-detection pass this has no equivalent of.
     QMenu *blur = filter->addMenu(tr("&Blur"));
+    blur->addAction(command(QStringLiteral("filter.average"), tr("&Average"),
+                            [this] { applyFilter(QStringLiteral("Average")); }));
+    blur->addAction(command(QStringLiteral("filter.blur"), tr("&Blur"),
+                            [this] { applyFilter(QStringLiteral("Blur")); }));
+    blur->addAction(command(QStringLiteral("filter.blurMore"), tr("Blur &More"),
+                            [this] { applyFilter(QStringLiteral("Blur More")); }));
+    blur->addAction(command(QStringLiteral("filter.boxBlur"), tr("Bo&x Blur..."),
+                            [this] { applyFilter(QStringLiteral("Box Blur")); }));
     blur->addAction(command(QStringLiteral("filter.gaussianBlur"), tr("&Gaussian Blur..."),
                             [this] { applyFilter(QStringLiteral("Gaussian Blur")); }));
+    QAction *lensBlur = blur->addAction(tr("&Lens Blur..."));
+    lensBlur->setEnabled(false);
+    lensBlur->setStatusTip(tr("Lens Blur needs a depth map, which is not implemented"));
+    blur->addAction(command(QStringLiteral("filter.motionBlur"), tr("Mo&tion Blur..."),
+                            [this] { applyFilter(QStringLiteral("Motion Blur")); }));
+    blur->addAction(command(QStringLiteral("filter.radialBlur"), tr("&Radial Blur..."),
+                            [this] { applyFilter(QStringLiteral("Radial Blur")); }));
+    QAction *shapeBlur = blur->addAction(tr("S&hape Blur..."));
+    shapeBlur->setEnabled(false);
+    shapeBlur->setStatusTip(tr("Shape Blur needs the preset shape library, which is not "
+                               "implemented"));
+    QAction *smartBlur = blur->addAction(tr("&Smart Blur..."));
+    smartBlur->setEnabled(false);
+    smartBlur->setStatusTip(tr("Smart Blur needs edge detection, which is not implemented"));
+    blur->addAction(command(QStringLiteral("filter.surfaceBlur"), tr("S&urface Blur..."),
+                            [this] { applyFilter(QStringLiteral("Surface Blur")); }));
     QMenu *sharpen = filter->addMenu(tr("&Sharpen"));
     sharpen->addAction(command(QStringLiteral("filter.sharpen"), tr("&Sharpen"),
                                [this] { applyFilter(QStringLiteral("Sharpen")); }));
@@ -1694,7 +2250,6 @@ void MainWindow::showSelectionContextMenu(const QPoint &globalPos)
     const Entry entries[] = {
         {"select.deselect", "Deselect", true},
         {"select.inverse", "Select Inverse", true},
-        {"select.feather", "Feather...", true},
         {"select.refineEdge", "Refine Edge...", false},
         {nullptr, nullptr, false},
         {nullptr, "Save Selection...", false},
@@ -1760,6 +2315,7 @@ void MainWindow::createToolPanel()
                              | QDockWidget::DockWidgetClosable);
 
     auto *header = new PanelHeader(m_toolsDock);
+    header->setCollapseTooltips(tr("Collapse to one column"), tr("Expand to two columns"));
     m_toolsDock->setTitleBarWidget(header);
     m_toolsDock->setWidget(m_toolStrip);
     addDockWidget(Qt::LeftDockWidgetArea, m_toolsDock);
@@ -1775,6 +2331,29 @@ void MainWindow::createToolPanel()
                 resizeDocks({m_toolsDock}, {m_toolStrip->sizeHint().width()},
                             Qt::Horizontal);
             });
+}
+
+void MainWindow::syncAntialiasMenu()
+{
+    if (!m_antialiasGroup) {
+        return;
+    }
+    const QList<QAction *> entries = m_antialiasGroup->actions();
+    for (QAction *entry : entries) {
+        QSignalBlocker blocker(entry);
+        entry->setChecked(entry->text() == m_typeAntialiasMode);
+    }
+}
+
+void MainWindow::syncOrientationMenu()
+{
+    if (!m_horizontalAction || !m_verticalAction) {
+        return;
+    }
+    QSignalBlocker horizontal(m_horizontalAction);
+    QSignalBlocker vertical(m_verticalAction);
+    m_horizontalAction->setChecked(!m_typeVertical);
+    m_verticalAction->setChecked(m_typeVertical);
 }
 
 void MainWindow::createOptionsBar()
@@ -3381,17 +3960,26 @@ void MainWindow::addTypeOptions()
 
     m_optionsBar->addSeparator();
 
-    // Anti-aliasing method. CS6 offers five; only None turns Qt's own text
-    // antialiasing off — the other four are all a *way* of smoothing, which
-    // Qt's rasterizer does not expose a choice between.
+    // Anti-aliasing method, from the same list as Type ▸ Anti-Alias — only
+    // "None" changes what is rendered, for the reason given there.
     auto *aa = new QComboBox(m_optionsBar);
-    aa->addItems({tr("None"), tr("Sharp"), tr("Crisp"), tr("Strong"), tr("Smooth")});
-    aa->setCurrentText(m_typeAntialias ? tr("Sharp") : tr("None"));
-    aa->setFixedWidth(90);
+    for (const QString &method : TypeDefaults::antialiasMethods()) {
+        if (method.isEmpty()) {
+            aa->insertSeparator(aa->count());
+        } else {
+            aa->addItem(method);
+        }
+    }
+    aa->setCurrentText(m_typeAntialiasMode);
+    aa->setFixedWidth(110);
     aa->setToolTip(tr("Set the anti-aliasing method"));
     m_optionsBar->addWidget(aa);
     connect(aa, &QComboBox::currentTextChanged, this, [this](const QString &text) {
-        m_typeAntialias = text != tr("None");
+        if (text.isEmpty()) {
+            return;
+        }
+        m_typeAntialiasMode = text;
+        syncAntialiasMenu();
         pushTypeOptions();
     });
 
@@ -3503,6 +4091,29 @@ void MainWindow::addTypeOptions()
     connect(commit, &QToolButton::clicked, this, [this] { m_canvas->commitTypeEdit(); });
 
     pushTypeOptions();
+
+    // The Character and Paragraph panels show the same state as this bar,
+    // whether it just got rebuilt for the Type tool or `adoptTypeStyle`
+    // reopened a layer.
+    if (m_characterPanel) {
+        m_characterPanel->setValues(m_typeFont, m_typeStyle, m_typeColor, m_typeAntialiasMode,
+                                    m_typeHScale, m_typeVScale);
+    }
+    if (m_paragraphPanel) {
+        m_paragraphPanel->setValues(m_typeAlignment, m_typeVertical);
+        // Indents and spacing belong to the layer rather than to the bar, so
+        // they are read straight off it — there is nothing here holding them.
+        const int layer = m_engine ? m_engine->getActiveLayerIndex() : -1;
+        if (layer >= 0 && m_engine->layerTextRunCount(layer) > 0) {
+            const rust::Vec<float> p = m_engine->layerTextParagraph(layer);
+            if (p.size() == 5) {
+                m_paragraphPanel->setParagraph(p[0], p[1], p[2], p[3], p[4]);
+            }
+        }
+    }
+    if (m_glyphsPanel) {
+        m_glyphsPanel->setTypeFont(m_typeFont, m_typeStyle);
+    }
 }
 
 void MainWindow::pushTypeOptions()
@@ -3514,7 +4125,8 @@ void MainWindow::pushTypeOptions()
                                          int(m_typeFont.pointSizeF()));
     resolved.setPointSizeF(m_typeFont.pointSizeF());
     m_canvas->setTypeOptions(resolved, m_typeStyle, m_typeColor, m_typeAlignment,
-                             m_typeAntialias);
+                             TypeDefaults::antialiasOn(m_typeAntialiasMode), m_typeHScale,
+                             m_typeVScale);
 
     // With a type layer selected and no edit in progress, the bar restyles
     // that layer — Photoshop does not make you click into the text and select
@@ -3539,13 +4151,21 @@ static Qt::Alignment typeAlignmentFor(int code)
     }
 }
 
-void MainWindow::syncTypeBarToActiveLayer()
+void MainWindow::syncTypeBarToActiveLayer(bool force)
 {
-    if (!m_engine || !m_canvas || m_canvas->isTyping() || m_activeTool != ToolId::Type) {
+    // Any tool, not just the Type tool. The options bar is only on screen
+    // under that one, but the Character and Paragraph panels are always up
+    // and restyle the selected layer whatever is in hand — so leaving the bar
+    // unsynced here meant changing one field on a layer selected under, say,
+    // the Move tool stamped the bar's untouched defaults over the rest of it,
+    // shrinking 40pt text to 12pt for the sake of an anti-aliasing change.
+    //
+    // Still not mid-edit: an open edit owns this state and sets it itself.
+    if (!m_engine || !m_canvas || m_canvas->isTyping()) {
         return;
     }
     const int index = m_engine->getActiveLayerIndex();
-    if (index == m_typeBarLayer) {
+    if (index == m_typeBarLayer && !force) {
         return;
     }
     m_typeBarLayer = index;
@@ -3561,17 +4181,20 @@ void MainWindow::syncTypeBarToActiveLayer()
                    m_engine->layerTextRunColor(index, 0),
                    typeAlignmentFor(m_engine->layerTextAlign(index)),
                    m_engine->layerTextAntialias(index),
-                   m_engine->layerTextVertical(index));
+                   m_engine->layerTextVertical(index),
+                   m_engine->layerTextRunHScale(index, 0),
+                   m_engine->layerTextRunVScale(index, 0));
 }
 
 void MainWindow::adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
                                 const QColor &color, Qt::Alignment alignment, bool antialias,
-                                bool vertical)
+                                bool vertical, qreal hScale, qreal vScale)
 {
     // Orientation belongs to the text: reopening vertical type edits it
     // vertically whichever Type tool was in hand, so the bar's alignment
     // buttons have to describe the axis actually being edited.
     m_typeVertical = vertical;
+    syncOrientationMenu();
     m_typeFont.setFamily(family);
     m_typeFont.setPointSizeF(pointSize);
     m_typeStyle = style;
@@ -3581,7 +4204,17 @@ void MainWindow::adoptTypeStyle(const QString &family, const QString &style, qre
     // is built.
     m_typeColorInitialized = true;
     m_typeAlignment = alignment;
-    m_typeAntialias = antialias;
+    if (!antialias) {
+        m_typeAntialiasMode = tr("None");
+    } else if (!TypeDefaults::antialiasOn(m_typeAntialiasMode)) {
+        // The record keeps a flag, not a method, so there is nothing to
+        // restore beyond "it was smoothed" — start from the default rather
+        // than leaving the menu on None while the text is antialiased.
+        m_typeAntialiasMode = TypeDefaults::defaultAntialiasMethod();
+    }
+    syncAntialiasMenu();
+    m_typeHScale = hScale;
+    m_typeVScale = vScale;
 
     // Rebuild the bar so its combos, swatch and alignment buttons show what is
     // now being edited. It ends by pushing these same values back to the
@@ -4616,7 +5249,31 @@ void MainWindow::createDocks()
         dock->setObjectName(title + QStringLiteral("Dock"));
         dock->setWidget(content);
         dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+        // Deliberately Qt's own title bar here, not `PanelHeader`: a dock that
+        // tabs with siblings (every panel below does) keeps its default title
+        // bar visible even while tabbed, stacked under the shared QTabBar —
+        // so a custom, textless one reads as a second, unlabelled header, and
+        // giving it one broke dragging a specific tab out by its label and
+        // dropping one floating panel onto another to tabify them. Only the
+        // Tools dock, which never tabs with anything, uses `PanelHeader`.
         addDockWidget(area, dock);
+
+        // The chevron on that title bar comes from `DockTitleStyle`; what it
+        // does depends on which side of the toggle the panel is on, so the
+        // tooltip has to follow the panel rather than be set once.
+        if (auto *floatButton = dock->findChild<QAbstractButton *>(
+                QStringLiteral("qt_dockwidget_floatbutton"))) {
+            auto describe = [this, floatButton](bool floating) {
+                floatButton->setToolTip(floating ? tr("Dock panel back")
+                                                 : tr("Float panel in its own window"));
+            };
+            describe(dock->isFloating());
+            connect(dock, &QDockWidget::topLevelChanged, floatButton, describe);
+        }
+        if (auto *closeButton = dock->findChild<QAbstractButton *>(
+                QStringLiteral("qt_dockwidget_closebutton"))) {
+            closeButton->setToolTip(tr("Close panel"));
+        }
 
         if (windowMenu) {
             QAction *toggle = dock->toggleViewAction();
@@ -4651,6 +5308,25 @@ void MainWindow::createDocks()
     m_propertiesDock = addPanel(tr("Properties"), m_propertiesPanel,
                                 Qt::RightDockWidgetArea);
 
+    m_characterPanel = new CharacterPanel(this);
+    m_characterDock = addPanel(tr("Character"), m_characterPanel, Qt::RightDockWidgetArea);
+
+    // CS6 tabs Character and Paragraph together, apart from Color/Swatches.
+    m_paragraphPanel = new ParagraphPanel(this);
+    m_paragraphDock = addPanel(tr("Paragraph"), m_paragraphPanel, Qt::RightDockWidgetArea);
+    tabifyDockWidget(m_characterDock, m_paragraphDock);
+
+    m_paragraphStylesPanel = new ParagraphStylesPanel(this);
+    m_paragraphStylesDock = addPanel(tr("Paragraph Styles"), m_paragraphStylesPanel,
+                                     Qt::RightDockWidgetArea);
+    tabifyDockWidget(m_paragraphDock, m_paragraphStylesDock);
+
+    m_glyphsPanel = new GlyphsPanel(this);
+    m_glyphsDock = addPanel(tr("Glyphs"), m_glyphsPanel, Qt::RightDockWidgetArea);
+    tabifyDockWidget(m_paragraphStylesDock, m_glyphsDock);
+
+    m_characterDock->raise();
+
     m_historyPanel = new HistoryPanel(m_engine, this);
     QDockWidget *historyDock = addPanel(tr("History"), m_historyPanel,
                                         Qt::RightDockWidgetArea);
@@ -4665,6 +5341,7 @@ void MainWindow::createDocks()
 
     m_pathsPanel = new PathsPanel(m_engine, this);
     QDockWidget *pathsDock = addPanel(tr("Paths"), m_pathsPanel, Qt::RightDockWidgetArea);
+    m_pathsDock = pathsDock;
 
     // Stack Color/Swatches into one tabbed group, as CS6 ships them.
     if (QDockWidget *colorDock =
@@ -5660,6 +6337,95 @@ void MainWindow::showNewGroup(bool fromSelection)
     refreshAll();
 }
 
+void MainWindow::showLockLayers()
+{
+    if (!m_engine) {
+        return;
+    }
+    const int index = m_engine->getActiveLayerIndex();
+    if (index < 0) {
+        return;
+    }
+    LockLayersDialog dialog(m_engine->layerLockTransparency(index),
+                            m_engine->layerLockPixels(index),
+                            m_engine->layerLockPosition(index), this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    // Every selected layer, as CS6's dialog does — the entry is Lock *Layers*.
+    for (int layer : selectedLayerIndices()) {
+        m_engine->setLayerLocks(layer, dialog.lockTransparency(), dialog.lockPixels(),
+                                dialog.lockPosition());
+    }
+    refreshAll();
+}
+
+bool MainWindow::selectedLayersAreLinked() const
+{
+    if (!m_engine) {
+        return false;
+    }
+    const QList<int> indices = selectedLayerIndices();
+    if (indices.isEmpty()) {
+        return false;
+    }
+    for (int index : indices) {
+        if (m_engine->layerLinkId(index) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MainWindow::toggleLinkSelectedLayers()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QVector<int> indices = selectedLayerVector();
+    const bool changed = selectedLayersAreLinked() ? m_engine->unlinkLayers(indices)
+                                                   : m_engine->linkLayers(indices);
+    if (changed) {
+        refreshAll();
+    }
+}
+
+void MainWindow::selectLinkedLayers()
+{
+    if (!m_engine || !m_layersPanel) {
+        return;
+    }
+    const qint64 link = m_engine->layerLinkId(m_engine->getActiveLayerIndex());
+    if (link == 0) {
+        return;
+    }
+    QList<int> linked;
+    for (int index = 0; index < m_engine->getLayerCount(); ++index) {
+        if (m_engine->layerLinkId(index) == link) {
+            linked << index;
+        }
+    }
+    m_layersPanel->selectLayers(linked);
+}
+
+void MainWindow::arrangeActiveLayer(int op)
+{
+    if (m_engine && m_engine->arrangeLayer(m_engine->getActiveLayerIndex(), op)) {
+        refreshAll();
+    }
+}
+
+void MainWindow::reverseSelectedLayers()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QVector<int> indices = selectedLayerVector();
+    if (indices.size() >= 2 && m_engine->reverseLayers(indices)) {
+        refreshAll();
+    }
+}
+
 void MainWindow::groupSelectedLayers()
 {
     if (!m_engine) {
@@ -5962,30 +6728,126 @@ void MainWindow::applyAdjustment(const QString &name)
 
 void MainWindow::applyFilter(const QString &name)
 {
-    float p1 = 0.0f;
-    float p2 = 0.0f;
-    bool ok = true;
+    applyFilterWith(name, {}, false);
+}
 
-    if (name == QLatin1String("Gaussian Blur")) {
-        p1 = float(QInputDialog::getDouble(this, name, tr("Radius (pixels):"), 2.0, 0.1,
-                                           250.0, 1, &ok));
-    } else if (name == QLatin1String("Unsharp Mask")) {
-        p1 = float(QInputDialog::getDouble(this, name, tr("Amount:"), 1.0, 0.0, 5.0, 2,
-                                           &ok));
-        if (ok) {
-            p2 = float(QInputDialog::getDouble(this, name, tr("Radius (pixels):"), 1.0,
-                                               0.1, 250.0, 1, &ok));
-        }
-    } else if (name == QLatin1String("Add Noise")) {
-        p1 = float(QInputDialog::getDouble(this, name, tr("Amount (0-1):"), 0.1, 0.0, 1.0,
-                                           2, &ok));
-    }
-
-    if (!ok) {
+void MainWindow::applyFilterWith(const QString &name, const QList<float> &presets, bool skipDialog)
+{
+    if (!m_engine) {
         return;
     }
-    m_engine->applyFilter(name, p1, p2);
+    // Ask before opening anything. A locked layer or a type layer would have
+    // swallowed the filter silently at the end, after the user had dialled in
+    // settings that were never going to be used.
+    if (!m_engine->canFilterActiveLayer()) {
+        QMessageBox::warning(this, name,
+                             tr("Could not apply the filter because the active layer is not a "
+                                "normal pixel layer, or its pixels are locked."));
+        return;
+    }
+
+    QList<float> params = presets;
+
+    // Every filter that takes a number gets the shared dialog: a slider per
+    // parameter, and — for all but Radial Blur, which CS6 gives a Blur Center
+    // box instead — a thumbnail with its own zoom and a Preview checkbox that
+    // shows the result on the canvas. Only the parameterless ones — Average,
+    // Blur, Blur More, Sharpen — go straight through.
+    const bool takesParameters =
+        name == QLatin1String("Gaussian Blur") || name == QLatin1String("Box Blur")
+        || name == QLatin1String("Motion Blur") || name == QLatin1String("Radial Blur")
+        || name == QLatin1String("Surface Blur") || name == QLatin1String("Unsharp Mask")
+        || name == QLatin1String("Add Noise");
+    if (takesParameters && !skipDialog) {
+        // Whatever the dialog was last given, or its own default.
+        auto preset = [&presets](int slot, float fallback) {
+            return double(presets.value(slot, fallback));
+        };
+
+        FilterPreviewDialog dialog(m_engine, name, this);
+        if (name == QLatin1String("Gaussian Blur")) {
+            dialog.addParameter(tr("Radius:"), 0.1, 250.0, preset(0, 2.0f), 1, tr(" Pixels"));
+        } else if (name == QLatin1String("Box Blur")) {
+            dialog.addParameter(tr("Radius:"), 1, 250, preset(0, 10.0f), 0, tr(" Pixels"));
+        } else if (name == QLatin1String("Motion Blur")) {
+            dialog.addParameter(tr("Angle:"), -360, 360, preset(0, 0.0f), 0,
+                                QStringLiteral("°"));
+            dialog.addParameter(tr("Distance:"), 1, 999, preset(1, 20.0f), 0, tr(" Pixels"));
+        } else if (name == QLatin1String("Radial Blur")) {
+            // CS6's Radial Blur, which is laid out unlike the others: Amount,
+            // then Blur Method and Quality as boxes of radio buttons, and the
+            // Blur Center box beside them. It has no preview thumbnail — the
+            // Blur Center box stands in for one — so this dialog drops it too.
+            dialog.setPreviewPaneVisible(false);
+            dialog.addParameter(tr("Amount:"), 1, 100, preset(0, 10.0f), 0);
+            // Spin is a flag to the engine and a word to the user; the dialog
+            // is where the two meet.
+            const int method =
+                dialog.addRadioChoice(tr("Blur Method:"), {tr("Spin"), tr("Zoom")}, {1.0, 0.0},
+                                      preset(1, 1.0f) != 0.0 ? 0 : 1);
+            dialog.addCenterPicker(tr("Blur Center"), [&dialog, method] {
+                return dialog.parameterValue(method) != 0.0f;
+            });
+            dialog.addRadioChoice(tr("Quality:"), {tr("Draft"), tr("Good"), tr("Best")},
+                                  {0.0, 1.0, 2.0}, int(preset(4, 1.0f)));
+        } else if (name == QLatin1String("Surface Blur")) {
+            dialog.addParameter(tr("Radius:"), 1, 100, preset(0, 5.0f), 0, tr(" Pixels"));
+            dialog.addParameter(tr("Threshold:"), 2, 255, preset(1, 15.0f), 0, tr(" Levels"));
+        } else if (name == QLatin1String("Unsharp Mask")) {
+            dialog.addParameter(tr("Amount:"), 0.0, 5.0, preset(0, 1.0f), 2);
+            dialog.addParameter(tr("Radius:"), 0.1, 250.0, preset(1, 1.0f), 1, tr(" Pixels"));
+        } else {
+            dialog.addParameter(tr("Amount:"), 0.0, 1.0, preset(0, 0.1f), 2);
+        }
+
+        // Open looking at the middle of what the canvas is showing, and mark
+        // that region on the canvas while the dialog is up.
+        if (m_canvas) {
+            dialog.setPreviewCenter(m_canvas->widgetToDocument(QPointF(m_canvas->width() / 2.0,
+                                                                      m_canvas->height() / 2.0)));
+            connect(&dialog, &FilterPreviewDialog::previewRegionChanged, m_canvas,
+                    &CanvasView::setFilterPreviewRect);
+        }
+
+        const int result = dialog.exec();
+        // The dialog's destructor takes the preview back off the layer; the
+        // canvas has to be told the square has gone with it.
+        if (m_canvas) {
+            m_canvas->setFilterPreviewRect(QRectF());
+        }
+        if (result != QDialog::Accepted) {
+            refreshAll();
+            return;
+        }
+        params = dialog.parameters();
+    }
+
+    m_engine->applyFilter(name,
+                          rust::Slice<const float>(params.constData(), size_t(params.size())));
+    m_lastFilterName = name;
+    m_lastFilterParams = params;
+    refreshLastFilterAction();
     refreshAll();
+}
+
+void MainWindow::repeatLastFilter(bool askAgain)
+{
+    if (m_lastFilterName.isEmpty()) {
+        return;
+    }
+    // Alt+Ctrl+F reopens the dialog on the settings it was last given;
+    // Ctrl+F runs straight off with them, which is the point of it.
+    applyFilterWith(m_lastFilterName, m_lastFilterParams, !askAgain);
+}
+
+void MainWindow::refreshLastFilterAction()
+{
+    if (!m_lastFilterAction) {
+        return;
+    }
+    const bool has = !m_lastFilterName.isEmpty();
+    m_lastFilterAction->setEnabled(has);
+    m_lastFilterAction->setText(has ? m_lastFilterName : tr("Last Filter"));
 }
 
 void MainWindow::zoomIn()
@@ -6430,6 +7292,127 @@ void MainWindow::closeEvent(QCloseEvent *event)
     } else {
         event->ignore();
     }
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::KeyPress
+        && forwardViewShortcut(watched, static_cast<QKeyEvent *>(event))) {
+        return true;
+    }
+
+    if (event->type() == QEvent::ContextMenu) {
+        if (auto *tabBar = qobject_cast<QTabBar *>(watched); tabBar && isAncestorOf(tabBar)) {
+            auto *contextEvent = static_cast<QContextMenuEvent *>(event);
+            const int index = tabBar->tabAt(contextEvent->pos());
+            // Every dock built by `addPanel` is named after its title plus
+            // "Dock", and Qt titles a tabbed dock's tab from that same
+            // title, so the clicked tab's text finds its way straight back
+            // to the QDockWidget it should float. The document tab bar uses
+            // this same QTabBar class but its labels never match a dock
+            // name, so it falls through untouched.
+            if (index >= 0) {
+                const QString title = tabBar->tabText(index);
+                if (QDockWidget *dock =
+                        findChild<QDockWidget *>(title + QStringLiteral("Dock"))) {
+                    QMenu menu(tabBar);
+                    QAction *floatAction = menu.addAction(tr("Float Panel"));
+                    connect(floatAction, &QAction::triggered, dock,
+                            [this, dock] { floatPanel(dock); });
+                    // A tabbed panel has no close button of its own — Qt
+                    // shows the tab bar in place of every title bar in the
+                    // group — so this is the only way to shut one but the
+                    // Window menu.
+                    QAction *closeAction = menu.addAction(tr("Close Panel"));
+                    connect(closeAction, &QAction::triggered, dock, &QWidget::close);
+                    menu.exec(contextEvent->globalPos());
+                    return true;
+                }
+            }
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+bool MainWindow::forwardViewShortcut(QObject *watched, QKeyEvent *event)
+{
+    if (!m_registry) {
+        return false;
+    }
+    // Only from inside one of our own dialogs. A modal dialog takes the whole
+    // keyboard, so a shortcut on the window behind it never fires — which is
+    // why zooming the canvas while a filter dialog is open does nothing until
+    // something forwards it, as Photoshop's dialogs do.
+    auto *widget = qobject_cast<QWidget *>(watched);
+    if (!widget) {
+        return false;
+    }
+    // Any dialog: this application has one document window, so every dialog
+    // on screen belongs to it. `isAncestorOf` is no help here — it stops at a
+    // window boundary, and a dialog is its own window.
+    if (!qobject_cast<QDialog *>(widget->window())) {
+        return false;
+    }
+
+    // The view commands only. Anything that edits the document would be a
+    // trap: the dialog is showing a preview of a change that has not been
+    // committed, and an undo or a paste underneath it would be applied to
+    // something the user cannot see.
+    static const QStringList kPassThrough{
+        QStringLiteral("view.zoomIn"), QStringLiteral("view.zoomOut"),
+        QStringLiteral("view.fitOnScreen"), QStringLiteral("view.actualPixels")};
+
+    const QKeySequence pressed(event->keyCombination());
+    for (const QString &id : kPassThrough) {
+        QAction *action = m_registry->action(id);
+        if (!action || !action->isEnabled()) {
+            continue;
+        }
+        // Every binding, not just the canonical one: Ctrl++ arrives as
+        // Ctrl+Shift+= on a US layout, which is exactly why the keymap
+        // carries aliases.
+        for (const QKeySequence &sequence : action->shortcuts()) {
+            if (!sequence.isEmpty() && sequence == pressed) {
+                action->trigger();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void MainWindow::floatPanel(QDockWidget *dock)
+{
+    if (!dock) {
+        return;
+    }
+
+    // A tabbed panel is only as tall as its share of the column, and the
+    // Swatches placeholder is barely taller than its own label, so floating
+    // one at its docked size can leave a window too small to notice.
+    const QSize size = dock->size().expandedTo(QSize(260, 300));
+
+    dock->setFloating(true);
+    dock->resize(size);
+
+    // Qt floats a dock at the geometry it had while docked, which drops it
+    // straight back on top of the column it came from. Put it over the canvas
+    // instead, cascading so a second float does not hide the first.
+    if (m_canvas) {
+        int cascade = 0;
+        for (const QDockWidget *other : findChildren<QDockWidget *>()) {
+            if (other != dock && other->isFloating() && other->isVisible()) {
+                ++cascade;
+            }
+        }
+        const QPoint centre = m_canvas->mapToGlobal(m_canvas->rect().center());
+        dock->move(centre - QPoint(size.width() / 2, size.height() / 2)
+                   + QPoint(cascade * 24, cascade * 24));
+    }
+
+    dock->show();
+    dock->raise();
+    dock->activateWindow();
 }
 
 // ------------------------------------------------- Transform Options Bar --

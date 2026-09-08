@@ -5,12 +5,13 @@
 # bridge (CLAUDE.md §2).
 
 set(SHELL_SOURCES
-    src/main.cpp
     src/MainWindow.cpp
     src/MainWindow.h
 
     src/canvas/CanvasView.cpp
     src/canvas/CanvasView.h
+    src/canvas/TypeWarp.cpp
+    src/canvas/TypeWarp.h
 
     src/dialogs/AngleDial.h
     src/dialogs/CanvasSizeDialog.cpp
@@ -19,6 +20,10 @@ set(SHELL_SOURCES
     src/dialogs/ChannelMixerDialog.h
     src/dialogs/ColorBalanceDialog.cpp
     src/dialogs/ColorBalanceDialog.h
+    src/dialogs/ColorRangeDialog.cpp
+    src/dialogs/ColorRangeDialog.h
+    src/dialogs/FilterPreviewDialog.cpp
+    src/dialogs/FilterPreviewDialog.h
     src/dialogs/ColorPickerDialog.cpp
     src/dialogs/ColorPickerDialog.h
     src/dialogs/ColorSettingsDialog.cpp
@@ -57,6 +62,8 @@ set(SHELL_SOURCES
     src/dialogs/ImageSizeDialog.h
     src/dialogs/IndexedColorDialog.cpp
     src/dialogs/IndexedColorDialog.h
+    src/dialogs/ParagraphStyleDialog.cpp
+    src/dialogs/ParagraphStyleDialog.h
     src/dialogs/PhotoFilterDialog.cpp
     src/dialogs/PhotoFilterDialog.h
     src/dialogs/PosterizeDialog.cpp
@@ -67,6 +74,8 @@ set(SHELL_SOURCES
     src/dialogs/LayerStyleDialog.h
     src/dialogs/LevelsDialog.cpp
     src/dialogs/LevelsDialog.h
+    src/dialogs/LockLayersDialog.cpp
+    src/dialogs/LockLayersDialog.h
     src/dialogs/KeyboardShortcutsDialog.cpp
     src/dialogs/KeyboardShortcutsDialog.h
     src/dialogs/NewDocumentDialog.cpp
@@ -93,13 +102,21 @@ set(SHELL_SOURCES
     src/dialogs/TrimDialog.h
     src/dialogs/VibranceDialog.cpp
     src/dialogs/VibranceDialog.h
+    src/dialogs/WarpTextDialog.cpp
+    src/dialogs/WarpTextDialog.h
 
     src/panels/BrushPresetPicker.cpp
     src/panels/BrushPresetPicker.h
     src/panels/ChannelsPanel.cpp
     src/panels/ChannelsPanel.h
+    src/panels/CharacterPanel.cpp
+    src/panels/CharacterPanel.h
     src/panels/ColorPanel.cpp
     src/panels/ColorPanel.h
+    src/panels/DockTitleStyle.cpp
+    src/panels/DockTitleStyle.h
+    src/panels/GlyphsPanel.cpp
+    src/panels/GlyphsPanel.h
     src/panels/HistoryPanel.cpp
     src/panels/HistoryPanel.h
     src/panels/InfoPanel.cpp
@@ -110,6 +127,10 @@ set(SHELL_SOURCES
     src/panels/LayersPanel.h
     src/panels/PathIcons.cpp
     src/panels/PathIcons.h
+    src/panels/ParagraphPanel.cpp
+    src/panels/ParagraphPanel.h
+    src/panels/ParagraphStylesPanel.cpp
+    src/panels/ParagraphStylesPanel.h
     src/panels/PathsPanel.cpp
     src/panels/PathsPanel.h
     src/panels/PropertiesPanel.cpp
@@ -127,13 +148,16 @@ set(SHELL_SOURCES
     src/tools/ToolStrip.h
 )
 
-add_executable(photorust ${SHELL_SOURCES})
+# Everything but `main` goes into a library, so the shell's own tests can link
+# the same widgets the application runs rather than a copy compiled with
+# different flags. The executable is then just the entry point.
+add_library(photorust_shell STATIC ${SHELL_SOURCES})
 
-target_include_directories(photorust PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(photorust_shell PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Link order matters: `photorust_core` carries the CXX-Qt generated headers and
 # the initializer objects as usage requirements.
-target_link_libraries(photorust PRIVATE
+target_link_libraries(photorust_shell PUBLIC
     photorust_core
     Qt::Core
     Qt::Gui
@@ -143,14 +167,25 @@ target_link_libraries(photorust PRIVATE
 )
 
 # Lets main.cpp fall back to the in-tree resources when running straight from
-# the build directory, before anything has been installed.
-target_compile_definitions(photorust PRIVATE
+# the build directory, before anything has been installed. PUBLIC so the tests
+# can find the theme and the keymap the same way.
+target_compile_definitions(photorust_shell PUBLIC
     PHOTORUST_SOURCE_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources"
 )
 
+target_compile_options(photorust_shell PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+)
+
+add_executable(photorust src/main.cpp)
+target_link_libraries(photorust PRIVATE photorust_shell)
 target_compile_options(photorust PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
 )
+
+if(BUILD_TESTING AND Qt6Test_FOUND)
+    add_subdirectory(tests)
+endif()
 
 # The application icon lives at the top of the repository, so it can be edited
 # in place without hunting through the source tree. It is staged and installed

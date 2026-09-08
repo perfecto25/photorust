@@ -7,6 +7,7 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QHBoxLayout>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -15,6 +16,7 @@
 #include <QIcon>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QSet>
 #include <QStyledItemDelegate>
 #include <QVBoxLayout>
 #include <QWidgetAction>
@@ -81,6 +83,11 @@ constexpr int kMaskLinkedRole = Qt::UserRole + 13;
 constexpr int kDepthRole = Qt::UserRole + 14;
 /// True on a group folder's row.
 constexpr int kGroupRole = Qt::UserRole + 15;
+/// True when the layer is linked to others, which puts a chain on its row.
+constexpr int kLinkedRole = Qt::UserRole + 18;
+/// The identity of the layer a row was built from. Survives everything that
+/// changes a row's position, which is what the selection is remembered by.
+constexpr int kLayerIdRole = Qt::UserRole + 17;
 /// Whether that folder is open. Kept apart from the tree's own expansion,
 /// which belongs to the Effects branch — a group's members are siblings in the
 /// view, hidden rather than collapsed, so that every row's position still is
@@ -96,6 +103,20 @@ constexpr int kGroupIndent = 14;
 /// The band at the top and bottom of a folder's row that still means "put it
 /// above/below this group" rather than "put it inside".
 constexpr int kDropEdge = 9;
+
+} // namespace
+
+bool dropsIntoGroupRow(const QRect &row, const QPoint &pos)
+{
+    // A row shorter than two bands has no middle to speak of; the whole of it
+    // is then an edge, and a drop goes between rows rather than into anything.
+    if (row.height() <= kDropEdge * 2) {
+        return false;
+    }
+    return pos.y() >= row.top() + kDropEdge && pos.y() <= row.bottom() - kDropEdge;
+}
+
+namespace {
 
 /// The slot before every layer row's thumbnail, where a group's disclosure
 /// triangle goes. Reserved on all of them so the thumbnails stay in one
@@ -255,6 +276,16 @@ public:
                                      3, 3);
             painter->drawPixmap(x, y, badge);
             textRight = x - 7;
+        }
+
+        // The chain, which says this layer travels with others. CS6 puts it
+        // on the right of the row, beside the `fx`.
+        if (index.data(kLinkedRole).toBool()) {
+            const QPixmap badge =
+                LayerIcons::pixmap(LayerIcons::Glyph::Link, kGlyph, kBadgeSize);
+            const int x = textRight - kBadgeSize;
+            painter->drawPixmap(x, row.top() + (row.height() - kBadgeSize) / 2, badge);
+            textRight = x - 4;
         }
 
         // The `fx` mark. It is the only thing on the row that says a layer
@@ -645,8 +676,7 @@ protected:
         if (!over || over->parent() || !over->data(0, kGroupRole).toBool()) {
             return -1;
         }
-        const QRect rect = visualItemRect(over);
-        if (pos.y() < rect.top() + kDropEdge || pos.y() > rect.bottom() - kDropEdge) {
+        if (!dropsIntoGroupRow(visualItemRect(over), pos)) {
             return -1;
         }
         // Not into itself, and not into a group already being dragged.
@@ -782,7 +812,11 @@ void LayersPanel::buildFilterRow(QWidget *parent, QBoxLayout *into)
     // for the panel's shape and disabled rather than quietly doing nothing.
     m_filterKind = new QComboBox(parent);
     m_filterKind->addItem(tr("Kind"));
-    const QStringList unimplemented = {tr("Name"), tr("Effect"), tr("Mode"), tr("Attribute"),
+    m_filterKind->addItem(tr("Name"));
+    // The remaining three need layer effects, blend-mode grouping and colour
+    // labels, so they are listed for the panel's shape and disabled rather
+    // than quietly doing nothing.
+    const QStringList unimplemented = {tr("Effect"), tr("Mode"), tr("Attribute"),
                                        tr("Color")};
     for (const QString &name : unimplemented) {
         m_filterKind->addItem(name);
@@ -792,6 +826,14 @@ void LayersPanel::buildFilterRow(QWidget *parent, QBoxLayout *into)
     }
     m_filterKind->setFixedWidth(76);
     row->addWidget(m_filterKind);
+
+    // Shown in place of the kind buttons when the combo is on Name.
+    m_filterName = new QLineEdit(parent);
+    m_filterName->setPlaceholderText(tr("Search layers"));
+    m_filterName->setClearButtonEnabled(true);
+    m_filterName->hide();
+    row->addWidget(m_filterName, 1);
+    connect(m_filterName, &QLineEdit::textChanged, this, [this] { applyFilter(); });
 
     struct Kind {
         LayerIcons::Glyph glyph;
@@ -873,6 +915,10 @@ void LayersPanel::buildLockRow(QWidget *parent, QBoxLayout *into)
         button->setIcon(LayerIcons::icon(entry.glyph, kGlyph, kButtonGlyph));
         button->setToolTip(entry.tip);
         button->setStatusTip(entry.tip);
+        // Named so the checked state can get a dark plate in theme.qss —
+        // against panelHeader's mid grey, the default Fusion checked look
+        // barely reads as "on".
+        button->setObjectName(QStringLiteral("lockRowButton"));
         row->addWidget(button);
         *entry.slot = button;
     }
@@ -1049,10 +1095,10 @@ void LayersPanel::buildUi()
         return b;
     };
 
-    // CS6's order, left to right. Linking and layer effects are not
-    // implemented; they are shown disabled so the footer keeps its shape rather
-    // than silently losing glyphs.
-    m_linkButton = makeButton(LayerIcons::Glyph::Link, tr("Link layers"), false);
+    // CS6's order, left to right. Layer effects is the one still not wired;
+    // it is shown disabled so the footer keeps its shape rather than silently
+    // losing a glyph.
+    m_linkButton = makeButton(LayerIcons::Glyph::Link, tr("Link layers"), true);
     m_effectsButton = makeButton(LayerIcons::Glyph::Effects, tr("Add a layer style"), false);
     m_maskButton = makeButton(LayerIcons::Glyph::Mask, tr("Add layer mask"), true);
     m_adjustmentButton =
@@ -1117,6 +1163,7 @@ void LayersPanel::buildUi()
     connect(m_adjustmentButton, &QToolButton::clicked,
             this, &LayersPanel::addAdjustmentLayer);
     connect(m_groupButton, &QToolButton::clicked, this, &LayersPanel::addGroup);
+    connect(m_linkButton, &QToolButton::clicked, this, &LayersPanel::toggleLinkSelected);
 }
 
 void LayersPanel::populateBlendModes()
@@ -1184,11 +1231,55 @@ QList<int> LayersPanel::selectedIndices() const
     return indices;
 }
 
+void LayersPanel::refreshFilterMode()
+{
+    const bool byName = m_filterKind->currentIndex() == 1;
+    m_filterName->setVisible(byName);
+    for (QToolButton *button : std::as_const(m_kindButtons)) {
+        button->setVisible(!byName);
+    }
+}
+
+void LayersPanel::beginFindLayers()
+{
+    // Searching with the switch off would list everything and look broken, so
+    // this turns filtering on the way choosing a kind does.
+    m_filterKind->setCurrentIndex(1);
+    if (!m_filterSwitch->isChecked()) {
+        m_filterSwitch->setChecked(true);
+        m_filterSwitch->click();
+        m_filterSwitch->setChecked(true);
+    }
+    refreshFilterMode();
+    applyFilter();
+    m_filterName->setFocus(Qt::OtherFocusReason);
+    m_filterName->selectAll();
+}
+
 bool LayersPanel::passesFilter(int index) const
 {
     if (!m_filterSwitch->isChecked()) {
         return true;
     }
+    if (m_filterKind->currentIndex() == 1) {
+        const QString needle = m_filterName->text().trimmed();
+        if (needle.isEmpty()) {
+            return true;
+        }
+        if (m_engine->layerName(index).contains(needle, Qt::CaseInsensitive)) {
+            return true;
+        }
+        // Type layers are searched by what they *say* as well as what they
+        // are called: a layer still named "Layer 3" is far easier to find by
+        // the words in it, and the words are right there in the record.
+        const int runs = m_engine->layerTextRunCount(index);
+        QString content;
+        for (int run = 0; run < runs; ++run) {
+            content += m_engine->layerTextRunText(index, run);
+        }
+        return !content.isEmpty() && content.contains(needle, Qt::CaseInsensitive);
+    }
+
     // Nothing selected filters nothing, which is how CS6 behaves with the
     // switch on and no kind chosen.
     bool anyChecked = false;
@@ -1230,7 +1321,22 @@ void LayersPanel::refresh()
     const int count = m_engine->getLayerCount();
     const int active = m_engine->getActiveLayerIndex();
 
-    const QList<int> prevSelected = selectedIndices();
+    // The selection is remembered by *which layers* were selected, not by
+    // which rows. Rows are positions, and an arrange or a drag moves layers
+    // between them — restoring row numbers there re-selects whatever moved
+    // into them, which is how one selected layer becomes three after three
+    // presses of Ctrl+].
+    //
+    // Read off the rows rather than asked of the engine: by the time the panel
+    // refreshes, the engine has already moved, so the old row numbers no
+    // longer mean anything to it. The row remembers what it was built from.
+    QSet<qint64> prevSelected;
+    for (const QTreeWidgetItem *item : m_tree->selectedItems()) {
+        if (item->data(0, kRowKindRole).toInt() == LayerRow) {
+            prevSelected.insert(item->data(0, kLayerIdRole).toLongLong());
+        }
+    }
+
     if (count != m_tree->topLevelItemCount()) {
         // The indices in `m_collapsed` no longer name the same layers.
         m_collapsed.clear();
@@ -1245,6 +1351,8 @@ void LayersPanel::refresh()
 
         item->setData(0, kRowKindRole, int(LayerRow));
         item->setData(0, kLayerRole, i);
+        item->setData(0, kLayerIdRole, qint64(m_engine->layerId(i)));
+        item->setData(0, kLinkedRole, m_engine->layerLinkId(i) != 0);
         item->setData(0, kVisibleRole, m_engine->layerVisible(i));
         item->setData(0, kBackgroundRole, name == QLatin1String("Background"));
         item->setData(0, kClippingRole, m_engine->layerIsClipping(i));
@@ -1364,11 +1472,21 @@ void LayersPanel::refresh()
 
 
     if (active >= 0 && active < count) {
-        m_tree->setCurrentItem(m_tree->topLevelItem(active));
+        QTreeWidgetItem *current = m_tree->topLevelItem(active);
+        m_tree->setCurrentItem(current);
 
-        for (int idx : prevSelected) {
-            if (idx >= 0 && idx < count) {
-                m_tree->topLevelItem(idx)->setSelected(true);
+        // Carrying the old selection over only makes sense when the active
+        // layer is part of it — that is a multi-selection the user built, and
+        // it should survive the refresh. When the engine has made some *other*
+        // layer active, it is because a new one arrived or the old one went,
+        // and Photoshop leaves only that one selected; keeping the previous
+        // rows ticked as well is how creating a layer ended up with two.
+        const bool activeWasSelected =
+            prevSelected.contains(current->data(0, kLayerIdRole).toLongLong());
+        for (int row = 0; row < count && activeWasSelected; ++row) {
+            QTreeWidgetItem *item = m_tree->topLevelItem(row);
+            if (prevSelected.contains(item->data(0, kLayerIdRole).toLongLong())) {
+                item->setSelected(true);
             }
         }
 
@@ -1739,6 +1857,61 @@ void LayersPanel::addLayer()
     m_engine->addLayer();
     emit documentChanged();
     refresh();
+}
+
+void LayersPanel::toggleLinkSelected()
+{
+    if (!m_engine) {
+        return;
+    }
+    const QList<int> selected = selectedIndices();
+    const QVector<int> indices(selected.begin(), selected.end());
+    if (indices.isEmpty()) {
+        return;
+    }
+
+    // One button for both directions, as CS6's is: a selection that is
+    // already linked unlinks, anything else links.
+    bool allLinked = indices.size() >= 2;
+    for (int index : indices) {
+        if (m_engine->layerLinkId(index) == 0) {
+            allLinked = false;
+        }
+    }
+    const bool changed = allLinked ? m_engine->unlinkLayers(indices)
+                                   : m_engine->linkLayers(indices);
+    if (changed) {
+        emit documentChanged();
+        refresh();
+    }
+}
+
+void LayersPanel::beginRenameActiveLayer()
+{
+    if (!m_engine) {
+        return;
+    }
+    if (QTreeWidgetItem *item = m_tree->topLevelItem(m_engine->getActiveLayerIndex())) {
+        m_tree->setCurrentItem(item);
+        m_tree->editItem(item, 0);
+    }
+}
+
+void LayersPanel::selectLayers(const QList<int> &indices)
+{
+    if (indices.isEmpty()) {
+        return;
+    }
+    // Guarded: selecting rows moves the active layer, and each move would
+    // otherwise rebuild the tree from under the loop.
+    m_updating = true;
+    m_tree->clearSelection();
+    for (int index : indices) {
+        if (QTreeWidgetItem *item = m_tree->topLevelItem(index)) {
+            item->setSelected(true);
+        }
+    }
+    m_updating = false;
 }
 
 void LayersPanel::addGroup()

@@ -387,8 +387,6 @@ QMenu#toolFlyout::item:disabled:selected {
 
 QDockWidget {
     color: #d4d4d4;
-    titlebar-close-icon: none;
-    titlebar-normal-icon: none;
 }
 
 QDockWidget::title {
@@ -727,6 +725,19 @@ QScrollArea#canvasScroll, QWidget#canvasSurround {
 QWidget#panelHeader {
     background-color: #4a4a4a;
     border-bottom: 1px solid #333333;
+}
+
+/* The Layers panel's Lock row toggles (transparency/image/position/all). A
+   dark plate on checked state, matching the padlock badge on a locked row,
+   so a lock reads at a glance against the header's mid grey. */
+QToolButton#lockRowButton:checked {
+    background-color: #1e1e1e;
+    border: 1px solid #0f0f0f;
+    border-radius: 2px;
+}
+
+QToolButton#lockRowButton:checked:hover {
+    background-color: #2a2a2a;
 }
 
 /* Button row at the bottom of a panel (new layer, delete, …). */

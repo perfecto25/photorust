@@ -161,8 +161,9 @@ pub struct StyleState {
 
 /// How a type layer's lines sit about its origin: left, centre or right for
 /// ordinary type, and top, centre or bottom for vertical type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextAlign {
+    #[default]
     Left,
     Center,
     Right,
@@ -187,7 +188,12 @@ pub enum TextAlign {
 /// letters in the middle of a word, set them to 72pt, and only those two change.
 /// A run carries its own text, so nothing here has to agree with anything else
 /// about how a string is indexed.
-#[derive(Clone, Debug)]
+/// `Default` is here so that adding a property to a type layer — a warp, a
+/// scale, an indent — does not break every place one is built. Callers that
+/// only care about a few fields spell those and leave `..Default::default()`
+/// to keep up. An empty `runs` is not a valid layer, so the default is a
+/// starting point rather than something to store.
+#[derive(Clone, Debug, Default)]
 pub struct TextContent {
     /// The text in order, split wherever its formatting changes. Never empty
     /// for a live type layer — text with nothing in it is not kept as a layer.
@@ -205,6 +211,59 @@ pub struct TextContent {
     /// from here per `align`, so reopening the layer resumes from the same
     /// anchor rather than having to work backwards from the pixel bounds.
     pub origin: (f32, f32),
+    /// Warp Text, if the letters have been bent.
+    pub warp: TextWarp,
+    /// The Paragraph panel's indents and spacing, in document pixels.
+    ///
+    /// Each hard return starts a paragraph, so with no line wrapping to do
+    /// every line is one — which is why `first_line_indent` shows up on all
+    /// of them rather than only at the top of the block.
+    pub indent_left: f32,
+    pub indent_right: f32,
+    pub first_line_indent: f32,
+    pub space_before: f32,
+    pub space_after: f32,
+}
+
+/// How a type layer's letters are bent — Photoshop's Warp Text.
+///
+/// A block property rather than a per-run one: the warp is defined over the
+/// whole text's bounding box, so a run cannot carry its own without the two
+/// disagreeing about what the box is.
+///
+/// The shell owns the geometry, because the letters are shaped by Qt and it
+/// is their outlines that get bent. This is only the record of what was
+/// asked for, so that reopening the dialog shows the same settings and the
+/// warp survives a restyle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextWarp {
+    /// Which of CS6's styles, as its menu order: 0 None, 1 Arc, 2 Arc Lower,
+    /// 3 Arc Upper, 4 Arch, 5 Bulge, 6 Shell Lower, 7 Shell Upper, 8 Flag,
+    /// 9 Wave, 10 Fish, 11 Rise, 12 Fisheye, 13 Inflate, 14 Squeeze,
+    /// 15 Twist. A number rather than an enum because it crosses the bridge
+    /// and is written to `.psd` as one.
+    pub style: i32,
+    /// Whether the warp runs along the text or across it — the dialog's
+    /// Horizontal/Vertical pair.
+    pub horizontal: bool,
+    /// All three are CS6 percentages as fractions: -1.0 to 1.0.
+    pub bend: f32,
+    pub h_distort: f32,
+    pub v_distort: f32,
+}
+
+impl Default for TextWarp {
+    fn default() -> Self {
+        Self { style: 0, horizontal: true, bend: 0.5, h_distort: 0.0, v_distort: 0.0 }
+    }
+}
+
+impl TextWarp {
+    /// Whether this actually bends anything. Style None is the dialog's way
+    /// of saying "no warp", whatever the sliders are left at.
+    pub fn is_active(&self) -> bool {
+        self.style != 0
+    }
 }
 
 /// A stretch of text set the same way — Photoshop's character run.
@@ -220,6 +279,16 @@ pub struct TextRun {
     /// Size in document pixels — the Type tool's point size.
     pub size: f32,
     pub color: Rgba8,
+    /// Horizontal and vertical scale, 1.0 being Photoshop's 100% — the
+    /// Character panel's Horizontal/Vertical Scale.
+    ///
+    /// A size is one number and so cannot say "half again as wide", which is
+    /// what a non-uniform Free Transform asks of a type layer. Photoshop
+    /// answers that with these, and so does this: `size` stays the vertical
+    /// measure and the stretch lands here, which keeps the record able to
+    /// describe what was actually drawn.
+    pub h_scale: f32,
+    pub v_scale: f32,
 }
 
 impl TextContent {
@@ -317,6 +386,14 @@ pub struct Layer {
     pub parent: Option<LayerId>,
     /// Whether a group is open in the panel. Meaningless on anything else.
     pub expanded: bool,
+
+    /// The set of layers this one is linked to, if any — CS6's chain.
+    ///
+    /// Linked layers move together, which is the whole of what linking does
+    /// here. The id is borrowed from the layer-id allocator so it is unique
+    /// without a second counter; which layer it originally named does not
+    /// matter, only that the set shares it.
+    pub link: Option<LayerId>,
 }
 
 impl Layer {
@@ -348,6 +425,7 @@ impl Layer {
             mask_hides_effects: true,
             parent: None,
             expanded: true,
+            link: None,
         }
     }
 
@@ -643,6 +721,51 @@ impl LayerStack {
             first -= 1;
         }
         first..group_index
+    }
+
+    /// The positions the stack offers at one level, in stack order.
+    ///
+    /// A slot is what Arrange moves past in one step: a loose layer, or a
+    /// whole group counted as one — sending a layer backward past a group has
+    /// to clear the group, not land in the middle of it. Inside a group the
+    /// slots are its members, so arranging there stays inside the folder,
+    /// which is what CS6 does.
+    ///
+    /// `inside` names the group whose members to list, or `None` for the top
+    /// level.
+    pub fn slots(&self, inside: Option<LayerId>) -> Vec<std::ops::Range<usize>> {
+        if let Some(group) = inside {
+            let Some(index) = self.index_of(group) else {
+                return Vec::new();
+            };
+            return self.group_members(index).map(|i| i..i + 1).collect();
+        }
+
+        let mut slots = Vec::new();
+        let mut i = 0;
+        while i < self.layers.len() {
+            match self.layers[i].parent {
+                Some(parent) => {
+                    // A group's members run up to their folder, which closes
+                    // the slot. A member without one — which the editing
+                    // operations do not produce — ends the run by itself.
+                    let mut end = i;
+                    while end < self.layers.len() && self.layers[end].parent == Some(parent) {
+                        end += 1;
+                    }
+                    if end < self.layers.len() && self.layers[end].id == parent {
+                        end += 1;
+                    }
+                    slots.push(i..end);
+                    i = end;
+                }
+                None => {
+                    slots.push(i..i + 1);
+                    i += 1;
+                }
+            }
+        }
+        slots
     }
 
     /// The group a layer belongs to, as a stack position.

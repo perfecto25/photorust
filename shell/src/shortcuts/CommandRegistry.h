@@ -52,6 +52,14 @@ public:
     /// The action for `id`, or nullptr if it was never registered.
     QAction *action(const QString &id) const;
 
+    /// What to call `id` in a list of commands.
+    ///
+    /// The name the keymap declared, which stays put, rather than the action's
+    /// text, which does not: the Filter menu's top entry renames itself to
+    /// whichever filter was last run, and a shortcut editor that followed it
+    /// would list "Blur More" beside the real Blur More.
+    QString commandName(const QString &id) const;
+
     /// Whether a command exists.
     bool contains(const QString &id) const;
 
@@ -96,6 +104,8 @@ private:
     bool loadKeymapFile(const QString &path, bool isDefaults);
 
     QHash<QString, QAction *> m_actions;
+    /// Names as the keymap declared them, by id. See `commandName`.
+    QHash<QString, QString> m_names;
     /// Defaults as shipped, so resetToDefaults() does not need the file again.
     /// Canonical binding first, layout aliases after.
     QHash<QString, QList<QKeySequence>> m_defaults;

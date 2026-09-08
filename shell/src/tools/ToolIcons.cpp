@@ -938,6 +938,26 @@ QString ToolIcons::textAlignSvg(Qt::Alignment align, bool vertical)
     return QStringLiteral(R"SVG(<path d="M3 5H17M3 10H12M3 15H15" stroke-width="1.6"/>)SVG");
 }
 
+QString ToolIcons::penCursorSvg(int sign)
+{
+    // The same nib the tool strip draws, turned 135° instead of -45° so it
+    // points up and left. Reusing the artwork keeps the cursor and the button
+    // recognisably the same pen.
+    QString svg = QStringLiteral(R"SVG(<g transform="rotate(135 10 10)">
+                  <path d="M10 18.4 6.6 8.6 8.5 3.2 12.6 4.1 13.2 9.4Z"/>
+                  <path d="M10.1 10V17"/>
+                  <circle cx="9.9" cy="8.2" r="1.05" fill="COLOR" stroke="none"/></g>)SVG");
+
+    // The badge sits clear of the nib, down and right of it, as CS6's does.
+    if (sign < 0) {
+        svg += QStringLiteral(R"SVG(<path d="M12.8 16.2H18.6" stroke-width="1.7"/>)SVG");
+    } else if (sign > 0) {
+        svg += QStringLiteral(
+            R"SVG(<path d="M12.8 16.2H18.6M15.7 13.3V19.1" stroke-width="1.7"/>)SVG");
+    }
+    return svg;
+}
+
 QString ToolIcons::commitSvg()
 {
     return QStringLiteral(R"SVG(<path d="M4 10.5 8.2 15 16.5 5.5" stroke-width="1.8"/>)SVG");

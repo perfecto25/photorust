@@ -462,7 +462,7 @@ fn find_type_tool(r: &mut Reader<'_>, extra_end: usize) -> Option<text::PsdText>
 /// bounds instead is right to within a pixel or two, and it is only used if the
 /// user reopens the text: until then the layer draws Photoshop's own pixels.
 fn to_text_content(psd: &text::PsdText, layer: &Layer) -> crate::layer::TextContent {
-    use crate::layer::{TextAlign, TextContent, TextRun};
+    use crate::layer::{TextAlign, TextContent, TextRun, TextWarp};
 
     let bounds = layer.bounds();
     let origin_x = match psd.align {
@@ -482,10 +482,22 @@ fn to_text_content(psd: &text::PsdText, layer: &Layer) -> crate::layer::TextCont
             style: psd.style.clone(),
             size: psd.size,
             color: psd.color,
+            // Photoshop's HorizontalScale/VerticalScale are not read back
+            // yet, so type arrives unstretched.
+            h_scale: 1.0,
+            v_scale: 1.0,
         }],
         align: psd.align,
         antialias: true,
         vertical: false,
+        // Photoshop's warp and paragraph settings are not read back yet, so
+        // type arrives unbent and unindented.
+        warp: TextWarp::default(),
+        indent_left: 0.0,
+        indent_right: 0.0,
+        first_line_indent: 0.0,
+        space_before: 0.0,
+        space_after: 0.0,
         origin: (origin_x, bounds.y as f32),
     }
 }

@@ -843,12 +843,74 @@ void CanvasView::setPenOptions(bool autoAddDelete, bool rubberBand)
     m_penRubberBand = rubberBand;
 }
 
+CanvasView::TypeParagraph CanvasView::layerParagraph(int layerIndex) const
+{
+    TypeParagraph paragraph;
+    if (!m_engine || layerIndex < 0) {
+        return paragraph;
+    }
+    const rust::Vec<float> values = m_engine->layerTextParagraph(layerIndex);
+    if (values.size() != 5) {
+        return paragraph;
+    }
+    paragraph.indentLeft = values[0];
+    paragraph.indentRight = values[1];
+    paragraph.firstLineIndent = values[2];
+    paragraph.spaceBefore = values[3];
+    paragraph.spaceAfter = values[4];
+    return paragraph;
+}
+
+TypeWarp CanvasView::layerWarp(int layerIndex) const
+{
+    if (!m_engine || layerIndex < 0) {
+        return TypeWarp();
+    }
+    const rust::Vec<float> amounts = m_engine->layerTextWarpAmounts(layerIndex);
+    if (amounts.size() != 3) {
+        return TypeWarp();
+    }
+    return TypeWarp(m_engine->layerTextWarpStyle(layerIndex),
+                    m_engine->layerTextWarpHorizontal(layerIndex), amounts[0], amounts[1],
+                    amounts[2]);
+}
+
 float CanvasView::pathHitRadius() const
 {
     // The same fixed-screen-size idea as `nearLassoStart`: reachable at any
     // zoom, rather than shrinking to nothing zoomed out or ballooning zoomed
     // in.
     return float(8.0 / std::max(m_zoom, 0.01));
+}
+
+int CanvasView::penBadgeAt(const QPointF &widgetPos) const
+{
+    if (!m_engine || m_tool != ToolId::Pen) {
+        return 0;
+    }
+    // The dedicated tools always say what they are for, whatever is under
+    // them; the plain Pen only offers to add or delete where Auto Add/Delete
+    // has made a click mean that, which is the same condition `penPress`
+    // acts on.
+    if (m_penTool == PenTool::AddAnchor) {
+        return 1;
+    }
+    if (m_penTool == PenTool::DeleteAnchor) {
+        return -1;
+    }
+    if (m_penTool != PenTool::Pen || !m_penAutoAddDelete || m_engine->pathIsEditing()) {
+        return 0;
+    }
+
+    const QPointF doc = widgetToDocument(widgetPos);
+    const float radius = pathHitRadius();
+    if (m_engine->pathHitAnchor(doc.x(), doc.y(), radius).size() == 2) {
+        return -1;
+    }
+    if (m_engine->pathHitSegment(doc.x(), doc.y(), radius).size() == 3) {
+        return 1;
+    }
+    return 0;
 }
 
 void CanvasView::penPress(const QPointF &doc)
@@ -2402,6 +2464,38 @@ namespace {
 /// The Rotate View cursor: the tool's own icon, drawn dark-behind-pale so it
 /// reads over both the image and the surround. Built once — a cursor is asked
 /// for on every pointer move.
+/// The Pen tool's cursor for what a click would do here: a plain nib, or one
+/// badged with a minus over an existing point or a plus over a segment.
+///
+/// Drawn pale over a dark copy offset by a pixel, like `rotateViewCursor`, so
+/// the nib reads against both the white of a document and the dark of the
+/// surround.
+const QCursor &penCursor(int sign)
+{
+    static const auto build = [](int badge) {
+        const int size = 24;
+        const QPixmap pale =
+            ToolIcons::pixmapFromSvgBody(ToolIcons::penCursorSvg(badge), Qt::white, size);
+        const QPixmap dark = ToolIcons::pixmapFromSvgBody(ToolIcons::penCursorSvg(badge),
+                                                          QColor(0, 0, 0, 190), size);
+        QPixmap art(pale.size());
+        art.setDevicePixelRatio(pale.devicePixelRatio());
+        art.fill(Qt::transparent);
+        QPainter painter(&art);
+        painter.drawPixmap(QPointF(1, 1), dark);
+        painter.drawPixmap(QPointF(0, 0), pale);
+        painter.end();
+
+        // The artwork's own tip, in pixels — see `ToolIcons::kPenCursorTip`.
+        const int hotspot = int(std::lround(ToolIcons::kPenCursorTip / 20.0 * size));
+        return QCursor(art, hotspot, hotspot);
+    };
+    static const QCursor minus = build(-1);
+    static const QCursor plain = build(0);
+    static const QCursor plus = build(1);
+    return sign < 0 ? minus : (sign > 0 ? plus : plain);
+}
+
 const QCursor &rotateViewCursor()
 {
     static const QCursor cursor = [] {
@@ -2487,6 +2581,20 @@ void CanvasView::updateCursor()
         break;
     case ToolId::Type:
         setCursor(Qt::IBeamCursor);
+        break;
+    // Tools that place or drag geometry rather than lay down paint. Without
+    // these they fell through to the brush circle below, which sized itself
+    // to the brush and left the Pen tool trailing a circle the width of a
+    // paintbrush across a path it was meant to be editing precisely.
+    case ToolId::Pen:
+        setCursor(penCursor(penBadgeAt(m_lastMousePos)));
+        break;
+    case ToolId::Shape:
+    case ToolId::Gradient:
+        setCursor(Qt::CrossCursor);
+        break;
+    case ToolId::PathSelect:
+        setCursor(Qt::ArrowCursor);
         break;
     default: {
         const double screenDiam = m_brushDiameter * m_zoom;
@@ -2670,6 +2778,7 @@ void CanvasView::paintEvent(QPaintEvent *event)
     paintSearchHighlight(painter);
     paintShapeOverlay(painter);
     paintZoomOverlay(painter);
+    paintFilterPreviewRect(painter);
 
     // Live marquee while the user is dragging one out. Drawn as the shape the
     // active variant will actually produce, so an elliptical drag previews an
@@ -3296,6 +3405,18 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
     if (m_colorSampling) {
         event->accept();
         return;
+    }
+
+    // The Pen tool's cursor says what a click here would do, so it has to be
+    // re-asked as the pointer crosses a point or a segment. Only on a change,
+    // since the answer is the same for most of any given move.
+    if (m_tool == ToolId::Pen && !m_dragging) {
+        const int badge = penBadgeAt(pos);
+        if (badge != m_penBadge) {
+            m_penBadge = badge;
+            m_lastMousePos = pos;
+            updateCursor();
+        }
     }
 
     if (m_panning) {
@@ -4512,7 +4633,7 @@ int CanvasView::createEmptyTypeLayer()
     // marks it with a T before a single character is typed.
     m_engine->beginTextRuns();
     m_engine->addTextRun(QString(), m_typeFont.family(), m_typeStyleName,
-                         float(m_typeFont.pointSizeF()), m_typeColor);
+                         float(m_typeFont.pointSizeF()), m_typeColor, 1.0f, 1.0f);
 
     // A pixel of nothing, since a layer with no pixels at all has no place in
     // the document. What is committed later replaces it wholesale.
@@ -4554,6 +4675,8 @@ void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
         run.style = m_engine->layerTextRunStyle(layerIndex, i);
         run.size = m_engine->layerTextRunSize(layerIndex, i);
         run.color = m_engine->layerTextRunColor(layerIndex, i);
+        run.hScale = m_engine->layerTextRunHScale(layerIndex, i);
+        run.vScale = m_engine->layerTextRunVScale(layerIndex, i);
         m_typeRuns.append(run);
         m_typeText += text;
     }
@@ -4565,6 +4688,8 @@ void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
     // Orientation belongs to the text, not to the tool in hand: clicking into
     // vertical type edits it vertically whichever of the two tools opened it.
     m_typeVertical = m_engine->layerTextVertical(layerIndex);
+    m_typeWarp = layerWarp(layerIndex);
+    m_typeParagraph = layerParagraph(layerIndex);
 
     // The reopened text is edited in its own type, not in whatever the options
     // bar happened to be left set to, so the bar takes on the formatting the
@@ -4593,7 +4718,7 @@ void CanvasView::beginTypeEdit(int layerIndex, const QPointF &doc)
     // differ from the first, so this goes through the same path a caret move
     // does rather than announcing the first run.
     emit typeStyleAdopted(first.family, first.style, first.size, first.color, m_typeAlignment,
-                          m_typeAntialias, m_typeVertical);
+                          m_typeAntialias, m_typeVertical, first.hScale, first.vScale);
     typeSyncStyleToCaret();
     update();
 }
@@ -4660,13 +4785,20 @@ CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
             segment.length = segmentEnd - cursor;
             segment.font = font;
             segment.color = run.color;
-            segment.ascent = metrics.ascent();
-            segment.height = metrics.lineSpacing();
+            // Every measurement is stretched by the run's scale, because the
+            // glyphs will be painted stretched: a caret, a bounding box and a
+            // committed image all have to agree about how wide a stretched
+            // letter is.
+            segment.hScale = run.hScale;
+            segment.vScale = run.vScale;
+            segment.ascent = metrics.ascent() * run.vScale;
+            segment.height = metrics.lineSpacing() * run.vScale;
 
             if (!m_typeVertical) {
                 segment.x = line.width;
                 segment.width = segment.length > 0
                     ? metrics.horizontalAdvance(m_typeText.mid(cursor, segment.length))
+                        * run.hScale
                     : 0.0;
                 line.width += segment.width;
                 // Every segment of a line shares one baseline, set by the
@@ -4676,7 +4808,7 @@ CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
             } else if (segment.length == 0) {
                 // An empty line still has to know how tall its caret is.
                 segment.y = line.height;
-                segment.width = metrics.horizontalAdvance(QLatin1Char('W'));
+                segment.width = metrics.horizontalAdvance(QLatin1Char('W')) * run.hScale;
                 line.height += segment.height;
                 line.width = qMax(line.width, segment.width);
                 line.segments.append(segment);
@@ -4685,7 +4817,7 @@ CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
                     TypeSegment glyph = segment;
                     glyph.start = i;
                     glyph.length = 1;
-                    glyph.width = metrics.horizontalAdvance(m_typeText.at(i));
+                    glyph.width = metrics.horizontalAdvance(m_typeText.at(i)) * run.hScale;
                     glyph.y = line.height;
                     line.height += glyph.height;
                     line.width = qMax(line.width, glyph.width);
@@ -4705,10 +4837,15 @@ CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
         if (line.segments.isEmpty()) {
             TypeSegment empty;
             empty.start = line.start;
-            const QFontMetricsF metrics(typeRunFont(typePendingRun(), scale));
-            empty.font = typeRunFont(typePendingRun(), scale);
-            empty.ascent = metrics.ascent();
-            empty.height = metrics.lineSpacing();
+            const TypeRun pending = typePendingRun();
+            const QFontMetricsF metrics(typeRunFont(pending, scale));
+            empty.font = typeRunFont(pending, scale);
+            // Scaled like every other segment, so the caret on an empty line
+            // in stretched text is the height of the text around it.
+            empty.hScale = pending.hScale;
+            empty.vScale = pending.vScale;
+            empty.ascent = metrics.ascent() * pending.vScale;
+            empty.height = metrics.lineSpacing() * pending.vScale;
             line.height = qMax(line.height, empty.height);
             line.segments.append(empty);
         }
@@ -4735,9 +4872,22 @@ CanvasView::TypeLayout CanvasView::typeLayout(qreal scale) const
     qreal cross = 0.0;
     for (TypeLineBox &line : layout.lines) {
         if (!m_typeVertical) {
+            // Paragraph spacing sits between the lines, and every line is a
+            // paragraph: point text has no wrapping, so each hard return
+            // starts one.
+            cross += m_typeParagraph.spaceBefore * scale;
             line.top = cross;
-            cross += line.height;
-            line.x = typeAlignOffset(line.width);
+            cross += line.height + m_typeParagraph.spaceAfter * scale;
+            // Indents are measured from whichever edge the alignment anchors
+            // to, which is what lets a right indent mean anything at all
+            // without a measure to wrap against.
+            qreal indent = m_typeParagraph.indentLeft + m_typeParagraph.firstLineIndent;
+            if (m_typeAlignment & Qt::AlignRight) {
+                indent = -m_typeParagraph.indentRight;
+            } else if (m_typeAlignment & Qt::AlignHCenter) {
+                indent = (m_typeParagraph.indentLeft - m_typeParagraph.indentRight) / 2.0;
+            }
+            line.x = typeAlignOffset(line.width) + indent * scale;
         } else {
             cross += line.width;
             line.x = -cross;
@@ -4793,9 +4943,14 @@ qreal CanvasView::typeFlowOffset(const TypeLayout &layout, int lineIndex, int in
             // above this character or below it.
             return at > segment.start ? segment.y + segment.height : segment.y;
         }
+        // Stretched by the run's horizontal scale, exactly as the segment
+        // widths this is added to were in `typeLayout`. Measuring the part
+        // inside a segment unstretched put the caret at a fraction of where
+        // the glyphs it sits between had been drawn.
         return segment.x
             + QFontMetricsF(segment.font)
-                  .horizontalAdvance(m_typeText.mid(segment.start, at - segment.start));
+                      .horizontalAdvance(m_typeText.mid(segment.start, at - segment.start))
+                * segment.hScale;
     }
     return layout.vertical ? line.height : line.width;
 }
@@ -4890,6 +5045,8 @@ CanvasView::TypeRun CanvasView::typePendingRun() const
     run.style = m_typeStyleName;
     run.size = m_typeFont.pointSizeF();
     run.color = m_typeColor;
+    run.hScale = m_typeHScale;
+    run.vScale = m_typeVScale;
     return run;
 }
 
@@ -5000,7 +5157,7 @@ void CanvasView::typeSyncStyleToCaret()
     m_typeStyleName = run.style;
     m_typeColor = run.color;
     emit typeStyleAdopted(run.family, run.style, run.size, run.color, m_typeAlignment,
-                          m_typeAntialias, m_typeVertical);
+                          m_typeAntialias, m_typeVertical, run.hScale, run.vScale);
 }
 
 void CanvasView::typeMoveCaret(int index, bool extend)
@@ -5044,6 +5201,17 @@ void CanvasView::typeRemove(int at, int length)
 
     m_typeText.remove(at, length);
     typeNormalizeRuns();
+}
+
+bool CanvasView::insertTypeText(const QString &text)
+{
+    if (!m_typing || text.isEmpty()) {
+        return false;
+    }
+    // The same two steps a typed key takes — see `typeKeyPress`.
+    typeInsert(text);
+    update();
+    return true;
 }
 
 void CanvasView::typeInsert(const QString &text)
@@ -5279,13 +5447,16 @@ void CanvasView::setTypeMask(bool mask)
 }
 
 void CanvasView::setTypeOptions(const QFont &font, const QString &styleName, const QColor &color,
-                                Qt::Alignment alignment, bool antialias)
+                                Qt::Alignment alignment, bool antialias, qreal hScale,
+                                qreal vScale)
 {
     m_typeFont = font;
     m_typeStyleName = styleName;
     m_typeColor = color;
     m_typeAlignment = alignment;
     m_typeAntialias = antialias;
+    m_typeHScale = hScale;
+    m_typeVScale = vScale;
 
     if (!m_typing) {
         return;
@@ -5306,9 +5477,53 @@ QRectF CanvasView::typeBounds() const
     // will be rasterized at, whatever the view is zoomed to. The layout's box
     // already carries the alignment and, for vertical type, the columns
     // trailing away to the left of the origin.
-    const QRectF box = typeLayout(1.0).box;
-    return QRectF(m_typeOrigin + box.topLeft(),
-                  QSizeF(qMax(box.width(), 1.0), qMax(box.height(), 1.0)));
+    const TypeLayout layout = typeLayout(1.0);
+    const QRectF box = layout.box;
+    const QRectF unbent(m_typeOrigin + box.topLeft(),
+                        QSizeF(qMax(box.width(), 1.0), qMax(box.height(), 1.0)));
+    if (!m_typeWarp.isActive()) {
+        return unbent;
+    }
+
+    // Bending moves letters outside the box they were laid out in, and this
+    // is what the committed image is sized from — so the warp has to be
+    // measured, not assumed to stay put. Sampled on a grid because the styles
+    // are not monotonic: Wave's crests are inside the span, so the corners
+    // alone would miss them.
+    // The same box the painting bends against — the letters' own, not the
+    // line box they sit in — or the image would be sized from a different
+    // warp than the one drawn into it.
+    const QRectF reference = typeInkBounds(layout, m_typeOrigin);
+
+    constexpr int kSamples = 16;
+    // Tracked as four numbers rather than a growing QRectF: a rectangle
+    // around a single point is zero by zero, which `QRectF` calls null, so
+    // uniting them would have kept discarding everything measured so far and
+    // left the text a few pixels wide.
+    qreal left = std::numeric_limits<qreal>::max();
+    qreal top = left;
+    qreal right = std::numeric_limits<qreal>::lowest();
+    qreal bottom = right;
+    for (int iy = 0; iy <= kSamples; ++iy) {
+        for (int ix = 0; ix <= kSamples; ++ix) {
+            // Sampled over the box the warp is *defined* on. Sampling the
+            // line box instead put points outside it, where the styles run
+            // off the end of their curves — a squeeze read a point above the
+            // text as being far outside its waist and flared it wildly.
+            const QPointF p(reference.left() + reference.width() * ix / kSamples,
+                            reference.top() + reference.height() * iy / kSamples);
+            const QPointF mapped = m_typeWarp.map(p, reference);
+            left = std::min(left, mapped.x());
+            right = std::max(right, mapped.x());
+            top = std::min(top, mapped.y());
+            bottom = std::max(bottom, mapped.y());
+        }
+    }
+    if (left > right || top > bottom) {
+        return unbent;
+    }
+    // A little slack for the glyph overshoot the grid cannot see.
+    return QRectF(QPointF(left, top), QPointF(right, bottom)).adjusted(-2, -2, 2, 2);
 }
 
 void CanvasView::commitTypeEdit()
@@ -5385,7 +5600,8 @@ void CanvasView::commitTypeEdit()
     int at = 0;
     for (const TypeRun &run : std::as_const(m_typeRuns)) {
         m_engine->addTextRun(m_typeText.mid(at, run.length), run.family, run.style,
-                             float(run.size), run.color);
+                             float(run.size), run.color, float(run.hScale),
+                             float(run.vScale));
         at += run.length;
     }
 
@@ -5412,6 +5628,37 @@ void CanvasView::commitTypeEdit()
     update();
 }
 
+/// Lay the runs currently in `m_typeText`/`m_typeRuns` out from
+/// `m_typeOrigin`, render them, and hand the layer both the pixels and the
+/// runs they were drawn from.
+///
+/// The three callers differ only in what they change before calling: the
+/// options bar's style, a transform's size, or the orientation. Everything
+/// after that is identical, and three copies of it would be three places for
+/// the record and the pixels to drift apart.
+bool CanvasView::commitTypeRunsToLayer(int layerIndex, int alignCode, bool antialias)
+{
+    const int pad = 2;
+    const QRect pixelBounds = typeBounds().toAlignedRect().adjusted(-pad, -pad, pad, pad);
+    QImage image(qMax(1, pixelBounds.width()), qMax(1, pixelBounds.height()),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+    renderTypeToImage(image, pixelBounds.topLeft());
+
+    m_engine->beginTextRuns();
+    int at = 0;
+    for (const TypeRun &run : std::as_const(m_typeRuns)) {
+        m_engine->addTextRun(m_typeText.mid(at, run.length), run.family, run.style,
+                             float(run.size), run.color, float(run.hScale),
+                             float(run.vScale));
+        at += run.length;
+    }
+    return m_engine->updateTextLayer(layerIndex, image, pixelBounds.left(), pixelBounds.top(),
+                                     m_engine->layerName(layerIndex), alignCode, antialias,
+                                     m_typeVertical, float(m_typeOrigin.x()),
+                                     float(m_typeOrigin.y()));
+}
+
 bool CanvasView::restyleTypeLayer(int layerIndex)
 {
     // Not while something is being typed: the edit in progress owns this state,
@@ -5431,6 +5678,8 @@ bool CanvasView::restyleTypeLayer(int layerIndex)
     const QList<TypeRun> savedRuns = m_typeRuns;
     const QPointF savedOrigin = m_typeOrigin;
     const bool savedVertical = m_typeVertical;
+    const TypeWarp savedWarp = m_typeWarp;
+    const TypeParagraph savedParagraph = m_typeParagraph;
 
     m_typeText.clear();
     m_typeRuns.clear();
@@ -5445,6 +5694,11 @@ bool CanvasView::restyleTypeLayer(int layerIndex)
         run.style = m_typeStyleName;
         run.size = m_typeFont.pointSizeF();
         run.color = m_typeColor;
+        // The bar's, like everything else here — `adoptTypeStyle` syncs it
+        // from the layer when one is selected, so a restyle carries the
+        // layer's own stretch rather than flattening it back to 100%.
+        run.hScale = m_typeHScale;
+        run.vScale = m_typeVScale;
         m_typeRuns.append(run);
         m_typeText += text;
     }
@@ -5453,26 +5707,11 @@ bool CanvasView::restyleTypeLayer(int layerIndex)
                            m_engine->layerTextOriginY(layerIndex));
     // Orientation belongs to the text; the rest is what the bar now says.
     m_typeVertical = m_engine->layerTextVertical(layerIndex);
+    m_typeWarp = layerWarp(layerIndex);
+    m_typeParagraph = layerParagraph(layerIndex);
 
-    const int pad = 2;
-    const QRect pixelBounds = typeBounds().toAlignedRect().adjusted(-pad, -pad, pad, pad);
-    QImage image(qMax(1, pixelBounds.width()), qMax(1, pixelBounds.height()),
-                 QImage::Format_ARGB32_Premultiplied);
-    image.fill(Qt::transparent);
-    renderTypeToImage(image, pixelBounds.topLeft());
-
-    m_engine->beginTextRuns();
-    int at = 0;
-    for (const TypeRun &run : std::as_const(m_typeRuns)) {
-        m_engine->addTextRun(m_typeText.mid(at, run.length), run.family, run.style,
-                             float(run.size), run.color);
-        at += run.length;
-    }
-    const QString name = m_engine->layerName(layerIndex);
-    const bool updated = m_engine->updateTextLayer(
-        layerIndex, image, pixelBounds.left(), pixelBounds.top(), name,
-        typeAlignCode(m_typeAlignment), m_typeAntialias, m_typeVertical,
-        float(m_typeOrigin.x()), float(m_typeOrigin.y()));
+    const bool updated =
+        commitTypeRunsToLayer(layerIndex, typeAlignCode(m_typeAlignment), m_typeAntialias);
 
     // Put back whatever the editor had; this borrowed its state rather than
     // starting an edit of its own.
@@ -5480,6 +5719,8 @@ bool CanvasView::restyleTypeLayer(int layerIndex)
     m_typeRuns = savedRuns;
     m_typeOrigin = savedOrigin;
     m_typeVertical = savedVertical;
+    m_typeWarp = savedWarp;
+    m_typeParagraph = savedParagraph;
     m_typeFontCache.clear();
 
     update();
@@ -5512,9 +5753,50 @@ void CanvasView::cancelTypeEdit()
     refresh();
 }
 
+QRectF CanvasView::typeInkBounds(const TypeLayout &layout, const QPointF &origin) const
+{
+    // The box the *letters* fill, rather than the one they were laid out in.
+    //
+    // A line box runs from the font's ascender line to below its baseline, so
+    // for most text there is empty space above the capitals and below the
+    // feet. Warping against that box puts the top of the letters at some v
+    // partway down it, and the styles that promise to hold one edge still —
+    // Shell Lower keeping the top straight, Shell Upper the bottom — end up
+    // moving it by whatever that gap comes to. Photoshop bends the text's own
+    // bounds, so this measures them.
+    QRectF ink;
+    for (const TypeLineBox &line : layout.lines) {
+        for (const TypeSegment &segment : line.segments) {
+            if (segment.length <= 0) {
+                continue;
+            }
+            QPainterPath glyphs;
+            glyphs.addText(QPointF(0, 0), segment.font,
+                           m_typeText.mid(segment.start, segment.length));
+            QTransform placed;
+            placed.translate(origin.x() + line.x + segment.x,
+                             origin.y() + line.top + segment.y + segment.ascent);
+            placed.scale(segment.hScale, segment.vScale);
+            const QRectF bounds = placed.map(glyphs).boundingRect();
+            if (bounds.isEmpty()) {
+                continue;
+            }
+            ink = ink.isValid() ? ink.united(bounds) : bounds;
+        }
+    }
+    // Nothing drawable — a caret on an empty line — leaves the layout box as
+    // the only thing there is to bend.
+    return ink.isValid() ? ink : QRectF(origin + layout.box.topLeft(), layout.box.size());
+}
+
 void CanvasView::paintTypeRuns(QPainter &painter, const TypeLayout &layout,
                                const QPointF &origin, const QColor &forcedColor) const
 {
+    // Measured once for the whole block: every segment has to bend against
+    // the same box, or each word would be warped as though it were the text.
+    const QRectF warpBounds =
+        m_typeWarp.isActive() ? typeInkBounds(layout, origin) : QRectF();
+
     for (const TypeLineBox &line : layout.lines) {
         for (const TypeSegment &segment : line.segments) {
             if (segment.length <= 0) {
@@ -5522,9 +5804,66 @@ void CanvasView::paintTypeRuns(QPainter &painter, const TypeLayout &layout,
             }
             painter.setFont(segment.font);
             painter.setPen(forcedColor.isValid() ? forcedColor : segment.color);
-            painter.drawText(QPointF(origin.x() + line.x + segment.x,
-                                     origin.y() + line.top + segment.y + segment.ascent),
-                             m_typeText.mid(segment.start, segment.length));
+            const QPointF pen(origin.x() + line.x + segment.x,
+                              origin.y() + line.top + segment.y + segment.ascent);
+            const QString text = m_typeText.mid(segment.start, segment.length);
+
+            if (m_typeWarp.isActive()) {
+                // Bent text is filled from its own outlines rather than drawn:
+                // the warp moves points, and a glyph the rasteriser has already
+                // turned into pixels has none left to move.
+                const QRectF block = warpBounds;
+                QPainterPath glyphs;
+                glyphs.addText(QPointF(0, 0), segment.font, text);
+
+                QTransform placed;
+                placed.translate(pen.x(), pen.y());
+                placed.scale(segment.hScale, segment.vScale);
+
+                QPainterPath bent;
+                const QList<QPolygonF> contours = placed.map(glyphs).toSubpathPolygons();
+                for (const QPolygonF &contour : contours) {
+                    QPolygonF mapped;
+                    for (int i = 0; i < contour.size(); ++i) {
+                        const QPointF from = contour.at(i);
+                        const QPointF to = contour.at((i + 1) % contour.size());
+                        // Split long edges before bending them. The warp moves
+                        // points, and an outline carries points only where it
+                        // changes direction — the stem of an "H" is two of
+                        // them, tens of pixels apart. Bending just those
+                        // leaves the straight line between them straight, so
+                        // any warp that varies along that stem is invisible
+                        // and the letter comes out merely displaced.
+                        const qreal length = QLineF(from, to).length();
+                        const int steps = qBound(1, int(std::ceil(length / 2.0)), 200);
+                        for (int step = 0; step < steps; ++step) {
+                            const qreal t = qreal(step) / steps;
+                            mapped << m_typeWarp.map(from * (1.0 - t) + to * t, block);
+                        }
+                    }
+                    bent.addPolygon(mapped);
+                    bent.closeSubpath();
+                }
+                // Odd-even, so a letter's counter stays a hole however its
+                // contours happen to be wound once bent.
+                bent.setFillRule(Qt::OddEvenFill);
+                painter.fillPath(bent, forcedColor.isValid() ? forcedColor : segment.color);
+                continue;
+            }
+
+            if (qFuzzyCompare(segment.hScale, 1.0) && qFuzzyCompare(segment.vScale, 1.0)) {
+                painter.drawText(pen, text);
+                continue;
+            }
+            // Stretched type is drawn through the painter rather than by
+            // resampling afterwards, so the outlines are scaled and the glyphs
+            // stay sharp however far they are pulled. Scaling about the pen
+            // keeps the baseline where the layout put it.
+            painter.save();
+            painter.translate(pen);
+            painter.scale(segment.hScale, segment.vScale);
+            painter.drawText(QPointF(0, 0), text);
+            painter.restore();
         }
     }
 }
@@ -5623,6 +5962,7 @@ void CanvasView::beginFreeTransform(TransformMode mode)
     QRect cb = m_engine->layerContentBounds(idx);
     if (cb.width() <= 0 || cb.height() <= 0) return;
     m_ftBounds = QRectF(cb);
+    m_ftStartBounds = m_ftBounds;
 
     QRect cropRect(cb.x() - ox, cb.y() - oy, cb.width(), cb.height());
     m_ftOrigImage = fullImage.copy(cropRect);
@@ -5664,12 +6004,301 @@ static QPointF evalPatch(const QPointF grid[4][4], double u, double v)
     return evalBezier(col, v);
 }
 
+QPainterPath CanvasView::typeLayerOutline(int layerIndex) const
+{
+    QPainterPath outline;
+    if (!m_engine || layerIndex < 0) {
+        return outline;
+    }
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    if (runCount <= 0) {
+        return outline;
+    }
+
+    // Borrowing the editor's state to lay the text out, then handing it back —
+    // as the other paths that rewrite a layer do. Const because this only
+    // reads the result, so the members are restored on the way out.
+    auto *self = const_cast<CanvasView *>(this);
+    const QString savedText = m_typeText;
+    const QList<TypeRun> savedRuns = m_typeRuns;
+    const QPointF savedOrigin = m_typeOrigin;
+    const bool savedVertical = m_typeVertical;
+    const TypeWarp savedWarp = m_typeWarp;
+    const TypeParagraph savedParagraph = m_typeParagraph;
+
+    self->m_typeText.clear();
+    self->m_typeRuns.clear();
+    self->m_typeFontCache.clear();
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        run.family = m_engine->layerTextRunFamily(layerIndex, i);
+        run.style = m_engine->layerTextRunStyle(layerIndex, i);
+        run.size = m_engine->layerTextRunSize(layerIndex, i);
+        run.color = m_engine->layerTextRunColor(layerIndex, i);
+        run.hScale = m_engine->layerTextRunHScale(layerIndex, i);
+        run.vScale = m_engine->layerTextRunVScale(layerIndex, i);
+        self->m_typeRuns.append(run);
+        self->m_typeText += text;
+    }
+    self->m_typeOrigin = QPointF(m_engine->layerTextOriginX(layerIndex),
+                                 m_engine->layerTextOriginY(layerIndex));
+    self->m_typeVertical = m_engine->layerTextVertical(layerIndex);
+    self->m_typeWarp = layerWarp(layerIndex);
+    self->m_typeParagraph = layerParagraph(layerIndex);
+
+    // The same layout the glyphs are rendered from, at document scale, so the
+    // outline lands exactly on the text rather than near it.
+    const TypeLayout layout = typeLayout(1.0);
+    for (const TypeLineBox &line : layout.lines) {
+        for (const TypeSegment &segment : line.segments) {
+            if (segment.length <= 0) {
+                continue;
+            }
+            const QPointF pen(m_typeOrigin.x() + line.x + segment.x,
+                              m_typeOrigin.y() + line.top + segment.y + segment.ascent);
+
+            QPainterPath glyphs;
+            glyphs.addText(QPointF(0, 0), segment.font,
+                           m_typeText.mid(segment.start, segment.length));
+
+            // Scaled about the pen, matching `paintTypeRuns` — a stretched
+            // layer has to give a stretched outline.
+            QTransform placed;
+            placed.translate(pen.x(), pen.y());
+            placed.scale(segment.hScale, segment.vScale);
+            outline.addPath(placed.map(glyphs));
+        }
+    }
+
+    self->m_typeText = savedText;
+    self->m_typeRuns = savedRuns;
+    self->m_typeOrigin = savedOrigin;
+    self->m_typeVertical = savedVertical;
+    self->m_typeWarp = savedWarp;
+    self->m_typeParagraph = savedParagraph;
+    self->m_typeFontCache.clear();
+    return outline;
+}
+
+void CanvasView::loadTypeRunsFrom(int layerIndex)
+{
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeFontCache.clear();
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        // Verbatim: the callers change how the text is laid out, not how it
+        // is set, so every run keeps its own family, size, colour and scale.
+        run.family = m_engine->layerTextRunFamily(layerIndex, i);
+        run.style = m_engine->layerTextRunStyle(layerIndex, i);
+        run.size = m_engine->layerTextRunSize(layerIndex, i);
+        run.color = m_engine->layerTextRunColor(layerIndex, i);
+        run.hScale = m_engine->layerTextRunHScale(layerIndex, i);
+        run.vScale = m_engine->layerTextRunVScale(layerIndex, i);
+        m_typeRuns.append(run);
+        m_typeText += text;
+    }
+    m_typeOrigin = QPointF(m_engine->layerTextOriginX(layerIndex),
+                           m_engine->layerTextOriginY(layerIndex));
+    m_typeVertical = m_engine->layerTextVertical(layerIndex);
+    m_typeWarp = layerWarp(layerIndex);
+    m_typeParagraph = layerParagraph(layerIndex);
+}
+
+/// Lay a type layer out again from its record and give it the result — what
+/// changing the warp needs, since bending the letters changes their shape and
+/// their bounds without touching a word of the text.
+bool CanvasView::reflowTypeLayer(int layerIndex)
+{
+    if (!m_engine || layerIndex < 0 || m_typing) {
+        return false;
+    }
+    if (m_engine->layerTextRunCount(layerIndex) <= 0) {
+        return false;
+    }
+
+    const QString savedText = m_typeText;
+    const QList<TypeRun> savedRuns = m_typeRuns;
+    const QPointF savedOrigin = m_typeOrigin;
+    const bool savedVertical = m_typeVertical;
+    const TypeWarp savedWarp = m_typeWarp;
+    const TypeParagraph savedParagraph = m_typeParagraph;
+
+    loadTypeRunsFrom(layerIndex);
+    const bool updated = commitTypeRunsToLayer(layerIndex, m_engine->layerTextAlign(layerIndex),
+                                               m_engine->layerTextAntialias(layerIndex));
+
+    m_typeText = savedText;
+    m_typeRuns = savedRuns;
+    m_typeOrigin = savedOrigin;
+    m_typeVertical = savedVertical;
+    m_typeWarp = savedWarp;
+    m_typeParagraph = savedParagraph;
+    m_typeFontCache.clear();
+    update();
+    return updated;
+}
+
+bool CanvasView::setTypeLayerVertical(int layerIndex, bool vertical)
+{
+    if (!m_engine || layerIndex < 0 || m_typing) {
+        return false;
+    }
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    if (runCount <= 0 || m_engine->layerTextVertical(layerIndex) == vertical) {
+        return false;
+    }
+
+    // Borrowing the editor's state to lay the text out, then handing it back —
+    // as `rescaleTypeLayer` does, and for the same reason.
+    const QString savedText = m_typeText;
+    const QList<TypeRun> savedRuns = m_typeRuns;
+    const QPointF savedOrigin = m_typeOrigin;
+    const bool savedVertical = m_typeVertical;
+    const TypeWarp savedWarp = m_typeWarp;
+    const TypeParagraph savedParagraph = m_typeParagraph;
+
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeFontCache.clear();
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        // Turning text on its side changes how it is laid out, not how it is
+        // set, so every run keeps its own formatting.
+        run.family = m_engine->layerTextRunFamily(layerIndex, i);
+        run.style = m_engine->layerTextRunStyle(layerIndex, i);
+        run.size = m_engine->layerTextRunSize(layerIndex, i);
+        run.color = m_engine->layerTextRunColor(layerIndex, i);
+        run.hScale = m_engine->layerTextRunHScale(layerIndex, i);
+        run.vScale = m_engine->layerTextRunVScale(layerIndex, i);
+        m_typeRuns.append(run);
+        m_typeText += text;
+    }
+    m_typeOrigin = QPointF(m_engine->layerTextOriginX(layerIndex),
+                           m_engine->layerTextOriginY(layerIndex));
+    m_typeVertical = vertical;
+
+    const bool updated = commitTypeRunsToLayer(layerIndex, m_engine->layerTextAlign(layerIndex),
+                                               m_engine->layerTextAntialias(layerIndex));
+
+    m_typeText = savedText;
+    m_typeRuns = savedRuns;
+    m_typeOrigin = savedOrigin;
+    m_typeVertical = savedVertical;
+    m_typeWarp = savedWarp;
+    m_typeParagraph = savedParagraph;
+    m_typeFontCache.clear();
+    update();
+    return updated;
+}
+
+bool CanvasView::rescaleTypeLayer(int layerIndex, double scale, double hStretch,
+                                  const QPointF &origin)
+{
+    if (!m_engine || layerIndex < 0 || scale <= 0.0 || hStretch <= 0.0) {
+        return false;
+    }
+    const int runCount = m_engine->layerTextRunCount(layerIndex);
+    if (runCount <= 0) {
+        return false;
+    }
+
+    // Borrowing the editor's state to lay the text out, then handing it back:
+    // the same trick `restyleTypeLayer` plays, and for the same reason — the
+    // render path reads these members rather than taking them as arguments.
+    const QString savedText = m_typeText;
+    const QList<TypeRun> savedRuns = m_typeRuns;
+    const QPointF savedOrigin = m_typeOrigin;
+    const bool savedVertical = m_typeVertical;
+    const TypeWarp savedWarp = m_typeWarp;
+    const TypeParagraph savedParagraph = m_typeParagraph;
+
+    m_typeText.clear();
+    m_typeRuns.clear();
+    m_typeFontCache.clear();
+    for (int i = 0; i < runCount; ++i) {
+        const QString text = m_engine->layerTextRunText(layerIndex, i);
+        TypeRun run;
+        run.length = text.size();
+        // Every run keeps its own family, style and colour, and only grows by
+        // the scale: a transform resizes text, it does not restyle it. This is
+        // where it differs from `restyleTypeLayer`, which is the options bar
+        // deliberately imposing one style on the lot.
+        run.family = m_engine->layerTextRunFamily(layerIndex, i);
+        run.style = m_engine->layerTextRunStyle(layerIndex, i);
+        run.size = m_engine->layerTextRunSize(layerIndex, i) * scale;
+        run.color = m_engine->layerTextRunColor(layerIndex, i);
+        // `scale` has already gone into the size, so what is left for the
+        // stretch is whatever the horizontal did beyond it.
+        run.hScale = m_engine->layerTextRunHScale(layerIndex, i) * hStretch;
+        run.vScale = m_engine->layerTextRunVScale(layerIndex, i);
+        m_typeRuns.append(run);
+        m_typeText += text;
+    }
+    m_typeOrigin = origin;
+    m_typeVertical = m_engine->layerTextVertical(layerIndex);
+    m_typeWarp = layerWarp(layerIndex);
+    m_typeParagraph = layerParagraph(layerIndex);
+
+    const bool updated = commitTypeRunsToLayer(layerIndex, m_engine->layerTextAlign(layerIndex),
+                                               m_engine->layerTextAntialias(layerIndex));
+
+    m_typeText = savedText;
+    m_typeRuns = savedRuns;
+    m_typeOrigin = savedOrigin;
+    m_typeVertical = savedVertical;
+    m_typeWarp = savedWarp;
+    m_typeParagraph = savedParagraph;
+    m_typeFontCache.clear();
+    return updated;
+}
+
 void CanvasView::commitFreeTransform()
 {
     if (!m_freeTransform || !m_engine) return;
     m_freeTransform = false;
 
     QRectF srcRect(0, 0, m_ftOrigImage.width(), m_ftOrigImage.height());
+
+    // A live type layer is set again at its new size rather than resampled.
+    // Magnifying rasterised glyphs is what left transformed text blurry, and
+    // the layer keeps its text record either way, so the record and the pixels
+    // have to agree about how big the type is.
+    //
+    // The vertical governs the size, and whatever the horizontal did beyond it
+    // becomes the run's horizontal scale — the same split Photoshop makes, and
+    // the reason the record can describe a stretch at all. Rotation and the
+    // quad modes would need a transform carried on the text record, which
+    // there is nowhere to put yet, so those still go through the pixels below.
+    if ((m_ftMode == TransformMode::Free || m_ftMode == TransformMode::Scale)
+        && qFuzzyIsNull(m_ftRotation) && m_ftStartBounds.width() > 0
+        && m_ftStartBounds.height() > 0
+        && m_engine->layerTextRunCount(m_ftLayerIndex) > 0) {
+        const double sx = m_ftBounds.width() / m_ftStartBounds.width();
+        const double sy = m_ftBounds.height() / m_ftStartBounds.height();
+        if (sx > 0.0 && sy > 0.0) {
+            // The anchor the text lays out from travels with the box.
+            const QPointF origin(m_engine->layerTextOriginX(m_ftLayerIndex),
+                                 m_engine->layerTextOriginY(m_ftLayerIndex));
+            const QPointF moved(
+                m_ftBounds.left() + (origin.x() - m_ftStartBounds.left()) * sx,
+                m_ftBounds.top() + (origin.y() - m_ftStartBounds.top()) * sy);
+            if (rescaleTypeLayer(m_ftLayerIndex, sy, sx / sy, moved)) {
+                m_ftOrigImage = QImage();
+                updateCursor();
+                refresh();
+                emit transformCommitted();
+                return;
+            }
+        }
+    }
 
     if (m_ftMode == TransformMode::Warp) {
         const int N = 30;
@@ -6036,6 +6665,9 @@ void CanvasView::paintSearchHighlight(QPainter &painter)
         QString text;
         QFont font;
         int start;
+        /// The run's horizontal scale — the advances below are along the same
+        /// stretched flow the glyphs were drawn on.
+        qreal hScale = 1.0;
     };
     QList<RunInfo> runs;
     QString fullText;
@@ -6049,6 +6681,7 @@ void CanvasView::paintSearchHighlight(QPainter &painter)
         ri.font = QFont(family);
         ri.font.setStyleName(style);
         ri.font.setPixelSize(qRound(size));
+        ri.hScale = m_engine->layerTextRunHScale(idx, r);
         runs.append(ri);
         fullText += ri.text;
     }
@@ -6089,7 +6722,8 @@ void CanvasView::paintSearchHighlight(QPainter &painter)
                 int segEnd = qMin(runEnd, overlapStart);
                 if (segStart < segEnd) {
                     QFontMetricsF sfm(ri.font);
-                    xBefore += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart));
+                    xBefore += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart))
+                        * ri.hScale;
                 }
             }
 
@@ -6102,7 +6736,8 @@ void CanvasView::paintSearchHighlight(QPainter &painter)
                 int segEnd = qMin(runEnd, overlapEnd);
                 if (segStart < segEnd) {
                     QFontMetricsF sfm(ri.font);
-                    matchWidth += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart));
+                    matchWidth += sfm.horizontalAdvance(fullText.mid(segStart, segEnd - segStart))
+                        * ri.hScale;
                 }
             }
 
@@ -6183,6 +6818,42 @@ void CanvasView::paintZoomOverlay(QPainter &painter)
     outline.append(documentToWidget(m_zoomRectDoc.bottomRight()));
     outline.append(documentToWidget(m_zoomRectDoc.bottomLeft()));
     paintPendingOutline(painter, outline);
+}
+
+void CanvasView::setFilterPreviewRect(const QRectF &region)
+{
+    if (m_filterPreviewRect == region) {
+        return;
+    }
+    m_filterPreviewRect = region;
+    update();
+}
+
+void CanvasView::paintFilterPreviewRect(QPainter &painter)
+{
+    if (m_filterPreviewRect.isEmpty()) {
+        return;
+    }
+
+    // Through `documentToWidget` for the reason the zoom overlay is: the
+    // square marks a region of the image, so it has to turn with it.
+    QPolygonF outline;
+    outline.append(documentToWidget(m_filterPreviewRect.topLeft()));
+    outline.append(documentToWidget(m_filterPreviewRect.topRight()));
+    outline.append(documentToWidget(m_filterPreviewRect.bottomRight()));
+    outline.append(documentToWidget(m_filterPreviewRect.bottomLeft()));
+
+    // Black under white, so the square reads against a light image and a dark
+    // one alike — the same trick the pending-gesture outline uses, but solid:
+    // a dashed square at this size is mostly gaps.
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(QColor(0, 0, 0, 200), 3.0));
+    painter.drawPolygon(outline);
+    painter.setPen(QPen(QColor(255, 255, 255, 230), 1.0));
+    painter.drawPolygon(outline);
+    painter.restore();
 }
 
 void CanvasView::paintTypeOverlay(QPainter &painter)

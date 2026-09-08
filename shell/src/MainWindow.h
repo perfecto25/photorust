@@ -10,27 +10,34 @@
 #include "tools/ToolId.h"
 
 class CanvasView;
+class ColorRangeDialog;
 class ReplaceColorDialog;
 class ChannelsPanel;
+class CharacterPanel;
 class ColorPanel;
 class CommandRegistry;
+class GlyphsPanel;
 class Engine;
 class BrushPresetPicker;
 class HistoryPanel;
 class InfoPanel;
 class LayersPanel;
+class ParagraphPanel;
+class ParagraphStylesPanel;
 class PathsPanel;
 class PropertiesPanel;
 class ToolStrip;
 class QLineEdit;
 class QComboBox;
 class QDockWidget;
+class QKeyEvent;
 class QMenu;
 class QTabBar;
 class QToolButton;
 class QDoubleSpinBox;
 class QSpinBox;
 class QToolBar;
+class QActionGroup;
 
 /// The application window: menus, options bar, tool strip, docked panels and
 /// the canvas.
@@ -47,6 +54,11 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    /// Right-click on a panel's tab offers "Float Panel" — `setFloating()`
+    /// alone, not the drag-to-float Qt normally offers, since `GroupedDragging`
+    /// is off (see the constructor) and dragging a tab out on its own would
+    /// otherwise have no way to pop it into its own window.
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
     // -- File --
@@ -126,6 +138,19 @@ private slots:
     /// `fromSelection` decides whether the group arrives empty or around what
     /// the Layers panel has selected.
     void showNewGroup(bool fromSelection);
+    /// Layer ▸ Lock Layers… — the four locks as a dialog.
+    void showLockLayers();
+    /// Layer ▸ Link Layers, and the Unlink Layers it becomes.
+    void toggleLinkSelectedLayers();
+    /// Layer ▸ Select Linked Layers.
+    void selectLinkedLayers();
+    /// Whether every selected layer is in a link set — what flips the entry's
+    /// wording, and what makes unlinking the sensible thing to offer.
+    bool selectedLayersAreLinked() const;
+    /// Layer ▸ Arrange ▸ … — `op` is the engine's direction, 0 to 3.
+    void arrangeActiveLayer(int op);
+    /// Layer ▸ Arrange ▸ Reverse, on the panel's selection.
+    void reverseSelectedLayers();
     /// Layer ▸ Group Layers — the panel's selection into a new group.
     void groupSelectedLayers();
     /// Layer ▸ Ungroup Layers, from the folder or from anything inside it.
@@ -150,6 +175,18 @@ private slots:
 
     // -- Filter --
     void applyFilter(const QString &name);
+    /// The body of the above. `presets` seeds the dialog's controls, in the
+    /// order it lists them — used when repeating a filter, so its dialog
+    /// reopens on the settings it was last given. A shorter list leaves the
+    /// rest at their defaults. `skipDialog` runs the filter straight off.
+    void applyFilterWith(const QString &name, const QList<float> &presets,
+                         bool skipDialog = false);
+    /// Repeat the last filter. `askAgain` reopens its dialog with the settings
+    /// it was last given, which is what CS6 puts on Alt+Ctrl+F; without it the
+    /// filter runs straight off with those settings, which is Ctrl+F.
+    void repeatLastFilter(bool askAgain);
+    /// Relabel the top item of the Filter menu to name the last filter run.
+    void refreshLastFilterAction();
 
     // -- View --
     void zoomIn();
@@ -168,6 +205,11 @@ private slots:
     void updateWindowTitle();
 
 private:
+    /// Let the View menu's zoom shortcuts through to the canvas while a dialog
+    /// is open, as Photoshop's dialogs do. Returns whether the key was one of
+    /// them and has been acted on.
+    bool forwardViewShortcut(QObject *watched, QKeyEvent *event);
+
     void createMenus();
     /// Build the Tools panel: the strip inside its dock with a CS6 header.
     void createToolPanel();
@@ -176,7 +218,16 @@ private:
     /// CS6's Zoom tool right-click menu, likewise.
     void showZoomContextMenu(const QPoint &globalPos);
     void createOptionsBar();
+    /// Tick the Type ▸ Anti-Alias entry matching `m_typeAntialiasMode`.
+    void syncAntialiasMenu();
+    /// Tick the Type ▸ Orientation entry matching `m_typeVertical`.
+    void syncOrientationMenu();
     void createDocks();
+    /// Pop a panel out into its own window — the tab context menu's "Float
+    /// Panel". Sized and placed over the canvas, because Qt otherwise floats
+    /// it at the exact geometry it had while docked, which lands it on top of
+    /// the column it just left and reads as the tab having vanished.
+    void floatPanel(QDockWidget *dock);
     /// Rebuild the document tab bar from the engine's open documents.
     void refreshDocumentTabs();
     /// The user picked a tab.
@@ -374,10 +425,17 @@ private:
     /// Take on the type of text the Type tool just reopened, and rebuild the
     /// options bar so it describes that text.
     /// Show the selected type layer's own formatting in the options bar.
-    void syncTypeBarToActiveLayer();
+    /// Point the type options and the Character/Paragraph panels at the
+    /// active layer's own formatting.
+    ///
+    /// `force` re-reads even when the same layer is still selected, which is
+    /// what a transform needs: it rewrites the layer's sizes and scale in
+    /// place, so the index has not changed but everything the bar holds about
+    /// it has gone stale.
+    void syncTypeBarToActiveLayer(bool force = false);
     void adoptTypeStyle(const QString &family, const QString &style, qreal pointSize,
                         const QColor &color, Qt::Alignment alignment, bool antialias,
-                        bool vertical);
+                        bool vertical, qreal hScale = 1.0, qreal vScale = 1.0);
     /// The brush preset picker, created on first use. It outlives the options
     /// bar because it holds the current tip.
     BrushPresetPicker *brushPicker();
@@ -403,15 +461,35 @@ private:
     /// The Replace Color dialog while it is open; non-modal, so only one at a
     /// time and the canvas needs telling when it goes.
     QPointer<ReplaceColorDialog> m_replaceColorDialog;
+    /// Colour Range is non-modal for the same reason, so it too can only be
+    /// open once.
+    QPointer<ColorRangeDialog> m_colorRangeDialog;
+
+    /// The top item of the Filter menu, which names the last filter run and
+    /// repeats it. Disabled until one has been.
+    QAction *m_lastFilterAction = nullptr;
+    /// What that item would repeat: the menu name and the values its dialog
+    /// was given. Empty when nothing has been run yet.
+    QString m_lastFilterName;
+    QList<float> m_lastFilterParams;
+
     ToolStrip *m_toolStrip = nullptr;
     QDockWidget *m_toolsDock = nullptr;
     QToolBar *m_optionsBar = nullptr;
     /// One tab per open document, above the canvas.
     QTabBar *m_documentTabs = nullptr;
+    /// The Type ▸ Anti-Alias entries, so the tick can follow a change made
+    /// from the options bar or the Character panel instead.
+    QActionGroup *m_antialiasGroup = nullptr;
+    /// The Type ▸ Orientation entries, ticked from the selected layer.
+    QAction *m_horizontalAction = nullptr;
+    QAction *m_verticalAction = nullptr;
 
     LayersPanel *m_layersPanel = nullptr;
     ChannelsPanel *m_channelsPanel = nullptr;
     PathsPanel *m_pathsPanel = nullptr;
+    /// Held so Create Work Path can bring the result into view.
+    QDockWidget *m_pathsDock = nullptr;
     ColorPanel *m_colorPanel = nullptr;
     HistoryPanel *m_historyPanel = nullptr;
     InfoPanel *m_infoPanel = nullptr;
@@ -419,6 +497,19 @@ private:
     PropertiesPanel *m_propertiesPanel = nullptr;
     /// Held so a new adjustment layer can raise it, as CS6 does.
     QDockWidget *m_propertiesDock = nullptr;
+    CharacterPanel *m_characterPanel = nullptr;
+    /// Held so Type ▸ Panels ▸ Character Panel can raise it directly, rather
+    /// than merely toggling it the way the Window menu entry does.
+    QDockWidget *m_characterDock = nullptr;
+    ParagraphPanel *m_paragraphPanel = nullptr;
+    /// Held so Type ▸ Panels ▸ Paragraph Panel can raise it directly.
+    QDockWidget *m_paragraphDock = nullptr;
+    ParagraphStylesPanel *m_paragraphStylesPanel = nullptr;
+    /// Held so Type ▸ Panels ▸ Paragraph Styles Panel can raise it directly.
+    QDockWidget *m_paragraphStylesDock = nullptr;
+    GlyphsPanel *m_glyphsPanel = nullptr;
+    /// Held so Type ▸ Panels ▸ Glyphs Panel can raise it directly.
+    QDockWidget *m_glyphsDock = nullptr;
 
     // Options-bar widgets for the brush family. Recreated per tool, so these
     // are only valid while a painting tool is active.
@@ -490,7 +581,16 @@ private:
     QString m_typeStyle = QStringLiteral("Regular");
     QColor m_typeColor = Qt::black;
     Qt::Alignment m_typeAlignment = Qt::AlignLeft;
-    bool m_typeAntialias = TypeDefaults::kAntialias;
+    /// Which of CS6's anti-aliasing methods is selected. Only "None" changes
+    /// what is rendered (see `TypeDefaults::antialiasMethods`), but the choice
+    /// is kept so the Anti-Alias menu, the options bar and the Character panel
+    /// all show the same one.
+    QString m_typeAntialiasMode = TypeDefaults::defaultAntialiasMethod();
+    /// Horizontal and vertical scale, 1.0 being Photoshop's 100% — the
+    /// Character panel's two Scale fields, and where a non-uniform Free
+    /// Transform of a type layer is recorded.
+    qreal m_typeHScale = 1.0;
+    qreal m_typeVScale = 1.0;
     /// True while the Vertical Type tool is the one in hand, or while text that
     /// is itself vertical is open for editing.
     bool m_typeVertical = false;

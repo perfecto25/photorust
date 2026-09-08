@@ -98,7 +98,7 @@ pub fn resample(src: &Pixmap, width: u32, height: u32, mode: Resample) -> Pixmap
 
 /// Read a pixel, clamping to the edge rather than reading nothing.
 #[inline]
-fn sample_clamped(src: &Pixmap, x: i32, y: i32) -> Rgba8 {
+pub(crate) fn sample_clamped(src: &Pixmap, x: i32, y: i32) -> Rgba8 {
     let cx = x.clamp(0, src.width() as i32 - 1);
     let cy = y.clamp(0, src.height() as i32 - 1);
     src.get(cx, cy)
@@ -134,7 +134,13 @@ fn area_average(src: &Pixmap, x: u32, y: u32, sx_scale: f32, sy_scale: f32) -> R
     )
 }
 
-fn bilinear(src: &Pixmap, fx: f32, fy: f32) -> Rgba8 {
+/// Bilinear sample at a fractional position, clamping at the edges.
+///
+/// Shared with the radial blur, which walks an arc across the image and lands
+/// between pixels at nearly every step: rounding to the nearest one instead
+/// leaves the visible ghost copies that undersampling and nearest-neighbour
+/// produce together.
+pub(crate) fn bilinear(src: &Pixmap, fx: f32, fy: f32) -> Rgba8 {
     let x0 = fx.floor() as i32;
     let y0 = fy.floor() as i32;
     let tx = fx - x0 as f32;

@@ -39,6 +39,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # --------------------------------------------------------------------- Qt ---
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui PrintSupport Svg Widgets)
+# Optional: the shell's own tests need it, and a machine without the Test
+# module should still be able to build the application.
+find_package(Qt6 6.4 QUIET COMPONENTS Test)
 
 # ---------------------------------------------------------------- CXX-Qt ---
 
@@ -67,13 +70,17 @@ cxx_qt_import_crate(
     QT_MODULES Qt::Core Qt::Gui
 )
 
+# ------------------------------------------------------------------ tests ---
+
+# Before the subdirectories, not after: `add_test` only registers a test if
+# testing was enabled by the time that directory was read, and the shell's
+# tests live under `shell/`. Enabled here, they are silently dropped there.
+include(CTest)
+
 # ------------------------------------------------------------------ shell ---
 
 add_subdirectory(shell)
 
-# ------------------------------------------------------------------ tests ---
-
-include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

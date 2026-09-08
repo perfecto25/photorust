@@ -108,6 +108,10 @@ bool CommandRegistry::loadKeymapFile(const QString &path, bool isDefaults)
             if (isDefaults) {
                 registerCommand(id, name, sequences);
                 m_defaults.insert(id, sequences);
+                // The declared name, kept apart from the action's text so
+                // that a menu label which changes at runtime does not rename
+                // the command. See `commandName`.
+                m_names.insert(id, name);
             } else if (QAction *existing = action(id)) {
                 // A user override rebinds a command the defaults declared.
                 existing->setShortcuts(sequences);
@@ -139,6 +143,18 @@ QAction *CommandRegistry::registerCommand(const QString &id,
         if (!text.isEmpty()) {
             existing->setText(text);
         }
+        // A binding arriving for an action that has none is the keymap
+        // catching up with a command some widget registered first. Without
+        // this the default is silently dropped and the command ends up in the
+        // menus with no shortcut beside it — which looks exactly like a
+        // missing keymap entry, and is not.
+        //
+        // Only when it has none: a caller passing no shortcut must not clear
+        // one, which is how `MainWindow::command` re-registers everything.
+        if (!shortcuts.isEmpty() && existing->shortcuts().isEmpty()) {
+            existing->setShortcuts(shortcuts);
+            emit shortcutChanged(id, existing->shortcut());
+        }
         return existing;
     }
 
@@ -151,6 +167,15 @@ QAction *CommandRegistry::registerCommand(const QString &id,
     act->setShortcutContext(Qt::WindowShortcut);
     m_actions.insert(id, act);
     return act;
+}
+
+QString CommandRegistry::commandName(const QString &id) const
+{
+    if (const QString declared = m_names.value(id); !declared.isEmpty()) {
+        return declared;
+    }
+    QAction *act = action(id);
+    return act ? act->text().remove(QLatin1Char('&')) : id;
 }
 
 QAction *CommandRegistry::action(const QString &id) const

@@ -176,7 +176,17 @@ paint, manage layers, select, filter and undo.
   moves, resizes and deletes them, and File ▸ Save Slices writes each one out
   as its own PNG.
 - Adjustments (destructive and as non-destructive adjustment layers) and
-  filters (Gaussian blur, sharpen, unsharp mask, noise).
+  filters. The Blur submenu is CS6's — Average, Blur, Blur More, Box Blur,
+  Gaussian Blur, Motion Blur, Radial Blur and Surface Blur — alongside sharpen,
+  unsharp mask and noise. Every filter that takes a number shares one dialog:
+  a preview thumbnail with its own zoom, a slider per parameter, and a Preview
+  checkbox that shows the result on the canvas with a square marking which
+  part of the image the thumbnail is looking at. Radial Blur is the exception
+  CS6 makes it: no thumbnail, but Blur Method and Quality as boxes of radio
+  buttons and a draggable Blur Center box beside them. The last filter run
+  sits at the top of the Filter menu on Ctrl+F. The View menu's zoom
+  shortcuts keep working while any dialog is open, as Photoshop's do — you
+  have to be able to zoom in to judge what a filter is doing.
 - A Photoshop-style **Color Picker**: square field + vertical ramp driven by
   the H/S/B/R/G/B radio buttons (each re-maps both axes as CS6 does),
   new/current comparison, HSB/RGB/Lab/CMYK readouts, hex entry, and web-safe
@@ -266,7 +276,7 @@ paint, manage layers, select, filter and undo.
 - gradient tools - done
 - blur tools - done
 - dodge tools - done
-- pen tools - done
+- pen tools - done - (needs more testing)
 - type tools - done
 - selection tools -  done
 - shape tools - done
@@ -448,7 +458,8 @@ paint, manage layers, select, filter and undo.
       - Hidden Layers - DONE
     Quick Export as PNG - DONE
     Export As - 
-    Rename Layer - 
+    Rename Layer - DONE. Renames in the panel row, as CS6 does, rather than
+      opening a dialog.
     Layer Style - PARTLY DONE
       Drop Shadow, Inner Shadow, Outer Glow, Inner Glow, Color Overlay,
       Blending Options - DONE except Knockout, Blend Interior/Clipped as Group
@@ -476,8 +487,6 @@ paint, manage layers, select, filter and undo.
       - Hide All Effects - 
       - Scale Effects -  
 
-    Rename Layer - 
-
     New Fill Layer - DONE (Solid Color, Gradient, Pattern — all evaluated per
       pixel rather than painted, so they stay editable)
       
@@ -492,15 +501,83 @@ paint, manage layers, select, filter and undo.
       default, cannot be nested, and Merge Group is not built.
     Hide Layers - DONE (Ctrl+,), on the panel's whole selection, and reads
       Show Layers once all of it is hidden.
+    Arrange - DONE. Bring to Front / Forward / Send Backward / Send to Back
+      with CS6's bracket shortcuts, plus Reverse for two or more selected
+      layers. A group moves as a unit and one step clears the whole of it; a
+      layer inside a group arranges within the folder; nothing goes below a
+      Background. Entries grey out at the ends of the stack.
+    Lock Layers... - DONE (Ctrl+/). The four locks as a dialog, applied to the
+      whole selection; Lock All is the other three together rather than a lock
+      of its own.
+    Link Layers / Select Linked Layers - DONE. Linked layers move together, in
+      one history step; a position-locked member holds still without pinning
+      the rest. Linking to a layer that is already in a set joins that set, and
+      a set left with one member dissolves. The row carries CS6's chain badge,
+      and the panel's footer chain button links or unlinks the selection.
+      Linking affects moving only — it does not gang up transforms or edits.
+
+    - Layers panel - show pixel layer, show adjustment layer, show type layer  - buttons dont work - 
 
 - Type dropdown
+  Panels > 
+    Character Panel - DONE
+    Paragraph Panel - done
+    Glyphs Panel - done
+    Character Styles Panel - not implemented
+    Paragraph Styles Panel - done
+    BUGS: 
+      - resized Text layer resizes to pixelated size, not clean vector - fixed
+    Anti Alias - done
+    Orientation - done
+    Create Work Path - done - needs testing
+    Convert to Shape  - done - needs testing
+    Rasterize Type Layer - done
+    Warp Text - in progress
+      - arc - done
+      - arc lower - done
+      - arc upper - done
+      - arch - done
+      - bulge - done
+      - shell lower - done
+      - shell upper - done
+      - flag - done
+      - wave - done
+      - fish - done
+      - rise - done
+      - fisheye - done
+      - inflate - done
+      - squeeze - done
+      - twist - done
+
 - Select dropdown
+  - Find layers - done
+  - Color range - done
 - Filter dropdown
+  - Last Filter (Ctrl+F) and Last Filter Settings (Alt+Ctrl+F) - done
+  - Blur submenu - done, except Lens, Shape and Smart Blur, which are listed
+    and disabled: they need a depth map, the preset shape library and an
+    edge-detection pass respectively
+    - box blur - done
+    - gaussian blur -  done
+    - radial blur - done
+    - motion blur - add angle wheel
+    - surface blur - taking too long to process 
+  - 
+  - Sharpen, Noise - partial
+  - Filter Gallery, Liquify, Vanishing Point, Distort, Pixelate, Render,
+    Stylize - not started
+
+
 - View dropdown
 - Window dropdown
 - Help dropdown
 Auto recovery - save working project to temp file for auto recover - not started
 
+BUGS:
+ - Panels - PR crashing when moving panel to independent panel window, and dragging another panel into 1st panel
+ - Panels missing Minimize and Close buttons on top right corner
+
+Swatches Panel - to do
 
 
 File format support:

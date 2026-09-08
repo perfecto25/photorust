@@ -208,8 +208,7 @@ KeyboardShortcutsDialog::KeyboardShortcutsDialog(CommandRegistry *registry,
 
         const QString conflict = m_registry->commandForShortcut(seq);
         if (!conflict.isEmpty() && conflict != id) {
-            QAction *conflictAction = m_registry->action(conflict);
-            const QString name = conflictAction ? conflictAction->text() : conflict;
+            const QString name = m_registry->commandName(conflict);
             m_editingItem->setToolTip(1,
                 tr("%1 is already assigned to \"%2\". Accepting will reassign it.")
                     .arg(seq.toString(QKeySequence::NativeText), name));
@@ -257,8 +256,7 @@ void KeyboardShortcutsDialog::buildTree()
         if (!parent)
             continue;
 
-        QAction *action = m_registry->action(id);
-        const QString name = action ? action->text().remove(QLatin1Char('&')) : id;
+        const QString name = m_registry->commandName(id);
         const QKeySequence seq = m_registry->shortcut(id);
 
         auto *item = new QTreeWidgetItem(parent, {

@@ -504,4 +504,213 @@ mod tests {
         q.add_dab(-50.0, -50.0, 4.0);
         assert_eq!(count_selected(q.mask()), 0);
     }
+
+    /// A two-pixel image: one exactly the target colour, one far from it.
+    fn pair(a: Rgba8, b: Rgba8) -> Pixmap {
+        let mut px = Pixmap::new(2, 1);
+        px.set(0, 0, a);
+        px.set(1, 0, b);
+        px
+    }
+
+    #[test]
+    fn color_range_takes_the_match_and_leaves_the_rest() {
+        let red = Rgba8::new(255, 0, 0, 255);
+        let blue = Rgba8::new(0, 0, 255, 255);
+        let mask = color_range(&pair(red, blue), ColorRange::Sampled, red, 40);
+        assert_eq!(mask[0], 255, "the exact colour should be fully selected");
+        assert_eq!(mask[1], 0, "a colour nowhere near it should be left out");
+    }
+
+    #[test]
+    fn fuzziness_widens_the_net_rather_than_only_hardening_it() {
+        let red = Rgba8::new(255, 0, 0, 255);
+        // Close to the target but not it, so whether it is caught is decided
+        // by the fuzziness alone.
+        let nearly = Rgba8::new(200, 40, 40, 255);
+        let tight = color_range(&pair(red, nearly), ColorRange::Sampled, red, 10);
+        let loose = color_range(&pair(red, nearly), ColorRange::Sampled, red, 120);
+        assert!(
+            loose[1] > tight[1],
+            "raising fuzziness should take more of a near-miss, got {} then {}",
+            tight[1],
+            loose[1]
+        );
+    }
+
+    #[test]
+    fn a_colour_band_goes_by_hue_and_ignores_greys() {
+        let red = Rgba8::new(255, 0, 0, 255);
+        let grey = Rgba8::new(128, 128, 128, 255);
+        let mask = color_range(&pair(red, grey), ColorRange::Reds, Rgba8::BLACK, 40);
+        assert!(mask[0] > 200, "red should be in the Reds band");
+        // Grey has no hue to speak of; without the saturation test it would
+        // land in whichever band its nominal hue rounded to.
+        assert_eq!(mask[1], 0, "grey belongs to no colour band");
+
+        let green = Rgba8::new(0, 255, 0, 255);
+        let greens = color_range(&pair(green, red), ColorRange::Greens, Rgba8::BLACK, 40);
+        assert!(greens[0] > 200);
+        assert_eq!(greens[1], 0, "red is not a green");
+    }
+
+    #[test]
+    fn the_tonal_bands_split_light_from_dark() {
+        let white = Rgba8::new(255, 255, 255, 255);
+        let black = Rgba8::new(0, 0, 0, 255);
+        let highlights = color_range(&pair(white, black), ColorRange::Highlights, white, 40);
+        assert!(highlights[0] > 200 && highlights[1] == 0);
+
+        let shadows = color_range(&pair(white, black), ColorRange::Shadows, black, 40);
+        assert!(shadows[1] > 200 && shadows[0] == 0);
+    }
+}
+
+/// Which colours Select ▸ Color Range is looking for.
+///
+/// The numbers are the order of CS6's Select menu in that dialog, because
+/// they cross the bridge as one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorRange {
+    /// A colour picked from the image, matched within `fuzziness`.
+    Sampled,
+    Reds,
+    Yellows,
+    Greens,
+    Cyans,
+    Blues,
+    Magentas,
+    Highlights,
+    Midtones,
+    Shadows,
+}
+
+impl ColorRange {
+    pub fn from_i32(value: i32) -> ColorRange {
+        match value {
+            1 => ColorRange::Reds,
+            2 => ColorRange::Yellows,
+            3 => ColorRange::Greens,
+            4 => ColorRange::Cyans,
+            5 => ColorRange::Blues,
+            6 => ColorRange::Magentas,
+            7 => ColorRange::Highlights,
+            8 => ColorRange::Midtones,
+            9 => ColorRange::Shadows,
+            _ => ColorRange::Sampled,
+        }
+    }
+
+    /// The hue a colour band is centred on, in degrees.
+    fn hue_centre(self) -> Option<f32> {
+        Some(match self {
+            ColorRange::Reds => 0.0,
+            ColorRange::Yellows => 60.0,
+            ColorRange::Greens => 120.0,
+            ColorRange::Cyans => 180.0,
+            ColorRange::Blues => 240.0,
+            ColorRange::Magentas => 300.0,
+            _ => return None,
+        })
+    }
+
+    /// The lightness a tonal band is centred on, 0 to 1.
+    fn tone_centre(self) -> Option<f32> {
+        Some(match self {
+            ColorRange::Shadows => 0.0,
+            ColorRange::Midtones => 0.5,
+            ColorRange::Highlights => 1.0,
+            _ => return None,
+        })
+    }
+}
+
+/// Hue in degrees, saturation and lightness, each 0..1 but for the hue.
+fn to_hsl(px: Rgba8) -> (f32, f32, f32) {
+    let r = px.r as f32 / 255.0;
+    let g = px.g as f32 / 255.0;
+    let b = px.b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let span = max - min;
+    if span <= f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = if lightness > 0.5 {
+        span / (2.0 - max - min)
+    } else {
+        span / (max + min)
+    };
+    let hue = if max == r {
+        60.0 * (((g - b) / span) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / span + 2.0)
+    } else {
+        60.0 * ((r - g) / span + 4.0)
+    };
+    (if hue < 0.0 { hue + 360.0 } else { hue }, saturation, lightness)
+}
+
+/// The shortest way round the colour wheel between two hues, in degrees.
+fn hue_distance(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs() % 360.0;
+    if d > 180.0 {
+        360.0 - d
+    } else {
+        d
+    }
+}
+
+/// How much of each pixel Select ▸ Color Range takes, 0 to 255.
+///
+/// Graded rather than a yes-or-no test: a pixel near the edge of the range is
+/// partly selected, which is what lets the dialog's Fuzziness soften an edge
+/// instead of only widening it. Photoshop's preview shows exactly this as a
+/// greyscale image, so the same numbers drive both.
+pub fn color_range(
+    pixels: &Pixmap,
+    range: ColorRange,
+    target: Rgba8,
+    fuzziness: u32,
+) -> Vec<u8> {
+    let width = pixels.width() as usize;
+    let height = pixels.height() as usize;
+    let mut mask = vec![0u8; width * height];
+    // CS6's slider runs to 200; as a fraction it is how far past an exact
+    // match a pixel may be and still count for something.
+    let fuzz = (fuzziness.min(200) as f32 / 200.0).max(0.001);
+
+    for y in 0..height {
+        for x in 0..width {
+            let px = pixels.get(x as i32, y as i32);
+            let coverage = match range {
+                ColorRange::Sampled => {
+                    // Distance in plain RGB, which is what the eyedropper and
+                    // the wand already agree on.
+                    let dr = px.r as f32 - target.r as f32;
+                    let dg = px.g as f32 - target.g as f32;
+                    let db = px.b as f32 - target.b as f32;
+                    let distance = (dr * dr + dg * dg + db * db).sqrt() / 441.673;
+                    1.0 - (distance / fuzz)
+                }
+                _ => {
+                    let (hue, saturation, lightness) = to_hsl(px);
+                    if let Some(centre) = range.hue_centre() {
+                        // A grey pixel has no hue worth speaking of, so it is
+                        // left out of every colour band however close its
+                        // nominal hue lands.
+                        let reach = 30.0 + fuzz * 60.0;
+                        let away = hue_distance(hue, centre) / reach;
+                        (1.0 - away) * saturation.min(1.0)
+                    } else {
+                        let centre = range.tone_centre().unwrap_or(0.5);
+                        1.0 - ((lightness - centre).abs() / (0.25 + fuzz * 0.5))
+                    }
+                }
+            };
+            mask[y * width + x] = (coverage.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+    }
+    mask
 }

@@ -266,6 +266,10 @@ bool FindReplaceTextDialog::replaceMatch(const Match &match)
         QString style;
         float size;
         QColor color;
+        // Carried through so replacing the words in a stretched type layer
+        // does not quietly set it back to unstretched.
+        float hScale = 1.0f;
+        float vScale = 1.0f;
     };
     QList<RunInfo> runs;
     QString fullText;
@@ -277,6 +281,8 @@ bool FindReplaceTextDialog::replaceMatch(const Match &match)
         ri.style = m_engine->layerTextRunStyle(layerIndex, r);
         ri.size = m_engine->layerTextRunSize(layerIndex, r);
         ri.color = m_engine->layerTextRunColor(layerIndex, r);
+        ri.hScale = m_engine->layerTextRunHScale(layerIndex, r);
+        ri.vScale = m_engine->layerTextRunVScale(layerIndex, r);
         runs.append(ri);
         fullText += ri.text;
     }
@@ -466,7 +472,8 @@ bool FindReplaceTextDialog::replaceMatch(const Match &match)
 
     m_engine->beginTextRuns();
     for (const RunInfo &ri : std::as_const(newRuns)) {
-        m_engine->addTextRun(ri.text, ri.family, ri.style, ri.size, ri.color);
+        m_engine->addTextRun(ri.text, ri.family, ri.style, ri.size, ri.color, ri.hScale,
+                             ri.vScale);
     }
 
     m_engine->beginTextEdit(layerIndex);

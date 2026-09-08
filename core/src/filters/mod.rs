@@ -12,7 +12,7 @@ pub mod adjust;
 pub mod convolve;
 
 pub use adjust::Adjustment;
-pub use convolve::{gaussian_blur, sharpen, unsharp_mask, Kernel};
+pub use convolve::{gaussian_blur, sharpen, unsharp_mask, Kernel, RadialQuality};
 
 use crate::buffer::Pixmap;
 
@@ -31,6 +31,36 @@ pub enum Filter {
     },
     /// Add monochrome or colour noise. `amount` is 0..=1.
     Noise { amount: f32, monochromatic: bool },
+
+    // The rest of CS6's Blur submenu. All of them are per-pixel work over a
+    // neighbourhood and would suit the GPU (CLAUDE.md §7), but none is
+    // enabled there: the backend's one shader is the Gaussian, and the
+    // measurements in docs/gpu-migration.md are that a single filter which
+    // uploads its input and reads the result straight back rarely pays for
+    // the trip. They belong in a batch with the rest of the filter stack, if
+    // that is ever done, rather than one at a time.
+    /// One flat colour: the mean of everything in range.
+    Average,
+    /// CS6's fixed-strength blurs, which take no radius — a soft 3×3 and a
+    /// stronger one. The numbers are what makes them "Blur" and "Blur More"
+    /// rather than a Gaussian you have to dial in.
+    Blur,
+    BlurMore,
+    /// `angle` in degrees, `distance` in pixels.
+    MotionBlur { angle: f32, distance: f32 },
+    /// `amount` as a percentage; `spin` turns about the centre rather than
+    /// running in and out from it. `center` is in normalized 0..1 coordinates
+    /// — CS6's Blur Center box, which is draggable and defaults to the middle
+    /// — and `quality` is how densely the path each pixel travels is sampled.
+    RadialBlur {
+        amount: f32,
+        spin: bool,
+        center: (f32, f32),
+        quality: RadialQuality,
+    },
+    /// Blurs within a region but not across its edges: a neighbour counts
+    /// only if it is within `threshold` of the centre pixel.
+    SurfaceBlur { radius: u32, threshold: u32 },
 }
 
 impl Filter {
@@ -41,6 +71,95 @@ impl Filter {
             Filter::Sharpen => "Sharpen",
             Filter::UnsharpMask { .. } => "Unsharp Mask",
             Filter::Noise { .. } => "Add Noise",
+            Filter::Average => "Average",
+            Filter::Blur => "Blur",
+            Filter::BlurMore => "Blur More",
+            Filter::MotionBlur { .. } => "Motion Blur",
+            Filter::RadialBlur { .. } => "Radial Blur",
+            Filter::SurfaceBlur { .. } => "Surface Blur",
+        }
+    }
+
+    /// Build a filter from the name the Filter menu uses, and the numbers its
+    /// dialog collected.
+    ///
+    /// The shell speaks in menu names because that is what it has — a menu
+    /// item and the values from its dialog — and this keeps the mapping in one
+    /// place where both `applyFilter` and the preview can reach it. An
+    /// unrecognised name is `None` rather than a guess.
+    ///
+    /// `p` is positional, in the order the dialog lists its controls. Five
+    /// slots because Radial Blur needs them all: amount, method, the two
+    /// coordinates of its centre, and quality.
+    pub fn from_menu_name(name: &str, p: [f32; 5]) -> Option<Filter> {
+        let [p1, p2, p3, p4, p5] = p;
+        Some(match name {
+            "Gaussian Blur" => Filter::GaussianBlur { radius: p1.max(0.0) },
+            "Box Blur" => Filter::BoxBlur {
+                radius: p1.max(0.0) as u32,
+            },
+            "Average" => Filter::Average,
+            "Blur" => Filter::Blur,
+            "Blur More" => Filter::BlurMore,
+            "Motion Blur" => Filter::MotionBlur {
+                angle: p1,
+                distance: p2.max(0.0),
+            },
+            "Radial Blur" => Filter::RadialBlur {
+                amount: p1.max(0.0),
+                spin: p2 != 0.0,
+                center: (p3, p4),
+                quality: RadialQuality::from_i32(p5 as i32),
+            },
+            "Surface Blur" => Filter::SurfaceBlur {
+                radius: p1.max(0.0) as u32,
+                threshold: p2.max(0.0) as u32,
+            },
+            "Sharpen" => Filter::Sharpen,
+            "Unsharp Mask" => Filter::UnsharpMask {
+                amount: p1,
+                radius: p2,
+                threshold: 0,
+            },
+            "Add Noise" => Filter::Noise {
+                amount: p1.clamp(0.0, 1.0),
+                monochromatic: p2 != 0.0,
+            },
+            _ => return None,
+        })
+    }
+
+    /// How far, in pixels, a result pixel reaches for its input.
+    ///
+    /// This is what lets a preview of one region be computed from a crop: pad
+    /// the crop by the reach, filter it, and the middle is identical to what
+    /// the whole image would have produced.
+    ///
+    /// `None` means the operation cannot be cropped at all. Average is the
+    /// mean of every pixel there is, and Radial Blur sweeps about a centre
+    /// given as a fraction of the whole image — neither has an answer that a
+    /// region can be asked for on its own, so a preview of them has to filter
+    /// the whole layer first.
+    pub fn reach(&self) -> Option<u32> {
+        match *self {
+            // Three sigma covers a Gaussian to well under a level of 255.
+            Filter::GaussianBlur { radius } => Some((radius * 3.0).ceil().max(1.0) as u32),
+            Filter::Blur => Some(3),
+            Filter::BlurMore => Some(6),
+            Filter::BoxBlur { radius } => Some(radius),
+            Filter::SurfaceBlur { radius, .. } => Some(radius),
+            // The line is centred on the pixel, so it reaches half its length
+            // in the worst direction.
+            Filter::MotionBlur { distance, .. } => Some((distance / 2.0).ceil().max(1.0) as u32),
+            Filter::UnsharpMask { radius, .. } => Some((radius * 3.0).ceil().max(1.0) as u32),
+            Filter::Sharpen => Some(1),
+            // Noise reads no neighbours at all, but it is seeded from each
+            // pixel's coordinates so that undo/redo reproduces it. A crop
+            // taken out of the layer would be at different coordinates and
+            // would show a different grain from the one the user is about to
+            // get, so it goes the whole-layer way with the other two.
+            Filter::Noise { .. } => None,
+            Filter::Average | Filter::RadialBlur { .. } => None,
         }
     }
 
@@ -51,6 +170,23 @@ impl Filter {
                 convolve::gaussian_blur_accelerated(pixmap, radius)
             }
             Filter::BoxBlur { radius } => convolve::box_blur(pixmap, radius),
+            Filter::Average => convolve::average(pixmap),
+            // CS6's two fixed blurs are a gentle Gaussian and a stronger one;
+            // the radii are chosen to match how far each visibly softens.
+            Filter::Blur => convolve::gaussian_blur_accelerated(pixmap, 0.7),
+            Filter::BlurMore => convolve::gaussian_blur_accelerated(pixmap, 2.0),
+            Filter::MotionBlur { angle, distance } => {
+                convolve::motion_blur(pixmap, angle, distance)
+            }
+            Filter::RadialBlur {
+                amount,
+                spin,
+                center,
+                quality,
+            } => convolve::radial_blur(pixmap, amount, spin, center, quality),
+            Filter::SurfaceBlur { radius, threshold } => {
+                convolve::surface_blur(pixmap, radius, threshold)
+            }
             Filter::Sharpen => sharpen(pixmap),
             Filter::UnsharpMask {
                 amount,

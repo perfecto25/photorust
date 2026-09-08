@@ -17,10 +17,10 @@ use crate::annotation::{MarkerKind, Ruler};
 use crate::blend::BlendMode;
 use crate::brush::{Brush, StrokeMask};
 use crate::buffer::{Pixmap, Rect, Rgba8};
-use crate::document::{ColorSample, Document, ImageMode, PasteMode, PatchOptions};
+use crate::document::{ArrangeOp, ColorSample, Document, ImageMode, PasteMode, PatchOptions};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{HealMode, MoveOptions};
-use crate::layer::{LayerId, LayerKind, LayerStack, TextAlign, TextContent, TextRun};
+use crate::layer::{LayerId, LayerKind, LayerStack, TextAlign, TextContent, TextRun, TextWarp};
 use crate::mixer::MixerOptions;
 use crate::replace::{ReplaceLimits, ReplaceMode, ReplaceOptions, ReplaceSampling};
 use crate::erase::BackgroundEraseOptions;
@@ -704,6 +704,121 @@ pub mod ffi {
             close: bool,
         ) -> bool;
 
+        /// Build a path from geometry the shell already has — the glyph
+        /// outlines behind Type ▸ Create Work Path.
+        ///
+        /// The Pen tool's calls above take one click at a time and cannot
+        /// state both control points of a curve, so a shape that is already
+        /// known in full arrives this way instead: `beginPathBuild`, then a
+        /// `pathBuildSubpath` per contour followed by its `pathBuildPoint`s,
+        /// then `commitBuiltPath`. The same begin/add/commit shape the text
+        /// runs above use, and for the same reason — a list is awkward to
+        /// pass as an argument.
+        #[qinvokable]
+        #[cxx_name = "beginPathBuild"]
+        fn begin_path_build(self: Pin<&mut Engine>);
+
+        /// Start a contour. Glyph outlines are always closed; an open one is
+        /// what a stroke that never came back would leave.
+        #[qinvokable]
+        #[cxx_name = "pathBuildSubpath"]
+        fn path_build_subpath(self: Pin<&mut Engine>, closed: bool);
+
+        /// One anchor of the contour being built, with the handles curving the
+        /// segments either side of it. A handle flagged absent leaves that
+        /// side straight.
+        #[qinvokable]
+        #[cxx_name = "pathBuildPoint"]
+        fn path_build_point(
+            self: Pin<&mut Engine>,
+            x: f32,
+            y: f32,
+            has_in: bool,
+            in_x: f32,
+            in_y: f32,
+            has_out: bool,
+            out_x: f32,
+            out_y: f32,
+        );
+
+        /// Install what was built under `name`, made active, replacing any
+        /// path already going by it. Returns its index, or -1 if nothing was
+        /// built.
+        #[qinvokable]
+        #[cxx_name = "commitBuiltPath"]
+        fn commit_built_path(self: Pin<&mut Engine>, name: &QString) -> i32;
+
+        /// The Paragraph panel's indents and spacing, in document pixels.
+        ///
+        /// Hyphenation and a right indent that means anything both need line
+        /// wrapping, which point text does not do — so those two are not here
+        /// and the panel leaves them disabled.
+        #[qinvokable]
+        #[cxx_name = "setLayerTextParagraph"]
+        fn set_layer_text_paragraph(
+            self: Pin<&mut Engine>,
+            index: i32,
+            indent_left: f32,
+            indent_right: f32,
+            first_line_indent: f32,
+            space_before: f32,
+            space_after: f32,
+        ) -> bool;
+
+        /// Those five back, in the same order.
+        #[qinvokable]
+        #[cxx_name = "layerTextParagraph"]
+        fn layer_text_paragraph(self: &Engine, index: i32) -> Vec<f32>;
+
+        /// The active type layer's warp — Type ▸ Warp Text. `style` is CS6's
+        /// menu order (0 None, 1 Arc, ... 15 Twist) and the three amounts are
+        /// its percentages as fractions.
+        ///
+        /// A setter of its own rather than more arguments on `updateTextLayer`:
+        /// bending the letters is not retyping them, and the two happen at
+        /// quite different moments.
+        #[qinvokable]
+        #[cxx_name = "setLayerTextWarp"]
+        fn set_layer_text_warp(
+            self: Pin<&mut Engine>,
+            index: i32,
+            style: i32,
+            horizontal: bool,
+            bend: f32,
+            h_distort: f32,
+            v_distort: f32,
+        ) -> bool;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextWarpStyle"]
+        fn layer_text_warp_style(self: &Engine, index: i32) -> i32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextWarpHorizontal"]
+        fn layer_text_warp_horizontal(self: &Engine, index: i32) -> bool;
+
+        /// The three amounts, as `[bend, horizontal, vertical]`.
+        #[qinvokable]
+        #[cxx_name = "layerTextWarpAmounts"]
+        fn layer_text_warp_amounts(self: &Engine, index: i32) -> Vec<f32>;
+
+        /// Drop the active type layer's text record, keeping its pixels —
+        /// Type ▸ Rasterize Type Layer. False when it was never type.
+        #[qinvokable]
+        #[cxx_name = "rasterizeTypeLayer"]
+        fn rasterize_type_layer(self: Pin<&mut Engine>) -> bool;
+
+        /// Replace the active type layer with a shape layer cut to the active
+        /// path — Type ▸ Convert to Shape.
+        ///
+        /// The path is the one just built from the layer's glyph outlines, so
+        /// this takes it as it stands rather than being handed the geometry a
+        /// second time. False when the active layer is not type, or the path
+        /// has nothing closed enough to fill.
+        #[qinvokable]
+        #[cxx_name = "convertTypeLayerToShape"]
+        fn convert_type_layer_to_shape(self: Pin<&mut Engine>) -> bool;
+
         /// Turn the active path into a selection — the Paths panel's "Make
         /// Selection". `op` is a `SelectionOp` discriminant.
         #[qinvokable]
@@ -1324,11 +1439,65 @@ pub mod ffi {
         #[cxx_name = "ungroupLayers"]
         fn ungroup_layers(self: Pin<&mut Engine>, index: i32) -> bool;
 
+        // -- Layer ▸ Arrange ------------------------------------------------
+
+        /// Move a layer: `op` is 0 = Bring to Front, 1 = Bring Forward,
+        /// 2 = Send Backward, 3 = Send to Back — the menu's order.
+        ///
+        /// A group travels with its members, a layer inside a group moves
+        /// within it, and nothing goes below a Background.
+        #[qinvokable]
+        #[cxx_name = "arrangeLayer"]
+        fn arrange_layer(self: Pin<&mut Engine>, index: i32, op: i32) -> bool;
+
+        /// Whether that move would do anything, for greying the entry.
+        #[qinvokable]
+        #[cxx_name = "canArrangeLayer"]
+        fn can_arrange_layer(self: &Engine, index: i32, op: i32) -> bool;
+
+        /// Reverse the order of these layers, leaving everything else where it
+        /// is. Needs two of them, at the same level.
+        #[qinvokable]
+        #[cxx_name = "reverseLayers"]
+        fn reverse_layers(self: Pin<&mut Engine>, indices: &QVector_i32) -> bool;
+
         /// Drop a layer onto a group folder: it lands at the top of that
         /// group's contents. Both are panel indices.
         #[qinvokable]
         #[cxx_name = "moveLayerIntoGroup"]
         fn move_layer_into_group(self: Pin<&mut Engine>, index: i32, group: i32) -> bool;
+
+        // -- linked layers --------------------------------------------------
+
+        /// Link these layers so they move together — Layer ▸ Link Layers.
+        /// Layers already linked bring their whole set with them. False for
+        /// fewer than two.
+        #[qinvokable]
+        #[cxx_name = "linkLayers"]
+        fn link_layers(self: Pin<&mut Engine>, indices: &QVector_i32) -> bool;
+
+        /// Take them out of their sets — the same menu entry, which reads
+        /// Unlink Layers once the selection is linked.
+        #[qinvokable]
+        #[cxx_name = "unlinkLayers"]
+        fn unlink_layers(self: Pin<&mut Engine>, indices: &QVector_i32) -> bool;
+
+        /// Which set a layer belongs to; 0 when it is not linked. Rows sharing
+        /// a value are linked to each other — what the panel's chain badge and
+        /// Select Linked Layers both go on.
+        #[qinvokable]
+        #[cxx_name = "layerLinkId"]
+        fn layer_link_id(self: &Engine, index: i32) -> i64;
+
+        /// The layer's identity, which survives everything that changes its
+        /// panel index — reordering, arranging, a layer added below it.
+        ///
+        /// The panel restores its selection through this rather than through
+        /// row numbers: after a move those name different layers, and
+        /// re-selecting them is how a selection quietly grows.
+        #[qinvokable]
+        #[cxx_name = "layerId"]
+        fn layer_id(self: &Engine, index: i32) -> i64;
 
         /// Whether the layer is a group folder.
         #[qinvokable]
@@ -1433,8 +1602,9 @@ pub mod ffi {
         fn begin_text_runs(self: Pin<&mut Engine>);
 
         /// Append one run of same-formatted text: its characters, the font they
-        /// are set in (family and style by name, `size` in document pixels) and
-        /// their colour.
+        /// are set in (family and style by name, `size` in document pixels),
+        /// their colour, and the horizontal/vertical scale they are stretched
+        /// by, 1.0 being Photoshop's 100%.
         #[qinvokable]
         #[cxx_name = "addTextRun"]
         fn add_text_run(
@@ -1444,6 +1614,8 @@ pub mod ffi {
             style: &QString,
             size: f32,
             color: &QColor,
+            h_scale: f32,
+            v_scale: f32,
         );
 
         /// Add a layer from an image the shell already decoded — the frames of
@@ -1556,6 +1728,17 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "layerTextRunColor"]
         fn layer_text_run_color(self: &Engine, index: i32, run: i32) -> QColor;
+
+        /// A run's horizontal and vertical scale, 1.0 being 100%. A
+        /// non-uniform Free Transform of a type layer lands here rather than
+        /// in the size, which is one number and cannot describe a stretch.
+        #[qinvokable]
+        #[cxx_name = "layerTextRunHScale"]
+        fn layer_text_run_h_scale(self: &Engine, index: i32, run: i32) -> f32;
+
+        #[qinvokable]
+        #[cxx_name = "layerTextRunVScale"]
+        fn layer_text_run_v_scale(self: &Engine, index: i32, run: i32) -> f32;
 
         #[qinvokable]
         #[cxx_name = "layerTextAlign"]
@@ -2365,6 +2548,35 @@ pub mod ffi {
         #[cxx_name = "endQuickSelect"]
         fn end_quick_select(self: Pin<&mut Engine>);
 
+        /// Select every pixel matching a colour range — Select ▸ Color Range.
+        ///
+        /// `range` is the dialog's Select list: 0 sampled, 1-6 the colour
+        /// bands, 7-9 highlights, midtones and shadows. `fuzziness` is its
+        /// slider, 0 to 200. The mask comes back graded rather than a plain
+        /// yes or no, so a soft edge stays soft.
+        #[qinvokable]
+        #[cxx_name = "selectColorRange"]
+        fn select_color_range(
+            self: Pin<&mut Engine>,
+            range: i32,
+            target: &QColor,
+            fuzziness: i32,
+            invert: bool,
+            op: i32,
+        );
+
+        /// That same mask without selecting anything, for the dialog's
+        /// preview. Row-major, one byte a pixel.
+        #[qinvokable]
+        #[cxx_name = "colorRangeMask"]
+        fn color_range_mask(
+            self: &Engine,
+            range: i32,
+            target: &QColor,
+            fuzziness: i32,
+            invert: bool,
+        ) -> Vec<u8>;
+
         #[qinvokable]
         #[cxx_name = "selectAll"]
         fn select_all(self: Pin<&mut Engine>);
@@ -2408,10 +2620,44 @@ pub mod ffi {
 
     // -- filters and adjustments -------------------------------------------
     unsafe extern "RustQt" {
-        /// Apply a filter by menu name. `p1`/`p2` are filter-specific.
+        /// Apply a filter by menu name.
+        ///
+        /// `params` are the values its dialog collected, positionally, in the
+        /// order the dialog lists its controls. Missing ones read as zero, so
+        /// a filter that takes one number passes one.
         #[qinvokable]
         #[cxx_name = "applyFilter"]
-        fn apply_filter(self: Pin<&mut Engine>, name: &QString, p1: f32, p2: f32);
+        fn apply_filter(self: Pin<&mut Engine>, name: &QString, params: &[f32]);
+
+        /// Whether `applyFilter` would reach the active layer at all — false
+        /// for a locked layer, a type layer, or no layer.
+        #[qinvokable]
+        #[cxx_name = "canFilterActiveLayer"]
+        fn can_filter_active_layer(self: &Engine) -> bool;
+
+        /// What the filter would make of one region, for a dialog's preview
+        /// thumbnail. The region is in document coordinates; the result is
+        /// exactly what applying the filter to the whole layer would give
+        /// there, edges included. Null if there is nothing to filter.
+        #[qinvokable]
+        #[cxx_name = "filterPreview"]
+        fn filter_preview(
+            self: &Engine,
+            name: &QString,
+            params: &[f32],
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        ) -> QImage;
+
+        /// Show a filter on the active layer without committing it — the
+        /// Preview checkbox on a filter dialog. An empty name takes the
+        /// preview away again and puts the layer back as it was. Nothing here
+        /// touches the History panel; OK still goes through `applyFilter`.
+        #[qinvokable]
+        #[cxx_name = "setFilterPreview"]
+        fn set_filter_preview(self: Pin<&mut Engine>, name: &QString, params: &[f32]);
 
         /// Apply an adjustment destructively by menu name.
         #[qinvokable]
@@ -2659,6 +2905,10 @@ pub struct EngineRust {
     /// rest — this is a builder's scratch space, not document state.
     pending_runs: Vec<TextRun>,
 
+    /// Contours accumulated between `begin_path_build` and
+    /// `commit_built_path`.
+    pending_subpaths: Vec<crate::path::Subpath>,
+
     /// Set while the Spot Healing Brush is active. `None` for every other tool,
     /// which is what makes `end_stroke` paint normally.
     heal_mode: Option<HealMode>,
@@ -2752,6 +3002,7 @@ impl Default for EngineRust {
             pattern_index: 0,
             pattern_aligned: true,
             pending_runs: Vec::new(),
+            pending_subpaths: Vec::new(),
             heal_mode: None,
             heal_source: None,
             clone_source: None,
@@ -2899,6 +3150,17 @@ fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
 
 /// a persistent back-buffer in [`EngineRust`] and hand out a `QImage` that
 /// borrows it, which is worth doing once the canvas renderer lands.
+/// A filter dialog's parameters, padded out to the fixed five a [`Filter`]
+/// can take. A dialog with one slider sends one number; the rest read as zero,
+/// which is what a filter that does not use them expects anyway.
+fn filter_params(params: &[f32]) -> [f32; 5] {
+    let mut out = [0.0f32; 5];
+    for (slot, value) in out.iter_mut().zip(params) {
+        *slot = *value;
+    }
+    out
+}
+
 fn pixmap_to_qimage(pm: Pixmap) -> QImage {
     if pm.is_empty() {
         return QImage::default();
@@ -2989,6 +3251,15 @@ impl EngineRust {
         }
         Some(TextContent {
             runs: std::mem::take(&mut self.pending_runs),
+            // None by default; `update_text_layer` puts back whatever the
+            // layer already had, so a restyle does not straighten bent text
+            // or lose its paragraph settings.
+            warp: TextWarp::default(),
+            indent_left: 0.0,
+            indent_right: 0.0,
+            first_line_indent: 0.0,
+            space_before: 0.0,
+            space_after: 0.0,
             align: match align {
                 1 => TextAlign::Center,
                 2 => TextAlign::Right,
@@ -3514,6 +3785,209 @@ impl ffi::Engine {
         }
         self.as_mut().paths_changed();
         true
+    }
+
+    fn begin_path_build(mut self: core::pin::Pin<&mut Self>) {
+        self.as_mut().rust_mut().pending_subpaths.clear();
+    }
+
+    fn path_build_subpath(mut self: core::pin::Pin<&mut Self>, closed: bool) {
+        self.as_mut()
+            .rust_mut()
+            .pending_subpaths
+            .push(crate::path::Subpath { points: Vec::new(), closed });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn path_build_point(
+        mut self: core::pin::Pin<&mut Self>,
+        x: f32,
+        y: f32,
+        has_in: bool,
+        in_x: f32,
+        in_y: f32,
+        has_out: bool,
+        out_x: f32,
+        out_y: f32,
+    ) {
+        let point = crate::path::PathPoint {
+            anchor: (x, y),
+            in_handle: has_in.then_some((in_x, in_y)),
+            out_handle: has_out.then_some((out_x, out_y)),
+            // Glyph outlines carry no notion of which joins are smooth, and
+            // guessing from collinearity would make editing one behave
+            // differently either side of a rounding error. Corner points keep
+            // both handles exactly where they were placed.
+            smooth: false,
+        };
+        // A point before any subpath was started would have nowhere to go;
+        // the shell always opens one first, so this simply drops it.
+        if let Some(subpath) = self.as_mut().rust_mut().pending_subpaths.last_mut() {
+            subpath.points.push(point);
+        }
+    }
+
+    fn commit_built_path(mut self: core::pin::Pin<&mut Self>, name: &QString) -> i32 {
+        let subpaths: Vec<crate::path::Subpath> =
+            std::mem::take(&mut self.as_mut().rust_mut().pending_subpaths)
+                .into_iter()
+                .filter(|s| !s.points.is_empty())
+                .collect();
+        if subpaths.is_empty() {
+            return -1;
+        }
+        let path = crate::path::VectorPath::from_subpaths(subpaths);
+        let index = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .paths_mut()
+            .set_named(&name.to_string(), path) as i32;
+        self.as_mut().paths_changed();
+        index
+    }
+
+    fn set_layer_text_paragraph(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        indent_left: f32,
+        indent_right: f32,
+        first_line_indent: f32,
+        space_before: f32,
+        space_after: f32,
+    ) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let changed = {
+            let mut engine = self.as_mut().rust_mut();
+            let layers = engine.doc.layers_mut_raw();
+            match layers.by_id_mut(id).and_then(|l| l.text.as_mut()) {
+                Some(text) => {
+                    let same = text.indent_left == indent_left
+                        && text.indent_right == indent_right
+                        && text.first_line_indent == first_line_indent
+                        && text.space_before == space_before
+                        && text.space_after == space_after;
+                    if !same {
+                        text.indent_left = indent_left;
+                        text.indent_right = indent_right;
+                        text.first_line_indent = first_line_indent;
+                        text.space_before = space_before;
+                        text.space_after = space_after;
+                    }
+                    !same
+                }
+                None => false,
+            }
+        };
+        if changed {
+            self.as_mut().rust_mut().doc.commit("Paragraph");
+            self.as_mut().sync();
+        }
+        changed
+    }
+
+    fn layer_text_paragraph(&self, index: i32) -> Vec<f32> {
+        self.text_content_at(index)
+            .map(|t| {
+                vec![
+                    t.indent_left,
+                    t.indent_right,
+                    t.first_line_indent,
+                    t.space_before,
+                    t.space_after,
+                ]
+            })
+            .unwrap_or_else(|| vec![0.0; 5])
+    }
+
+    fn set_layer_text_warp(
+        mut self: core::pin::Pin<&mut Self>,
+        index: i32,
+        style: i32,
+        horizontal: bool,
+        bend: f32,
+        h_distort: f32,
+        v_distort: f32,
+    ) -> bool {
+        let Some(id) = self.layer_id_at(index) else {
+            return false;
+        };
+        let warp = TextWarp {
+            style,
+            horizontal,
+            bend: bend.clamp(-1.0, 1.0),
+            h_distort: h_distort.clamp(-1.0, 1.0),
+            v_distort: v_distort.clamp(-1.0, 1.0),
+        };
+        let changed = {
+            let mut engine = self.as_mut().rust_mut();
+            let layers = engine.doc.layers_mut_raw();
+            match layers.by_id_mut(id).and_then(|l| l.text.as_mut()) {
+                Some(text) if text.warp != warp => {
+                    text.warp = warp;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            // The pixels are re-rendered by the shell, which redraws the layer
+            // straight after; this only records what was asked for.
+            self.as_mut().rust_mut().doc.commit("Warp Text");
+            self.as_mut().sync();
+        }
+        changed
+    }
+
+    fn layer_text_warp_style(&self, index: i32) -> i32 {
+        self.text_content_at(index).map_or(0, |t| t.warp.style)
+    }
+
+    fn layer_text_warp_horizontal(&self, index: i32) -> bool {
+        self.text_content_at(index).map_or(true, |t| t.warp.horizontal)
+    }
+
+    fn layer_text_warp_amounts(&self, index: i32) -> Vec<f32> {
+        self.text_content_at(index)
+            .map(|t| vec![t.warp.bend, t.warp.h_distort, t.warp.v_distort])
+            .unwrap_or_else(|| vec![0.0, 0.0, 0.0])
+    }
+
+    fn rasterize_type_layer(mut self: core::pin::Pin<&mut Self>) -> bool {
+        let done = self.as_mut().rust_mut().doc.rasterize_type_layer();
+        if done {
+            // The pixels are unchanged, but the Layers panel draws a type
+            // layer differently and every menu that asks "is this type?" has
+            // to be re-asked.
+            self.as_mut().sync();
+        }
+        done
+    }
+
+    fn convert_type_layer_to_shape(mut self: core::pin::Pin<&mut Self>) -> bool {
+        // Flattened here rather than in the shell: the curve maths and the
+        // tolerance that goes with it belong on this side, and the mask is
+        // rasterised from polygons anyway.
+        let Some(path) = self.doc.paths().active() else {
+            return false;
+        };
+        let contours: Vec<Vec<(f32, f32)>> =
+            path.flatten(0.25).into_iter().map(|(points, _closed)| points).collect();
+        if contours.is_empty() {
+            return false;
+        }
+        let made = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .convert_type_layer_to_shape(&contours)
+            .is_some();
+        if made {
+            self.as_mut().sync();
+        }
+        made
     }
 
     fn add_path(mut self: core::pin::Pin<&mut Self>) -> i32 {
@@ -5445,6 +5919,33 @@ impl ffi::Engine {
         done
     }
 
+    fn arrange_layer(mut self: core::pin::Pin<&mut Self>, index: i32, op: i32) -> bool {
+        let (Some(id), Some(op)) = (self.layer_id_at(index), ArrangeOp::from_i32(op)) else {
+            return false;
+        };
+        let moved = self.as_mut().rust_mut().doc.arrange_layer(id, op);
+        if moved {
+            self.sync();
+        }
+        moved
+    }
+
+    fn can_arrange_layer(&self, index: i32, op: i32) -> bool {
+        let (Some(id), Some(op)) = (self.layer_id_at(index), ArrangeOp::from_i32(op)) else {
+            return false;
+        };
+        self.doc.can_arrange_layer(id, op)
+    }
+
+    fn reverse_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
+        let ids = self.layer_ids_at(indices);
+        let reversed = self.as_mut().rust_mut().doc.reverse_layers(&ids);
+        if reversed {
+            self.sync();
+        }
+        reversed
+    }
+
     fn move_layer_into_group(
         mut self: core::pin::Pin<&mut Self>,
         index: i32,
@@ -5463,6 +5964,33 @@ impl ffi::Engine {
             self.sync();
         }
         moved
+    }
+
+    fn link_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
+        let ids = self.layer_ids_at(indices);
+        let linked = self.as_mut().rust_mut().doc.link_layers(&ids);
+        if linked {
+            self.sync();
+        }
+        linked
+    }
+
+    fn unlink_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
+        let ids = self.layer_ids_at(indices);
+        let unlinked = self.as_mut().rust_mut().doc.unlink_layers(&ids);
+        if unlinked {
+            self.sync();
+        }
+        unlinked
+    }
+
+    fn layer_link_id(&self, index: i32) -> i64 {
+        self.layer_id_at(index)
+            .map_or(0, |id| self.doc.layer_link(id).0 as i64)
+    }
+
+    fn layer_id(&self, index: i32) -> i64 {
+        self.layer_id_at(index).map_or(0, |id| id.0 as i64)
     }
 
     fn layer_is_group(&self, index: i32) -> bool {
@@ -5693,6 +6221,8 @@ impl ffi::Engine {
         style: &QString,
         size: f32,
         color: &QColor,
+        h_scale: f32,
+        v_scale: f32,
     ) {
         let run = TextRun {
             text: text.to_string(),
@@ -5700,6 +6230,8 @@ impl ffi::Engine {
             style: style.to_string(),
             size,
             color: qcolor_to_rgba(color),
+            h_scale,
+            v_scale,
         };
         self.as_mut().rust_mut().pending_runs.push(run);
     }
@@ -5747,7 +6279,7 @@ impl ffi::Engine {
         origin_x: f32,
         origin_y: f32,
     ) -> bool {
-        let Some(content) = self
+        let Some(mut content) = self
             .as_mut()
             .rust_mut()
             .take_text_content(align, antialias, vertical, origin_x, origin_y)
@@ -5757,6 +6289,18 @@ impl ffi::Engine {
         let Some(id) = self.layer_id_at(index) else {
             return false;
         };
+        // The record is replaced wholesale, so anything the shell does not
+        // rebuild has to be carried over by hand. The warp is set by its own
+        // call and is nothing to do with retyping or restyling the letters —
+        // without this, changing their colour would straighten them out.
+        if let Some(existing) = self.text_content_at(index) {
+            content.warp = existing.warp;
+            content.indent_left = existing.indent_left;
+            content.indent_right = existing.indent_right;
+            content.first_line_indent = existing.first_line_indent;
+            content.space_before = existing.space_before;
+            content.space_after = existing.space_after;
+        }
         let Some(pixels) = qimage_to_pixmap(image) else {
             return false;
         };
@@ -5842,6 +6386,14 @@ impl ffi::Engine {
 
     fn layer_text_run_color(&self, index: i32, run: i32) -> QColor {
         rgba_to_qcolor(self.text_run_at(index, run).map_or(Rgba8::BLACK, |r| r.color))
+    }
+
+    fn layer_text_run_h_scale(&self, index: i32, run: i32) -> f32 {
+        self.text_run_at(index, run).map_or(1.0, |r| r.h_scale)
+    }
+
+    fn layer_text_run_v_scale(&self, index: i32, run: i32) -> f32 {
+        self.text_run_at(index, run).map_or(1.0, |r| r.v_scale)
     }
 
     fn layer_text_align(&self, index: i32) -> i32 {
@@ -7023,6 +7575,55 @@ impl ffi::Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Shared by the selection and the preview, so the picture in the dialog
+    /// is the selection that will be made rather than a second guess at it.
+    fn color_range_coverage(
+        &self,
+        range: i32,
+        target: &QColor,
+        fuzziness: i32,
+        invert: bool,
+    ) -> Vec<u8> {
+        let composite = self.doc.composite();
+        let mut mask = wand::color_range(
+            &composite,
+            wand::ColorRange::from_i32(range),
+            qcolor_to_rgba(target),
+            fuzziness.clamp(0, 200) as u32,
+        );
+        if invert {
+            for value in mask.iter_mut() {
+                *value = 255 - *value;
+            }
+        }
+        mask
+    }
+
+    fn color_range_mask(
+        &self,
+        range: i32,
+        target: &QColor,
+        fuzziness: i32,
+        invert: bool,
+    ) -> Vec<u8> {
+        self.color_range_coverage(range, target, fuzziness, invert)
+    }
+
+    fn select_color_range(
+        mut self: core::pin::Pin<&mut Self>,
+        range: i32,
+        target: &QColor,
+        fuzziness: i32,
+        invert: bool,
+        op: i32,
+    ) {
+        let mask = self.color_range_coverage(range, target, fuzziness, invert);
+        let op = SelectionOp::from_i32(op);
+        self.as_mut().rust_mut().doc.select_mask(&mask, op, 0);
+        self.as_mut().selection_changed();
+        self.as_mut().canvas_changed();
+    }
+
     fn magic_wand(
         mut self: core::pin::Pin<&mut Self>,
         x: i32,
@@ -7156,27 +7757,58 @@ impl ffi::Engine {
 
     // -- filters ------------------------------------------------------------
 
-    fn apply_filter(mut self: core::pin::Pin<&mut Self>, name: &QString, p1: f32, p2: f32) {
-        let filter = match name.to_string().as_str() {
-            "Gaussian Blur" => Filter::GaussianBlur { radius: p1.max(0.0) },
-            "Box Blur" => Filter::BoxBlur {
-                radius: p1.max(0.0) as u32,
-            },
-            "Sharpen" => Filter::Sharpen,
-            "Unsharp Mask" => Filter::UnsharpMask {
-                amount: p1,
-                radius: p2,
-                threshold: 0,
-            },
-            "Add Noise" => Filter::Noise {
-                amount: p1.clamp(0.0, 1.0),
-                monochromatic: p2 != 0.0,
-            },
-            // Unknown names are ignored rather than guessed at.
-            _ => return,
+    fn apply_filter(mut self: core::pin::Pin<&mut Self>, name: &QString, params: &[f32]) {
+        // Unknown names are ignored rather than guessed at.
+        let Some(filter) = Filter::from_menu_name(&name.to_string(), filter_params(params)) else {
+            return;
         };
+        // A preview may still be showing when OK is pressed. Take it away
+        // first, so that the filter is applied to the layer as it really is
+        // and the history step holds one application rather than two.
+        self.as_mut().rust_mut().doc.clear_filter_preview();
         self.as_mut().rust_mut().doc.apply_filter(filter);
         self.sync();
+    }
+
+    fn can_filter_active_layer(&self) -> bool {
+        self.doc.can_filter_active_layer()
+    }
+
+    fn filter_preview(
+        &self,
+        name: &QString,
+        params: &[f32],
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> QImage {
+        if width <= 0 || height <= 0 {
+            return QImage::default();
+        }
+        let Some(filter) = Filter::from_menu_name(&name.to_string(), filter_params(params)) else {
+            return QImage::default();
+        };
+        match self
+            .doc
+            .filter_preview(filter, Rect::new(x, y, width as u32, height as u32))
+        {
+            Some(pm) => pixmap_to_qimage(pm),
+            None => QImage::default(),
+        }
+    }
+
+    fn set_filter_preview(mut self: core::pin::Pin<&mut Self>, name: &QString, params: &[f32]) {
+        let name = name.to_string();
+        let filter = if name.is_empty() {
+            None
+        } else {
+            Filter::from_menu_name(&name, filter_params(params))
+        };
+        self.as_mut().rust_mut().doc.set_filter_preview(filter);
+        // Only the canvas: a preview is not a document change, so neither the
+        // History panel nor the Layers panel should hear about it.
+        self.as_mut().canvas_changed();
     }
 
     fn apply_adjustment(

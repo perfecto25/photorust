@@ -24,6 +24,10 @@ public:
     void setCollapsePointsLeft(bool pointsLeft);
     /// Hide the chevron for panels with nothing to collapse.
     void setCollapseVisible(bool visible);
+    /// Wording for the two chevron states — the tool strip means "one column
+    /// versus two", an ordinary panel means "collapsed to its title versus
+    /// showing its content", so the caller supplies which.
+    void setCollapseTooltips(const QString &collapseTip, const QString &expandTip);
 
 signals:
     void collapseClicked();
@@ -36,4 +40,7 @@ protected:
 private:
     QToolButton *m_collapse = nullptr;
     QToolButton *m_close = nullptr;
+    QString m_collapseTip;
+    QString m_expandTip;
+    bool m_pointsLeft = false;
 };

@@ -93,4 +93,17 @@ QString commitSvg();
 /// with a diagonal slash through it.
 QString cancelSvg();
 
+/// SVG body for the Pen tool's cursor: the tool-strip nib turned to point up
+/// and left, where a cursor's tip belongs, with CS6's badge for what clicking
+/// would do. `sign` is -1 for "delete this point", +1 for "add one here", and
+/// 0 for a plain nib.
+///
+/// The tip lands at (4.06, 4.06) on the 20-unit grid this artwork is drawn
+/// on — see `kPenCursorTip`, which turns that into the cursor's hotspot. The
+/// two have to agree, or every click lands somewhere other than the nib.
+QString penCursorSvg(int sign);
+
+/// Where `penCursorSvg` puts the nib's tip, in grid units.
+constexpr double kPenCursorTip = 4.06;
+
 } // namespace ToolIcons

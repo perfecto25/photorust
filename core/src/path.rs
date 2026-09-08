@@ -117,6 +117,13 @@ impl VectorPath {
         Self::default()
     }
 
+    /// A path made of contours that are already known in full — glyph
+    /// outlines, rather than anything drawn a click at a time. Nothing is
+    /// left being edited: there is no pen mid-stroke here.
+    pub fn from_subpaths(subpaths: Vec<Subpath>) -> Self {
+        Self { subpaths, editing: None }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.subpaths.iter().all(|s| s.points.is_empty())
     }
@@ -696,6 +703,27 @@ impl PathSet {
         self.entries.push(PathEntry { name, path: VectorPath::new() });
         self.active = Some(self.entries.len() - 1);
         self.active.unwrap()
+    }
+
+    /// Install `path` under `name`, made active, replacing any entry that
+    /// already has that name.
+    ///
+    /// The replacement is what makes this right for Photoshop's Work Path:
+    /// there is only ever one, and converting type to a path a second time
+    /// rewrites it rather than stacking up "Work Path", "Work Path 2", ...
+    pub fn set_named(&mut self, name: &str, path: VectorPath) -> usize {
+        let index = match self.entries.iter().position(|e| e.name == name) {
+            Some(existing) => {
+                self.entries[existing].path = path;
+                existing
+            }
+            None => {
+                self.entries.push(PathEntry { name: name.to_string(), path });
+                self.entries.len() - 1
+            }
+        };
+        self.active = Some(index);
+        index
     }
 
     /// The active path, creating a "Work Path" if none exists yet — what

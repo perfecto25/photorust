@@ -27,6 +27,14 @@ class LayerTreeWidget;
 /// with one row per effect, as CS6 does. Everything below therefore works from
 /// the layer index stored on each row rather than from the row's position —
 /// with children in the way, the two are no longer the same number.
+/// Whether a point on a group's row means "drop inside this group".
+///
+/// The middle of the row does; bands at its top and bottom edges mean above
+/// and below, so a layer can be moved *past* a group without being swallowed
+/// by it. A free function because it is a rule, not a widget — the view uses
+/// it to decide, and the tests can ask it directly.
+bool dropsIntoGroupRow(const QRect &row, const QPoint &pos);
+
 class LayersPanel : public QWidget
 {
     Q_OBJECT
@@ -39,6 +47,15 @@ public:
 public slots:
     /// Rebuild the list from the engine.
     void refresh();
+    /// Put the active layer's name into edit, as CS6's Rename Layer… does —
+    /// it renames in the panel rather than opening a dialog.
+    void beginRenameActiveLayer();
+    /// Select exactly these rows, for the commands that choose layers on the
+    /// user's behalf — Select Linked Layers.
+    void selectLayers(const QList<int> &indices);
+    /// Switch the filter row to searching by name and put the cursor in the
+    /// field — Select ▸ Find Layers.
+    void beginFindLayers();
 
 signals:
     /// Something changed that requires the canvas to repaint.
@@ -62,6 +79,8 @@ private slots:
     void addAdjustmentLayer();
     /// The folder button: a new, empty group above the active layer.
     void addGroup();
+    /// The chain button: link the selection, or unlink it if it already is.
+    void toggleLinkSelected();
     void mergeDown();
 
 private:
@@ -91,6 +110,9 @@ private:
     void applyLocks();
     /// Redraw the Lock row from the active layer's flags.
     void syncLockRow();
+    /// Show the kind buttons or the search field, whichever the filter combo
+    /// is set to.
+    void refreshFilterMode();
     /// Whether a row passes the filter row's current kind selection.
     bool passesFilter(int index) const;
     /// Re-apply the filter to rows already built.
@@ -102,6 +124,9 @@ private:
 
     QComboBox *m_filterKind = nullptr;
     QList<QToolButton *> m_kindButtons;
+    /// The Name filter's search field. Shown in place of the kind buttons
+    /// when the combo is on Name, as CS6 swaps them.
+    QLineEdit *m_filterName = nullptr;
     QToolButton *m_filterSwitch = nullptr;
 
     QComboBox *m_blendMode = nullptr;

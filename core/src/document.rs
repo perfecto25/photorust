@@ -13,7 +13,7 @@ use crate::fill::{GradientFill, PatternFill};
 use crate::filters::{Adjustment, Filter};
 use crate::healing::{self, HealMode, MoveOptions, Transfer};
 use crate::history::History;
-use crate::layer::{Layer, LayerId, LayerKind, LayerStack, StyleState, TextContent};
+use crate::layer::{Layer, LayerId, LayerKind, LayerStack, StyleState, TextContent, TextWarp};
 use crate::effects::LayerEffects;
 use crate::metadata::Orientation;
 use crate::perspective;
@@ -457,6 +457,11 @@ pub struct Document {
     /// The type layer the Type tool currently has open, and the visibility it
     /// had before the edit hid it. See [`Document::begin_text_edit`].
     text_edit: Option<(LayerId, bool)>,
+
+    /// The layer a filter dialog is previewing on, and the pixels it had
+    /// before. See [`Document::set_filter_preview`]. Not part of a history
+    /// state: a preview the user cancels never happened.
+    filter_preview: Option<(LayerId, Pixmap)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +591,31 @@ pub enum PasteMode {
     Outside,
 }
 
+/// Which way Layer ▸ Arrange moves a layer.
+///
+/// "Forward" is toward the front of the image — up the panel, and up the stack,
+/// which runs bottom-first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArrangeOp {
+    Front,
+    Forward,
+    Backward,
+    Back,
+}
+
+impl ArrangeOp {
+    /// From the discriminant the bridge passes, in menu order.
+    pub fn from_i32(value: i32) -> Option<ArrangeOp> {
+        Some(match value {
+            0 => ArrangeOp::Front,
+            1 => ArrangeOp::Forward,
+            2 => ArrangeOp::Backward,
+            3 => ArrangeOp::Back,
+            _ => return None,
+        })
+    }
+}
+
 /// Where the dabs of a direct-to-layer stroke fall between two mouse positions.
 ///
 /// The tools that edit the layer as they go — the Color Replacement Brush and
@@ -658,6 +688,7 @@ impl Document {
             dirty: false,
             quick_mask: false,
             text_edit: None,
+            filter_preview: None,
         }
     }
 
@@ -724,6 +755,7 @@ impl Document {
             dirty: false,
             quick_mask: false,
             text_edit: None,
+            filter_preview: None,
         }
     }
 
@@ -768,6 +800,7 @@ impl Document {
             dirty: false,
             quick_mask: false,
             text_edit: None,
+            filter_preview: None,
         }
     }
 
@@ -1515,6 +1548,88 @@ impl Document {
         Some(id)
     }
 
+    /// Drop a type layer's text record, keeping the pixels it was already
+    /// rendered to — Type ▸ Rasterize Type Layer.
+    ///
+    /// Nothing is redrawn. A type layer *is* a raster layer that also
+    /// remembers what it was set in, so rasterising is forgetting that rather
+    /// than producing anything new. What changes is that the letters can no
+    /// longer be retyped, and every paint tool that refuses a type layer will
+    /// now touch them.
+    ///
+    /// False when the active layer was never type, which is what makes the
+    /// menu entry harmless to press twice.
+    pub fn rasterize_type_layer(&mut self) -> bool {
+        let Some(index) = self.active_index() else {
+            return false;
+        };
+        let Some(layer) = self.stack.get_mut(index) else {
+            return false;
+        };
+        if layer.text.is_none() {
+            return false;
+        }
+        layer.text = None;
+        self.commit("Rasterize Type");
+        true
+    }
+
+    /// Replace the active type layer with a shape layer masked to `contours` —
+    /// Type ▸ Convert to Shape.
+    ///
+    /// The result is what Photoshop's is: a solid fill in the text's own
+    /// colour, cut to the letters by a mask, in the type layer's place. The
+    /// text record goes with the layer, which is the point — the letters stop
+    /// being text and become an outline that can be pushed around point by
+    /// point.
+    ///
+    /// Holes come out of the fill rule rather than any special handling here:
+    /// every contour is rasterised together under nonzero winding, and a
+    /// glyph's counters are wound against their outer ring, so the middle of
+    /// an "O" is left uncovered (see `Selection::rasterize_polygons`).
+    pub fn convert_type_layer_to_shape(
+        &mut self,
+        contours: &[Vec<(f32, f32)>],
+    ) -> Option<LayerId> {
+        let index = self.active_index()?;
+        let old = self.stack.get(index)?;
+        // The colour of the text being replaced, so the shape looks like what
+        // it was drawn from rather than whatever the foreground happens to be.
+        let text = old.text.as_ref()?;
+        let color = text.first_run().map_or(Rgba8::BLACK, |r| r.color);
+        let name = old.name.clone();
+
+        let usable: Vec<Vec<(f32, f32)>> =
+            contours.iter().filter(|c| c.len() >= 3).cloned().collect();
+        if usable.is_empty() {
+            return None;
+        }
+
+        let mut coverage = Selection::new(self.width, self.height);
+        coverage.apply_polygons_feathered(&usable, SelectionOp::Replace, 0);
+
+        let id = self.stack.allocate_id();
+        let mut layer = Layer::new_raster(id, name, 0, 0);
+        layer.kind = LayerKind::SolidColor(color);
+
+        let mut mask = Pixmap::new(self.width, self.height);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                let a = (coverage.coverage_at(x, y) * 255.0 + 0.5) as u8;
+                mask.set(x, y, Rgba8::new(a, a, a, a));
+            }
+        }
+        layer.mask = Some(mask);
+
+        // In its place, not above it: converting is a replacement, so
+        // everything stacked over the text stays over the shape.
+        self.stack.insert(index, layer);
+        self.stack.remove(index + 1);
+        self.active_layer = id;
+        self.commit("Convert to Shape");
+        Some(id)
+    }
+
     /// Add a shape to the work path — the shape tools' Path mode.
     ///
     /// The subpath is closed, since a dragged shape encloses an area, and left
@@ -2033,6 +2148,125 @@ impl Document {
         Some(id)
     }
 
+    /// Where a layer would go — Layer ▸ Arrange.
+    ///
+    /// The slot it is moving to, or `None` when there is nowhere to go: it is
+    /// already at that end, or it is the Background, which stays put.
+    fn arrange_target(&self, id: LayerId, op: ArrangeOp) -> Option<(usize, usize)> {
+        let index = self.stack.index_of(id)?;
+        // The Background is the floor of the document — Photoshop will not let
+        // it move, and will not let anything under it either.
+        if self.has_background() && self.stack.run_at(index).contains(&0) {
+            return None;
+        }
+
+        let parent = self.stack.get(index)?.parent;
+        let slots = self.stack.slots(parent);
+        let from = slots.iter().position(|slot| slot.contains(&index))?;
+
+        // The lowest slot anything may occupy: above the Background, if the
+        // document has one and we are at the top level.
+        let floor = if parent.is_none() && self.has_background() { 1 } else { 0 };
+        let to = match op {
+            ArrangeOp::Front => slots.len() - 1,
+            ArrangeOp::Back => floor,
+            // "Forward" is toward the front of the image, which is up the
+            // stack — the stack runs bottom-first.
+            ArrangeOp::Forward => from + 1,
+            ArrangeOp::Backward => from.checked_sub(1)?,
+        };
+        if to >= slots.len() || to < floor || to == from {
+            return None;
+        }
+        Some((from, to))
+    }
+
+    /// Whether that move would do anything, for greying the menu entry.
+    pub fn can_arrange_layer(&self, id: LayerId, op: ArrangeOp) -> bool {
+        self.arrange_target(id, op).is_some()
+    }
+
+    /// Move a layer to the front, back, or one place either way.
+    ///
+    /// A group travels with its members, and a layer inside a group moves
+    /// within it — reaching the front of the image from inside a folder means
+    /// leaving the folder first, which is a drag, not an arrange.
+    pub fn arrange_layer(&mut self, id: LayerId, op: ArrangeOp) -> bool {
+        let Some((from, to)) = self.arrange_target(id, op) else {
+            return false;
+        };
+        let parent = self
+            .stack
+            .index_of(id)
+            .and_then(|i| self.stack.get(i))
+            .and_then(|l| l.parent);
+        let slots = self.stack.slots(parent);
+        let (moving, target) = (slots[from].clone(), slots[to].clone());
+
+        let lifted: Vec<Layer> = moving
+            .clone()
+            .rev()
+            .filter_map(|i| self.stack.remove(i))
+            .collect();
+        // Past the target slot when moving up, in front of it when moving
+        // down; the destination shifts by what was lifted out below it.
+        let at = if to > from {
+            target.end - moving.len()
+        } else {
+            target.start
+        };
+        for (offset, layer) in lifted.into_iter().rev().enumerate() {
+            self.stack.insert(at + offset, layer);
+        }
+
+        self.commit(match op {
+            ArrangeOp::Front => "Bring to Front",
+            ArrangeOp::Forward => "Bring Forward",
+            ArrangeOp::Backward => "Send Backward",
+            ArrangeOp::Back => "Send to Back",
+        });
+        true
+    }
+
+    /// Reverse the order of these layers, leaving everything else where it is
+    /// — Layer ▸ Arrange ▸ Reverse. Needs two of them, at the same level.
+    pub fn reverse_layers(&mut self, ids: &[LayerId]) -> bool {
+        let mut positions: Vec<usize> = ids
+            .iter()
+            .filter_map(|id| self.stack.index_of(*id))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        if positions.len() < 2 {
+            return false;
+        }
+        // Reversing across levels has no meaning: the slots are not comparable.
+        let parent = self.stack.get(positions[0]).and_then(|l| l.parent);
+        if positions
+            .iter()
+            .any(|i| self.stack.get(*i).and_then(|l| l.parent) != parent)
+        {
+            return false;
+        }
+
+        // The layers swap places; the positions themselves stay put, which is
+        // what leaves everything not selected exactly where it was.
+        //
+        // Taken from the top down, `lifted` comes out already reversed — the
+        // topmost first — so putting them back at the positions bottom-up is
+        // the reversal itself.
+        let lifted: Vec<Layer> = positions
+            .iter()
+            .rev()
+            .filter_map(|i| self.stack.remove(*i))
+            .collect();
+        for (slot, layer) in positions.iter().zip(lifted.into_iter()) {
+            self.stack.insert(*slot, layer);
+        }
+        self.commit("Reverse Layers");
+        true
+    }
+
     /// Put a layer into a group by naming the group rather than a position —
     /// what dropping onto the folder in the Layers panel means.
     ///
@@ -2341,9 +2575,18 @@ impl Document {
     }
 
     pub fn offset_layer(&mut self, id: LayerId, dx: i32, dy: i32) {
-        if let Some(l) = self.stack.by_id_mut(id) {
+        // Linked layers travel together — that is the whole of what the chain
+        // does. Moving one of a set moves all of it, in one history step.
+        let ids = self.linked_with(id);
+        let mut moved = false;
+        for id in ids {
+            let Some(l) = self.stack.by_id_mut(id) else {
+                continue;
+            };
             if l.lock_position {
-                return;
+                // One locked member holds still while the rest of the set
+                // moves, rather than pinning the whole chain.
+                continue;
             }
             l.offset.0 += dx;
             l.offset.1 += dy;
@@ -2354,8 +2597,104 @@ impl Document {
                 text.origin.0 += dx as f32;
                 text.origin.1 += dy as f32;
             }
+            moved = true;
+        }
+        if moved {
             self.commit_coalescing("Move Layer");
         }
+    }
+
+    /// A layer and everything linked to it, or just the layer when it is not
+    /// linked. In stack order.
+    pub fn linked_with(&self, id: LayerId) -> Vec<LayerId> {
+        let Some(link) = self.stack.by_id(id).and_then(|l| l.link) else {
+            return vec![id];
+        };
+        self.stack
+            .iter()
+            .filter(|l| l.link == Some(link))
+            .map(|l| l.id)
+            .collect()
+    }
+
+    /// Link these layers so they move together — Layer ▸ Link Layers.
+    ///
+    /// Layers already in a set bring that set with them, so linking a layer to
+    /// one of a chain joins the chain rather than splitting it. False for
+    /// fewer than two layers to link.
+    pub fn link_layers(&mut self, ids: &[LayerId]) -> bool {
+        let mut members: Vec<LayerId> = Vec::new();
+        for id in ids {
+            for linked in self.linked_with(*id) {
+                if self.stack.by_id(linked).is_some() && !members.contains(&linked) {
+                    members.push(linked);
+                }
+            }
+        }
+        if members.len() < 2 {
+            return false;
+        }
+
+        // Reuse a set the selection already belongs to, so linking twice does
+        // not renumber a chain for no reason.
+        let link = members
+            .iter()
+            .find_map(|id| self.stack.by_id(*id).and_then(|l| l.link))
+            .unwrap_or_else(|| self.stack.allocate_id());
+        for id in &members {
+            if let Some(layer) = self.stack.by_id_mut(*id) {
+                layer.link = Some(link);
+            }
+        }
+        self.commit("Link Layers");
+        true
+    }
+
+    /// Take these layers out of their sets — Layer ▸ Unlink Layers.
+    ///
+    /// A set left with one member is no set at all, so that last layer is
+    /// unlinked too rather than kept as a chain of one.
+    pub fn unlink_layers(&mut self, ids: &[LayerId]) -> bool {
+        let mut links: Vec<LayerId> = Vec::new();
+        let mut changed = false;
+        for id in ids {
+            if let Some(layer) = self.stack.by_id_mut(*id) {
+                if let Some(link) = layer.link.take() {
+                    changed = true;
+                    if !links.contains(&link) {
+                        links.push(link);
+                    }
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+
+        for link in links {
+            let remaining: Vec<LayerId> = self
+                .stack
+                .iter()
+                .filter(|l| l.link == Some(link))
+                .map(|l| l.id)
+                .collect();
+            if remaining.len() == 1 {
+                if let Some(layer) = self.stack.by_id_mut(remaining[0]) {
+                    layer.link = None;
+                }
+            }
+        }
+        self.commit("Unlink Layers");
+        true
+    }
+
+    /// The set a layer belongs to, for the panel's badge and for Select Linked
+    /// Layers. `LayerId::NONE` when it is not linked.
+    pub fn layer_link(&self, id: LayerId) -> LayerId {
+        self.stack
+            .by_id(id)
+            .and_then(|l| l.link)
+            .unwrap_or(LayerId::NONE)
     }
 
     /// Add a mask to a layer, either revealing or hiding everything.
@@ -4314,6 +4653,92 @@ impl Document {
             filter.apply(&mut layer.pixels);
         }
         self.commit(filter.name());
+    }
+
+    /// Whether `apply_filter` would do anything to the active layer.
+    ///
+    /// The filter dialogs ask before they open, so that a locked layer or a
+    /// type layer is refused up front rather than after the user has dialled
+    /// in settings that were never going to be applied.
+    pub fn can_filter_active_layer(&self) -> bool {
+        match self.stack.by_id(self.active_layer) {
+            Some(layer) => !layer.lock_pixels && matches!(layer.kind, LayerKind::Raster),
+            None => false,
+        }
+    }
+
+    /// What `filter` would make of the document region `rect`, for a dialog's
+    /// preview thumbnail.
+    ///
+    /// The region is padded by the filter's reach and the padding is trimmed
+    /// off again, so the middle is exactly what applying the filter to the
+    /// whole layer would have produced — no false softness at the edges of
+    /// the thumbnail. A filter with no reach ([`Filter::reach`]) has to be run
+    /// over the whole layer first, because there is no smaller question to
+    /// ask it.
+    ///
+    /// Returns the region in document space, so pixels outside the layer come
+    /// back transparent and the thumbnail lines up with what the canvas shows.
+    pub fn filter_preview(&self, filter: Filter, rect: Rect) -> Option<Pixmap> {
+        if rect.is_empty() {
+            return None;
+        }
+        let layer = self.stack.by_id(self.active_layer)?;
+        if !matches!(layer.kind, LayerKind::Raster) {
+            return None;
+        }
+        let (ox, oy) = layer.offset;
+
+        // The padded region, in the layer's own coordinates.
+        let pad = filter.reach();
+        let want = Rect::new(rect.x - ox, rect.y - oy, rect.width, rect.height);
+        let padded = match pad {
+            Some(n) => want.inflate(n),
+            None => layer.pixels.rect(),
+        };
+
+        let mut work = layer.pixels.crop(padded);
+        filter.apply(&mut work);
+
+        // Cut the asked-for region back out of the padded result.
+        Some(work.crop(Rect::new(
+            want.x - padded.x,
+            want.y - padded.y,
+            want.width,
+            want.height,
+        )))
+    }
+
+    /// Show `filter` on the active layer without committing it, or clear the
+    /// preview when passed `None`.
+    ///
+    /// This is the Preview checkbox on a filter dialog: the canvas shows the
+    /// result while the dialog is open, and the layer goes back to how it was
+    /// when the dialog closes. Nothing reaches the History panel either way —
+    /// pressing OK re-applies through [`Document::apply_filter`], which is the
+    /// one path that commits.
+    pub fn set_filter_preview(&mut self, filter: Option<Filter>) {
+        self.clear_filter_preview();
+        let Some(filter) = filter else {
+            return;
+        };
+        if !self.can_filter_active_layer() {
+            return;
+        }
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            self.filter_preview = Some((id, layer.pixels.clone()));
+            filter.apply(&mut layer.pixels);
+        }
+    }
+
+    /// Put back the pixels a preview replaced, if one is showing.
+    pub fn clear_filter_preview(&mut self) {
+        if let Some((id, pixels)) = self.filter_preview.take() {
+            if let Some(layer) = self.stack.by_id_mut(id) {
+                layer.pixels = pixels;
+            }
+        }
     }
 
     /// Apply an adjustment destructively to the active layer.
@@ -6558,6 +6983,136 @@ mod tests {
         Document::new(16, 16, Rgba8::WHITE)
     }
 
+    /// A checkerboard, so that a blur has something to move everywhere.
+    fn checkered(size: u32, square: u32) -> Document {
+        let mut d = Document::new(size, size, Rgba8::WHITE);
+        let layer = d.active_layer_mut().unwrap();
+        for y in 0..size {
+            for x in 0..size {
+                if ((x / square) + (y / square)) % 2 == 0 {
+                    layer.pixels.set(x as i32, y as i32, Rgba8::BLACK);
+                }
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn a_preview_of_a_region_matches_filtering_the_whole_layer() {
+        // The point of padding the crop: what the thumbnail shows has to be
+        // what OK will produce, right up to the thumbnail's own edges.
+        let region = Rect::new(6, 6, 12, 12);
+        let filter = Filter::BoxBlur { radius: 4 };
+
+        let preview = checkered(40, 5).filter_preview(filter, region).unwrap();
+
+        let mut whole = checkered(40, 5);
+        whole.apply_filter(filter);
+        let expected = whole.active_layer().unwrap().pixels.crop(region);
+
+        assert_eq!(
+            preview.as_bytes(),
+            expected.as_bytes(),
+            "the preview of a region differs from applying the filter for real"
+        );
+    }
+
+    #[test]
+    fn a_preview_does_not_soften_its_own_edges() {
+        // The failure this guards against is the plausible one: cropping
+        // first and blurring after, which starves the crop's border of the
+        // neighbours it should have had and darkens or lightens the rim.
+        let region = Rect::new(6, 6, 12, 12);
+        let filter = Filter::BoxBlur { radius: 4 };
+
+        let d = checkered(40, 5);
+        let preview = d.filter_preview(filter, region).unwrap();
+
+        let mut naive = d.active_layer().unwrap().pixels.crop(region);
+        filter.apply(&mut naive);
+
+        assert_ne!(
+            preview.as_bytes(),
+            naive.as_bytes(),
+            "the preview looks like an unpadded crop, so its edges are wrong"
+        );
+    }
+
+    #[test]
+    fn a_preview_of_average_takes_the_whole_layer_into_account() {
+        // Average has no reach, so a region cannot be asked about on its own.
+        // Half the layer is black and half white; a preview of a corner that
+        // is entirely white must still come back mid-grey.
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let layer = d.active_layer_mut().unwrap();
+            for y in 0..20 {
+                for x in 0..40 {
+                    layer.pixels.set(x, y, Rgba8::BLACK);
+                }
+            }
+        }
+
+        let preview = d.filter_preview(Filter::Average, Rect::new(30, 30, 8, 8)).unwrap();
+        let px = preview.get(0, 0);
+        assert!(
+            (100..=155).contains(&px.r),
+            "a preview of an all-white corner should still average the whole layer, got {}",
+            px.r
+        );
+    }
+
+    #[test]
+    fn the_preview_checkbox_puts_the_pixels_back_and_leaves_no_history() {
+        let mut d = checkered(40, 5);
+        let before = d.active_layer().unwrap().pixels.as_bytes().to_vec();
+        let steps = d.history().len();
+
+        d.set_filter_preview(Some(Filter::BoxBlur { radius: 4 }));
+        assert_ne!(
+            d.active_layer().unwrap().pixels.as_bytes(),
+            before.as_slice(),
+            "turning Preview on did not change what the canvas would show"
+        );
+
+        d.set_filter_preview(None);
+        assert_eq!(
+            d.active_layer().unwrap().pixels.as_bytes(),
+            before.as_slice(),
+            "cancelling a preview left the filter on the layer"
+        );
+        assert_eq!(d.history().len(), steps, "a preview reached the History panel");
+    }
+
+    #[test]
+    fn pressing_ok_after_a_preview_applies_the_filter_once() {
+        // The trap: the preview has already blurred the layer, so applying on
+        // top of it would blur twice as far as the dialog promised.
+        let filter = Filter::BoxBlur { radius: 4 };
+
+        let mut previewed = checkered(40, 5);
+        previewed.set_filter_preview(Some(filter));
+        previewed.clear_filter_preview();
+        previewed.apply_filter(filter);
+
+        let mut direct = checkered(40, 5);
+        direct.apply_filter(filter);
+
+        assert_eq!(
+            previewed.active_layer().unwrap().pixels.as_bytes(),
+            direct.active_layer().unwrap().pixels.as_bytes(),
+            "OK after a preview did not give the same image as OK without one"
+        );
+    }
+
+    #[test]
+    fn a_locked_layer_is_refused_before_the_dialog_opens() {
+        let mut d = doc();
+        assert!(d.can_filter_active_layer());
+        d.active_layer_mut().unwrap().lock_pixels = true;
+        assert!(!d.can_filter_active_layer());
+    }
+
     #[test]
     fn make_selection_from_a_square_path() {
         let mut d = Document::new(40, 40, Rgba8::WHITE);
@@ -7587,6 +8142,8 @@ mod tests {
 
     #[test]
     fn pasting_puts_the_pixels_on_a_layer_of_their_own() {
+        // As Photoshop does: a paste never edits the layer you were on, it
+        // arrives above it as its own layer, ready to be moved about.
         let mut d = clipboard_fixture();
         let before = d.layer_count();
         let patch = Pixmap::filled(4, 4, Rgba8::opaque(0, 255, 0));
@@ -9493,6 +10050,166 @@ mod tests {
     }
 
     #[test]
+    fn cutting_takes_the_selection_out_of_the_layer() {
+        // What Edit ▸ Cut does: copy the selection, then erase it.
+        let mut d = Document::new(8, 8, Rgba8::opaque(255, 0, 0));
+        d.select_rect(Rect::new(2, 2, 4, 4), SelectionOp::Replace, 0);
+
+        let (copied, origin) = d.copy_selection(false).expect("nothing was copied");
+        assert_eq!(origin, (2, 2), "the copy is cropped to the selection");
+        assert_eq!((copied.width(), copied.height()), (4, 4));
+        assert_eq!(copied.get(0, 0), Rgba8::opaque(255, 0, 0));
+
+        d.clear_selection_pixels();
+        let layer = &d.layers().get(0).unwrap().pixels;
+        assert_eq!(layer.get(3, 3).a, 0, "the cut pixels are gone from the layer");
+        assert_eq!(layer.get(0, 0).a, 255, "and nothing outside it was touched");
+    }
+
+    #[test]
+    fn linked_layers_move_together() {
+        let (mut d, red, green) = stacked();
+        assert!(d.link_layers(&[red, green]));
+        assert_eq!(d.layer_link(red), d.layer_link(green));
+
+        // Moving one moves the whole set, in one history step.
+        let entries = d.history().len();
+        d.offset_layer(red, 5, -3);
+        assert_eq!(d.layers().by_id(red).unwrap().offset, (5, -3));
+        assert_eq!(d.layers().by_id(green).unwrap().offset, (5, -3));
+        assert_eq!(d.history().len(), entries + 1, "one move, one step");
+
+        // The Background is not in the set and stays put.
+        assert_eq!(d.layers().get(0).unwrap().offset, (0, 0));
+    }
+
+    #[test]
+    fn linking_to_a_chain_joins_the_chain() {
+        let (mut d, red, green) = stacked();
+        let third = d.add_layer(Some("Third".to_string()));
+        assert!(d.link_layers(&[red, green]));
+        let link = d.layer_link(red);
+
+        // Linking a loose layer to one that is already in a set puts it in
+        // that set rather than starting a rival one.
+        assert!(d.link_layers(&[third, green]));
+        assert_eq!(d.layer_link(third), link);
+        assert_eq!(d.linked_with(red).len(), 3);
+    }
+
+    #[test]
+    fn unlinking_the_second_to_last_member_dissolves_the_set() {
+        let (mut d, red, green) = stacked();
+        let third = d.add_layer(Some("Third".to_string()));
+        d.link_layers(&[red, green, third]);
+
+        assert!(d.unlink_layers(&[third]));
+        assert!(d.layer_link(third).is_none());
+        assert_eq!(d.linked_with(red).len(), 2, "the other two are still linked");
+
+        // Taking one more out leaves a chain of one, which is no chain: the
+        // last layer is unlinked too, or its row would keep a badge that
+        // means nothing.
+        assert!(d.unlink_layers(&[green]));
+        assert!(d.layer_link(green).is_none());
+        assert!(d.layer_link(red).is_none());
+    }
+
+    #[test]
+    fn a_position_locked_member_holds_still_while_the_rest_moves() {
+        let (mut d, red, green) = stacked();
+        d.link_layers(&[red, green]);
+        d.layers_mut_raw().by_id_mut(green).unwrap().lock_position = true;
+
+        d.offset_layer(red, 4, 4);
+        assert_eq!(d.layers().by_id(red).unwrap().offset, (4, 4));
+        assert_eq!(
+            d.layers().by_id(green).unwrap().offset,
+            (0, 0),
+            "a locked layer does not move, and does not pin the chain"
+        );
+    }
+
+    #[test]
+    fn arrange_moves_a_layer_one_place_and_all_the_way() {
+        let (mut d, red, green) = stacked();
+        // Stack, bottom-up: Background, Red, Green.
+        assert!(d.arrange_layer(red, ArrangeOp::Forward));
+        assert_eq!(d.layers().index_of(red), Some(2), "red is now on top");
+        assert_eq!(d.layers().index_of(green), Some(1));
+
+        assert!(d.arrange_layer(red, ArrangeOp::Back));
+        // Not below the Background: Photoshop keeps that at the floor, and so
+        // does this.
+        assert_eq!(d.layers().index_of(red), Some(1));
+        assert_eq!(d.layers().get(0).unwrap().name, "Background");
+
+        assert!(d.arrange_layer(red, ArrangeOp::Front));
+        assert_eq!(d.layers().index_of(red), Some(2));
+        // Already there, so nothing to do and no history entry.
+        let entries = d.history().len();
+        assert!(!d.arrange_layer(red, ArrangeOp::Front));
+        assert!(!d.arrange_layer(red, ArrangeOp::Forward));
+        assert_eq!(d.history().len(), entries);
+    }
+
+    #[test]
+    fn arrange_steps_over_a_whole_group() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+        let top = d.add_layer(Some("Top".to_string()));
+        // Stack: Background, Red, Green, Group, Top.
+
+        // One step back has to clear the group, not land inside it.
+        assert!(d.arrange_layer(top, ArrangeOp::Backward));
+        assert_eq!(d.layers().index_of(top), Some(1), "below the whole group");
+        assert!(d.layers().by_id(top).unwrap().parent.is_none());
+        assert_eq!(d.layers().group_members(d.layers().index_of(group).unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn arranging_inside_a_group_stays_inside_it() {
+        let (mut d, red, green) = stacked();
+        let group = d.group_layers(&[red, green]).unwrap();
+
+        // Red is the lower member. Bringing it to the front takes it to the
+        // top of the *group*, not of the image — leaving a folder is a drag,
+        // not an arrange.
+        assert!(d.arrange_layer(red, ArrangeOp::Front));
+        assert_eq!(d.layers().by_id(red).unwrap().parent, Some(group));
+        let index = d.layers().index_of(group).unwrap();
+        assert_eq!(d.layers().group_members(index), 1..3);
+        assert_eq!(d.layers().get(2).unwrap().id, red, "red is the top member");
+        assert_eq!(d.layers().get(1).unwrap().id, green);
+        // And it cannot go further: the folder is the ceiling.
+        assert!(!d.arrange_layer(red, ArrangeOp::Forward));
+    }
+
+    #[test]
+    fn the_background_cannot_be_arranged() {
+        let (mut d, _red, _green) = stacked();
+        let background = d.layers().get(0).unwrap().id;
+        assert!(!d.arrange_layer(background, ArrangeOp::Front));
+        assert!(!d.arrange_layer(background, ArrangeOp::Forward));
+        assert_eq!(d.layers().get(0).unwrap().name, "Background");
+    }
+
+    #[test]
+    fn reverse_swaps_the_selected_layers_and_leaves_the_rest() {
+        let (mut d, red, green) = stacked();
+        let top = d.add_layer(Some("Top".to_string()));
+        // Stack: Background, Red, Green, Top. Reverse the outer two of the
+        // three above the background.
+        assert!(d.reverse_layers(&[red, top]));
+        assert_eq!(d.layers().index_of(top), Some(1));
+        assert_eq!(d.layers().index_of(green), Some(2), "untouched in the middle");
+        assert_eq!(d.layers().index_of(red), Some(3));
+
+        // One layer is not a reversal.
+        assert!(!d.reverse_layers(&[red]));
+    }
+
+    #[test]
     fn a_group_moves_up_past_the_layer_above_it() {
         // Background, then a group of two, then a loose layer on top.
         let (mut d, red, green) = stacked();
@@ -10135,6 +10852,8 @@ mod tests {
             style: "Regular".to_string(),
             size,
             color: Rgba8::BLACK,
+            h_scale: 1.0,
+            v_scale: 1.0,
         }
     }
 
@@ -10145,6 +10864,8 @@ mod tests {
             antialias: true,
             vertical: false,
             origin: (4.0, 4.0),
+            warp: TextWarp::default(),
+            ..Default::default()
         }
     }
 
@@ -10171,6 +10892,8 @@ mod tests {
             antialias: true,
             vertical: false,
             origin: (4.0, 4.0),
+            warp: TextWarp::default(),
+            ..Default::default()
         };
         let id = d.add_text_layer(pixels, (4, 4), "das".to_string(), content);
 

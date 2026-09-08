@@ -14,6 +14,7 @@
 #include <QWidget>
 
 #include "../tools/ToolId.h"
+#include "TypeWarp.h"
 
 class Engine;
 class QScrollBar;
@@ -318,9 +319,47 @@ public:
     bool restyleTypeLayer(int layerIndex);
 
     void setTypeOptions(const QFont &font, const QString &styleName, const QColor &color,
-                        Qt::Alignment alignment, bool antialias);
+                        Qt::Alignment alignment, bool antialias, qreal hScale = 1.0,
+                        qreal vScale = 1.0);
     /// True while the Type tool has an edit in progress.
     bool isTyping() const { return m_typing; }
+    /// Insert text at the caret, as the Glyphs panel does on a double-click.
+    /// False when no edit is open to receive it — there is no caret to insert
+    /// at, and Photoshop likewise wants a live one before a glyph can land.
+    bool insertTypeText(const QString &text);
+    /// The glyph outlines of a type layer, in document coordinates — what
+    /// Type ▸ Create Work Path turns into a path. Empty when the layer is not
+    /// type. Carries the layer's own stretch, so the outline sits on the
+    /// letters rather than beside them.
+    QPainterPath typeLayerOutline(int layerIndex) const;
+
+    /// Lay a type layer out again from its record — what Warp Text needs
+    /// after changing how the letters are bent.
+    bool reflowTypeLayer(int layerIndex);
+
+    /// A layer's warp, read back off its record — what the Warp Text dialog
+    /// opens on, and what Cancel puts back.
+    TypeWarp layerWarp(int layerIndex) const;
+
+    /// The Paragraph panel's indents and spacing, in document pixels.
+    struct TypeParagraph {
+        qreal indentLeft = 0.0;
+        qreal indentRight = 0.0;
+        qreal firstLineIndent = 0.0;
+        qreal spaceBefore = 0.0;
+        qreal spaceAfter = 0.0;
+    };
+
+    /// A layer's paragraph indents and spacing, read off its record.
+    TypeParagraph layerParagraph(int layerIndex) const;
+
+    /// Turn an existing type layer on its side — Type ▸ Orientation.
+    ///
+    /// Unlike `setTypeVertical`, which switches which *tool* is in hand, this
+    /// re-lays the text that is already there. False when the layer is not
+    /// type, is already that way round, or an edit is open and owns the state.
+    bool setTypeLayerVertical(int layerIndex, bool vertical);
+
     /// Switch between the Horizontal and Vertical Type tools. Vertical type
     /// stacks characters downward and starts each new line as a column to the
     /// left of the last. Any edit in progress is committed first: the two are
@@ -335,6 +374,11 @@ public:
     /// Show a yellow highlight over matched text on the canvas.
     void setSearchHighlight(int layerIndex, int charOffset, int charLength);
     void clearSearchHighlight();
+
+    /// Mark the region a filter dialog's preview thumbnail is showing, the way
+    /// CS6 draws a small square on the image while Box Blur is open. In
+    /// document coordinates; an empty rect takes the marker away.
+    void setFilterPreviewRect(const QRectF &region);
 
     enum class TransformMode { Free, Scale, Rotate, Skew, Distort, Perspective, Warp };
 
@@ -404,7 +448,7 @@ signals:
     /// bar describe *that* text rather than what was last set up.
     void typeStyleAdopted(const QString &family, const QString &style, qreal pointSize,
                           const QColor &color, Qt::Alignment alignment, bool antialias,
-                          bool vertical);
+                          bool vertical, qreal hScale, qreal vScale);
     /// A mixer stroke ended, so the paint on the brush has changed. The options
     /// bar's load swatch reads it back from the engine.
     void mixerLoadChanged();
@@ -491,6 +535,18 @@ private:
     /// current zoom — the same idea as `nearLassoStart`'s, generalised for
     /// anchor/handle/segment hit-testing.
     float pathHitRadius() const;
+    /// A layer's warp, read back off its record.
+    /// Fill the editor's state from a layer's record, run for run and
+    /// verbatim — the shared front half of every path that lays one out
+    /// again without restyling it.
+    void loadTypeRunsFrom(int layerIndex);
+    /// What the Pen tool would do at `widgetPos`: -1 delete the point under
+    /// it, +1 add one to the segment under it, 0 neither. Drives the badge on
+    /// the cursor, and answers the same question `penPress` acts on.
+    int penBadgeAt(const QPointF &widgetPos) const;
+    /// The badge the Pen cursor is currently wearing, so a move only replaces
+    /// the cursor when the answer has actually changed.
+    int m_penBadge = 0;
     /// Handle a press with one of the Pen button's five tools. Alt at press
     /// time is not consulted — unlike real Photoshop, this Pen tool does not
     /// temporarily borrow Convert Point's press behaviour under Alt; that
@@ -632,6 +688,8 @@ private:
     void paintShapeOverlay(QPainter &painter);
     /// Draw the rectangle a Zoom drag is marking out.
     void paintZoomOverlay(QPainter &painter);
+    /// Draw the square marking what a filter dialog's thumbnail is showing.
+    void paintFilterPreviewRect(QPainter &painter);
     /// The two-tone dashed outline a pending gesture is drawn with — nothing
     /// has been committed until the button comes up, and this is what says so.
     void paintPendingOutline(QPainter &painter, const QPolygonF &widgetOutline) const;
@@ -659,11 +717,17 @@ private:
         QString style;
         qreal size = 12.0;
         QColor color = Qt::black;
+        /// Photoshop's Horizontal/Vertical Scale, 1.0 being 100%. A size is
+        /// one number, so a non-uniform Free Transform is recorded here.
+        qreal hScale = 1.0;
+        qreal vScale = 1.0;
 
         bool sameStyle(const TypeRun &other) const
         {
             return family == other.family && style == other.style
-                && qFuzzyCompare(size, other.size) && color == other.color;
+                && qFuzzyCompare(size, other.size) && color == other.color
+                && qFuzzyCompare(hScale, other.hScale)
+                && qFuzzyCompare(vScale, other.vScale);
         }
     };
 
@@ -685,6 +749,10 @@ private:
         qreal ascent = 0.0;
         qreal width = 0.0;
         qreal height = 0.0;
+        /// Carried from the run so painting can stretch the glyphs by the
+        /// same amount the measurements above were stretched by.
+        qreal hScale = 1.0;
+        qreal vScale = 1.0;
     };
 
     /// One line of the text — a column, for vertical type — with its segments
@@ -745,6 +813,8 @@ private:
     /// the inverted selection is drawn. `origin` is where `m_typeOrigin` falls
     /// in whatever the painter is drawing on: the widget for the overlay, the
     /// image being rasterized for a commit.
+    /// The box the letters actually fill, which is what a warp bends.
+    QRectF typeInkBounds(const TypeLayout &layout, const QPointF &origin) const;
     void paintTypeRuns(QPainter &painter, const TypeLayout &layout, const QPointF &origin,
                        const QColor &forcedColor = QColor()) const;
     /// Draw mask type: the rubylith veil over the document with the letters
@@ -758,6 +828,19 @@ private:
     /// matters, not the ink.
     void renderTypeToImage(QImage &image, const QPoint &imageOrigin,
                            const QColor &forcedColor = QColor()) const;
+
+    /// Re-set a live type layer's text at `scale` times its current size,
+    /// laid out from `origin`, and hand the engine both the new glyphs and the
+    /// sizes they were set at. This is what keeps transformed text sharp:
+    /// scaling a type layer as pixels magnifies the rasterised glyphs instead
+    /// of setting them again at the size asked for.
+    bool rescaleTypeLayer(int layerIndex, double scale, double hStretch,
+                          const QPointF &origin);
+
+    /// Render the runs held in `m_typeText`/`m_typeRuns` and give the layer
+    /// both them and the pixels — the shared tail of every path that rewrites
+    /// a type layer in place.
+    bool commitTypeRunsToLayer(int layerIndex, int alignCode, bool antialias);
 
     /// The run covering a character index, and the run the next character typed
     /// at the caret should join.
@@ -996,6 +1079,9 @@ private:
     QImage m_ftOrigImage;
     QPointF m_ftOrigOffset;
     QRectF m_ftBounds;
+    /// `m_ftBounds` as it was when the transform opened. The drag rewrites
+    /// the live one, so the scale factor has to be measured against this.
+    QRectF m_ftStartBounds;
     double m_ftRotation = 0.0;
     QPointF m_ftScale{1.0, 1.0};
     QPolygonF m_ftQuad;
@@ -1018,6 +1104,11 @@ private:
     int m_searchHighlightLayer = -1;
     int m_searchHighlightChar = -1;
     int m_searchHighlightLen = 0;
+
+    // -- Filter preview --
+    /// The region an open filter dialog's thumbnail is showing, in document
+    /// coordinates. Empty when no filter dialog is open.
+    QRectF m_filterPreviewRect;
 
     // -- Type --
     /// True while text is being composed on the canvas, between a click with
@@ -1043,6 +1134,16 @@ private:
     /// True between pressing and releasing while sweeping out a selection.
     bool m_typeSelecting = false;
     QFont m_typeFont;
+    TypeParagraph m_typeParagraph;
+    /// How the text being laid out is bent — Warp Text. Part of the borrowed
+    /// state, like the runs: every path that lays a layer out loads it from
+    /// the record first and puts it back afterwards.
+    TypeWarp m_typeWarp;
+    /// Horizontal and vertical scale the options bar and Character panel
+    /// currently hold, 1.0 being 100%. Part of the style newly typed or
+    /// restyled characters take, alongside the font and colour.
+    qreal m_typeHScale = 1.0;
+    qreal m_typeVScale = 1.0;
     /// The style name `m_typeFont` was resolved from — see `setTypeOptions`.
     QString m_typeStyleName = QStringLiteral("Regular");
     QColor m_typeColor = Qt::black;

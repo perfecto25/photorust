@@ -24,7 +24,7 @@
 //! which we do not offer), and Photoshop's `Rendered` cache, which it rebuilds.
 
 use crate::buffer::Rgba8;
-use crate::layer::{TextAlign, TextContent, TextRun};
+use crate::layer::{TextAlign, TextContent, TextRun, TextWarp};
 
 /// The `TySh` block for `text`.
 ///
@@ -372,6 +372,8 @@ fn write_style_sheet(d: &mut Dump, depth: usize, run: Option<&TextRun>, fonts: &
         style: "Regular".to_string(),
         size: 12.0,
         color: Rgba8::BLACK,
+        h_scale: 1.0,
+        v_scale: 1.0,
     };
     let run = run.unwrap_or(&default);
     let font = font_index(fonts, run);
@@ -626,6 +628,8 @@ mod tests {
             antialias: true,
             vertical: false,
             origin: (40.0, 80.0),
+            warp: TextWarp::default(),
+            ..Default::default()
         }
     }
 
@@ -636,6 +640,8 @@ mod tests {
             style: style.to_string(),
             size,
             color,
+            h_scale: 1.0,
+            v_scale: 1.0,
         }
     }
 

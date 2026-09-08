@@ -24,6 +24,8 @@ const QColor kGripColor(0x8a, 0x8a, 0x8a);
 
 PanelHeader::PanelHeader(QWidget *parent)
     : QWidget(parent)
+    , m_collapseTip(tr("Collapse panel"))
+    , m_expandTip(tr("Expand panel"))
 {
     setObjectName(QStringLiteral("panelTitleBar"));
     setFixedHeight(kHeaderHeight);
@@ -41,7 +43,7 @@ PanelHeader::PanelHeader(QWidget *parent)
     m_collapse->setIconSize(QSize(11, 11));
     m_collapse->setFocusPolicy(Qt::NoFocus);
     m_collapse->setIcon(ToolIcons::fromSvgBody(ToolIcons::columnToggleSvg(false), kIconColor));
-    m_collapse->setToolTip(tr("Expand to two columns"));
+    m_collapse->setToolTip(m_expandTip);
     connect(m_collapse, &QToolButton::clicked, this, &PanelHeader::collapseClicked);
     row->addWidget(m_collapse);
 
@@ -59,15 +61,22 @@ PanelHeader::PanelHeader(QWidget *parent)
 
 void PanelHeader::setCollapsePointsLeft(bool pointsLeft)
 {
+    m_pointsLeft = pointsLeft;
     m_collapse->setIcon(
         ToolIcons::fromSvgBody(ToolIcons::columnToggleSvg(pointsLeft), kIconColor));
-    m_collapse->setToolTip(pointsLeft ? tr("Collapse to one column")
-                                      : tr("Expand to two columns"));
+    m_collapse->setToolTip(pointsLeft ? m_collapseTip : m_expandTip);
 }
 
 void PanelHeader::setCollapseVisible(bool visible)
 {
     m_collapse->setVisible(visible);
+}
+
+void PanelHeader::setCollapseTooltips(const QString &collapseTip, const QString &expandTip)
+{
+    m_collapseTip = collapseTip;
+    m_expandTip = expandTip;
+    m_collapse->setToolTip(m_pointsLeft ? m_collapseTip : m_expandTip);
 }
 
 QSize PanelHeader::sizeHint() const

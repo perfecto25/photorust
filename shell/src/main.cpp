@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "panels/DockTitleStyle.h"
 #include "shortcuts/CommandRegistry.h"
 
 #include "photorust_core/src/bridge.cxxqt.h"
@@ -84,8 +85,11 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));
 
     // Fusion gives QSS a predictable base to style; the native styles on Linux
-    // and macOS each override too much of it to match CS6 reliably.
-    QApplication::setStyle(QStringLiteral("Fusion"));
+    // and macOS each override too much of it to match CS6 reliably. It is
+    // wrapped so a panel's float button gets a chevron saying which way it
+    // goes, in place of Fusion's unlabelled square. Set before the stylesheet,
+    // since applying one wraps whatever style is current at the time.
+    QApplication::setStyle(new DockTitleStyle(QStringLiteral("Fusion")));
     applyTheme(app);
     applyIcon(app);
 
