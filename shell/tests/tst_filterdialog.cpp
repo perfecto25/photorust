@@ -11,6 +11,7 @@
 
 #include "MainWindow.h"
 #include "canvas/CanvasView.h"
+#include "dialogs/AngleDial.h"
 #include "dialogs/FilterPreviewDialog.h"
 #include "shortcuts/CommandRegistry.h"
 
@@ -18,6 +19,12 @@
 
 #include <QAction>
 #include <QCheckBox>
+#include <QComboBox>
+#include <QDialogButtonBox>
+#include <QPushButton>
+#include <QSlider>
+#include <QTabWidget>
+#include <QDoubleSpinBox>
 #include <QImage>
 #include <QSignalSpy>
 #include <QTest>
@@ -37,6 +44,17 @@ private slots:
     void aRadioChoiceReportsTheValueItStandsFor();
     void theBlurCentreFillsTwoSlotsAndStartsInTheMiddle();
     void radialBlurLaysItselfOutLikeCs6();
+    void theAngleWheelAndItsFieldStayInStep();
+    void smartSharpensAngleIsOnlyLiveForMotionBlur();
+    void addNoiseHandsOverAmountThenDistributionThenMonochromatic();
+    void displaceCollectsItsTwoScalesAndTwoModes();
+    void theShearCurveFillsOneSlotPerSampledRow();
+    void colorHalftoneOpensOnTheStandardPressAngles();
+    void aSeparatorDoesNotShiftWhatAListMeans();
+    void pointillizeTakesItsGroundFromTheDocument();
+    void flameNeedsAPathToBurnAlong();
+    void aTabbedDialogStillNumbersItsControlsInOrder();
+    void randomizeRollsANewSeedThatStaysPut();
     void zoomShortcutsReachTheCanvasThroughADialog();
     void aDialogDoesNotLetEditingShortcutsThrough();
     void theTopOfTheFilterMenuNamesTheLastFilterRun();
@@ -257,6 +275,320 @@ void TestFilterDialog::radialBlurLaysItselfOutLikeCs6()
 
     // ...and with no thumbnail on show, it must not be asking for one either.
     QVERIFY2(bare.previewRegion().isValid(), "the region should still be well-formed");
+
+    // With no thumbnail to sit beside, OK and Cancel drop to the foot of the
+    // dialog and lie flat. Left where they were, they would be a column of
+    // two floating at the top with nothing alongside them.
+    auto *buttons = bare.findChild<QDialogButtonBox *>();
+    QVERIFY(buttons);
+    QCOMPARE(buttons->orientation(), Qt::Horizontal);
+    QVERIFY2(buttons->y() > bare.height() / 2,
+             "the buttons stayed at the top of a dialog with no preview beside them");
+}
+
+void TestFilterDialog::theAngleWheelAndItsFieldStayInStep()
+{
+    // Two controls on one value. The failure to guard against is one of them
+    // driving the other in a loop, or the wheel moving and the filter still
+    // being handed the number the field was showing before.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Motion Blur"));
+    const int angle = dialog.addAngleParameter(QStringLiteral("Angle:"), 0);
+    dialog.addParameter(QStringLiteral("Distance:"), 1, 999, 20);
+
+    QCOMPARE(dialog.parameterValue(angle), 0.0f);
+
+    auto *dial = dialog.findChild<AngleDial *>();
+    QVERIFY2(dial, "Motion Blur's angle has no wheel");
+
+    // Drag the wheel a quarter turn. It reports the angle it was dragged to,
+    // and the parameter must follow.
+    emit dial->angleChanged(45.0);
+    QCOMPARE(dialog.parameterValue(angle), 45.0f);
+
+    // ...and the other way: typing in the field turns the wheel. The field is
+    // the one sharing a cell with the wheel — the dialog has another for the
+    // distance.
+    auto *field = dial->parentWidget()->findChild<QDoubleSpinBox *>();
+    QVERIFY(field);
+    field->setValue(120);
+    QCOMPARE(dialog.parameterValue(angle), 120.0f);
+}
+
+void TestFilterDialog::smartSharpensAngleIsOnlyLiveForMotionBlur()
+{
+    // Only a motion streak has a direction. CS6 greys the angle out for the
+    // other two rather than hiding it, so the row does not jump about — and
+    // the two controls it greys out are a field and a wheel, so both have to
+    // follow the combo.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Smart Sharpen"));
+    dialog.addParameter(QStringLiteral("Amount:"), 1, 500, 100);
+    dialog.addParameter(QStringLiteral("Radius:"), 0.1, 64.0, 1.0, 1);
+    dialog.addParameter(QStringLiteral("Reduce Noise:"), 0, 100, 10);
+    const int remove = dialog.addChoiceWithAngle(
+        QStringLiteral("Remove:"),
+        {QStringLiteral("Gaussian Blur"), QStringLiteral("Lens Blur"),
+         QStringLiteral("Motion Blur")},
+        {0.0, 1.0, 2.0}, 1, 0.0, 2);
+
+    // Five slots in all, with the angle right after the choice — the order
+    // the engine reads them in.
+    QCOMPARE(remove, 3);
+    QCOMPARE(dialog.parameters().size(), 5);
+    QCOMPARE(dialog.parameterValue(remove), 1.0f);
+
+    auto *dial = dialog.findChild<AngleDial *>();
+    QVERIFY(dial);
+    auto *field = dial->parentWidget()->findChild<QDoubleSpinBox *>();
+    QVERIFY(field);
+    QVERIFY2(!dial->isEnabled(), "the angle is live on Lens Blur, which has no direction");
+    QVERIFY(!field->isEnabled());
+
+    auto *combo = dial->parentWidget()->findChild<QComboBox *>();
+    QVERIFY(combo);
+    combo->setCurrentIndex(2);
+    QVERIFY2(dial->isEnabled(), "the angle stayed greyed out on Motion Blur");
+    QVERIFY(field->isEnabled());
+    QCOMPARE(dialog.parameterValue(remove), 2.0f);
+}
+
+void TestFilterDialog::addNoiseHandsOverAmountThenDistributionThenMonochromatic()
+{
+    // Three controls of three different kinds on one filter, read
+    // positionally by the engine. Getting the order wrong would swap the
+    // distribution for the monochromatic flag, and both are booleans, so
+    // nothing would complain.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Add Noise"));
+    dialog.addParameter(QStringLiteral("Amount:"), 0.1, 400.0, 12.5, 1);
+    dialog.addRadioChoice(QStringLiteral("Distribution"),
+                          {QStringLiteral("Uniform"), QStringLiteral("Gaussian")}, {0.0, 1.0}, 1);
+    dialog.addCheckBox(QStringLiteral("Monochromatic"), true);
+
+    QCOMPARE(dialog.parameters(), QList<float>({12.5f, 1.0f, 1.0f}));
+}
+
+void TestFilterDialog::displaceCollectsItsTwoScalesAndTwoModes()
+{
+    // Displace is the one filter that does not go through applyFilter — it
+    // needs an image, not numbers — so its four values are read positionally
+    // by hand. Two of them are booleans dressed as radio boxes, and swapping
+    // them would tile a stretched map or wrap what should repeat, neither of
+    // which announces itself.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Displace"));
+    dialog.setPreviewPaneVisible(false);
+    dialog.addParameter(QStringLiteral("Horizontal Scale:"), -999, 999, 10);
+    dialog.addParameter(QStringLiteral("Vertical Scale:"), -999, 999, 25);
+    dialog.addRadioChoice(QStringLiteral("Displacement Map:"),
+                          {QStringLiteral("Stretch To Fit"), QStringLiteral("Tile")},
+                          {1.0, 0.0}, 1);
+    dialog.addRadioChoice(QStringLiteral("Undefined Areas:"),
+                          {QStringLiteral("Wrap Around"), QStringLiteral("Repeat Edge Pixels")},
+                          {1.0, 0.0}, 0);
+
+    // Tile, and Wrap Around.
+    QCOMPARE(dialog.parameters(), QList<float>({10.0f, 25.0f, 0.0f, 1.0f}));
+}
+
+void TestFilterDialog::theShearCurveFillsOneSlotPerSampledRow()
+{
+    // The curve is a whole sampled line rather than a number, and the
+    // Undefined Areas flag sits after it. Miscount the curve and the flag is
+    // read out of the middle of it — which is a valid float, so nothing
+    // complains, and the filter quietly wraps when it should clamp.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Shear"));
+    dialog.setPreviewPaneVisible(false);
+    const int curve = dialog.addShearCurve(17);
+    dialog.addRadioChoice(QStringLiteral("Undefined Areas:"),
+                          {QStringLiteral("Wrap Around"), QStringLiteral("Repeat Edge Pixels")},
+                          {1.0, 0.0}, 1);
+
+    QCOMPARE(curve, 0);
+    const QList<float> params = dialog.parameters();
+    QCOMPARE(params.size(), 18);
+    // An untouched curve is a straight line down the middle: no offset at all.
+    for (int i = 0; i < 17; ++i) {
+        QCOMPARE(params.at(i), 0.0f);
+    }
+    QCOMPARE(params.at(17), 0.0f); // Repeat Edge Pixels.
+}
+
+void TestFilterDialog::colorHalftoneOpensOnTheStandardPressAngles()
+{
+    // Five fields that are all just numbers, read positionally by the engine:
+    // the radius first, then the four screens in channel order. Shuffled, the
+    // filter still produces a perfectly convincing halftone — with the plates
+    // at each other's angles.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Color Halftone"));
+    dialog.setPreviewPaneVisible(false);
+    dialog.addParameter(QStringLiteral("Max. Radius:"), 4, 127, 8, 0, QString(), false);
+    dialog.addHeading(QStringLiteral("Screen Angles (Degrees):"));
+    const double angles[4] = {108, 162, 90, 45};
+    for (int channel = 0; channel < 4; ++channel) {
+        dialog.addParameter(QStringLiteral("Channel %1:").arg(channel + 1), -360, 360,
+                            angles[channel], 0, QString(), false);
+    }
+
+    QCOMPARE(dialog.parameters(), QList<float>({8.0f, 108.0f, 162.0f, 90.0f, 45.0f}));
+
+    // ...and a field with no slider under it really has none, or the dialog
+    // would be four times the height CS6's is.
+    QCOMPARE(dialog.findChildren<QSlider *>().size(), 0);
+}
+
+void TestFilterDialog::aSeparatorDoesNotShiftWhatAListMeans()
+{
+    // Mezzotint's ten types are ruled off into dots, lines and strokes. If
+    // the value were read from the chosen item's position, every separator
+    // would push everything below it along by one and Short Strokes would
+    // apply as Long Lines — a perfectly convincing mezzotint, just the wrong
+    // one.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Mezzotint"));
+    const int type = dialog.addChoice(
+        QStringLiteral("Type:"),
+        {QStringLiteral("Fine Dots"), QStringLiteral("Medium Dots"), QStringLiteral("Grainy Dots"),
+         QStringLiteral("Coarse Dots"), QStringLiteral("Short Lines"),
+         QStringLiteral("Medium Lines"), QStringLiteral("Long Lines"),
+         QStringLiteral("Short Strokes"), QStringLiteral("Medium Strokes"),
+         QStringLiteral("Long Strokes")},
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, 0, {3, 6});
+
+    auto *combo = dialog.findChild<QComboBox *>();
+    QVERIFY(combo);
+    // Ten types plus the two rules between the groups.
+    QCOMPARE(combo->count(), 12);
+    QCOMPARE(dialog.parameterValue(type), 0.0f);
+
+    // Short Strokes is the eighth type but sits two rows further down.
+    const int row = combo->findText(QStringLiteral("Short Strokes"));
+    QCOMPARE(row, 9);
+    combo->setCurrentIndex(row);
+    QCOMPARE(dialog.parameterValue(type), 7.0f);
+}
+
+void TestFilterDialog::pointillizeTakesItsGroundFromTheDocument()
+{
+    // Pointillize paints the canvas between its dabs in the background
+    // colour, which belongs to the document rather than to the dialog — so
+    // the dialog never asks for it and the engine fills it in. If that seam
+    // is broken the filter still works and still looks like pointillism; it
+    // just paints on white whatever the swatch says.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(220, 40, 40));
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Red")));
+    engine.setBackgroundColor(QColor(0, 0, 255));
+
+    const float cell = 9.0f;
+    engine.applyFilter(QStringLiteral("Pointillize"), rust::Slice<const float>(&cell, 1));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    bool ground = false;
+    for (int y = 0; y < after.height() && !ground; ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            if (after.pixelColor(x, y) == QColor(0, 0, 255)) {
+                ground = true;
+                break;
+            }
+        }
+    }
+    QVERIFY2(ground, "the gaps between the dabs are not the document's background colour");
+}
+
+void TestFilterDialog::flameNeedsAPathToBurnAlong()
+{
+    // Flame draws along a line, and without one there is nothing to draw.
+    // Refusing is the whole behaviour here: rendering nothing quietly would
+    // leave the user wondering which of twenty settings was at fault.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::black);
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Ground")));
+
+    QVERIFY2(!engine.hasActivePath(), "a fresh document should have no path");
+    const QList<float> params{2.0f, 100.0f};
+    QVERIFY2(!engine.applyFlame(rust::Slice<const float>(params.constData(),
+                                                         size_t(params.size()))),
+             "Flame claimed to have burned with no path to burn along");
+
+    // With a path it goes ahead, and something lights up.
+    engine.beginPathBuild();
+    engine.pathBuildSubpath(false);
+    engine.pathBuildPoint(60, 220, false, 0, 0, false, 0, 0);
+    engine.pathBuildPoint(240, 220, false, 0, 0, false, 0, 0);
+    engine.commitBuiltPath(QStringLiteral("Wick"));
+    QVERIFY(engine.hasActivePath());
+
+    QVERIFY(engine.applyFlame(rust::Slice<const float>(params.constData(),
+                                                       size_t(params.size()))));
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    bool burned = false;
+    for (int y = 0; y < after.height() && !burned; ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            if (after.pixelColor(x, y).red() > 40) {
+                burned = true;
+                break;
+            }
+        }
+    }
+    QVERIFY2(burned, "Flame ran with a path and left the layer black");
+}
+
+void TestFilterDialog::aTabbedDialogStillNumbersItsControlsInOrder()
+{
+    // Flame has twenty settings across two tabs, read positionally by the
+    // engine. Tabs are a change of layout, not of numbering, and a control
+    // that landed in the wrong slot would still produce a flame.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Flame"));
+    dialog.setPreviewPaneVisible(false);
+
+    dialog.beginTab(QStringLiteral("Basic"));
+    dialog.addChoice(QStringLiteral("Flame Type:"), {QStringLiteral("a"), QStringLiteral("b")},
+                     {0.0, 1.0}, 1);
+    dialog.addParameter(QStringLiteral("Length:"), 1, 500, 120);
+
+    dialog.beginTab(QStringLiteral("Advanced"));
+    dialog.addParameter(QStringLiteral("Turbulent:"), 0, 100, 40);
+    const int last = dialog.addCheckBox(QStringLiteral("Randomize Shapes"), true);
+
+    QCOMPARE(last, 3);
+    QCOMPARE(dialog.parameters(), QList<float>({1.0f, 120.0f, 40.0f, 1.0f}));
+
+    auto *tabs = dialog.findChild<QTabWidget *>();
+    QVERIFY(tabs);
+    QCOMPARE(tabs->count(), 2);
+    QCOMPARE(tabs->tabText(1), QStringLiteral("Advanced"));
+}
+
+void TestFilterDialog::randomizeRollsANewSeedThatStaysPut()
+{
+    // Wave's generators are drawn from a seed rather than from a running
+    // random source, because the preview and the applied filter are separate
+    // runs and undo and redo are two more. Randomize must change the seed;
+    // everything else must leave it alone.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Wave"));
+    dialog.addParameter(QStringLiteral("Number of Generators:"), 1, 999, 5);
+    const int seed = dialog.addRandomizeButton(QStringLiteral("Randomize"));
+
+    const float before = dialog.parameterValue(seed);
+    QCOMPARE(dialog.parameterValue(seed), before);
+
+    auto *button = dialog.findChild<QPushButton *>();
+    QVERIFY(button);
+    button->click();
+    QVERIFY2(dialog.parameterValue(seed) != before, "Randomize did not re-roll the seed");
+    // ...and it stays put until asked again.
+    const float rolled = dialog.parameterValue(seed);
+    QCOMPARE(dialog.parameterValue(seed), rolled);
 }
 
 void TestFilterDialog::zoomShortcutsReachTheCanvasThroughADialog()

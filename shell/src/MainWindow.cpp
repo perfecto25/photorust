@@ -2090,14 +2090,92 @@ void MainWindow::createMenus()
     smartBlur->setStatusTip(tr("Smart Blur needs edge detection, which is not implemented"));
     blur->addAction(command(QStringLiteral("filter.surfaceBlur"), tr("S&urface Blur..."),
                             [this] { applyFilter(QStringLiteral("Surface Blur")); }));
+    // CS6's Sharpen submenu, in its order.
     QMenu *sharpen = filter->addMenu(tr("&Sharpen"));
     sharpen->addAction(command(QStringLiteral("filter.sharpen"), tr("&Sharpen"),
                                [this] { applyFilter(QStringLiteral("Sharpen")); }));
+    sharpen->addAction(command(QStringLiteral("filter.sharpenEdges"), tr("Sharpen &Edges"),
+                               [this] { applyFilter(QStringLiteral("Sharpen Edges")); }));
+    sharpen->addAction(command(QStringLiteral("filter.sharpenMore"), tr("Sharpen &More"),
+                               [this] { applyFilter(QStringLiteral("Sharpen More")); }));
+    sharpen->addAction(command(QStringLiteral("filter.smartSharpen"), tr("S&mart Sharpen..."),
+                               [this] { applyFilter(QStringLiteral("Smart Sharpen")); }));
     sharpen->addAction(command(QStringLiteral("filter.unsharpMask"), tr("&Unsharp Mask..."),
                                [this] { applyFilter(QStringLiteral("Unsharp Mask")); }));
+    // CS6's Distort submenu, in its order. The five not built are listed and
+    // disabled rather than left out, so what is missing is visible.
+    QMenu *distort = filter->addMenu(tr("&Distort"));
+    distort->addAction(command(QStringLiteral("filter.displace"), tr("Displace..."),
+                               [this] { applyFilter(QStringLiteral("Displace")); }));
+    distort->addAction(command(QStringLiteral("filter.pinch"), tr("&Pinch..."),
+                               [this] { applyFilter(QStringLiteral("Pinch")); }));
+    distort->addAction(command(QStringLiteral("filter.polarCoordinates"),
+                               tr("Polar &Coordinates..."),
+                               [this] { applyFilter(QStringLiteral("Polar Coordinates")); }));
+    distort->addAction(command(QStringLiteral("filter.ripple"), tr("&Ripple..."),
+                               [this] { applyFilter(QStringLiteral("Ripple")); }));
+    distort->addAction(command(QStringLiteral("filter.shear"), tr("S&hear..."),
+                               [this] { applyFilter(QStringLiteral("Shear")); }));
+    distort->addAction(command(QStringLiteral("filter.spherize"), tr("&Spherize..."),
+                               [this] { applyFilter(QStringLiteral("Spherize")); }));
+    distort->addAction(command(QStringLiteral("filter.twirl"), tr("&Twirl..."),
+                               [this] { applyFilter(QStringLiteral("Twirl")); }));
+    distort->addAction(command(QStringLiteral("filter.wave"), tr("&Wave..."),
+                               [this] { applyFilter(QStringLiteral("Wave")); }));
+    distort->addAction(command(QStringLiteral("filter.zigZag"), tr("&ZigZag..."),
+                               [this] { applyFilter(QStringLiteral("ZigZag")); }));
+
+    // CS6's Pixelate submenu, in its order.
+    QMenu *pixelate = filter->addMenu(tr("Pi&xelate"));
+    pixelate->addAction(command(QStringLiteral("filter.colorHalftone"), tr("&Color Halftone..."),
+                                [this] { applyFilter(QStringLiteral("Color Halftone")); }));
+    pixelate->addAction(command(QStringLiteral("filter.crystallize"), tr("C&rystallize..."),
+                                [this] { applyFilter(QStringLiteral("Crystallize")); }));
+    // Neither of these takes a parameter in CS6, so neither opens a dialog.
+    pixelate->addAction(command(QStringLiteral("filter.facet"), tr("Fa&cet"),
+                                [this] { applyFilter(QStringLiteral("Facet")); }));
+    pixelate->addAction(command(QStringLiteral("filter.fragment"), tr("Fra&gment"),
+                                [this] { applyFilter(QStringLiteral("Fragment")); }));
+    pixelate->addAction(command(QStringLiteral("filter.mezzotint"), tr("Me&zzotint..."),
+                                [this] { applyFilter(QStringLiteral("Mezzotint")); }));
+    pixelate->addAction(command(QStringLiteral("filter.mosaic"), tr("&Mosaic..."),
+                                [this] { applyFilter(QStringLiteral("Mosaic")); }));
+    pixelate->addAction(command(QStringLiteral("filter.pointillize"), tr("&Pointillize..."),
+                                [this] { applyFilter(QStringLiteral("Pointillize")); }));
+
+    // CS6's Render submenu. Only Flame is built; the rest are listed and
+    // disabled so what is missing is visible.
+    QMenu *render = filter->addMenu(tr("&Render"));
+    render->addAction(command(QStringLiteral("filter.flame"), tr("&Flame..."),
+                              &MainWindow::showFlame));
+    for (const QString &entry : {tr("Pictu&re Frame..."), tr("&Tree..."),
+                                 tr("&Clouds"), tr("Di&fference Clouds"),
+                                 tr("&Fibers..."), tr("&Lens Flare..."),
+                                 tr("Li&ghting Effects...")}) {
+        QAction *action = render->addAction(entry);
+        action->setEnabled(false);
+        action->setStatusTip(tr("%1 is not implemented")
+                                 .arg(QString(entry).remove(QLatin1Char('&'))
+                                          .remove(QStringLiteral("..."))));
+    }
+
+    // CS6's Noise submenu, in its order. Despeckle and Reduce Noise are
+    // listed and disabled: the first is a fixed edge-preserving pass and the
+    // second a whole panel of its own, and neither is built.
     QMenu *noise = filter->addMenu(tr("&Noise"));
     noise->addAction(command(QStringLiteral("filter.addNoise"), tr("&Add Noise..."),
                              [this] { applyFilter(QStringLiteral("Add Noise")); }));
+    QAction *despeckle = noise->addAction(tr("Des&peckle"));
+    despeckle->setEnabled(false);
+    despeckle->setStatusTip(tr("Despeckle is not implemented"));
+    noise->addAction(command(QStringLiteral("filter.dustAndScratches"),
+                             tr("&Dust && Scratches..."),
+                             [this] { applyFilter(QStringLiteral("Dust & Scratches")); }));
+    noise->addAction(command(QStringLiteral("filter.median"), tr("&Median..."),
+                             [this] { applyFilter(QStringLiteral("Median")); }));
+    QAction *reduceNoise = noise->addAction(tr("&Reduce Noise..."));
+    reduceNoise->setEnabled(false);
+    reduceNoise->setStatusTip(tr("Reduce Noise is not implemented"));
 
     // -- View ---------------------------------------------------------------
     QMenu *view = menuBar()->addMenu(tr("&View"));
@@ -6757,7 +6835,15 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         name == QLatin1String("Gaussian Blur") || name == QLatin1String("Box Blur")
         || name == QLatin1String("Motion Blur") || name == QLatin1String("Radial Blur")
         || name == QLatin1String("Surface Blur") || name == QLatin1String("Unsharp Mask")
-        || name == QLatin1String("Add Noise");
+        || name == QLatin1String("Smart Sharpen") || name == QLatin1String("Add Noise")
+        || name == QLatin1String("Median") || name == QLatin1String("Dust & Scratches")
+        || name == QLatin1String("Pinch") || name == QLatin1String("Polar Coordinates")
+        || name == QLatin1String("Ripple") || name == QLatin1String("Displace")
+        || name == QLatin1String("Shear") || name == QLatin1String("Spherize")
+        || name == QLatin1String("Twirl") || name == QLatin1String("Wave")
+        || name == QLatin1String("ZigZag") || name == QLatin1String("Color Halftone")
+        || name == QLatin1String("Crystallize") || name == QLatin1String("Mezzotint")
+        || name == QLatin1String("Mosaic") || name == QLatin1String("Pointillize");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -6770,8 +6856,10 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         } else if (name == QLatin1String("Box Blur")) {
             dialog.addParameter(tr("Radius:"), 1, 250, preset(0, 10.0f), 0, tr(" Pixels"));
         } else if (name == QLatin1String("Motion Blur")) {
-            dialog.addParameter(tr("Angle:"), -360, 360, preset(0, 0.0f), 0,
-                                QStringLiteral("°"));
+            // CS6 gives the angle a wheel and no slider, and the distance a
+            // slider and no wheel. Each control fits what it sets: an angle
+            // wraps round, a distance runs between two ends.
+            dialog.addAngleParameter(tr("Angle:"), preset(0, 0.0f));
             dialog.addParameter(tr("Distance:"), 1, 999, preset(1, 20.0f), 0, tr(" Pixels"));
         } else if (name == QLatin1String("Radial Blur")) {
             // CS6's Radial Blur, which is laid out unlike the others: Amount,
@@ -6793,11 +6881,133 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         } else if (name == QLatin1String("Surface Blur")) {
             dialog.addParameter(tr("Radius:"), 1, 100, preset(0, 5.0f), 0, tr(" Pixels"));
             dialog.addParameter(tr("Threshold:"), 2, 255, preset(1, 15.0f), 0, tr(" Levels"));
+        } else if (name == QLatin1String("Smart Sharpen")) {
+            dialog.addParameter(tr("Amount:"), 1, 500, preset(0, 100.0f), 0,
+                                QStringLiteral("%"));
+            dialog.addParameter(tr("Radius:"), 0.1, 64.0, preset(1, 1.0f), 1, tr(" px"));
+            dialog.addParameter(tr("Reduce Noise:"), 0, 100, preset(2, 10.0f), 0,
+                                QStringLiteral("%"));
+            // Sharpening is an attempt to undo a blur, so which blur it was
+            // is the question this filter asks that the others do not. Only
+            // a motion streak has a direction, so the angle beside it is
+            // greyed out for the other two.
+            dialog.addChoiceWithAngle(tr("Remove:"),
+                                      {tr("Gaussian Blur"), tr("Lens Blur"), tr("Motion Blur")},
+                                      {0.0, 1.0, 2.0}, int(preset(3, 1.0f)), preset(4, 0.0f), 2);
+            // CS6's Shadows/Highlights section fades the sharpening back in
+            // the darkest and lightest tones. Named here rather than left out
+            // so it is clear what is missing, not that it was forgotten.
+            dialog.addDisabledNote(tr("Shadows / Highlights — not implemented"));
         } else if (name == QLatin1String("Unsharp Mask")) {
             dialog.addParameter(tr("Amount:"), 0.0, 5.0, preset(0, 1.0f), 2);
             dialog.addParameter(tr("Radius:"), 0.1, 250.0, preset(1, 1.0f), 1, tr(" Pixels"));
+        } else if (name == QLatin1String("Pinch")) {
+            dialog.addParameter(tr("Amount:"), -100, 100, preset(0, 0.0f), 0,
+                                QStringLiteral("%"));
+            // CS6's wireframe: a grid deformed the way the picture will be,
+            // which reads the distortion at a glance in a way a thumbnail of
+            // a photograph does not.
+            dialog.addDistortGrid();
+        } else if (name == QLatin1String("Polar Coordinates")) {
+            dialog.addRadioChoice(QString(),
+                                  {tr("Rectangular to Polar"), tr("Polar to Rectangular")},
+                                  {1.0, 0.0}, preset(0, 1.0f) != 0.0 ? 0 : 1);
+        } else if (name == QLatin1String("Ripple")) {
+            dialog.addParameter(tr("Amount:"), -999, 999, preset(0, 100.0f), 0,
+                                QStringLiteral("%"));
+            dialog.addChoice(tr("Size:"), {tr("Small"), tr("Medium"), tr("Large")},
+                             {0.0, 1.0, 2.0}, int(preset(1, 1.0f)));
+        } else if (name == QLatin1String("Spherize")) {
+            dialog.addParameter(tr("Amount:"), -100, 100, preset(0, 100.0f), 0,
+                                QStringLiteral("%"));
+            dialog.addChoice(tr("Mode:"),
+                             {tr("Normal"), tr("Horizontal Only"), tr("Vertical Only")},
+                             {0.0, 1.0, 2.0}, int(preset(1, 0.0f)));
+            dialog.addDistortGrid();
+        } else if (name == QLatin1String("Twirl")) {
+            dialog.addParameter(tr("Angle:"), -999, 999, preset(0, 50.0f), 0,
+                                QStringLiteral("°"));
+            dialog.addDistortGrid();
+        } else if (name == QLatin1String("ZigZag")) {
+            dialog.addParameter(tr("Amount:"), -100, 100, preset(0, 10.0f), 0);
+            dialog.addParameter(tr("Ridges:"), 1, 20, preset(1, 5.0f), 0);
+            dialog.addChoice(tr("Style:"),
+                             {tr("Around Center"), tr("Out From Center"), tr("Pond Ripples")},
+                             {0.0, 1.0, 2.0}, int(preset(2, 2.0f)));
+            dialog.addDistortGrid();
+        } else if (name == QLatin1String("Shear")) {
+            // CS6's Shear has no thumbnail — the curve box takes its place —
+            // and only the one choice under it.
+            dialog.setPreviewPaneVisible(false);
+            dialog.addShearCurve(kShearCurvePoints);
+            dialog.addRadioChoice(tr("Undefined Areas:"),
+                                  {tr("Wrap Around"), tr("Repeat Edge Pixels")}, {1.0, 0.0},
+                                  preset(kShearCurvePoints, 1.0f) != 0.0 ? 0 : 1);
+        } else if (name == QLatin1String("Wave")) {
+            dialog.addParameter(tr("Number of Generators:"), 1, 999, preset(0, 5.0f), 0);
+            dialog.addRangeParameter(tr("Wavelength:"), tr("Min."), tr("Max."), 1, 999,
+                                     preset(1, 10.0f), preset(2, 120.0f));
+            dialog.addRangeParameter(tr("Amplitude:"), tr("Min."), tr("Max."), 1, 999,
+                                     preset(3, 5.0f), preset(4, 35.0f));
+            dialog.addRangeParameter(tr("Scale:"), tr("Horiz."), tr("Vert."), 1, 100,
+                                     preset(5, 100.0f), preset(6, 100.0f), 0,
+                                     QStringLiteral("%"));
+            dialog.addRadioChoice(tr("Type:"), {tr("Sine"), tr("Triangle"), tr("Square")},
+                                  {0.0, 1.0, 2.0}, int(preset(7, 0.0f)));
+            dialog.addRadioChoice(tr("Undefined Areas:"),
+                                  {tr("Wrap Around"), tr("Repeat Edge Pixels")}, {1.0, 0.0},
+                                  preset(8, 0.0f) != 0.0 ? 0 : 1);
+            dialog.addRandomizeButton(tr("Randomize"));
+        } else if (name == QLatin1String("Mezzotint")) {
+            // CS6 rules the ten off into dots, lines and strokes.
+            dialog.addChoice(tr("Type:"),
+                             {tr("Fine Dots"), tr("Medium Dots"), tr("Grainy Dots"),
+                              tr("Coarse Dots"), tr("Short Lines"), tr("Medium Lines"),
+                              tr("Long Lines"), tr("Short Strokes"), tr("Medium Strokes"),
+                              tr("Long Strokes")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0},
+                             int(preset(0, 0.0f)), {3, 6});
+        } else if (name == QLatin1String("Crystallize")) {
+            dialog.addParameter(tr("Cell Size"), 3, 300, preset(0, 10.0f), 0);
+        } else if (name == QLatin1String("Mosaic")) {
+            dialog.addParameter(tr("Cell Size:"), 2, 200, preset(0, 10.0f), 0, tr(" square"));
+        } else if (name == QLatin1String("Pointillize")) {
+            dialog.addParameter(tr("Cell Size"), 3, 300, preset(0, 5.0f), 0);
+        } else if (name == QLatin1String("Color Halftone")) {
+            // CS6's dialog is a set of plain fields with no preview and no
+            // sliders — the effect is far too fine to judge in a thumbnail
+            // anyway, and the numbers are typed rather than dialled.
+            dialog.setPreviewPaneVisible(false);
+            dialog.addParameter(tr("Max. Radius:"), 4, 127, preset(0, 8.0f), 0, tr(" (Pixels)"),
+                                false);
+            dialog.addHeading(tr("Screen Angles (Degrees):"));
+            for (int channel = 0; channel < 4; ++channel) {
+                dialog.addParameter(tr("Channel %1:").arg(channel + 1), -360, 360,
+                                    preset(channel + 1, kDefaultScreenAngles[channel]), 0,
+                                    QString(), false);
+            }
+        } else if (name == QLatin1String("Displace")) {
+            // CS6's Displace has no preview — the effect depends on a file it
+            // has not asked for yet — and two boxes of radio buttons instead.
+            dialog.setPreviewPaneVisible(false);
+            dialog.addParameter(tr("Horizontal Scale:"), -999, 999, preset(0, 10.0f), 0);
+            dialog.addParameter(tr("Vertical Scale:"), -999, 999, preset(1, 10.0f), 0);
+            dialog.addRadioChoice(tr("Displacement Map:"), {tr("Stretch To Fit"), tr("Tile")},
+                                  {1.0, 0.0}, preset(2, 1.0f) != 0.0 ? 0 : 1);
+            dialog.addRadioChoice(tr("Undefined Areas:"),
+                                  {tr("Wrap Around"), tr("Repeat Edge Pixels")}, {1.0, 0.0},
+                                  preset(3, 0.0f) != 0.0 ? 0 : 1);
+        } else if (name == QLatin1String("Median")) {
+            dialog.addParameter(tr("Radius:"), 1, 100, preset(0, 3.0f), 0, tr(" Pixels"));
+        } else if (name == QLatin1String("Dust & Scratches")) {
+            dialog.addParameter(tr("Radius:"), 1, 100, preset(0, 2.0f), 0, tr(" Pixels"));
+            dialog.addParameter(tr("Threshold:"), 0, 255, preset(1, 15.0f), 0, tr(" levels"));
         } else {
-            dialog.addParameter(tr("Amount:"), 0.0, 1.0, preset(0, 0.1f), 2);
+            dialog.addParameter(tr("Amount:"), 0.1, 400.0, preset(0, 12.5f), 1,
+                                QStringLiteral("%"));
+            dialog.addRadioChoice(tr("Distribution"), {tr("Uniform"), tr("Gaussian")},
+                                  {0.0, 1.0}, preset(1, 0.0f) != 0.0 ? 1 : 0);
+            dialog.addCheckBox(tr("Monochromatic"), preset(2, 0.0f) != 0.0);
         }
 
         // Open looking at the middle of what the canvas is showing, and mark
@@ -6822,11 +7032,143 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         params = dialog.parameters();
     }
 
-    m_engine->applyFilter(name,
-                          rust::Slice<const float>(params.constData(), size_t(params.size())));
+    if (name == QLatin1String("Displace")) {
+        if (!applyDisplacementMap(params, skipDialog)) {
+            refreshAll();
+            return;
+        }
+    } else {
+        m_engine->applyFilter(
+            name, rust::Slice<const float>(params.constData(), size_t(params.size())));
+    }
     m_lastFilterName = name;
     m_lastFilterParams = params;
     refreshLastFilterAction();
+    refreshAll();
+}
+
+bool MainWindow::applyDisplacementMap(const QList<float> &params, bool reuseLastMap)
+{
+    // Photoshop asks for the map *after* the settings, in a second dialog. It
+    // has to be a real image rather than a set of numbers, which is why this
+    // is the one filter with its own path through the bridge.
+    if (!reuseLastMap || m_lastDisplacementMap.isNull()) {
+        const QString path = QFileDialog::getOpenFileName(
+            this, tr("Choose a Displacement Map"), QString(),
+            tr("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.psd);;All Files (*)"));
+        if (path.isEmpty()) {
+            return false;
+        }
+        QImage map(path);
+        if (map.isNull()) {
+            QMessageBox::warning(this, tr("Displace"),
+                                 tr("Could not read \"%1\" as an image.").arg(path));
+            return false;
+        }
+        m_lastDisplacementMap = map.convertToFormat(QImage::Format_RGBA8888);
+    }
+
+    m_engine->applyDisplace(m_lastDisplacementMap, params.value(0, 10.0f),
+                            params.value(1, 10.0f), params.value(2, 1.0f) != 0.0f,
+                            params.value(3, 0.0f) != 0.0f);
+    return true;
+}
+
+void MainWindow::showFlame()
+{
+    if (!m_engine) {
+        return;
+    }
+    // Flame draws along a line, and without one there is nothing to draw.
+    // Photoshop refuses it outright rather than rendering nothing, and says
+    // so in these words.
+    if (!m_engine->hasActivePath()) {
+        QMessageBox::warning(this, tr("Flame"),
+                             tr("Please create a path before using this filter."));
+        return;
+    }
+    if (!m_engine->canFilterActiveLayer()) {
+        QMessageBox::warning(this, tr("Flame"),
+                             tr("Could not apply the filter because the active layer is not a "
+                                "normal pixel layer, or its pixels are locked."));
+        return;
+    }
+
+    FilterPreviewDialog dialog(m_engine, tr("Flame"), this);
+    // No thumbnail: the flame follows the document's path, so a crop of it
+    // would have to render the whole fire and then throw most of it away.
+    // The canvas itself is the preview instead, which is where the path is.
+    dialog.setPreviewPaneVisible(false);
+    dialog.setCanvasPreviewDriver([this](const QList<float> &params, bool on) {
+        if (!m_engine) {
+            return;
+        }
+        m_engine->setFlamePreview(on ? rust::Slice<const float>(params.constData(),
+                                                                size_t(params.size()))
+                                     : rust::Slice<const float>());
+    });
+    auto preset = [this](int slot, float fallback) {
+        return double(m_lastFlameParams.value(slot, fallback));
+    };
+
+    // CS6 divides this one into two tabs — there are twenty settings, and the
+    // first seven are the ones anybody touches.
+    dialog.beginTab(tr("Basic"));
+    dialog.addChoice(tr("Flame Type:"),
+                     {tr("1. One Flame Along Path"), tr("2. Multiple Flames Along Path"),
+                      tr("3. Multiple Flames One Direction"),
+                      tr("4. Multiple Flames Path Directed"),
+                      tr("5. Multiple Flames Various Angle"), tr("6. Candle Light")},
+                     {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}, int(preset(0, 2.0f)));
+    dialog.addParameter(tr("Length:"), 1, 500, preset(1, 100.0f), 0);
+    dialog.addCheckBox(tr("Randomize Length"), preset(2, 0.0f) != 0.0);
+    dialog.addParameter(tr("Width:"), 1, 500, preset(3, 100.0f), 0);
+    dialog.addParameter(tr("Angle:"), -180, 180, preset(4, 0.0f), 0, QStringLiteral("°"));
+    dialog.addParameter(tr("Interval:"), 1, 100, preset(5, 30.0f), 0);
+    dialog.addCheckBox(tr("Adjust Interval for Loops"), preset(6, 1.0f) != 0.0);
+    const int custom = dialog.addCheckBox(tr("Use Custom Color for Flames"),
+                                          preset(7, 0.0f) != 0.0);
+    dialog.addColorButton(tr("Custom Color for Flames:"),
+                          QColor(int(preset(8, 255.0f)), int(preset(9, 140.0f)),
+                                 int(preset(10, 0.0f))),
+                          [&dialog, custom] { return dialog.parameterValue(custom) != 0.0f; });
+    dialog.addChoice(tr("Quality:"),
+                     {tr("Draft"), tr("Low"), tr("Medium"), tr("High"), tr("Very High")},
+                     {0.0, 1.0, 2.0, 3.0, 4.0}, int(preset(11, 2.0f)));
+
+    dialog.beginTab(tr("Advanced"));
+    dialog.addParameter(tr("Turbulent:"), 0, 100, preset(12, 15.0f), 0);
+    dialog.addParameter(tr("Jag:"), 0, 100, preset(13, 0.0f), 0);
+    dialog.addParameter(tr("Opacity:"), 1, 100, preset(14, 25.0f), 0);
+    dialog.addParameter(tr("Flame Lines (Complexity):"), 1, 30, preset(15, 10.0f), 0);
+    dialog.addParameter(tr("Flame Bottom Alignment:"), 0, 100, preset(16, 30.0f), 0);
+    dialog.addChoice(tr("Flame Style:"), {tr("1. Normal"), tr("2. Violent"), tr("3. Flat")},
+                     {0.0, 1.0, 2.0}, int(preset(17, 0.0f)));
+    dialog.addChoice(tr("Flame Shape:"),
+                     {tr("1. Parallel"), tr("2. To the Center"), tr("3. Spread"), tr("4. Oval"),
+                      tr("5. Pointing")},
+                     {0.0, 1.0, 2.0, 3.0, 4.0}, int(preset(18, 0.0f)));
+    dialog.addCheckBox(tr("Randomize Shapes"), preset(19, 0.0f) != 0.0);
+    dialog.addParameter(tr("Arrangement:"), 1, 20, preset(20, 1.0f), 0);
+
+    if (m_canvas) {
+        dialog.setPreviewCenter(m_canvas->widgetToDocument(
+            QPointF(m_canvas->width() / 2.0, m_canvas->height() / 2.0)));
+        connect(&dialog, &FilterPreviewDialog::previewRegionChanged, m_canvas,
+                &CanvasView::setFilterPreviewRect);
+    }
+    const int result = dialog.exec();
+    if (m_canvas) {
+        m_canvas->setFilterPreviewRect(QRectF());
+    }
+    if (result != QDialog::Accepted) {
+        refreshAll();
+        return;
+    }
+
+    m_lastFlameParams = dialog.parameters();
+    m_engine->applyFlame(rust::Slice<const float>(m_lastFlameParams.constData(),
+                                                  size_t(m_lastFlameParams.size())));
     refreshAll();
 }
 

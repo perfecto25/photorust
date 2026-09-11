@@ -1,10 +1,13 @@
 #include "FilterPreviewDialog.h"
 
+#include "AngleDial.h"
+
 #include "../tools/ToolIcons.h"
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QButtonGroup>
@@ -18,7 +21,10 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QRandomGenerator>
+#include <QSpinBox>
 #include <QSlider>
+#include <QTabWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -48,6 +54,14 @@ constexpr int kPaneHeight = 200;
 
 /// CS6's Blur Center box is a small square beside the options.
 constexpr int kCenterBoxSize = 108;
+
+/// Pinch's wireframe, which CS6 puts under the OK/Cancel column.
+constexpr int kGridBoxSize = 120;
+
+/// Shear's curve box.
+constexpr int kCurveBoxSize = 140;
+/// How near a click has to land to grab a control point, in pixels.
+constexpr double kGrabRadius = 7.0;
 
 /// Tint for the two magnifier buttons, matching the options bar's glyphs.
 const QColor kGlyphColor(0xd4, 0xd4, 0xd4);
@@ -228,6 +242,188 @@ void BlurCenterWidget::moveCenterTo(const QPointF &pos)
     m_dialog->parametersChanged();
 }
 
+// ------------------------------------------------------------ shear curve --
+
+ShearCurveWidget::ShearCurveWidget(FilterPreviewDialog *dialog)
+    : QWidget(dialog)
+    , m_dialog(dialog)
+{
+    setFixedSize(kCurveBoxSize, kCurveBoxSize);
+    setCursor(Qt::CrossCursor);
+    setToolTip(QCoreApplication::translate(
+        "ShearCurveWidget",
+        "Drag the line to bend the image; click it to add a point, drag a point out to remove"));
+}
+
+QPointF ShearCurveWidget::at(int index) const
+{
+    const QPointF p = m_points.at(index);
+    // The offset runs the full width of the box, so -1 is the left edge.
+    return QPointF((p.x() + 1.0) / 2.0 * (width() - 1), p.y() * (height() - 1));
+}
+
+QList<double> ShearCurveWidget::sampled(int count) const
+{
+    QList<double> out;
+    out.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const double y = count > 1 ? double(i) / (count - 1) : 0.0;
+        // Between the two control points either side of this row. The list is
+        // kept sorted, so the first point past `y` is the one to blend to.
+        double value = m_points.first().x();
+        for (int k = 1; k < m_points.size(); ++k) {
+            const QPointF &low = m_points.at(k - 1);
+            const QPointF &high = m_points.at(k);
+            if (y <= high.y() || k == m_points.size() - 1) {
+                const double span = high.y() - low.y();
+                const double t = span > 0.0 ? qBound(0.0, (y - low.y()) / span, 1.0) : 0.0;
+                value = low.x() * (1.0 - t) + high.x() * t;
+                break;
+            }
+        }
+        out.append(value);
+    }
+    return out;
+}
+
+void ShearCurveWidget::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event)
+    QPainter painter(this);
+    painter.fillRect(rect(), Qt::white);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    // The dotted 4×4 grid CS6 rules the box with.
+    QPen guide(QColor(0xa0, 0xa0, 0xa0), 1.0, Qt::DotLine);
+    painter.setPen(guide);
+    for (int i = 1; i < 4; ++i) {
+        const double t = double(i) / 4.0;
+        painter.drawLine(QPointF(t * width(), 0), QPointF(t * width(), height()));
+        painter.drawLine(QPointF(0, t * height()), QPointF(width(), t * height()));
+    }
+
+    QPolygonF line;
+    for (int i = 0; i < m_points.size(); ++i) {
+        line.append(at(i));
+    }
+    painter.setPen(QPen(QColor(0x20, 0x20, 0x20), 1.4));
+    painter.drawPolyline(line);
+
+    painter.setBrush(QColor(0x20, 0x20, 0x20));
+    painter.setPen(Qt::NoPen);
+    for (const QPointF &p : line) {
+        painter.drawRect(QRectF(p.x() - 2.5, p.y() - 2.5, 5, 5));
+    }
+
+    painter.setBrush(Qt::NoBrush);
+    painter.setPen(QPen(QColor(0x50, 0x50, 0x50), 1));
+    painter.drawRect(rect().adjusted(0, 0, -1, -1));
+}
+
+void ShearCurveWidget::mousePressEvent(QMouseEvent *event)
+{
+    const QPointF pos = event->position();
+    for (int i = 0; i < m_points.size(); ++i) {
+        if (QLineF(pos, at(i)).length() <= kGrabRadius) {
+            m_dragging = i;
+            return;
+        }
+    }
+
+    // Not on a point, so add one where the click landed, in curve order.
+    const double y = qBound(0.0, pos.y() / (height() - 1), 1.0);
+    const double x = qBound(-1.0, pos.x() / (width() - 1) * 2.0 - 1.0, 1.0);
+    int index = 1;
+    while (index < m_points.size() - 1 && m_points.at(index).y() < y) {
+        ++index;
+    }
+    m_points.insert(index, QPointF(x, y));
+    m_dragging = index;
+    update();
+    m_dialog->parametersChanged();
+}
+
+void ShearCurveWidget::mouseMoveEvent(QMouseEvent *event)
+{
+    if (m_dragging < 0) {
+        return;
+    }
+    const QPointF pos = event->position();
+    QPointF &point = m_points[m_dragging];
+    point.setX(qBound(-1.0, pos.x() / (width() - 1) * 2.0 - 1.0, 1.0));
+    // The two ends belong to the top and bottom rows and only slide sideways.
+    if (m_dragging > 0 && m_dragging < m_points.size() - 1) {
+        point.setY(qBound(m_points.at(m_dragging - 1).y(), pos.y() / (height() - 1),
+                          m_points.at(m_dragging + 1).y()));
+    }
+    update();
+    m_dialog->parametersChanged();
+}
+
+void ShearCurveWidget::mouseReleaseEvent(QMouseEvent *event)
+{
+    // Dragged out of the box: take the point away, unless it is an end, which
+    // the curve cannot do without.
+    if (m_dragging > 0 && m_dragging < m_points.size() - 1
+        && !rect().adjusted(-2, -2, 2, 2).contains(event->position().toPoint())) {
+        m_points.removeAt(m_dragging);
+        update();
+        m_dialog->parametersChanged();
+    }
+    m_dragging = -1;
+}
+
+// ------------------------------------------------------------ distort grid --
+
+DistortGridWidget::DistortGridWidget(QWidget *parent)
+    : QWidget(parent)
+{
+    setFixedSize(kGridBoxSize, kGridBoxSize);
+}
+
+void DistortGridWidget::setGrid(const QList<QPointF> &points, int cells)
+{
+    m_points = points;
+    m_cells = cells;
+    update();
+}
+
+void DistortGridWidget::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event)
+    QPainter painter(this);
+    painter.fillRect(rect(), Qt::white);
+    if (m_cells < 1 || m_points.size() != (m_cells + 1) * (m_cells + 1)) {
+        return;
+    }
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(0x20, 0x20, 0x20), 0.9));
+
+    // A margin, because a bulge pushes the outermost lines past the frame the
+    // undistorted grid occupied.
+    const qreal inset = 6.0;
+    const qreal span = width() - inset * 2;
+    auto at = [&](int row, int col) {
+        const QPointF p = m_points.at(row * (m_cells + 1) + col);
+        return QPointF(inset + p.x() * span, inset + p.y() * span);
+    };
+
+    for (int row = 0; row <= m_cells; ++row) {
+        QPolygonF line;
+        for (int col = 0; col <= m_cells; ++col) {
+            line.append(at(row, col));
+        }
+        painter.drawPolyline(line);
+    }
+    for (int col = 0; col <= m_cells; ++col) {
+        QPolygonF line;
+        for (int row = 0; row <= m_cells; ++row) {
+            line.append(at(row, col));
+        }
+        painter.drawPolyline(line);
+    }
+}
+
 // ----------------------------------------------------------------- dialog --
 
 FilterPreviewDialog::FilterPreviewDialog(Engine *engine, const QString &filterName,
@@ -245,12 +441,13 @@ FilterPreviewDialog::FilterPreviewDialog(Engine *engine, const QString &filterNa
     root->addWidget(m_pane, 0, 0);
 
     // The OK/Cancel column, with Preview beneath it — CS6's arrangement.
-    auto *side = new QVBoxLayout();
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    buttons->setOrientation(Qt::Vertical);
-    connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    side->addWidget(buttons);
+    m_sideColumn = new QVBoxLayout();
+    auto *side = m_sideColumn;
+    m_buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    m_buttons->setOrientation(Qt::Vertical);
+    connect(m_buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(m_buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    side->addWidget(m_buttons);
     m_preview = new QCheckBox(tr("Preview"), this);
     m_preview->setChecked(true);
     m_preview->setToolTip(tr("Show the filter on the image while this is open"));
@@ -322,14 +519,16 @@ FilterPreviewDialog::~FilterPreviewDialog()
     // Whatever happened, the layer goes back to how it was and the square
     // comes off the canvas. Pressing OK re-applies through `applyFilter`,
     // which is the only path that commits.
-    if (m_engine) {
+    if (m_canvasDriver) {
+        m_canvasDriver({}, false);
+    } else if (m_engine) {
         m_engine->setFilterPreview(QString(), rust::Slice<const float>());
     }
     emit previewRegionChanged(QRectF());
 }
 
 int FilterPreviewDialog::addParameter(const QString &label, double min, double max, double value,
-                                      int decimals, const QString &suffix)
+                                      int decimals, const QString &suffix, bool withSlider)
 {
     const int row = m_params->rowCount();
 
@@ -342,6 +541,12 @@ int FilterPreviewDialog::addParameter(const QString &label, double min, double m
 
     m_params->addWidget(new QLabel(label, this), row, 0);
     m_params->addWidget(spin, row, 1);
+
+    if (!withSlider) {
+        connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { parametersChanged(); });
+        m_slots.append([spin] { return spin->value(); });
+        return m_slots.size() - 1;
+    }
 
     // The slider beneath it, which is the part that makes a filter dialog
     // usable: a blur is dialled in by dragging until it looks right, not by
@@ -368,23 +573,304 @@ int FilterPreviewDialog::addParameter(const QString &label, double min, double m
     return m_slots.size() - 1;
 }
 
+int FilterPreviewDialog::addAngleParameter(const QString &label, double value)
+{
+    const int row = m_params->rowCount();
+
+    auto *spin = new QDoubleSpinBox(this);
+    spin->setDecimals(0);
+    spin->setRange(-360, 360);
+    spin->setValue(value);
+    spin->setSuffix(QStringLiteral("°"));
+    spin->setWrapping(true);
+
+    auto *dial = new AngleDial(this);
+    dial->setAngle(value);
+
+    auto *cell = new QWidget(this);
+    auto *across = new QHBoxLayout(cell);
+    across->setContentsMargins(0, 0, 0, 0);
+    across->addWidget(spin);
+    across->addWidget(dial);
+    across->addStretch(1);
+
+    m_params->addWidget(new QLabel(label, this), row, 0);
+    m_params->addWidget(cell, row, 1);
+
+    connect(dial, &AngleDial::angleChanged, this, [spin](double degrees) {
+        // Through the spin box, so that dragging the wheel and typing a number
+        // take the same path — as they do for a slider and its field.
+        spin->setValue(degrees);
+    });
+    connect(spin, &QDoubleSpinBox::valueChanged, this, [this, dial](double degrees) {
+        QSignalBlocker block(dial);
+        dial->setAngle(degrees);
+        parametersChanged();
+    });
+
+    m_slots.append([spin] { return spin->value(); });
+    return m_slots.size() - 1;
+}
+
+int FilterPreviewDialog::addRangeParameter(const QString &label, const QString &lowLabel,
+                                           const QString &highLabel, double min, double max,
+                                           double low, double high, int decimals,
+                                           const QString &suffix)
+{
+    const int row = m_params->rowCount();
+
+    // The two headings sit above the fields, shared between them, which is
+    // how CS6 fits Wave's six numbers into three rows.
+    auto *headings = new QWidget(this);
+    auto *headingRow = new QHBoxLayout(headings);
+    headingRow->setContentsMargins(0, 0, 0, 0);
+    headingRow->addWidget(new QLabel(lowLabel, headings), 1);
+    headingRow->addWidget(new QLabel(highLabel, headings), 1);
+    m_params->addWidget(headings, row, 1);
+
+    auto *fields = new QWidget(this);
+    auto *fieldRow = new QHBoxLayout(fields);
+    fieldRow->setContentsMargins(0, 0, 0, 0);
+
+    auto build = [&](double value) {
+        auto *spin = new QDoubleSpinBox(fields);
+        spin->setDecimals(decimals);
+        spin->setRange(min, max);
+        spin->setValue(value);
+        spin->setSuffix(suffix);
+        fieldRow->addWidget(spin, 1);
+        return spin;
+    };
+    QDoubleSpinBox *lowSpin = build(low);
+    QDoubleSpinBox *highSpin = build(high);
+
+    m_params->addWidget(new QLabel(label, this), row + 1, 0);
+    m_params->addWidget(fields, row + 1, 1);
+
+    for (QDoubleSpinBox *spin : {lowSpin, highSpin}) {
+        connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { parametersChanged(); });
+    }
+    // The pair is a range, so the low field must not overtake the high one.
+    connect(lowSpin, &QDoubleSpinBox::valueChanged, this, [highSpin](double v) {
+        if (v > highSpin->value()) {
+            highSpin->setValue(v);
+        }
+    });
+    connect(highSpin, &QDoubleSpinBox::valueChanged, this, [lowSpin](double v) {
+        if (v < lowSpin->value()) {
+            lowSpin->setValue(v);
+        }
+    });
+
+    const int first = m_slots.size();
+    m_slots.append([lowSpin] { return lowSpin->value(); });
+    m_slots.append([highSpin] { return highSpin->value(); });
+    return first;
+}
+
+int FilterPreviewDialog::addRandomizeButton(const QString &label)
+{
+    // The seed lives in a spin box that happens to be hidden: the button has
+    // to re-roll something the filter can be handed, and something a repeat of
+    // the filter can be handed *again* — a wave that changed every time it was
+    // applied could not be previewed, undone or redone.
+    auto *seed = new QSpinBox(this);
+    seed->setRange(0, 999999);
+    seed->setValue(1);
+    seed->setVisible(false);
+
+    auto *button = new QPushButton(label, this);
+    m_params->addWidget(button, m_params->rowCount(), 1, Qt::AlignLeft);
+    connect(button, &QPushButton::clicked, this, [this, seed] {
+        seed->setValue(QRandomGenerator::global()->bounded(1, 999999));
+        parametersChanged();
+    });
+
+    m_slots.append([seed] { return double(seed->value()); });
+    return m_slots.size() - 1;
+}
+
+int FilterPreviewDialog::addShearCurve(int points)
+{
+    auto *curve = new ShearCurveWidget(this);
+    m_params->addWidget(curve, m_params->rowCount(), 0, 1, 2, Qt::AlignHCenter);
+
+    const int first = m_slots.size();
+    for (int i = 0; i < points; ++i) {
+        m_slots.append([curve, points, i] { return curve->sampled(points).at(i); });
+    }
+    return first;
+}
+
 int FilterPreviewDialog::addChoice(const QString &label, const QStringList &items,
-                                   const QList<double> &values, int index)
+                                   const QList<double> &values, int index,
+                                   const QList<int> &separatorsAfter)
 {
     const int row = m_params->rowCount();
     auto *combo = new QComboBox(this);
-    combo->addItems(items);
-    combo->setCurrentIndex(qBound(0, index, items.size() - 1));
+    for (int i = 0; i < items.size(); ++i) {
+        // The value travels with the item, so a separator inserted between
+        // two of them cannot quietly shift what the list means.
+        combo->addItem(items.at(i), values.value(i, 0.0));
+        if (separatorsAfter.contains(i)) {
+            combo->insertSeparator(combo->count());
+        }
+    }
+    combo->setCurrentIndex(combo->findData(values.value(qBound(0, index, items.size() - 1), 0.0)));
     m_params->addWidget(new QLabel(label, this), row, 0);
     m_params->addWidget(combo, row, 1);
 
     connect(combo, &QComboBox::currentIndexChanged, this,
             [this] { parametersChanged(); });
 
-    m_slots.append([combo, values] {
-        return values.value(combo->currentIndex(), 0.0);
-    });
+    m_slots.append([combo] { return combo->currentData().toDouble(); });
     return m_slots.size() - 1;
+}
+
+int FilterPreviewDialog::addChoiceWithAngle(const QString &label, const QStringList &items,
+                                            const QList<double> &values, int index, double angle,
+                                            int angleForIndex)
+{
+    const int row = m_params->rowCount();
+
+    auto *combo = new QComboBox(this);
+    combo->addItems(items);
+    combo->setCurrentIndex(qBound(0, index, items.size() - 1));
+
+    auto *spin = new QDoubleSpinBox(this);
+    spin->setDecimals(0);
+    spin->setRange(-360, 360);
+    spin->setValue(angle);
+    spin->setSuffix(QStringLiteral("°"));
+    spin->setWrapping(true);
+    auto *dial = new AngleDial(this);
+    dial->setAngle(angle);
+
+    auto *cell = new QWidget(this);
+    auto *across = new QHBoxLayout(cell);
+    across->setContentsMargins(0, 0, 0, 0);
+    across->addWidget(combo);
+    across->addWidget(spin);
+    across->addWidget(dial);
+    across->addStretch(1);
+
+    m_params->addWidget(new QLabel(label, this), row, 0);
+    m_params->addWidget(cell, row, 1);
+
+    // An angle only means something for one of the choices; CS6 greys it out
+    // for the rest rather than hiding it, so the row does not jump about.
+    auto syncEnabled = [combo, spin, dial, angleForIndex] {
+        const bool wanted = combo->currentIndex() == angleForIndex;
+        spin->setEnabled(wanted);
+        dial->setEnabled(wanted);
+    };
+    syncEnabled();
+
+    connect(combo, &QComboBox::currentIndexChanged, this, [this, syncEnabled] {
+        syncEnabled();
+        parametersChanged();
+    });
+    connect(dial, &AngleDial::angleChanged, this, [spin](double degrees) {
+        spin->setValue(degrees);
+    });
+    connect(spin, &QDoubleSpinBox::valueChanged, this, [this, dial](double degrees) {
+        QSignalBlocker block(dial);
+        dial->setAngle(degrees);
+        parametersChanged();
+    });
+
+    const int first = m_slots.size();
+    m_slots.append([combo, values] { return values.value(combo->currentIndex(), 0.0); });
+    m_slots.append([spin] { return spin->value(); });
+    return first;
+}
+
+int FilterPreviewDialog::addCheckBox(const QString &label, bool checked)
+{
+    auto *box = new QCheckBox(label, this);
+    box->setChecked(checked);
+    m_params->addWidget(box, m_params->rowCount(), 0, 1, 2);
+    connect(box, &QCheckBox::toggled, this, [this] { parametersChanged(); });
+
+    m_slots.append([box] { return box->isChecked() ? 1.0 : 0.0; });
+    return m_slots.size() - 1;
+}
+
+void FilterPreviewDialog::beginTab(const QString &title)
+{
+    auto *root = static_cast<QGridLayout *>(layout());
+    if (!m_tabs) {
+        m_tabs = new QTabWidget(this);
+        // Below whatever was added before it, and above the boxes row, so a
+        // dialog can have a line or two outside the tabs if it wants.
+        root->addWidget(m_tabs, root->rowCount(), 0, 1, 2);
+    }
+
+    // Each tab gets its own parameter grid, and `m_params` is simply pointed
+    // at the newest one — every `add…` below goes on adding rows without
+    // knowing that tabs exist at all.
+    auto *page = new QWidget(m_tabs);
+    auto *grid = new QGridLayout(page);
+    grid->setColumnStretch(1, 1);
+    grid->setRowStretch(1000, 1);
+    m_params = grid;
+    m_tabs->addTab(page, title);
+}
+
+int FilterPreviewDialog::addColorButton(const QString &label, const QColor &initial,
+                                        std::function<bool()> enabledWhen)
+{
+    const int row = m_params->rowCount();
+    auto *button = new QPushButton(this);
+    button->setFixedSize(32, 20);
+    button->setAutoFillBackground(true);
+
+    // The swatch is the button: its own colour is the readout, so there is no
+    // separate label to fall out of step with it.
+    auto *chosen = new QColor(initial);
+    button->setProperty("swatch", initial);
+    auto paint = [button] {
+        const QColor colour = button->property("swatch").value<QColor>();
+        button->setStyleSheet(QStringLiteral("background-color: %1; border: 1px solid #202020;")
+                                  .arg(colour.name()));
+    };
+    paint();
+
+    m_params->addWidget(new QLabel(label, this), row, 0);
+    m_params->addWidget(button, row, 1, Qt::AlignLeft);
+
+    connect(button, &QPushButton::clicked, this, [this, button, paint] {
+        const QColor before = button->property("swatch").value<QColor>();
+        const QColor picked = QColorDialog::getColor(before, this, tr("Color"));
+        if (picked.isValid()) {
+            button->setProperty("swatch", picked);
+            paint();
+            parametersChanged();
+        }
+    });
+
+    if (enabledWhen) {
+        m_conditional.append({button, enabledWhen});
+    }
+    delete chosen;
+
+    const int first = m_slots.size();
+    m_slots.append([button] { return button->property("swatch").value<QColor>().red(); });
+    m_slots.append([button] { return button->property("swatch").value<QColor>().green(); });
+    m_slots.append([button] { return button->property("swatch").value<QColor>().blue(); });
+    return first;
+}
+
+void FilterPreviewDialog::addHeading(const QString &text)
+{
+    m_params->addWidget(new QLabel(text, this), m_params->rowCount(), 0, 1, 2);
+}
+
+void FilterPreviewDialog::addDisabledNote(const QString &text)
+{
+    auto *note = new QLabel(text, this);
+    note->setEnabled(false);
+    m_params->addWidget(note, m_params->rowCount(), 0, 1, 2);
 }
 
 int FilterPreviewDialog::addRadioChoice(const QString &title, const QStringList &items,
@@ -429,6 +915,16 @@ int FilterPreviewDialog::addCenterPicker(const QString &title, std::function<boo
     return first;
 }
 
+void FilterPreviewDialog::setCanvasPreviewDriver(PreviewDriver driver)
+{
+    m_canvasDriver = std::move(driver);
+    // There is something to preview again even without a thumbnail.
+    if (m_canvasDriver && !m_paneVisible) {
+        m_preview->setVisible(true);
+        m_preview->setChecked(true);
+    }
+}
+
 void FilterPreviewDialog::setPreviewPaneVisible(bool visible)
 {
     m_paneVisible = visible;
@@ -438,9 +934,47 @@ void FilterPreviewDialog::setPreviewPaneVisible(bool visible)
     // beside, and CS6's Radial Blur — the one dialog in this shape — has no
     // Preview either. Hiding it also spares the user a full-layer radial blur
     // recomputed on every twitch of the Amount slider.
-    m_preview->setVisible(visible);
-    m_preview->setChecked(visible);
+    m_preview->setVisible(visible || bool(m_canvasDriver));
+    m_preview->setChecked(visible || bool(m_canvasDriver));
+
+    // With no thumbnail to sit beside, the buttons drop to the foot of the
+    // dialog. Left where they were they would be a column of two floating at
+    // the top with nothing alongside them.
+    if (!visible) {
+        m_sideColumn->removeWidget(m_buttons);
+        m_buttons->setOrientation(Qt::Horizontal);
+        auto *root = static_cast<QGridLayout *>(layout());
+        root->addWidget(m_buttons, root->rowCount(), 0, 1, 2);
+    }
     adjustSize();
+}
+
+void FilterPreviewDialog::addDistortGrid()
+{
+    m_distortGrid = new DistortGridWidget(this);
+    // Below the buttons and the Preview tick, but above the stretch that
+    // holds the column up — which is where CS6 puts it.
+    m_sideColumn->insertWidget(m_sideColumn->count() - 1, m_distortGrid, 0, Qt::AlignHCenter);
+    refreshDistortGrid();
+}
+
+void FilterPreviewDialog::refreshDistortGrid()
+{
+    if (!m_distortGrid || !m_engine) {
+        return;
+    }
+    constexpr int kCells = 12;
+    const QList<float> params = parameters();
+    const rust::Vec<float> flat = m_engine->distortGrid(
+        m_filterName, rust::Slice<const float>(params.constData(), size_t(params.size())),
+        kCells);
+
+    QList<QPointF> points;
+    points.reserve(int(flat.size()) / 2);
+    for (size_t i = 0; i + 1 < flat.size(); i += 2) {
+        points.append(QPointF(flat[i], flat[i + 1]));
+    }
+    m_distortGrid->setGrid(points, kCells);
 }
 
 float FilterPreviewDialog::slotValue(int slot) const
@@ -527,6 +1061,12 @@ void FilterPreviewDialog::parametersChanged()
     for (BlurCenterWidget *picker : m_pickers) {
         picker->update();
     }
+    // A control that follows a tick box elsewhere — CS6 greys the custom
+    // colour out until its box is ticked.
+    for (const auto &[widget, live] : m_conditional) {
+        widget->setEnabled(live());
+    }
+    refreshDistortGrid();
     m_thumbTimer->start();
     m_canvasTimer->start();
 }
@@ -553,6 +1093,10 @@ void FilterPreviewDialog::refreshPreview()
 void FilterPreviewDialog::refreshCanvasPreview()
 {
     if (!m_engine) {
+        return;
+    }
+    if (m_canvasDriver) {
+        m_canvasDriver(parameters(), m_preview->isChecked());
         return;
     }
     if (m_preview->isChecked()) {

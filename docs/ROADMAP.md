@@ -560,11 +560,51 @@ paint, manage layers, select, filter and undo.
     - box blur - done
     - gaussian blur -  done
     - radial blur - done
-    - motion blur - add angle wheel
-    - surface blur - taking too long to process 
+    - motion blur - done
+    - surface blur - done 
+    - 
   - 
-  - Sharpen, Noise - partial
-  - Filter Gallery, Liquify, Vanishing Point, Distort, Pixelate, Render,
+  - Sharpen 
+    - sharpen - done
+    - sharpen edges - done 
+    - sharpen more - done
+    - smart sharpen - done
+    
+  - Noise 
+    - Add Noise - done
+    - Despeckle - not implemented
+    - Dust and scratches - done
+    - Median - done
+    - Reduce Noise - not implemented
+    -
+  - Distort
+    - Displace - done
+    - Pinch - done
+    - Polar Coordinates - done
+    - Ripple - done
+    - Shear - done
+    - Spherize - done
+    - Twirl - done
+    - Wave - done
+    - Zigzag - done
+
+  - Pixelate
+    - Color halftone - done
+    - Crystalize - done
+    - Facet - done
+    - Fragment - done
+    - Mezzotint - done
+    - Mosaic - done
+    - Pointilize - 
+
+  - Render
+    - Flame - in progress
+    - Picture Frame
+    - 
+
+
+
+  - Filter Gallery, Liquify, Vanishing Point, Pixelate, Render,
     Stylize - not started
 
 

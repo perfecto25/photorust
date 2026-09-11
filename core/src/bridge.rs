@@ -2651,6 +2651,57 @@ pub mod ffi {
             height: i32,
         ) -> QImage;
 
+        /// Filter ▸ Render ▸ Flame: burn along the active path.
+        ///
+        /// `params` are what its dialog collected, positionally. Returns
+        /// false when there is no path, which is the one thing Photoshop
+        /// refuses this filter for — it is a filter that draws along a line,
+        /// and without one there is nothing to draw.
+        #[qinvokable]
+        #[cxx_name = "applyFlame"]
+        fn apply_flame(self: Pin<&mut Engine>, params: &[f32]) -> bool;
+
+        /// Show a flame without committing it — the Preview tick on the
+        /// Flame dialog. An empty `params` takes it away again.
+        #[qinvokable]
+        #[cxx_name = "setFlamePreview"]
+        fn set_flame_preview(self: Pin<&mut Engine>, params: &[f32]);
+
+        /// Whether there is a path for Flame to burn along.
+        #[qinvokable]
+        #[cxx_name = "hasActivePath"]
+        fn has_active_path(self: &Engine) -> bool;
+
+        /// Where a regular grid drawn on the image would end up under a
+        /// distortion — the wireframe CS6 shows beside Pinch's preview.
+        ///
+        /// Flattened as `(cells + 1)²` `x, y` pairs, row-major, in normalized
+        /// 0..1 coordinates. Empty for a filter that has no wireframe. The
+        /// engine works it out rather than the dialog so that the diagram
+        /// cannot drift away from what the filter does (CLAUDE.md §2).
+        #[qinvokable]
+        #[cxx_name = "distortGrid"]
+        fn distort_grid(self: &Engine, name: &QString, params: &[f32], cells: i32) -> Vec<f32>;
+
+        /// Filter ▸ Distort ▸ Displace, which is the one filter that takes a
+        /// second image rather than a set of numbers: the map's red channel
+        /// says how far each pixel moves sideways and its green channel how
+        /// far up or down.
+        ///
+        /// It has its own entry point for that reason — `applyFilter` speaks
+        /// in floats — and for the same reason it has no preview: CS6's
+        /// Displace dialog has none either.
+        #[qinvokable]
+        #[cxx_name = "applyDisplace"]
+        fn apply_displace(
+            self: Pin<&mut Engine>,
+            map: &QImage,
+            h_scale: f32,
+            v_scale: f32,
+            stretch: bool,
+            wrap: bool,
+        );
+
         /// Show a filter on the active layer without committing it — the
         /// Preview checkbox on a filter dialog. An empty name takes the
         /// preview away again and puts the layer back as it was. Nothing here
@@ -3150,17 +3201,6 @@ fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
 
 /// a persistent back-buffer in [`EngineRust`] and hand out a `QImage` that
 /// borrows it, which is worth doing once the canvas renderer lands.
-/// A filter dialog's parameters, padded out to the fixed five a [`Filter`]
-/// can take. A dialog with one slider sends one number; the rest read as zero,
-/// which is what a filter that does not use them expects anyway.
-fn filter_params(params: &[f32]) -> [f32; 5] {
-    let mut out = [0.0f32; 5];
-    for (slot, value) in out.iter_mut().zip(params) {
-        *slot = *value;
-    }
-    out
-}
-
 fn pixmap_to_qimage(pm: Pixmap) -> QImage {
     if pm.is_empty() {
         return QImage::default();
@@ -7759,7 +7799,7 @@ impl ffi::Engine {
 
     fn apply_filter(mut self: core::pin::Pin<&mut Self>, name: &QString, params: &[f32]) {
         // Unknown names are ignored rather than guessed at.
-        let Some(filter) = Filter::from_menu_name(&name.to_string(), filter_params(params)) else {
+        let Some(filter) = self.filter_for(name, params) else {
             return;
         };
         // A preview may still be showing when OK is pressed. Take it away
@@ -7768,6 +7808,73 @@ impl ffi::Engine {
         self.as_mut().rust_mut().doc.clear_filter_preview();
         self.as_mut().rust_mut().doc.apply_filter(filter);
         self.sync();
+    }
+
+    fn apply_flame(mut self: core::pin::Pin<&mut Self>, params: &[f32]) -> bool {
+        let options = crate::filters::FlameOptions::from_params(params);
+        self.as_mut().rust_mut().doc.clear_filter_preview();
+        if !self.as_mut().rust_mut().doc.apply_flame(&options) {
+            return false;
+        }
+        self.sync();
+        true
+    }
+
+    fn set_flame_preview(mut self: core::pin::Pin<&mut Self>, params: &[f32]) {
+        let options = if params.is_empty() {
+            None
+        } else {
+            Some(crate::filters::FlameOptions::from_params(params))
+        };
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .set_flame_preview(options.as_ref());
+        // Only the canvas: a preview is not a document change, so neither the
+        // History panel nor the Layers panel should hear about it.
+        self.as_mut().canvas_changed();
+    }
+
+    fn has_active_path(&self) -> bool {
+        self.doc.has_active_path()
+    }
+
+    fn distort_grid(&self, name: &QString, params: &[f32], cells: i32) -> Vec<f32> {
+        crate::filters::distort::distort_grid(&name.to_string(), params, cells.max(1) as usize)
+    }
+
+    fn apply_displace(
+        mut self: core::pin::Pin<&mut Self>,
+        map: &QImage,
+        h_scale: f32,
+        v_scale: f32,
+        stretch: bool,
+        wrap: bool,
+    ) {
+        let Some(map) = qimage_to_pixmap(map) else {
+            return;
+        };
+        self.as_mut().rust_mut().doc.clear_filter_preview();
+        self.as_mut()
+            .rust_mut()
+            .doc
+            .apply_displace(&map, h_scale, v_scale, stretch, wrap);
+        self.sync();
+    }
+
+    /// A filter from the menu name and the dialog's numbers, with anything
+    /// that comes from the document rather than from the dialog filled in.
+    ///
+    /// At present that is Pointillize alone, which paints the gaps between its
+    /// dabs in the background colour — a property of the document, which its
+    /// dialog therefore does not ask for and the shell should not have to
+    /// know to send.
+    fn filter_for(&self, name: &QString, params: &[f32]) -> Option<Filter> {
+        let mut filter = Filter::from_menu_name(&name.to_string(), params)?;
+        if let Filter::Pointillize { background, .. } = &mut filter {
+            *background = self.background;
+        }
+        Some(filter)
     }
 
     fn can_filter_active_layer(&self) -> bool {
@@ -7786,7 +7893,7 @@ impl ffi::Engine {
         if width <= 0 || height <= 0 {
             return QImage::default();
         }
-        let Some(filter) = Filter::from_menu_name(&name.to_string(), filter_params(params)) else {
+        let Some(filter) = self.filter_for(name, params) else {
             return QImage::default();
         };
         match self
@@ -7803,7 +7910,7 @@ impl ffi::Engine {
         let filter = if name.is_empty() {
             None
         } else {
-            Filter::from_menu_name(&name, filter_params(params))
+            self.as_ref().filter_for(&QString::from(&name), params)
         };
         self.as_mut().rust_mut().doc.set_filter_preview(filter);
         // Only the canvas: a preview is not a document change, so neither the

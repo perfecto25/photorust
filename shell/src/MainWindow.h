@@ -5,6 +5,7 @@
 #include <QLabel>
 #include <QMainWindow>
 #include <QPointer>
+#include <QImage>
 #include <QStringList>
 
 #include "tools/ToolId.h"
@@ -175,12 +176,20 @@ private slots:
 
     // -- Filter --
     void applyFilter(const QString &name);
+    /// Filter ▸ Render ▸ Flame, which has a dialog of its own: it burns along
+    /// the active path rather than working on the layer alone, so it does not
+    /// go through `applyFilter`.
+    void showFlame();
     /// The body of the above. `presets` seeds the dialog's controls, in the
     /// order it lists them — used when repeating a filter, so its dialog
     /// reopens on the settings it was last given. A shorter list leaves the
     /// rest at their defaults. `skipDialog` runs the filter straight off.
     void applyFilterWith(const QString &name, const QList<float> &presets,
                          bool skipDialog = false);
+    /// Ask for a displacement map and run Displace with it. `reuseLastMap`
+    /// skips the file dialog and re-uses the one already chosen, which is what
+    /// repeating the filter should do. False if the user cancelled.
+    bool applyDisplacementMap(const QList<float> &params, bool reuseLastMap);
     /// Repeat the last filter. `askAgain` reopens its dialog with the settings
     /// it was last given, which is what CS6 puts on Alt+Ctrl+F; without it the
     /// filter runs straight off with those settings, which is Ctrl+F.
@@ -205,6 +214,15 @@ private slots:
     void updateWindowTitle();
 
 private:
+    /// How many rows CS6's Shear curve is sampled at before it is handed to
+    /// the engine. Must match `SHEAR_POINTS` there.
+    static constexpr int kShearCurvePoints = 17;
+
+    /// Color Halftone's default screen angles, in CS6's channel order. The
+    /// same numbers a four-colour press uses; `DEFAULT_SCREEN_ANGLES` in the
+    /// engine.
+    static constexpr float kDefaultScreenAngles[4] = {108.0f, 162.0f, 90.0f, 45.0f};
+
     /// Let the View menu's zoom shortcuts through to the canvas while a dialog
     /// is open, as Photoshop's dialogs do. Returns whether the key was one of
     /// them and has been acted on.
@@ -472,6 +490,12 @@ private:
     /// was given. Empty when nothing has been run yet.
     QString m_lastFilterName;
     QList<float> m_lastFilterParams;
+    /// The displacement map last chosen, so that repeating Displace does not
+    /// ask for the file again.
+    QImage m_lastDisplacementMap;
+    /// What the Flame dialog was last set to, so that it reopens where it was
+    /// left — twenty settings is too many to dial in twice.
+    QList<float> m_lastFlameParams;
 
     ToolStrip *m_toolStrip = nullptr;
     QDockWidget *m_toolsDock = nullptr;

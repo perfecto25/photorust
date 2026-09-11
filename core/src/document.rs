@@ -4655,6 +4655,114 @@ impl Document {
         self.commit(filter.name());
     }
 
+    /// Filter ▸ Distort ▸ Displace, which needs a second image and so cannot
+    /// go through [`Document::apply_filter`].
+    pub fn apply_displace(
+        &mut self,
+        map: &Pixmap,
+        h_scale: f32,
+        v_scale: f32,
+        stretch: bool,
+        wrap: bool,
+    ) {
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+                return;
+            }
+            crate::filters::distort::displace(
+                &mut layer.pixels,
+                map,
+                h_scale,
+                v_scale,
+                stretch,
+                wrap,
+            );
+        }
+        self.commit("Displace");
+    }
+
+    /// Filter ▸ Render ▸ Flame, which burns along the active path.
+    ///
+    /// Like Displace it cannot go through [`Document::apply_filter`], and for
+    /// a sharper reason: it needs the *path*, which belongs to the document
+    /// rather than to the layer. False when there is no path to burn along,
+    /// which is the one thing Photoshop refuses this filter for.
+    pub fn apply_flame(&mut self, options: &crate::filters::FlameOptions) -> bool {
+        if !self.burn_flame(options) {
+            return false;
+        }
+        self.commit("Flame");
+        true
+    }
+
+    /// Draw the fire, without putting anything on the History panel. Shared
+    /// by the filter and by its preview.
+    fn burn_flame(&mut self, options: &crate::filters::FlameOptions) -> bool {
+        let Some(path) = self.paths.active() else {
+            return false;
+        };
+        if path.is_empty() {
+            return false;
+        }
+        // Half a pixel of tolerance: the flame is drawn from the flattened
+        // line, so a coarse one would show as straight runs in the fire.
+        let polylines = path.flatten(0.5);
+        if polylines.is_empty() {
+            return false;
+        }
+
+        let id = self.active_layer;
+        let Some(layer) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
+            return false;
+        }
+
+        // The path is in document coordinates and the layer may hang off the
+        // canvas, so the fire has to be moved into the layer's own frame.
+        let (ox, oy) = layer.offset;
+        let moved: Vec<(Vec<(f32, f32)>, bool)> = polylines
+            .into_iter()
+            .map(|(points, closed)| {
+                (
+                    points
+                        .into_iter()
+                        .map(|(x, y)| (x - ox as f32, y - oy as f32))
+                        .collect(),
+                    closed,
+                )
+            })
+            .collect();
+
+        crate::filters::render::flame(&mut layer.pixels, &moved, options);
+        true
+    }
+
+    /// Show a flame on the active layer without committing it — the Preview
+    /// tick on the Flame dialog. Uses the same stash as the filter preview,
+    /// since only one of them can be open at a time.
+    pub fn set_flame_preview(&mut self, options: Option<&crate::filters::FlameOptions>) {
+        self.clear_filter_preview();
+        let Some(options) = options else {
+            return;
+        };
+        if !self.can_filter_active_layer() || !self.has_active_path() {
+            return;
+        }
+        let id = self.active_layer;
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            self.filter_preview = Some((id, layer.pixels.clone()));
+        }
+        self.burn_flame(options);
+    }
+
+    /// Whether there is a path for Flame to burn along.
+    pub fn has_active_path(&self) -> bool {
+        self.paths.active().map(|p| !p.is_empty()).unwrap_or(false)
+    }
+
     /// Whether `apply_filter` would do anything to the active layer.
     ///
     /// The filter dialogs ask before they open, so that a locked layer or a
