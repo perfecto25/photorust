@@ -366,15 +366,67 @@ impl Pixmap {
     }
 
     /// Copy out a sub-region. Areas outside the source read as transparent.
+    ///
+    /// Byte-exact: `get`/`set` would narrow a 16- or 32-bit pixel to `Rgba8`
+    /// and back, which is a real loss for callers that crop a region only to
+    /// put it back — see [`Pixmap::blit`].
     pub fn crop(&self, rect: Rect) -> Pixmap {
         let mut out = Pixmap::new_with_depth(rect.width, rect.height, self.bpc);
-        for y in 0..rect.height {
-            for x in 0..rect.width {
-                let px = self.get(rect.x + x as i32, rect.y + y as i32);
-                out.set(x as i32, y as i32, px);
-            }
+        let inside = rect.intersect(&self.rect());
+        if inside.is_empty() {
+            return out;
+        }
+
+        let bytes_per_px = 4 * self.bpc as usize;
+        let span = inside.width as usize * bytes_per_px;
+        let src_stride = self.stride();
+        let out_stride = out.stride();
+        let src_x = inside.x as usize * bytes_per_px;
+        let out_x = (inside.x - rect.x) as usize * bytes_per_px;
+        for dy in 0..inside.height as usize {
+            let out_y = (inside.y - rect.y) as usize + dy;
+            let src_row = &self.data[(inside.y as usize + dy) * src_stride + src_x..][..span];
+            out.data[out_y * out_stride + out_x..][..span].copy_from_slice(src_row);
         }
         out
+    }
+
+    /// Copy `src` in at `(x, y)`, replacing what is there.
+    ///
+    /// The inverse of [`Pixmap::crop`]: `crop` then `blit` at the same origin
+    /// round-trips a region *byte for byte* when the depths match, which is
+    /// what lets the live stroke preview borrow a region of the active layer
+    /// and put it back — a round-trip through `Rgba8` would quantize a 16- or
+    /// 32-bit layer on every mouse-move. Pixels landing outside this pixmap
+    /// are dropped.
+    pub fn blit(&mut self, src: &Pixmap, x: i32, y: i32) {
+        // Clip to the overlap, in this pixmap's coordinates.
+        let dst = Rect::new(x, y, src.width(), src.height()).intersect(&self.rect());
+        if dst.is_empty() {
+            return;
+        }
+
+        if src.bpc != self.bpc {
+            for dy in 0..dst.height {
+                for dx in 0..dst.width {
+                    let (px, py) = (dst.x + dx as i32, dst.y + dy as i32);
+                    self.set(px, py, src.get(px - x, py - y));
+                }
+            }
+            return;
+        }
+
+        let bytes_per_px = 4 * self.bpc as usize;
+        let span = dst.width as usize * bytes_per_px;
+        for dy in 0..dst.height {
+            let sy = (dst.y - y) as usize + dy as usize;
+            let sx = (dst.x - x) as usize * bytes_per_px;
+            let dest_y = dst.y as usize + dy as usize;
+            let dest_x = dst.x as usize * bytes_per_px;
+            let src_row = &src.data[sy * src.stride() + sx..][..span];
+            let stride = self.stride();
+            self.data[dest_y * stride + dest_x..][..span].copy_from_slice(src_row);
+        }
     }
 
     /// Convert this pixmap to a different bit depth, returning a new pixmap.
@@ -591,6 +643,56 @@ mod tests {
             }
         }
         pm
+    }
+
+    #[test]
+    fn crop_and_blit_round_trip_a_region_exactly() {
+        let mut pm = Pixmap::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                pm.set(x, y, Rgba8::opaque((x * 30) as u8, (y * 30) as u8, 7));
+            }
+        }
+        let before = pm.as_bytes().to_vec();
+
+        let region = Rect::new(2, 3, 4, 3);
+        let backup = pm.crop(region);
+        pm.fill_rect(region, Rgba8::opaque(1, 2, 3));
+        assert_ne!(pm.as_bytes(), &before[..], "the region was not disturbed");
+
+        pm.blit(&backup, region.x, region.y);
+        assert_eq!(pm.as_bytes(), &before[..], "the region did not come back");
+    }
+
+    #[test]
+    fn a_blit_round_trip_keeps_more_than_eight_bits() {
+        // The live stroke preview borrows a region of the layer and puts it
+        // back on every mouse-move. Going through `Rgba8` on the way would
+        // quietly flatten a 16-bit document to 8 as the user painted.
+        let mut pm = Pixmap::new_with_depth(4, 2, 2);
+        let raw: Vec<u8> = (0..pm.as_bytes().len()).map(|i| (i * 7 % 251) as u8).collect();
+        pm.as_bytes_mut().copy_from_slice(&raw);
+
+        let region = Rect::new(1, 0, 2, 2);
+        let backup = pm.crop(region);
+        pm.fill_rect(region, Rgba8::TRANSPARENT);
+        pm.blit(&backup, region.x, region.y);
+
+        assert_eq!(pm.as_bytes(), &raw[..], "16-bit pixels lost precision on the way back");
+    }
+
+    #[test]
+    fn a_blit_clips_at_the_edges() {
+        let mut pm = Pixmap::new(4, 4);
+        let patch = Pixmap::filled(3, 3, Rgba8::opaque(9, 9, 9));
+        pm.blit(&patch, 2, 2);
+        assert_eq!(pm.get(3, 3), Rgba8::opaque(9, 9, 9));
+        assert_eq!(pm.get(1, 1), Rgba8::TRANSPARENT);
+
+        // Entirely outside, and straddling the origin: neither may panic.
+        pm.blit(&patch, 40, 40);
+        pm.blit(&patch, -2, -2);
+        assert_eq!(pm.get(0, 0), Rgba8::opaque(9, 9, 9));
     }
 
     #[test]

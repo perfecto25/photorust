@@ -244,6 +244,31 @@ pub mod ffi {
         #[cxx_name = "previewImage"]
         fn preview_image(self: &Engine) -> QImage;
 
+        /// Just the area the in-progress stroke has covered since the last
+        /// call, composited, for the shell to blit over the canvas image it
+        /// already holds. A null image means there is nothing new to draw, or
+        /// that this stroke is not patchable and `previewImage` must be used
+        /// instead — Quick Mask is the case that is not.
+        ///
+        /// `strokePatchRect` gives the rectangle *this* patch belongs at, so it
+        /// has to be read after the patch it describes.
+        #[qinvokable]
+        #[cxx_name = "strokePatch"]
+        fn stroke_patch(self: Pin<&mut Engine>) -> QImage;
+
+        /// Where the last [`Engine::stroke_patch`] goes, in document pixels.
+        #[qinvokable]
+        #[cxx_name = "strokePatchRect"]
+        fn stroke_patch_rect(self: &Engine) -> QRect;
+
+        /// Whether strokes must be previewed a whole document at a time rather
+        /// than by patch. True in Quick Mask, where the stroke changes a veil
+        /// over the image instead of the image. Constant for the duration of a
+        /// stroke, so the shell need only ask when one begins.
+        #[qinvokable]
+        #[cxx_name = "strokeNeedsFullPreview"]
+        fn stroke_needs_full_preview(self: &Engine) -> bool;
+
         /// Memory footprint as `[flattened, withLayers]` in bytes — the two
         /// numbers behind the Info panel's "Doc:" line.
         #[qinvokable]
@@ -2975,6 +3000,10 @@ pub struct EngineRust {
     /// `commit_built_path`.
     pending_subpaths: Vec<crate::path::Subpath>,
 
+    /// Where the last `stroke_patch` belongs, since the patch itself is a
+    /// `QImage` and carries no position of its own.
+    stroke_patch_rect: Rect,
+
     /// Set while the Spot Healing Brush is active. `None` for every other tool,
     /// which is what makes `end_stroke` paint normally.
     heal_mode: Option<HealMode>,
@@ -3069,6 +3098,7 @@ impl Default for EngineRust {
             pattern_aligned: true,
             pending_runs: Vec::new(),
             pending_subpaths: Vec::new(),
+            stroke_patch_rect: Rect::default(),
             heal_mode: None,
             heal_source: None,
             clone_source: None,
@@ -3583,6 +3613,42 @@ impl ffi::Engine {
             Some(pm) => pixmap_to_qimage(pm),
             None => self.composite_image(),
         }
+    }
+
+    fn stroke_patch(mut self: core::pin::Pin<&mut Self>) -> QImage {
+        // The same choice of colour `preview_image` makes, and for the same
+        // reasons: a healing stroke previews as a grey wash rather than paint.
+        let (color, opacity) = if self.heal_mode.is_some() {
+            (Rgba8::new(128, 128, 128, 255), 0.45)
+        } else {
+            (self.paint_color(), self.brush.opacity)
+        };
+
+        let patch = self
+            .as_mut()
+            .rust_mut()
+            .doc
+            .preview_stroke_patch(color, opacity);
+
+        match patch {
+            Some(result) => {
+                self.as_mut().rust_mut().stroke_patch_rect = result.dirty;
+                pixmap_to_qimage(result.pixels)
+            }
+            None => {
+                self.as_mut().rust_mut().stroke_patch_rect = Rect::default();
+                QImage::default()
+            }
+        }
+    }
+
+    fn stroke_patch_rect(&self) -> QRect {
+        let r = self.stroke_patch_rect;
+        QRect::new(r.x, r.y, r.width as i32, r.height as i32)
+    }
+
+    fn stroke_needs_full_preview(&self) -> bool {
+        self.doc.quick_mask()
     }
 
     // -- annotations ------------------------------------------------------------

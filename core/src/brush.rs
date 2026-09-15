@@ -20,9 +20,35 @@
 //!
 //! Speed still cannot darken a stroke, because dabs are placed by *distance*
 //! along the path — the spacing setting — not by how many mouse events arrived.
+//!
+//! The *path* those dabs follow is a curve, not the raw polyline of mouse
+//! positions. Joining the samples with straight lines makes a fast stroke come
+//! out as a polygon, because the pointer only reports every few milliseconds
+//! and a hand moves a long way between reports. So each pair of samples
+//! contributes a quadratic Bézier: the curve runs from the midpoint of the
+//! previous pair to the midpoint of the current one, with the sample between
+//! them as its control point. Consecutive curves meet at a midpoint sharing
+//! the same tangent, so the whole path is smooth, and paint only ever reaches
+//! the midpoint of the latest pair — the stroke trails half a sample behind the
+//! cursor and [`StrokeMask::finish`] closes that gap when the stroke ends.
 
 use crate::buffer::{Pixmap, Rect, Rgba8};
 use crate::selection::Selection;
+
+/// Halfway between two stroke samples, pressure included.
+fn midpoint(a: (f32, f32, f32), b: (f32, f32, f32)) -> (f32, f32, f32) {
+    (
+        (a.0 + b.0) / 2.0,
+        (a.1 + b.1) / 2.0,
+        (a.2 + b.2) / 2.0,
+    )
+}
+
+/// Distance between two stroke samples, ignoring pressure.
+fn distance(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    (dx * dx + dy * dy).sqrt()
+}
 
 /// Seed every stroke's randomness starts from.
 ///
@@ -214,11 +240,26 @@ pub struct StrokeMask {
     coverage: Pixmap,
     /// Region touched so far, so the compositor can repaint just that area.
     dirty: Rect,
-    /// Where the last dab was stamped, for spacing along the path.
-    last_point: Option<(f32, f32)>,
+    /// Region touched since the last [`StrokeMask::take_pending`], which is
+    /// what the live preview repaints. Separate from `dirty` because `dirty`
+    /// grows to cover the whole stroke, and repainting all of that on every
+    /// mouse-move is the cost this exists to avoid.
+    pending: Rect,
+    /// The most recent sample the stroke was extended to.
+    prev: Option<(f32, f32, f32)>,
+    /// The sample before that, so a curve has a previous midpoint to start
+    /// from. `None` until the second extend, where there is no curve yet.
+    prev2: Option<(f32, f32, f32)>,
+    /// How far along the path paint has actually reached — the midpoint of the
+    /// last pair of samples, which is half a sample behind `prev`.
+    painted_to: Option<(f32, f32, f32)>,
     /// Distance carried over from the previous segment, so spacing stays even
     /// across event boundaries rather than resetting at each mouse-move.
     residual: f32,
+    /// The brush the stroke is being drawn with, remembered so `finish` can
+    /// close the half-sample gap without every `end_*_stroke` having to thread
+    /// the brush back down to here.
+    brush: Option<Brush>,
     /// Random state for scatter and jitter.
     ///
     /// Advanced per dab and reset at the start of each stroke, so a stroke
@@ -232,14 +273,34 @@ impl StrokeMask {
         Self {
             coverage: Pixmap::new(width, height),
             dirty: Rect::default(),
-            last_point: None,
+            pending: Rect::default(),
+            prev: None,
+            prev2: None,
+            painted_to: None,
             residual: 0.0,
+            brush: None,
             rng: STROKE_SEED,
         }
     }
 
     pub fn dirty(&self) -> Rect {
         self.dirty
+    }
+
+    /// Take the region touched since this was last called, clearing it.
+    ///
+    /// The live preview asks for this once per mouse-move and repaints only
+    /// what comes back; an empty rect means the pointer moved too little to
+    /// place a dab and there is nothing to redraw.
+    pub fn take_pending(&mut self) -> Rect {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Record that `region` has been painted, for both the whole-stroke dirty
+    /// rect and the not-yet-previewed one.
+    fn mark(&mut self, region: Rect) {
+        self.dirty = self.dirty.union(&region);
+        self.pending = self.pending.union(&region);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -253,41 +314,132 @@ impl StrokeMask {
 
     /// Begin a stroke at `(x, y)`, stamping the first dab.
     pub fn begin(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) {
-        self.last_point = None;
+        self.prev = None;
+        self.prev2 = None;
+        self.painted_to = None;
         self.residual = 0.0;
         self.rng = STROKE_SEED;
+        self.brush = Some(*brush);
         self.stamp(brush, x, y, pressure);
-        self.last_point = Some((x, y));
+        self.prev = Some((x, y, pressure));
+        self.painted_to = Some((x, y, pressure));
     }
 
     /// Extend the stroke to `(x, y)`, stamping evenly spaced dabs along the way.
+    ///
+    /// Paint reaches the midpoint between this sample and the previous one, not
+    /// this sample itself — see the module comment. [`StrokeMask::finish`]
+    /// covers the remaining half.
     pub fn extend(&mut self, brush: &Brush, x: f32, y: f32, pressure: f32) {
-        let Some((lx, ly)) = self.last_point else {
+        let Some(prev) = self.prev else {
             self.begin(brush, x, y, pressure);
             return;
         };
+        self.brush = Some(*brush);
+        let here = (x, y, pressure);
+        let from = self.painted_to.unwrap_or(prev);
 
-        let dx = x - lx;
-        let dy = y - ly;
+        match self.prev2 {
+            // Two samples is a line, not a curve: there is no earlier
+            // direction to be smooth against, so paint the whole of it. This
+            // also means a stroke made of a single `extend` still reaches its
+            // endpoint, which is what the path-stroking and testing callers
+            // rely on.
+            None => {
+                self.stamp_line(brush, from, here);
+                self.painted_to = Some(here);
+            }
+            // From the midpoint already reached to the midpoint of this pair,
+            // curving through the sample between them.
+            Some(_) => {
+                let mid = midpoint(prev, here);
+                self.stamp_quad(brush, from, prev, mid);
+                self.painted_to = Some(mid);
+            }
+        }
+        self.prev2 = Some(prev);
+        self.prev = Some(here);
+    }
+
+    /// Paint the half-sample the smoothing holds back, so the stroke ends under
+    /// the cursor rather than short of it.
+    ///
+    /// Called when a stroke is committed. Idempotent: a second call paints
+    /// nothing, because paint has then already reached the last sample.
+    pub fn finish(&mut self) {
+        let (Some(brush), Some(prev), Some(from)) = (self.brush, self.prev, self.painted_to) else {
+            return;
+        };
+        if (from.0 - prev.0).abs() < 1e-6 && (from.1 - prev.1).abs() < 1e-6 {
+            return;
+        }
+        self.stamp_line(&brush, from, prev);
+        self.painted_to = Some(prev);
+    }
+
+    /// Stamp evenly spaced dabs along the straight run `from` -> `to`,
+    /// interpolating pressure between them.
+    ///
+    /// `residual` carries the distance left over past the last dab, so spacing
+    /// stays even across calls rather than restarting at every sample.
+    fn stamp_line(&mut self, brush: &Brush, from: (f32, f32, f32), to: (f32, f32, f32)) {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
         let dist = (dx * dx + dy * dy).sqrt();
+        if dist < 1e-6 {
+            return;
+        }
         // Spacing is a fraction of diameter; clamp so a tiny spacing value
         // cannot request an unbounded number of dabs.
         let step = (brush.size * brush.spacing.max(0.01)).max(0.5);
 
-        if dist < 1e-6 {
-            return;
-        }
-
-        // Walk the segment, carrying `residual` so dab spacing is continuous
-        // across separate calls.
         let mut travelled = step - self.residual;
         while travelled <= dist {
             let t = travelled / dist;
-            self.stamp(brush, lx + dx * t, ly + dy * t, pressure);
+            let pressure = from.2 + (to.2 - from.2) * t;
+            self.stamp(brush, from.0 + dx * t, from.1 + dy * t, pressure);
             travelled += step;
         }
         self.residual = (self.residual + dist) % step;
-        self.last_point = Some((x, y));
+    }
+
+    /// Stamp along the quadratic Bézier `from` -> `to` with control point
+    /// `control`.
+    ///
+    /// Flattened into short straight runs and handed to [`Self::stamp_line`],
+    /// which is what keeps dab spacing measured along the curve and continuous
+    /// with the segments either side of it. The flattening step is finer than
+    /// any useful dab spacing, so the dabs land on the curve rather than on the
+    /// chords.
+    fn stamp_quad(
+        &mut self,
+        brush: &Brush,
+        from: (f32, f32, f32),
+        control: (f32, f32, f32),
+        to: (f32, f32, f32),
+    ) {
+        // Control-polygon length bounds the arc length, so it is a safe basis
+        // for choosing how finely to flatten.
+        let hull = distance(from, control) + distance(control, to);
+        if hull < 1e-6 {
+            return;
+        }
+        let pieces = ((hull / 2.0).ceil() as u32).clamp(1, 256);
+
+        let mut last = from;
+        for i in 1..=pieces {
+            let t = i as f32 / pieces as f32;
+            let u = 1.0 - t;
+            let (a, b, c) = (u * u, 2.0 * u * t, t * t);
+            let next = (
+                a * from.0 + b * control.0 + c * to.0,
+                a * from.1 + b * control.1 + c * to.1,
+                // Pressure follows the parameter, not the curve — it is a
+                // scalar along the stroke, with no geometry to bend.
+                from.2 + (to.2 - from.2) * t,
+            );
+            self.stamp_line(brush, last, next);
+            last = next;
+        }
     }
 
     /// A deterministic random value in `0.0..1.0`.
@@ -382,7 +534,7 @@ impl StrokeMask {
                 let existing = self.coverage.get(px, py).a as f32 / 255.0;
                 let v = ((existing + flow * (1.0 - existing)) * 255.0 + 0.5) as u8;
                 self.coverage.set(px, py, Rgba8::new(v, v, v, v));
-                self.dirty = self.dirty.union(&Rect::new(px, py, 1, 1));
+                self.mark(Rect::new(px, py, 1, 1));
             }
             return;
         }
@@ -413,7 +565,7 @@ impl StrokeMask {
             }
         }
 
-        self.dirty = self.dirty.union(&clipped);
+        self.mark(clipped);
     }
 
     /// Composite the accumulated stroke onto `target` in `color`.
@@ -429,7 +581,35 @@ impl StrokeMask {
         selection: Option<&Selection>,
         lock_transparency: bool,
     ) -> Rect {
-        if self.dirty.is_empty() {
+        self.composite_region_onto(
+            target,
+            color,
+            opacity,
+            offset,
+            selection,
+            lock_transparency,
+            self.dirty,
+        )
+    }
+
+    /// [`Self::composite_onto`], confined to `limit` in document space.
+    ///
+    /// The live preview composites one mouse-move's worth of dabs onto a copy
+    /// of the layer's pixels and puts the original back afterwards; it can only
+    /// restore what it saved, so it needs the paint confined to the same rect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_region_onto(
+        &self,
+        target: &mut Pixmap,
+        color: Rgba8,
+        opacity: f32,
+        offset: (i32, i32),
+        selection: Option<&Selection>,
+        lock_transparency: bool,
+        limit: Rect,
+    ) -> Rect {
+        let limit = limit.intersect(&self.dirty);
+        if limit.is_empty() {
             return Rect::default();
         }
         let opacity = opacity.clamp(0.0, 1.0);
@@ -441,10 +621,10 @@ impl StrokeMask {
         let selection = selection.filter(|sel| !sel.is_empty());
 
         let region = Rect::new(
-            self.dirty.x - offset.0,
-            self.dirty.y - offset.1,
-            self.dirty.width,
-            self.dirty.height,
+            limit.x - offset.0,
+            limit.y - offset.1,
+            limit.width,
+            limit.height,
         )
         .intersect(&target.rect());
 
@@ -503,17 +683,45 @@ impl StrokeMask {
         selection: Option<&Selection>,
         lock_transparency: bool,
     ) -> Rect {
-        if self.dirty.is_empty() {
+        self.composite_source_region_onto(
+            target,
+            source,
+            source_offset,
+            opacity,
+            offset,
+            selection,
+            lock_transparency,
+            self.dirty,
+        )
+    }
+
+    /// [`Self::composite_source_onto`], confined to `limit` in document space —
+    /// the Clone Stamp's half of what [`Self::composite_region_onto`] does for
+    /// paint, and for the same reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_source_region_onto(
+        &self,
+        target: &mut Pixmap,
+        source: &Pixmap,
+        source_offset: (i32, i32),
+        opacity: f32,
+        offset: (i32, i32),
+        selection: Option<&Selection>,
+        lock_transparency: bool,
+        limit: Rect,
+    ) -> Rect {
+        let limit = limit.intersect(&self.dirty);
+        if limit.is_empty() {
             return Rect::default();
         }
         let opacity = opacity.clamp(0.0, 1.0);
         let selection = selection.filter(|sel| !sel.is_empty());
 
         let region = Rect::new(
-            self.dirty.x - offset.0,
-            self.dirty.y - offset.1,
-            self.dirty.width,
-            self.dirty.height,
+            limit.x - offset.0,
+            limit.y - offset.1,
+            limit.width,
+            limit.height,
         )
         .intersect(&target.rect());
 
@@ -565,16 +773,25 @@ impl StrokeMask {
             }
         }
         self.dirty = Rect::default();
-        self.last_point = None;
-        self.residual = 0.0;
+        self.pending = Rect::default();
+        self.clear_path();
     }
 
     /// Resize the scratch buffer to a new canvas size, discarding coverage.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.coverage = Pixmap::new(width, height);
         self.dirty = Rect::default();
-        self.last_point = None;
+        self.pending = Rect::default();
+        self.clear_path();
+    }
+
+    /// Forget where the stroke had got to along its path.
+    fn clear_path(&mut self) {
+        self.prev = None;
+        self.prev2 = None;
+        self.painted_to = None;
         self.residual = 0.0;
+        self.brush = None;
     }
 }
 
@@ -785,6 +1002,127 @@ mod tests {
         for x in 12..48 {
             assert!(mask.coverage_at(x, 32) > 0.5, "gap at x={}", x);
         }
+    }
+
+    #[test]
+    fn a_turn_is_rounded_rather_than_cornered() {
+        // The bug this smoothing exists for: a hand moving fast reports its
+        // position every few milliseconds, and joining those samples with
+        // straight lines draws a polygon. A right-angle turn in the samples
+        // should come out as an arc, which means paint lands off the corner's
+        // inside diagonal where a polyline would leave bare canvas.
+        let brush = Brush { size: 6.0, hardness: 1.0, spacing: 0.1, ..Brush::default() };
+
+        let mut smooth = StrokeMask::new(120, 120);
+        smooth.begin(&brush, 10.0, 20.0, 1.0);
+        for &(x, y) in &[(40.0, 20.0), (60.0, 20.0), (60.0, 40.0), (60.0, 70.0)] {
+            smooth.extend(&brush, x, y, 1.0);
+        }
+        smooth.finish();
+
+        // Between the samples (40,20), (60,20) and (60,40) the path is the
+        // quadratic from (50,20) to (60,30) through (60,20), which passes
+        // through (57, 22.05) and comes no closer than 3.54px to the corner
+        // itself. A 6px brush — 3px of radius — therefore paints the arc and
+        // leaves the corner bare, where a polyline would put a dab right on it.
+        let on_arc = smooth.coverage_at(57, 22);
+        assert!(on_arc > 0.5, "nothing was painted along the turn: {on_arc}");
+
+        let at_corner = smooth.coverage_at(60, 20);
+        assert!(
+            at_corner < 0.1,
+            "the path went into the corner ({at_corner}) instead of rounding it"
+        );
+    }
+
+    #[test]
+    fn a_smoothed_stroke_still_has_no_gaps() {
+        // Smoothing moves where the dabs go; it must not thin them out. The
+        // curve is longer than the chord it replaces, so spacing is measured
+        // along the curve.
+        let brush = Brush { size: 10.0, hardness: 1.0, spacing: 0.25, ..Brush::default() };
+        let mut mask = StrokeMask::new(200, 120);
+        mask.begin(&brush, 10.0, 60.0, 1.0);
+        for i in 1..=18 {
+            let x = 10.0 + i as f32 * 10.0;
+            // A zig-zag, so every sample is a turn.
+            let y = if i % 2 == 0 { 40.0 } else { 80.0 };
+            mask.extend(&brush, x, y, 1.0);
+        }
+        mask.finish();
+
+        // Walk the painted region and check the stroke is one connected run
+        // down every column it passes through.
+        for x in 20..180 {
+            let covered = (30..90).any(|y| mask.coverage_at(x, y) > 0.5);
+            assert!(covered, "the smoothed stroke has a gap at x={x}");
+        }
+    }
+
+    #[test]
+    fn finish_brings_the_stroke_up_to_the_last_sample() {
+        // Paint trails half a sample behind the cursor while the curve is
+        // being drawn; releasing the mouse has to close that gap, or every
+        // stroke would stop short of where it was let go.
+        let brush = Brush { size: 6.0, hardness: 1.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(120, 40);
+        mask.begin(&brush, 10.0, 20.0, 1.0);
+        for x in [30.0, 50.0, 70.0, 90.0] {
+            mask.extend(&brush, x, 20.0, 1.0);
+        }
+
+        assert!(
+            mask.coverage_at(90, 20) < 0.5,
+            "paint reached the last sample before the stroke was finished"
+        );
+        mask.finish();
+        assert!(
+            mask.coverage_at(90, 20) > 0.5,
+            "the stroke stopped short of where it ended"
+        );
+    }
+
+    #[test]
+    fn finishing_twice_paints_nothing_more() {
+        let brush = Brush { size: 6.0, hardness: 1.0, flow: 0.5, ..Brush::default() };
+        let mut mask = StrokeMask::new(120, 40);
+        mask.begin(&brush, 10.0, 20.0, 1.0);
+        mask.extend(&brush, 40.0, 20.0, 1.0);
+        mask.extend(&brush, 70.0, 20.0, 1.0);
+        mask.finish();
+        let once = mask.coverage_at(70, 20);
+        mask.finish();
+        assert_eq!(once, mask.coverage_at(70, 20), "finishing twice laid more paint");
+    }
+
+    #[test]
+    fn pending_covers_only_the_latest_dabs() {
+        // What the live preview repaints. It has to reset each time it is
+        // read, or a long stroke ends up repainting everything it has covered
+        // on every mouse-move — which is the cost this replaced.
+        let brush = Brush { size: 8.0, ..Brush::default() };
+        let mut mask = StrokeMask::new(400, 60);
+        mask.begin(&brush, 10.0, 30.0, 1.0);
+        mask.take_pending();
+
+        mask.extend(&brush, 60.0, 30.0, 1.0);
+        let first = mask.take_pending();
+        assert!(!first.is_empty(), "the first extend reported nothing to repaint");
+
+        mask.extend(&brush, 110.0, 30.0, 1.0);
+        let second = mask.take_pending();
+        assert!(
+            second.x >= first.x + 20,
+            "the second patch went back over the first: {first:?} then {second:?}"
+        );
+        assert!(
+            mask.take_pending().is_empty(),
+            "a patch was reported twice"
+        );
+        assert!(
+            mask.dirty().width > second.width,
+            "the whole-stroke dirty rect should still span everything painted"
+        );
     }
 
     #[test]
