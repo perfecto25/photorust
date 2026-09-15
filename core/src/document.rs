@@ -210,6 +210,141 @@ fn restore_unselected(px: &mut [u8], original: [u8; 3], coverage: f32) {
     }
 }
 
+/// Run `filter` over only the part of `pixels` that a selection covers.
+///
+/// Three things have to be true for this to behave like Photoshop's:
+///
+/// - What is outside the selection comes back untouched.
+/// - The coverage fades it at the edge, so a feathered or antialiased marquee
+///   blends the result in rather than cutting it out.
+/// - A filter whose geometry belongs to the *frame* — Radial Blur's centre, a
+///   flare's position, the pattern Clouds lays down — takes the selection as
+///   its frame. That is why a radial blur inside a marquee spins about the
+///   middle of the marquee and not the middle of the picture.
+///
+/// The third is what [`Filter::reach`] already answers, from the other side:
+/// a filter that reads a neighbourhood has a reach and gets padding, so
+/// pixels at the edge of the selection pull from the layer beyond it rather
+/// than from nothing; one whose answer depends on the whole frame has no
+/// reach, and is handed exactly the selection to treat as its frame.
+///
+/// `offset` is the layer's position, since a layer may sit anywhere on or off
+/// the canvas and the selection is in document space.
+fn filter_through_selection(
+    pixels: &mut Pixmap,
+    offset: (i32, i32),
+    filter: Filter,
+    selection: &Selection,
+    bounds: Rect,
+) {
+    let layer = pixels.rect();
+    let want = Rect::new(
+        bounds.x - offset.0,
+        bounds.y - offset.1,
+        bounds.width,
+        bounds.height,
+    )
+    .intersect(&layer);
+    if want.is_empty() {
+        return;
+    }
+
+    let padded = match filter.reach() {
+        Some(n) => want.inflate(n).intersect(&layer),
+        None => want,
+    };
+    let mut work = pixels.crop(padded);
+    filter.apply(&mut work);
+    blend_region(pixels, &work, (padded.x, padded.y), want, offset, selection);
+}
+
+/// Put back whatever a whole-layer render changed outside the selection.
+///
+/// For an operation whose geometry comes from somewhere other than the frame
+/// — Flame draws along the document's path — cropping to the selection would
+/// move the drawing rather than confine it. So it is drawn over everything
+/// and then faded back towards `before` by the coverage, which for that kind
+/// of operation is the same picture.
+fn confine_to_selection(
+    pixels: &mut Pixmap,
+    before: &Pixmap,
+    offset: (i32, i32),
+    selection: &Selection,
+) {
+    for y in 0..pixels.height() as i32 {
+        for x in 0..pixels.width() as i32 {
+            let coverage = selection.coverage_at(x + offset.0, y + offset.1);
+            if coverage >= 1.0 {
+                continue;
+            }
+            let restored = if coverage <= 0.0 {
+                before.get(x, y)
+            } else {
+                fade_between(before.get(x, y), pixels.get(x, y), coverage)
+            };
+            pixels.set(x, y, restored);
+        }
+    }
+}
+
+/// Write a filtered crop back into `pixels` over `region`, faded by what the
+/// selection covers.
+///
+/// `work_origin` is where `work`'s top-left sits in the same coordinates as
+/// `region` — the two differ whenever the crop was padded to give a filter
+/// its neighbourhood. `offset` carries those coordinates into the document's,
+/// which is where the selection is.
+fn blend_region(
+    pixels: &mut Pixmap,
+    work: &Pixmap,
+    work_origin: (i32, i32),
+    region: Rect,
+    offset: (i32, i32),
+    selection: &Selection,
+) {
+    for y in region.y..region.bottom() {
+        for x in region.x..region.right() {
+            let coverage = selection.coverage_at(x + offset.0, y + offset.1);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let after = work.get(x - work_origin.0, y - work_origin.1);
+            if coverage >= 1.0 {
+                pixels.set(x, y, after);
+                continue;
+            }
+            pixels.set(x, y, fade_between(pixels.get(x, y), after, coverage));
+        }
+    }
+}
+
+/// Part of the way from one pixel to another, for a selection edge that is
+/// half covered.
+///
+/// Mixed with the alpha multiplied back in and then taken out again. The
+/// buffers hold straight alpha, where the colour of a nearly transparent
+/// pixel means almost nothing, so mixing the two colours directly would drag
+/// whatever was left in an invisible pixel into a visible one — which shows
+/// up as a dark or coloured fringe exactly where a distort filter has pulled
+/// transparency to the edge of a feathered selection.
+fn fade_between(before: Rgba8, after: Rgba8, t: f32) -> Rgba8 {
+    let (a0, a1) = (before.a as f32 / 255.0, after.a as f32 / 255.0);
+    let alpha = a0 + (a1 - a0) * t;
+    if alpha <= 0.0 {
+        return Rgba8::TRANSPARENT;
+    }
+    let channel = |b: u8, a: u8| {
+        let lit = b as f32 * a0 + (a as f32 * a1 - b as f32 * a0) * t;
+        (lit / alpha).clamp(0.0, 255.0).round() as u8
+    };
+    Rgba8::new(
+        channel(before.r, after.r),
+        channel(before.g, after.g),
+        channel(before.b, after.b),
+        (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
 /// Write an adjusted colour, faded by the selection's coverage.
 ///
 /// At full coverage the value is written straight through, so an unselected
@@ -4645,14 +4780,36 @@ impl Document {
 
     /// Apply a destructive filter to the active layer.
     pub fn apply_filter(&mut self, filter: Filter) {
+        // Asked before the layer is borrowed: working out the bounds updates
+        // the selection's cache of them, which needs it mutably.
+        let bounds = self.selection_bounds();
         let id = self.active_layer;
+        let selection = active_selection(&self.selection);
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            filter.apply(&mut layer.pixels);
+            match (selection, bounds) {
+                (Some(selection), Some(bounds)) => filter_through_selection(
+                    &mut layer.pixels,
+                    layer.offset,
+                    filter,
+                    selection,
+                    bounds,
+                ),
+                _ => filter.apply(&mut layer.pixels),
+            }
         }
         self.commit(filter.name());
+    }
+
+    /// The rectangle a selection covers, or `None` when there is no selection
+    /// and the whole layer is fair game.
+    fn selection_bounds(&mut self) -> Option<Rect> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        Some(self.selection.bounds())
     }
 
     /// Filter ▸ Distort ▸ Displace, which needs a second image and so cannot
@@ -4665,19 +4822,51 @@ impl Document {
         stretch: bool,
         wrap: bool,
     ) {
+        let bounds = self.selection_bounds();
         let id = self.active_layer;
+        let selection = active_selection(&self.selection);
         if let Some(layer) = self.stack.by_id_mut(id) {
             if layer.lock_pixels || !matches!(layer.kind, LayerKind::Raster) {
                 return;
             }
-            crate::filters::distort::displace(
-                &mut layer.pixels,
-                map,
-                h_scale,
-                v_scale,
-                stretch,
-                wrap,
-            );
+            // Displace cannot go through `Filter`, so it cannot go through
+            // `filter_through_selection` either: it is confined by hand, on
+            // the same rule — the displacement map is stretched over the
+            // *selection*, since that is the frame CS6 gives it.
+            match (selection, bounds) {
+                (Some(selection), Some(bounds)) => {
+                    let layer_rect = layer.pixels.rect();
+                    let want = Rect::new(
+                        bounds.x - layer.offset.0,
+                        bounds.y - layer.offset.1,
+                        bounds.width,
+                        bounds.height,
+                    )
+                    .intersect(&layer_rect);
+                    if !want.is_empty() {
+                        let mut work = layer.pixels.crop(want);
+                        crate::filters::distort::displace(
+                            &mut work, map, h_scale, v_scale, stretch, wrap,
+                        );
+                        blend_region(
+                            &mut layer.pixels,
+                            &work,
+                            (want.x, want.y),
+                            want,
+                            layer.offset,
+                            selection,
+                        );
+                    }
+                }
+                _ => crate::filters::distort::displace(
+                    &mut layer.pixels,
+                    map,
+                    h_scale,
+                    v_scale,
+                    stretch,
+                    wrap,
+                ),
+            }
         }
         self.commit("Displace");
     }
@@ -4713,6 +4902,7 @@ impl Document {
         }
 
         let id = self.active_layer;
+        let selection = active_selection(&self.selection);
         let Some(layer) = self.stack.by_id_mut(id) else {
             return false;
         };
@@ -4736,7 +4926,14 @@ impl Document {
             })
             .collect();
 
+        // Flame is placed by the path rather than by the frame, so it is
+        // drawn over the layer and then held back to the selection, rather
+        // than being handed the selection to draw inside.
+        let untouched = selection.map(|_| layer.pixels.clone());
         crate::filters::render::flame(&mut layer.pixels, &moved, options);
+        if let (Some(before), Some(selection)) = (untouched, selection) {
+            confine_to_selection(&mut layer.pixels, &before, layer.offset, selection);
+        }
         true
     }
 
@@ -4787,6 +4984,90 @@ impl Document {
     ///
     /// Returns the region in document space, so pixels outside the layer come
     /// back transparent and the thumbnail lines up with what the canvas shows.
+    /// What `filter` makes of the whole active layer, shrunk to fit a box —
+    /// the preview for a dialog that shows the picture *entire* rather than a
+    /// region of it.
+    ///
+    /// The filter runs on the shrunk copy, which is only honest for one whose
+    /// geometry is a fraction of the frame rather than a length in pixels. A
+    /// flare placed two thirds of the way across and sized against the
+    /// diagonal is the same picture at any scale; a twenty-pixel blur is not.
+    /// Lens Flare is the filter that qualifies, and the reason this exists:
+    /// its dialog has to show where the flare sits in the whole frame, and
+    /// filtering a twenty-megapixel layer on every drag of the crosshair to
+    /// show it three hundred pixels wide is not a preview, it is a wait.
+    pub fn filter_proxy(&self, filter: Filter, max_width: u32, max_height: u32) -> Option<Pixmap> {
+        let layer = self.stack.by_id(self.active_layer)?;
+        if !matches!(layer.kind, LayerKind::Raster) {
+            return None;
+        }
+        let (width, height) = (layer.pixels.width(), layer.pixels.height());
+        if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
+            return None;
+        }
+        // Never enlarge: a layer already smaller than the box is its own
+        // proxy.
+        let scale = (max_width as f32 / width as f32)
+            .min(max_height as f32 / height as f32)
+            .min(1.0);
+        let fitted = (
+            ((width as f32 * scale).round() as u32).max(1),
+            ((height as f32 * scale).round() as u32).max(1),
+        );
+        let mut work = if fitted == (width, height) {
+            layer.pixels.clone()
+        } else {
+            crate::resample::resample(&layer.pixels, fitted.0, fitted.1, Resample::Bilinear)
+        };
+        match self.selection_proxy(fitted, layer.offset) {
+            // The selection is shrunk alongside the picture rather than
+            // ignored, so a proxy preview shows the flare or the lamp
+            // confined the way the commit will confine it.
+            Some((selection, bounds)) => {
+                filter_through_selection(&mut work, (0, 0), filter, &selection, bounds)
+            }
+            None => filter.apply(&mut work),
+        }
+        Some(work)
+    }
+
+    /// The selection, shrunk to a proxy of `fitted` pixels, and the bounds it
+    /// covers there — both in the proxy's own coordinates.
+    ///
+    /// `None` when there is no selection, or when nothing of it lands on the
+    /// layer at all.
+    fn selection_proxy(
+        &self,
+        fitted: (u32, u32),
+        offset: (i32, i32),
+    ) -> Option<(Selection, Rect)> {
+        let selection = active_selection(&self.selection)?;
+        // Cut the selection down to the layer first, so that the scaling
+        // below is the layer's and not the canvas's — a layer may sit
+        // anywhere on or off the canvas.
+        let layer_rect = Rect::new(
+            offset.0,
+            offset.1,
+            self.stack.by_id(self.active_layer)?.pixels.width(),
+            self.stack.by_id(self.active_layer)?.pixels.height(),
+        );
+        let mut cut = selection.clone();
+        cut.crop(layer_rect);
+        let coverage = crate::resample::resample_coverage(
+            cut.as_bytes(),
+            cut.width(),
+            cut.height(),
+            fitted.0,
+            fitted.1,
+        );
+        let mut shrunk = Selection::from_coverage(fitted.0, fitted.1, coverage)?;
+        if shrunk.is_empty() {
+            return None;
+        }
+        let bounds = shrunk.bounds();
+        Some((shrunk, bounds))
+    }
+
     pub fn filter_preview(&self, filter: Filter, rect: Rect) -> Option<Pixmap> {
         if rect.is_empty() {
             return None;
@@ -4805,8 +5086,32 @@ impl Document {
             None => layer.pixels.rect(),
         };
 
+        // A selection confines the thumbnail exactly as it will confine the
+        // commit, or the dialog shows one picture and OK produces another.
+        // The crop has to take in the whole selection for a filter with no
+        // reach, since the selection is the frame such a filter works in and
+        // a part of it would give a different answer.
+        let confined = active_selection(&self.selection).map(|selection| {
+            let bounds = selection.immediate_bounds();
+            let bounds = Rect::new(bounds.x - ox, bounds.y - oy, bounds.width, bounds.height);
+            (selection, bounds)
+        });
+        let padded = match confined {
+            Some((_, bounds)) if pad.is_none() => want.union(&bounds),
+            _ => padded,
+        };
+
         let mut work = layer.pixels.crop(padded);
-        filter.apply(&mut work);
+        match confined {
+            Some((selection, bounds)) => filter_through_selection(
+                &mut work,
+                (ox + padded.x, oy + padded.y),
+                filter,
+                selection,
+                Rect::new(bounds.x + ox, bounds.y + oy, bounds.width, bounds.height),
+            ),
+            None => filter.apply(&mut work),
+        }
 
         // Cut the asked-for region back out of the padded result.
         Some(work.crop(Rect::new(
@@ -4833,10 +5138,23 @@ impl Document {
         if !self.can_filter_active_layer() {
             return;
         }
+        let bounds = self.selection_bounds();
         let id = self.active_layer;
+        let selection = active_selection(&self.selection);
         if let Some(layer) = self.stack.by_id_mut(id) {
             self.filter_preview = Some((id, layer.pixels.clone()));
-            filter.apply(&mut layer.pixels);
+            // Confined the same way the commit will be, or the preview shows
+            // one picture and OK produces another.
+            match (selection, bounds) {
+                (Some(selection), Some(bounds)) => filter_through_selection(
+                    &mut layer.pixels,
+                    layer.offset,
+                    filter,
+                    selection,
+                    bounds,
+                ),
+                _ => filter.apply(&mut layer.pixels),
+            }
         }
     }
 
@@ -7084,6 +7402,7 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::RadialQuality;
     use crate::layer::{TextAlign, TextRun};
     use crate::sample::Limits;
 
@@ -11119,5 +11438,211 @@ mod tests {
         assert_eq!(px_after.r, px_after.g);
         assert_eq!(px_after.g, px_after.b);
         assert!(px_after.r > 0 && px_after.r < 255, "should be a mid gray, got {}", px_after.r);
+    }
+
+    // ---------------------------------------------------------------- selections --
+
+    /// Nothing outside the marquee moves. The first thing anyone checks, and
+    /// the thing that was wrong: filters ran over the whole layer and ignored
+    /// the selection entirely.
+    #[test]
+    fn a_filter_leaves_what_is_outside_the_selection_alone() {
+        let before = checkered(40, 5);
+        let mut after = checkered(40, 5);
+        after.select_rect(Rect::new(10, 10, 16, 16), SelectionOp::Replace, 0);
+        after.apply_filter(Filter::BoxBlur { radius: 3 });
+
+        let (old, new) = (
+            &before.active_layer().unwrap().pixels,
+            &after.active_layer().unwrap().pixels,
+        );
+        for y in 0..40 {
+            for x in 0..40 {
+                let inside = (10..26).contains(&x) && (10..26).contains(&y);
+                if !inside {
+                    assert_eq!(old.get(x, y), new.get(x, y), "({x}, {y}) changed outside the marquee");
+                }
+            }
+        }
+        // ...and something inside it did change, or the test above passes on
+        // a filter that did nothing at all.
+        assert_ne!(old.get(17, 17), new.get(17, 17));
+    }
+
+    /// A filter with no reach works in the frame the selection gives it, not
+    /// the frame of the whole layer. Average is the plainest case of it: what
+    /// it fills the selection with is the average of the *selection*.
+    ///
+    /// This is the same rule that puts a radial blur's centre in the middle
+    /// of the marquee, which is what CS6 does and what a whole-layer render
+    /// masked afterwards would get wrong.
+    #[test]
+    fn a_filter_with_no_reach_takes_the_selection_as_its_frame() {
+        let mut d = Document::new(20, 20, Rgba8::WHITE);
+        {
+            let layer = d.active_layer_mut().unwrap();
+            // Left half black, right half white.
+            for y in 0..20 {
+                for x in 0..10 {
+                    layer.pixels.set(x, y, Rgba8::BLACK);
+                }
+            }
+        }
+        // A marquee wholly inside the black half: its average is black, where
+        // the whole layer's average is a mid grey.
+        d.select_rect(Rect::new(2, 2, 6, 6), SelectionOp::Replace, 0);
+        d.apply_filter(Filter::Average);
+        assert_eq!(d.active_layer().unwrap().pixels.get(4, 4).r, 0);
+    }
+
+    /// A pixel at the edge of the selection still sees the picture beyond it.
+    /// The selection says what may be *written*, not what may be read — blur
+    /// the edge of a marquee and it pulls in the colours outside it, rather
+    /// than behaving as though the marquee were the edge of the world.
+    #[test]
+    fn a_filter_reads_past_the_edge_of_the_selection() {
+        let mut d = Document::new(40, 40, Rgba8::WHITE);
+        {
+            let layer = d.active_layer_mut().unwrap();
+            for y in 0..40 {
+                for x in 0..40 {
+                    layer.pixels.set(x, y, Rgba8::BLACK);
+                }
+            }
+            // A white band just outside the marquee's left edge.
+            for y in 0..40 {
+                for x in 0..10 {
+                    layer.pixels.set(x, y, Rgba8::WHITE);
+                }
+            }
+        }
+        d.select_rect(Rect::new(10, 10, 20, 20), SelectionOp::Replace, 0);
+        d.apply_filter(Filter::BoxBlur { radius: 4 });
+        let edge = d.active_layer().unwrap().pixels.get(10, 20).r;
+        assert!(edge > 0, "the blur did not see the white band outside the marquee");
+    }
+
+    /// Partial coverage fades the filter in, so a feathered marquee has no
+    /// visible border where the effect starts.
+    #[test]
+    fn a_feathered_selection_fades_a_filter_in() {
+        let mut d = checkered(60, 5);
+        let before = d.active_layer().unwrap().pixels.clone();
+        d.select_rect(Rect::new(15, 15, 30, 30), SelectionOp::Replace, 8);
+        d.apply_filter(Filter::BoxBlur { radius: 5 });
+        let after = &d.active_layer().unwrap().pixels;
+
+        // Somewhere in the feathered band, a pixel has to have landed
+        // *between* what it was and what the filter made of it. A hard edge
+        // would put every pixel at one end or the other.
+        let mut between = 0;
+        for y in 15..45 {
+            for x in 15..45 {
+                let (was, now) = (before.get(x, y).r as i32, after.get(x, y).r as i32);
+                if was != now {
+                    between += 1;
+                }
+            }
+        }
+        assert!(between > 0);
+        let corner = (before.get(16, 16).r as i32 - after.get(16, 16).r as i32).abs();
+        let middle = (before.get(30, 30).r as i32 - after.get(30, 30).r as i32).abs();
+        assert!(
+            corner < middle,
+            "the feathered corner changed as much as the middle: {corner} against {middle}"
+        );
+    }
+
+    /// The dialog's thumbnail has to show what OK will do — with a selection
+    /// as well as without one, and for a filter whose frame the selection
+    /// changes.
+    #[test]
+    fn a_preview_inside_a_selection_matches_what_the_commit_does() {
+        let region = Rect::new(8, 8, 20, 20);
+        for filter in [
+            Filter::BoxBlur { radius: 4 },
+            Filter::Average,
+            Filter::RadialBlur {
+                amount: 30.0,
+                spin: true,
+                center: (0.5, 0.5),
+                quality: RadialQuality::Good,
+            },
+        ] {
+            let mut previewed = checkered(40, 5);
+            previewed.select_rect(Rect::new(6, 6, 24, 24), SelectionOp::Replace, 3);
+            let preview = previewed.filter_preview(filter, region).unwrap();
+
+            let mut committed = checkered(40, 5);
+            committed.select_rect(Rect::new(6, 6, 24, 24), SelectionOp::Replace, 3);
+            committed.apply_filter(filter);
+            let expected = committed.active_layer().unwrap().pixels.crop(region);
+
+            assert_eq!(
+                preview.as_bytes(),
+                expected.as_bytes(),
+                "the preview of {} differs from what it commits",
+                filter.name()
+            );
+        }
+    }
+
+    /// Flame is placed by the document's path rather than by the frame, so it
+    /// is confined the other way about — drawn everywhere, then held back to
+    /// the selection. The result has to be the same: nothing outside.
+    #[test]
+    fn a_flame_is_held_back_to_the_selection_too() {
+        let scene = || {
+            let mut d = Document::new(60, 60, Rgba8::BLACK);
+            {
+                let path = d.paths_mut().ensure_active();
+                path.append_corner(10.0, 50.0);
+                path.append_corner(50.0, 50.0);
+            }
+            d
+        };
+        let options = crate::filters::FlameOptions::default();
+
+        let mut whole = scene();
+        assert!(whole.apply_flame(&options), "nothing was burned at all");
+        // Somewhere above the path caught fire, or the rest proves nothing.
+        let burned = whole.active_layer().unwrap().pixels.clone();
+        assert!(
+            (0..60).any(|y| (20..60).any(|x| burned.get(x, y) != Rgba8::BLACK)),
+            "nothing burned in the half this test is about"
+        );
+
+        let mut d = scene();
+        d.select_rect(Rect::new(0, 0, 20, 60), SelectionOp::Replace, 0);
+        assert!(d.apply_flame(&options));
+        let held = d.active_layer().unwrap().pixels.clone();
+        for y in 0..60 {
+            for x in 20..60 {
+                assert_eq!(
+                    held.get(x, y),
+                    Rgba8::BLACK,
+                    "the flame burned outside the marquee at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// And the canvas preview behind the Preview tick box, which is a
+    /// different path again.
+    #[test]
+    fn the_canvas_preview_is_confined_too() {
+        let filter = Filter::BoxBlur { radius: 4 };
+        let mut d = checkered(40, 5);
+        let before = d.active_layer().unwrap().pixels.clone();
+        d.select_rect(Rect::new(10, 10, 16, 16), SelectionOp::Replace, 0);
+        d.set_filter_preview(Some(filter));
+
+        let shown = d.active_layer().unwrap().pixels.clone();
+        assert_eq!(before.get(2, 2), shown.get(2, 2), "the preview reached outside the marquee");
+        assert_ne!(before.get(17, 17), shown.get(17, 17), "the preview showed nothing");
+
+        // And it puts everything back.
+        d.clear_filter_preview();
+        assert_eq!(before.as_bytes(), d.active_layer().unwrap().pixels.as_bytes());
     }
 }

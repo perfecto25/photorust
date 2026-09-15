@@ -81,7 +81,9 @@ paint, manage layers, select, filter and undo.
   (shadows / midtones / highlights), Exposure, Protect Tones, and the Sponge's
   Desaturate / Saturate and Vibrance. Protect Tones works on luminance and keeps
   the pixel's own colour, so a dodge cannot bleach a hue or clip to white.
-- **Blur**, **Sharpen** and **Smudge**: all three work dab by dab on what they
+- **Blur**, **Sharpen** and **Smudge**: their Strength carries CS6's drop-down
+  slider beside the field, shared with the Layers panel's Opacity and Fill.
+  All three work dab by dab on what they
   pass over, so dwelling goes on deepening the effect. Blur and Sharpen are one
   tool with its sign flipped — toward or away from the local average — with CS6's
   Strength, cut-down Mode list, Sample All Layers and Sharpen's Protect Detail.
@@ -518,6 +520,7 @@ paint, manage layers, select, filter and undo.
 
     - Layers panel - show pixel layer, show adjustment layer, show type layer  - buttons dont work - 
 
+---
 - Type dropdown
   Panels > 
     Character Panel - DONE
@@ -549,11 +552,59 @@ paint, manage layers, select, filter and undo.
       - squeeze - done
       - twist - done
 
+---
 - Select dropdown
+
   - Find layers - done
   - Color range - done
+
+---
 - Filter dropdown
+
   - Last Filter (Ctrl+F) and Last Filter Settings (Alt+Ctrl+F) - done
+  - Artistic 
+    - Colored Pencil - done 
+    - Cutout - done
+    - Dry Brush - done
+    - Film Grain - done
+    - Fresco - done
+    - Neon Glow - done
+    - Paint Daubs - need work
+    - Palette Knife - need work
+    - Plastic Wrap
+    - Poster Edges
+    - Rough Pastels
+    - Smudge Stick
+    - Sponge
+    - Underpainting
+    - Watercolor
+    
+  - Brush Strokes
+    - Accented Edges
+    - Angled Strokes
+    - Cross Hatch
+    - Dark Strokes
+    - Ink Outlines
+    - Spatter
+    - Sprayed Strokes
+    - Sumi-e
+    
+  - Sketch
+    - Bas Relief
+    - Chalk & Charcoal
+    - Charcoal
+    - Chrome
+    - Conte Crayon
+    - Graphic Pen
+    - Halftone Pattern
+    - Note Paper 
+    - Photocopy
+    - Plaster
+    - Reticulation
+    - Stamp
+    - Torn Edges
+    - Water Paper
+
   - Blur submenu - done, except Lens, Shape and Smart Blur, which are listed
     and disabled: they need a depth map, the preset shape library and an
     edge-detection pass respectively
@@ -563,7 +614,7 @@ paint, manage layers, select, filter and undo.
     - motion blur - done
     - surface blur - done 
     - 
-  - 
+
   - Sharpen 
     - sharpen - done
     - sharpen edges - done 
@@ -576,7 +627,7 @@ paint, manage layers, select, filter and undo.
     - Dust and scratches - done
     - Median - done
     - Reduce Noise - not implemented
-    -
+  
   - Distort
     - Displace - done
     - Pinch - done
@@ -587,6 +638,9 @@ paint, manage layers, select, filter and undo.
     - Twirl - done
     - Wave - done
     - Zigzag - done
+    - Diffuse Glow - 
+    - Glass - 
+    - Ocean Ripple - 
 
   - Pixelate
     - Color halftone - done
@@ -595,17 +649,49 @@ paint, manage layers, select, filter and undo.
     - Fragment - done
     - Mezzotint - done
     - Mosaic - done
-    - Pointilize - 
+    - Pointilize - done
 
   - Render
     - Flame - in progress
     - Picture Frame
+    - Clouds - done
+    - Difference clouds - done
+    - Fibers - done
+    - Lens Flare - done
+    - Lighting Effects - one lamp, done; CS6's Lights panel of several
+      lamps, its on-canvas handles and its Presets list are not built
     - 
 
+  - Stylize
+    - Diffuse - done
+    - Emboss - done
+    - Extrude - done
+    - Find Edges - done
+    - Solarize - done
+    - Tiles - done
+    - Trace Contour - done
+    - Wind - done
+    - Glowing Edges - done 
+    
+  - Texture 
+    - Craquelure
+    - Grain
+    - Mosaic Tiles
+    - Patchwork
+    - Stained Glass
+    - Texturizer
 
+  - Other 
+    - Custom - done (5×5 grid, Scale, Offset; the dialog's Load/Save of
+      .acf kernel files is not built)
+    - High Pass - 
+    - HSB/HSL - 
+    - Maximum - 
+    - Minimum - 
+    - Offset -
+    
 
-  - Filter Gallery, Liquify, Vanishing Point, Pixelate, Render,
-    Stylize - not started
+  - Filter Gallery, Liquify, Vanishing Point - not started
 
 
 - View dropdown
@@ -617,7 +703,11 @@ BUGS:
  - Panels - PR crashing when moving panel to independent panel window, and dragging another panel into 1st panel
  - Panels missing Minimize and Close buttons on top right corner
 
-Swatches Panel - to do
+Swatches Panel - done: the reflowing grid, click for foreground, ctrl-click
+for background, alt-click to delete, the empty area and the footer button to
+add one from the foreground colour, named tooltips, and a context menu with
+New / Delete / Reset. Not done: loading and saving `.aco` libraries, the
+preset libraries in the panel menu, and the list view modes.
 
 
 File format support:

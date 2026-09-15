@@ -87,6 +87,42 @@ private:
     QPointF m_center{0.5, 0.5};
 };
 
+/// The whole picture, fitted into a box, with a crosshair you drag to place
+/// something in it — CS6's Lens Flare preview, and where the lamp stands in
+/// Lighting Effects.
+///
+/// Unlike [`FilterPreviewPane`] this shows the image *entire* rather than a
+/// magnified region, because the question it answers is "where in the frame
+/// does this sit" — which a crop cannot show. The picture it draws is a
+/// shrunk proxy the engine filters (`Engine::filterProxyPreview`), so dragging
+/// the crosshair across a large photograph stays interactive.
+///
+/// The centre is kept in normalized 0..1 coordinates, so it means the same
+/// thing on the proxy as on the layer itself.
+class PlacementPreviewWidget : public QWidget
+{
+public:
+    PlacementPreviewWidget(FilterPreviewDialog *dialog, const QPointF &initial);
+
+    void setContent(const QImage &image);
+    QPointF center() const { return m_center; }
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+
+private:
+    /// Where the fitted image sits inside the widget — the crosshair is
+    /// placed against the picture, not the box around it.
+    QRectF imageRect() const;
+    void moveCenterTo(const QPointF &pos);
+
+    FilterPreviewDialog *m_dialog = nullptr;
+    QImage m_image;
+    QPointF m_center;
+};
+
 /// The wireframe CS6 draws beside Pinch's preview: a regular grid deformed the
 /// way the filter will deform the picture.
 ///
@@ -172,9 +208,12 @@ public:
     /// `withSlider` adds CS6's slider under the field. Off for the dialogs
     /// that have none — Color Halftone is a set of plain numbers, and a
     /// slider under each would be four times the height for no gain.
+    /// `enabledWhen` is asked, whenever anything changes, whether the row
+    /// should be live — Lighting Effects greys its Hotspot out for a lamp
+    /// that has no cone, and its Height out with no texture to raise.
     int addParameter(const QString &label, double min, double max, double value,
                      int decimals = 0, const QString &suffix = QString(),
-                     bool withSlider = true);
+                     bool withSlider = true, std::function<bool()> enabledWhen = {});
 
     /// Add an angle: a field in degrees with CS6's angle wheel beside it, and
     /// no slider — an angle wraps, so a bar with two ends is the wrong shape
@@ -219,8 +258,11 @@ public:
     void addDistortGrid();
 
     /// A tick box — Add Noise's "Monochromatic". Fills one slot, worth 1 when
-    /// ticked and 0 when not.
-    int addCheckBox(const QString &label, bool checked);
+    /// ticked and 0 when not. `enabledWhen` greys it out behind another
+    /// control, as CS6 greys Extrude's Solid Front Faces out for a shape that
+    /// has no front face.
+    int addCheckBox(const QString &label, bool checked,
+                    std::function<bool()> enabledWhen = {});
 
     /// Put everything added from here on into a tab of this name, as CS6's
     /// longer filter dialogs are divided. The first call turns the parameter
@@ -250,9 +292,27 @@ public:
     int addRadioChoice(const QString &title, const QStringList &items,
                        const QList<double> &values, int index);
 
+    /// CS6's Custom dialog: a `size`×`size` grid of weights read row by row
+    /// from the top left, with Scale and Offset on a row beneath it. Fills
+    /// `size * size + 2` slots — the weights, then Scale, then Offset — and
+    /// returns the first.
+    ///
+    /// Its own method rather than `size * size + 2` calls to `addParameter`
+    /// because the grid *is* the control: twenty-five labelled rows each with
+    /// a slider would be a dialog several screens tall, and CS6's is a block
+    /// of bare fields you read as a matrix.
+    int addKernelGrid(int size, const QList<double> &weights, double scale, double offset);
+
     /// Add CS6's Blur Center box. Fills **two** slots, x then y, in normalized
     /// 0..1 coordinates, and returns the first of them.
     int addCenterPicker(const QString &title, std::function<bool()> spinning);
+
+    /// Add the whole-picture preview with its draggable crosshair, in place
+    /// of the magnified thumbnail. Fills **two** slots, x then y in
+    /// normalized 0..1 coordinates, and returns the first of them. `initial`
+    /// is where the crosshair starts — the middle of the frame, or wherever
+    /// it was left last time.
+    int addPlacementPreview(const QPointF &initial = QPointF(0.5, 0.5));
 
     /// Drive the canvas preview through something other than `applyFilter`.
     ///
@@ -273,6 +333,16 @@ public:
     /// The parameters, in the order they were added — what
     /// `Engine::applyFilter` takes.
     QList<float> parameters() const;
+
+private:
+    /// Move OK/Cancel and Preview from the column beside the thumbnail into a
+    /// row at the foot of the dialog — the shape for a dialog without a
+    /// thumbnail. Called from showEvent, when the caller has finished adding
+    /// controls, not from setPreviewPaneVisible: a footer placed mid-build
+    /// would end up stranded above whatever was added after it.
+    void placeFooterButtons();
+
+public:
 
     /// One of them, for a caller that needs to look at a control's value while
     /// building the dialog: the Blur Center box asks the method's slot which
@@ -330,6 +400,8 @@ private:
     /// to the foot of the dialog when there is not — a column of two buttons
     /// alone at the top of a dialog with nothing beside it reads as a mistake.
     QDialogButtonBox *m_buttons = nullptr;
+    /// Whether `placeFooterButtons` has run — it must run only once.
+    bool m_buttonsAtFoot = false;
     QVBoxLayout *m_sideColumn = nullptr;
     QCheckBox *m_preview = nullptr;
     QGridLayout *m_params = nullptr;
@@ -350,6 +422,8 @@ private:
     QList<BlurCenterWidget *> m_pickers;
     /// The distortion wireframe, if this dialog has one.
     DistortGridWidget *m_distortGrid = nullptr;
+    /// The whole-picture preview, if this dialog has one.
+    PlacementPreviewWidget *m_placement = nullptr;
 
     /// One entry per parameter, in the order they were added — each just a
     /// way of reading the control that owns it. A closure rather than a widget

@@ -1,13 +1,13 @@
 #include "FilterPreviewDialog.h"
 
 #include "AngleDial.h"
+#include "ColorPickerDialog.h"
 
 #include "../tools/ToolIcons.h"
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QCheckBox>
-#include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QButtonGroup>
@@ -54,6 +54,11 @@ constexpr int kPaneHeight = 200;
 
 /// CS6's Blur Center box is a small square beside the options.
 constexpr int kCenterBoxSize = 108;
+
+/// The whole-picture preview, which is bigger than the shared thumbnail: it
+/// shows the picture entire, and pointing at a place in it wants room.
+constexpr int kPlacementWidth = 250;
+constexpr int kPlacementHeight = 250;
 
 /// Pinch's wireframe, which CS6 puts under the OK/Cancel column.
 constexpr int kGridBoxSize = 120;
@@ -234,6 +239,104 @@ void BlurCenterWidget::moveCenterTo(const QPointF &pos)
 {
     const QPointF wanted(qBound(0.0, pos.x() / width(), 1.0),
                          qBound(0.0, pos.y() / height(), 1.0));
+    if (wanted == m_center) {
+        return;
+    }
+    m_center = wanted;
+    update();
+    m_dialog->parametersChanged();
+}
+
+// ------------------------------------------------------- placement centre --
+
+PlacementPreviewWidget::PlacementPreviewWidget(FilterPreviewDialog *dialog, const QPointF &initial)
+    : QWidget(dialog)
+    , m_dialog(dialog)
+    , m_center(qBound(0.0, initial.x(), 1.0), qBound(0.0, initial.y(), 1.0))
+{
+    setFixedSize(kPlacementWidth, kPlacementHeight);
+    setCursor(Qt::CrossCursor);
+    setToolTip(QCoreApplication::translate("PlacementPreviewWidget",
+                                           "Click or drag to move the centre of the flare"));
+}
+
+void PlacementPreviewWidget::setContent(const QImage &image)
+{
+    m_image = image;
+    update();
+}
+
+QRectF PlacementPreviewWidget::imageRect() const
+{
+    if (m_image.isNull()) {
+        return QRectF(rect());
+    }
+    // Fitted, keeping the picture's shape: the flare's position means a
+    // fraction of the *image*, so a stretched preview would point at the
+    // wrong place.
+    const double scale = std::min(double(width()) / m_image.width(),
+                                  double(height()) / m_image.height());
+    const QSizeF size(m_image.width() * scale, m_image.height() * scale);
+    return QRectF(QPointF((width() - size.width()) / 2.0, (height() - size.height()) / 2.0),
+                  size);
+}
+
+void PlacementPreviewWidget::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event)
+    QPainter painter(this);
+    painter.fillRect(rect(), QColor(0x2b, 0x2b, 0x2b));
+
+    const QRectF area = imageRect();
+    if (!m_image.isNull()) {
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        painter.drawImage(area, m_image);
+    }
+
+    // CS6's crosshair: a cross with a gap in the middle, so what is under it
+    // stays visible. Black under white, so it reads on a blown-out flare as
+    // well as on a dark picture.
+    const QPointF at(area.x() + m_center.x() * area.width(),
+                     area.y() + m_center.y() * area.height());
+    constexpr double kArm = 9.0;
+    constexpr double kGap = 3.0;
+    const QList<QLineF> cross{{at + QPointF(-kArm, 0), at + QPointF(-kGap, 0)},
+                              {at + QPointF(kGap, 0), at + QPointF(kArm, 0)},
+                              {at + QPointF(0, -kArm), at + QPointF(0, -kGap)},
+                              {at + QPointF(0, kGap), at + QPointF(0, kArm)}};
+    for (const auto &[colour, pen] : {std::pair{QColor(0, 0, 0, 180), 3.0},
+                                      std::pair{QColor(255, 255, 255), 1.0}}) {
+        painter.setPen(QPen(colour, pen));
+        for (const QLineF &line : cross) {
+            painter.drawLine(line);
+        }
+    }
+
+    painter.setPen(QPen(QColor(0x14, 0x14, 0x14), 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRect(rect().adjusted(0, 0, -1, -1));
+}
+
+void PlacementPreviewWidget::mousePressEvent(QMouseEvent *event)
+{
+    moveCenterTo(event->position());
+}
+
+void PlacementPreviewWidget::mouseMoveEvent(QMouseEvent *event)
+{
+    if (event->buttons() & Qt::LeftButton) {
+        moveCenterTo(event->position());
+    }
+}
+
+void PlacementPreviewWidget::moveCenterTo(const QPointF &pos)
+{
+    const QRectF area = imageRect();
+    if (area.width() <= 0.0 || area.height() <= 0.0) {
+        return;
+    }
+    const QPointF wanted(qBound(0.0, (pos.x() - area.x()) / area.width(), 1.0),
+                         qBound(0.0, (pos.y() - area.y()) / area.height(), 1.0));
     if (wanted == m_center) {
         return;
     }
@@ -528,10 +631,12 @@ FilterPreviewDialog::~FilterPreviewDialog()
 }
 
 int FilterPreviewDialog::addParameter(const QString &label, double min, double max, double value,
-                                      int decimals, const QString &suffix, bool withSlider)
+                                      int decimals, const QString &suffix, bool withSlider,
+                                      std::function<bool()> enabledWhen)
 {
     const int row = m_params->rowCount();
 
+    auto *caption = new QLabel(label, this);
     auto *spin = new QDoubleSpinBox(this);
     spin->setDecimals(decimals);
     spin->setRange(min, max);
@@ -539,8 +644,14 @@ int FilterPreviewDialog::addParameter(const QString &label, double min, double m
     spin->setSuffix(suffix);
     spin->setSingleStep(decimals > 0 ? 0.1 : 1.0);
 
-    m_params->addWidget(new QLabel(label, this), row, 0);
+    m_params->addWidget(caption, row, 0);
     m_params->addWidget(spin, row, 1);
+    // The whole row follows, not just the field: a live label over a dead
+    // slider reads as a bug rather than as a control that does not apply.
+    if (enabledWhen) {
+        m_conditional.append({caption, enabledWhen});
+        m_conditional.append({spin, enabledWhen});
+    }
 
     if (!withSlider) {
         connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { parametersChanged(); });
@@ -557,6 +668,9 @@ int FilterPreviewDialog::addParameter(const QString &label, double min, double m
     slider->setRange(int(std::lround(min * scale)), int(std::lround(max * scale)));
     slider->setValue(int(std::lround(value * scale)));
     m_params->addWidget(slider, row + 1, 0, 1, 2);
+    if (enabledWhen) {
+        m_conditional.append({slider, enabledWhen});
+    }
 
     connect(spin, &QDoubleSpinBox::valueChanged, this, [this, slider, scale](double v) {
         QSignalBlocker block(slider);
@@ -785,12 +899,16 @@ int FilterPreviewDialog::addChoiceWithAngle(const QString &label, const QStringL
     return first;
 }
 
-int FilterPreviewDialog::addCheckBox(const QString &label, bool checked)
+int FilterPreviewDialog::addCheckBox(const QString &label, bool checked,
+                                     std::function<bool()> enabledWhen)
 {
     auto *box = new QCheckBox(label, this);
     box->setChecked(checked);
     m_params->addWidget(box, m_params->rowCount(), 0, 1, 2);
     connect(box, &QCheckBox::toggled, this, [this] { parametersChanged(); });
+    if (enabledWhen) {
+        m_conditional.append({box, enabledWhen});
+    }
 
     m_slots.append([box] { return box->isChecked() ? 1.0 : 0.0; });
     return m_slots.size() - 1;
@@ -841,7 +959,8 @@ int FilterPreviewDialog::addColorButton(const QString &label, const QColor &init
 
     connect(button, &QPushButton::clicked, this, [this, button, paint] {
         const QColor before = button->property("swatch").value<QColor>();
-        const QColor picked = QColorDialog::getColor(before, this, tr("Color"));
+        // The app's own picker, not Qt's — one colour chooser everywhere.
+        const QColor picked = ColorPickerDialog::getColor(before, this, tr("Custom Color"));
         if (picked.isValid()) {
             button->setProperty("swatch", picked);
             paint();
@@ -897,6 +1016,63 @@ int FilterPreviewDialog::addRadioChoice(const QString &title, const QStringList 
     return m_slots.size() - 1;
 }
 
+int FilterPreviewDialog::addKernelGrid(int size, const QList<double> &weights, double scale,
+                                       double offset)
+{
+    // Bare fields with no spin arrows, narrow enough that five of them read
+    // as a matrix rather than as five separate controls — CS6's block of
+    // little boxes.
+    auto cell = [this](QWidget *parent, double min, double max, double value) {
+        auto *field = new QDoubleSpinBox(parent);
+        field->setDecimals(0);
+        field->setRange(min, max);
+        field->setValue(value);
+        field->setButtonSymbols(QAbstractSpinBox::NoButtons);
+        field->setAlignment(Qt::AlignCenter);
+        field->setMinimumWidth(48);
+        connect(field, &QDoubleSpinBox::valueChanged, this, [this] { parametersChanged(); });
+        return field;
+    };
+
+    auto *grid = new QWidget(this);
+    auto *cells = new QGridLayout(grid);
+    cells->setContentsMargins(0, 0, 0, 0);
+    cells->setSpacing(3);
+
+    QList<QDoubleSpinBox *> fields;
+    for (int i = 0; i < size * size; ++i) {
+        // CS6's fields take a whole number either side of zero; a weight
+        // larger than this is a picture of nothing but clipping.
+        QDoubleSpinBox *field = cell(grid, -999, 999, weights.value(i, 0.0));
+        cells->addWidget(field, i / size, i % size);
+        fields.append(field);
+    }
+    m_params->addWidget(grid, m_params->rowCount(), 0, 1, 2, Qt::AlignCenter);
+
+    // Scale and Offset share one row under the grid, as they do in CS6.
+    auto *footer = new QWidget(this);
+    auto *row = new QHBoxLayout(footer);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->addWidget(new QLabel(tr("Scale:"), footer));
+    // Scale is a divisor, so zero is not a number it can take.
+    QDoubleSpinBox *scaleField = cell(footer, 1, 9999, scale);
+    row->addWidget(scaleField);
+    row->addSpacing(12);
+    row->addWidget(new QLabel(tr("Offset:"), footer));
+    QDoubleSpinBox *offsetField = cell(footer, -9999, 9999, offset);
+    row->addWidget(offsetField);
+    row->addStretch(1);
+    m_params->addWidget(footer, m_params->rowCount(), 0, 1, 2);
+
+    const int first = m_slots.size();
+    for (QDoubleSpinBox *field : fields) {
+        m_slots.append([field] { return field->value(); });
+    }
+    m_slots.append([scaleField] { return scaleField->value(); });
+    m_slots.append([offsetField] { return offsetField->value(); });
+    return first;
+}
+
 int FilterPreviewDialog::addCenterPicker(const QString &title, std::function<bool()> spinning)
 {
     auto *box = new QGroupBox(title, this);
@@ -912,6 +1088,27 @@ int FilterPreviewDialog::addCenterPicker(const QString &title, std::function<boo
     const int first = m_slots.size();
     m_slots.append([picker] { return picker->center().x(); });
     m_slots.append([picker] { return picker->center().y(); });
+    return first;
+}
+
+int FilterPreviewDialog::addPlacementPreview(const QPointF &initial)
+{
+    // It stands where the magnified thumbnail would, because it *is* this
+    // dialog's preview — CS6 shows one or the other, never both.
+    setPreviewPaneVisible(false);
+    m_placement = new PlacementPreviewWidget(this, initial);
+    if (auto *root = qobject_cast<QGridLayout *>(layout())) {
+        root->addWidget(m_placement, 0, 0, Qt::AlignTop | Qt::AlignLeft);
+    }
+    // Hiding the thumbnail took the Preview tick with it, but there is a
+    // preview here to switch on, and CS6's Lens Flare has one.
+    m_preview->setVisible(true);
+    m_preview->setChecked(true);
+
+    // One widget, two slots — the filter takes the centre as a pair.
+    const int first = m_slots.size();
+    m_slots.append([this] { return m_placement->center().x(); });
+    m_slots.append([this] { return m_placement->center().y(); });
     return first;
 }
 
@@ -937,16 +1134,10 @@ void FilterPreviewDialog::setPreviewPaneVisible(bool visible)
     m_preview->setVisible(visible || bool(m_canvasDriver));
     m_preview->setChecked(visible || bool(m_canvasDriver));
 
-    // With no thumbnail to sit beside, the buttons drop to the foot of the
-    // dialog. Left where they were they would be a column of two floating at
-    // the top with nothing alongside them.
-    if (!visible) {
-        m_sideColumn->removeWidget(m_buttons);
-        m_buttons->setOrientation(Qt::Horizontal);
-        auto *root = static_cast<QGridLayout *>(layout());
-        root->addWidget(m_buttons, root->rowCount(), 0, 1, 2);
-    }
-    adjustSize();
+    // With no thumbnail the buttons move to the foot of the dialog — but not
+    // here: the caller may still be building (Flame starts its tabs after
+    // this), and a footer placed now would end up above the later rows. The
+    // move happens in showEvent, once the dialog is complete.
 }
 
 void FilterPreviewDialog::addDistortGrid()
@@ -1073,10 +1264,22 @@ void FilterPreviewDialog::parametersChanged()
 
 void FilterPreviewDialog::refreshPreview()
 {
+    if (!m_engine) {
+        return;
+    }
+    // A whole-picture preview shows the frame entire rather than a region of
+    // it, and comes back already shrunk to fit.
+    if (m_placement) {
+        const QList<float> params = parameters();
+        m_placement->setContent(m_engine->filterProxyPreview(
+            m_filterName, rust::Slice<const float>(params.constData(), size_t(params.size())),
+            m_placement->width(), m_placement->height()));
+        return;
+    }
     // Nothing to draw, and for Radial Blur — the one dialog without a
     // thumbnail — asking would mean filtering the whole layer for an image
     // nobody sees, which is a second or more on a large one.
-    if (!m_engine || !m_paneVisible) {
+    if (!m_paneVisible) {
         return;
     }
     const QRectF region = previewRegion();
@@ -1109,9 +1312,45 @@ void FilterPreviewDialog::refreshCanvasPreview()
     }
 }
 
+void FilterPreviewDialog::placeFooterButtons()
+{
+    // With no thumbnail beside them, the OK/Cancel column becomes a row at
+    // the foot of the dialog — Preview on the left, the buttons on the right.
+    // Left where they were they would be a column of two floating at the top
+    // with nothing alongside them.
+    m_sideColumn->removeWidget(m_buttons);
+    m_sideColumn->removeWidget(m_preview);
+    m_buttons->setOrientation(Qt::Horizontal);
+    auto *foot = new QHBoxLayout();
+    foot->addWidget(m_preview);
+    foot->addStretch(1);
+    foot->addWidget(m_buttons);
+    auto *root = static_cast<QGridLayout *>(layout());
+    root->addLayout(foot, root->rowCount(), 0, 1, 2);
+    // Runs during showEvent, past the point where showing activates the
+    // layout on its own — without this the row sits at 0,0 until the next
+    // pass.
+    root->activate();
+    adjustSize();
+}
+
 void FilterPreviewDialog::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
+    // The dialog is fully built now, so the footer can safely take the last
+    // row — placed any earlier it could end up stranded mid-dialog.
+    // A whole-picture preview is the exception: it stands where the thumbnail
+    // would, so the buttons have something to sit beside after all and stay
+    // in the column, as CS6's do.
+    if (!m_paneVisible && !m_placement && !m_buttonsAtFoot) {
+        m_buttonsAtFoot = true;
+        placeFooterButtons();
+    }
+    // Rows that follow another control start in the right state rather than
+    // waiting for the first change to grey themselves out.
+    for (const auto &[widget, live] : m_conditional) {
+        widget->setEnabled(live());
+    }
     // Both previews are drawn once the dialog is up rather than during
     // construction, so that a caller still adding parameters is not filtering
     // the layer once per parameter.

@@ -2651,6 +2651,21 @@ pub mod ffi {
             height: i32,
         ) -> QImage;
 
+        /// What the filter would make of the *whole* layer, shrunk to fit a
+        /// box — for Lens Flare, whose dialog shows where the flare sits in
+        /// the entire frame rather than a region magnified. Null if there is
+        /// nothing to filter. See `Document::filter_proxy` for why this is
+        /// not the path the other dialogs take.
+        #[qinvokable]
+        #[cxx_name = "filterProxyPreview"]
+        fn filter_proxy_preview(
+            self: &Engine,
+            name: &QString,
+            params: &[f32],
+            max_width: i32,
+            max_height: i32,
+        ) -> QImage;
+
         /// Filter ▸ Render ▸ Flame: burn along the active path.
         ///
         /// `params` are what its dialog collected, positionally. Returns
@@ -7865,14 +7880,39 @@ impl ffi::Engine {
     /// A filter from the menu name and the dialog's numbers, with anything
     /// that comes from the document rather than from the dialog filled in.
     ///
-    /// At present that is Pointillize alone, which paints the gaps between its
-    /// dabs in the background colour — a property of the document, which its
-    /// dialog therefore does not ask for and the shell should not have to
-    /// know to send.
+    /// That is Pointillize, which paints the gaps between its dabs in the
+    /// background colour, and Fibers, which draws between the two swatch
+    /// colours — properties of the document, which their dialogs therefore
+    /// do not ask for and the shell should not have to know to send.
     fn filter_for(&self, name: &QString, params: &[f32]) -> Option<Filter> {
         let mut filter = Filter::from_menu_name(&name.to_string(), params)?;
-        if let Filter::Pointillize { background, .. } = &mut filter {
-            *background = self.background;
+        match &mut filter {
+            Filter::Pointillize { background, .. } => *background = self.background,
+            Filter::Fibers {
+                foreground,
+                background,
+                ..
+            } => {
+                *foreground = self.foreground;
+                *background = self.background;
+            }
+            // Neon Glow renders the picture between the two swatches and
+            // lights it with the one colour its dialog does ask for.
+            Filter::NeonGlow {
+                foreground,
+                background,
+                ..
+            } => {
+                *foreground = self.foreground;
+                *background = self.background;
+            }
+            // Tiles fills the gaps its shifted tiles leave with one swatch or
+            // the other, so it needs both whichever was chosen.
+            Filter::Tiles { options } => {
+                options.foreground = self.foreground;
+                options.background = self.background;
+            }
+            _ => {}
         }
         Some(filter)
     }
@@ -7899,6 +7939,28 @@ impl ffi::Engine {
         match self
             .doc
             .filter_preview(filter, Rect::new(x, y, width as u32, height as u32))
+        {
+            Some(pm) => pixmap_to_qimage(pm),
+            None => QImage::default(),
+        }
+    }
+
+    fn filter_proxy_preview(
+        &self,
+        name: &QString,
+        params: &[f32],
+        max_width: i32,
+        max_height: i32,
+    ) -> QImage {
+        if max_width <= 0 || max_height <= 0 {
+            return QImage::default();
+        }
+        let Some(filter) = self.filter_for(name, params) else {
+            return QImage::default();
+        };
+        match self
+            .doc
+            .filter_proxy(filter, max_width as u32, max_height as u32)
         {
             Some(pm) => pixmap_to_qimage(pm),
             None => QImage::default(),

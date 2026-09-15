@@ -134,6 +134,137 @@ pub fn convolve(pixmap: &mut Pixmap, kernel: &Kernel) {
         });
 }
 
+/// Spread the brightest values about: every pixel takes the largest value
+/// within `radius` of it, per channel.
+///
+/// A maximum over a box is separable the same way a blur is, so this is two
+/// passes of one dimension each and costs `O(r)` per pixel rather than
+/// `O(r²)`. Glowing Edges thickens its lines with it; Colored Pencil spreads
+/// its detail mask out over the region the detail sits in.
+pub(crate) fn dilate(source: &Pixmap, radius: i32) -> Pixmap {
+    let pass = |input: &Pixmap, horizontal: bool| {
+        let width = input.width() as i32;
+        let height = input.height() as i32;
+        let mut out = Pixmap::new(input.width(), input.height());
+        let stride = out.stride();
+        out.as_bytes_mut()
+            .par_chunks_exact_mut(stride)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let y = row as i32;
+                for x in 0..width {
+                    let mut best = [0u8; 3];
+                    for step in -radius..=radius {
+                        let p = if horizontal {
+                            input.get((x + step).clamp(0, width - 1), y)
+                        } else {
+                            input.get(x, (y + step).clamp(0, height - 1))
+                        };
+                        best[0] = best[0].max(p.r);
+                        best[1] = best[1].max(p.g);
+                        best[2] = best[2].max(p.b);
+                    }
+                    let i = x as usize * 4;
+                    out[i..i + 3].copy_from_slice(&best);
+                    out[i + 3] = 255;
+                }
+            });
+        out
+    };
+    pass(&pass(source, true), false)
+}
+
+/// The side of CS6's Custom kernel, and so the number of weights it holds.
+pub const CUSTOM_SIZE: usize = 5;
+pub const CUSTOM_WEIGHTS: usize = CUSTOM_SIZE * CUSTOM_SIZE;
+
+/// What CS6's Custom dialog opens with: the classic sharpen, a 5 in the middle
+/// pulling against a -1 on each of its four sides.
+pub fn custom_default() -> [f32; CUSTOM_WEIGHTS] {
+    let mut weights = [0.0; CUSTOM_WEIGHTS];
+    weights[2 * CUSTOM_SIZE + 2] = 5.0;
+    weights[1 * CUSTOM_SIZE + 2] = -1.0;
+    weights[3 * CUSTOM_SIZE + 2] = -1.0;
+    weights[2 * CUSTOM_SIZE + 1] = -1.0;
+    weights[2 * CUSTOM_SIZE + 3] = -1.0;
+    weights
+}
+
+/// Filter ▸ Other ▸ Custom: the convolution the user writes out by hand.
+///
+/// Each output pixel is the weighted sum of the 5×5 block around it, divided
+/// by `scale` and shifted by `offset` — which is CS6's dialog exactly: the
+/// grid of weights, the Scale that stands for "divide the total by this", and
+/// the Offset added afterwards so a kernel that sums to nothing has somewhere
+/// to put its negatives.
+///
+/// Unlike the rest of this module it leaves **alpha alone**. Running the
+/// user's weights over the alpha channel as well would let an edge-detect
+/// kernel — a perfectly ordinary thing to type in, since its weights sum to
+/// zero — delete the whole layer. The colour is still convolved
+/// premultiplied, so a soft edge does not drag the colour of transparent
+/// pixels into view.
+///
+/// No GPU path, for the reason the rest of the Blur and Sharpen family has
+/// none: one filter that uploads its input and reads the result straight back
+/// rarely pays for the trip (docs/gpu-migration.md).
+pub fn custom(pixmap: &mut Pixmap, weights: &[f32; CUSTOM_WEIGHTS], scale: f32, offset: f32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    // CS6's Scale cannot be zero; a file with one in it would divide the
+    // picture into infinity, so it reads as "do not scale".
+    let inv = if scale.abs() < 1e-6 { 1.0 } else { 1.0 / scale };
+    let radius = (CUSTOM_SIZE / 2) as i32;
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+
+    let mut src = pixmap.clone();
+    src.premultiply();
+    let src = &src;
+
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let y = row as i32;
+            for x in 0..width {
+                let mut acc = [0.0f32; 3];
+                for ky in -radius..=radius {
+                    for kx in -radius..=radius {
+                        let w = weights[((ky + radius) as usize) * CUSTOM_SIZE
+                            + (kx + radius) as usize];
+                        if w == 0.0 {
+                            continue;
+                        }
+                        // Clamp-to-edge, so the border does not read as a
+                        // cliff and draw a line round the picture.
+                        let p = src.get((x + kx).clamp(0, width - 1), (y + ky).clamp(0, height - 1));
+                        acc[0] += p.r as f32 * w;
+                        acc[1] += p.g as f32 * w;
+                        acc[2] += p.b as f32 * w;
+                    }
+                }
+
+                let i = x as usize * 4;
+                // The alpha the pixel came with — it is not part of the sum,
+                // and it is what the colour has to be un-premultiplied by.
+                let a = out[i + 3] as f32;
+                if a <= 0.0 {
+                    continue;
+                }
+                for (c, value) in acc.into_iter().enumerate() {
+                    // Back to straight alpha before the offset, so that the
+                    // offset means the level CS6's field says it does.
+                    let straight = value * inv * 255.0 / a;
+                    out[i + c] = (straight + offset).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+}
+
 /// Gaussian blur with the given standard-deviation-like `radius`, in pixels.
 ///
 /// Implemented as two 1-D passes; a 2-D Gaussian is separable, so this is
@@ -1818,5 +1949,122 @@ mod blur_tests {
             softness(&spun),
             softness(&zoomed)
         );
+    }
+}
+
+#[cfg(test)]
+mod custom_tests {
+    use super::*;
+
+    fn grey(v: u8) -> Pixmap {
+        Pixmap::filled(16, 16, Rgba8::new(v, v, v, 255))
+    }
+
+    /// An identity kernel — a single 1 in the middle — gives the picture
+    /// back, which is the ground everything else is measured against.
+    #[test]
+    fn the_identity_kernel_changes_nothing() {
+        let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+        weights[CUSTOM_WEIGHTS / 2] = 1.0;
+        let mut pm = Pixmap::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                pm.set(x, y, Rgba8::new((x * 30) as u8, (y * 30) as u8, 90, 255));
+            }
+        }
+        let before = pm.clone();
+        custom(&mut pm, &weights, 1.0, 0.0);
+        assert_eq!(pm.as_bytes(), before.as_bytes());
+    }
+
+    /// Scale divides the total, so an identity kernel over 2 halves the
+    /// picture — which is how CS6's field is meant to read.
+    #[test]
+    fn scale_divides_and_offset_is_added_afterwards() {
+        let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+        weights[CUSTOM_WEIGHTS / 2] = 1.0;
+
+        let mut pm = grey(200);
+        custom(&mut pm, &weights, 2.0, 0.0);
+        assert_eq!(pm.get(8, 8).r, 100);
+
+        let mut pm = grey(200);
+        custom(&mut pm, &weights, 2.0, 30.0);
+        assert_eq!(pm.get(8, 8).r, 130);
+    }
+
+    /// A zero Scale would divide the picture into infinity, so it reads as
+    /// "do not scale" rather than producing white.
+    #[test]
+    fn a_zero_scale_is_treated_as_one() {
+        let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+        weights[CUSTOM_WEIGHTS / 2] = 1.0;
+        let mut pm = grey(120);
+        custom(&mut pm, &weights, 0.0, 0.0);
+        assert_eq!(pm.get(8, 8).r, 120);
+    }
+
+    /// The weights that sum to zero are the whole reason Offset exists: an
+    /// edge detector over flat ground gives nothing, and the offset is where
+    /// that nothing sits.
+    #[test]
+    fn a_zero_sum_kernel_lands_on_the_offset() {
+        let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+        weights[CUSTOM_WEIGHTS / 2] = 4.0;
+        weights[1 * CUSTOM_SIZE + 2] = -1.0;
+        weights[3 * CUSTOM_SIZE + 2] = -1.0;
+        weights[2 * CUSTOM_SIZE + 1] = -1.0;
+        weights[2 * CUSTOM_SIZE + 3] = -1.0;
+
+        let mut pm = grey(120);
+        custom(&mut pm, &weights, 1.0, 128.0);
+        assert_eq!(pm.get(8, 8).r, 128);
+    }
+
+    /// Alpha is not part of the sum. A zero-sum kernel run over the alpha
+    /// channel as well would take the layer away altogether, and an
+    /// edge-detect is an ordinary thing to type into this dialog.
+    #[test]
+    fn a_zero_sum_kernel_does_not_delete_the_layer() {
+        let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+        weights[CUSTOM_WEIGHTS / 2] = 4.0;
+        weights[1 * CUSTOM_SIZE + 2] = -1.0;
+        weights[3 * CUSTOM_SIZE + 2] = -1.0;
+        weights[2 * CUSTOM_SIZE + 1] = -1.0;
+        weights[2 * CUSTOM_SIZE + 3] = -1.0;
+
+        let mut pm = Pixmap::filled(16, 16, Rgba8::new(120, 120, 120, 200));
+        custom(&mut pm, &weights, 1.0, 0.0);
+        assert!(pm.as_bytes().chunks_exact(4).all(|p| p[3] == 200));
+    }
+
+    /// The default the dialog opens with is a sharpener, so it has to make an
+    /// edge steeper rather than softer.
+    #[test]
+    fn the_default_kernel_sharpens() {
+        // A softened step: something with a shoulder for a sharpener to
+        // find. A straight ramp would not do — a sharpen kernel is built on
+        // the second difference, which a straight line has none of.
+        let mut pm = Pixmap::new(32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                let v = if x < 16 { 0 } else { 255 };
+                pm.set(x, y, Rgba8::new(v, v, v, 255));
+            }
+        }
+        gaussian_blur(&mut pm, 2.0);
+        let before = pm.clone();
+        custom(&mut pm, &custom_default(), 1.0, 0.0);
+        let step = |px: &Pixmap| px.get(16, 16).r as i32 - px.get(15, 16).r as i32;
+        assert!(
+            step(&pm) > step(&before),
+            "the default kernel softened the ramp instead of steepening it"
+        );
+    }
+
+    #[test]
+    fn a_custom_kernel_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        custom(&mut pm, &custom_default(), 1.0, 0.0);
     }
 }

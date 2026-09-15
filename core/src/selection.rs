@@ -569,6 +569,18 @@ impl Selection {
 
     /// Bounding box of all selected pixels. Empty when nothing is selected.
     pub fn bounds(&mut self) -> Rect {
+        let b = self.immediate_bounds();
+        self.cached_bounds = Some(b);
+        // The scan just answered both questions.
+        self.cached_empty.set(Some(b.is_empty()));
+        b
+    }
+
+    /// The same, for a caller that only has the selection by shared
+    /// reference — a filter preview, which must not disturb the document to
+    /// draw itself. Uses the cache when there is one and works the answer out
+    /// without filling it when there is not.
+    pub fn immediate_bounds(&self) -> Rect {
         if let Some(b) = self.cached_bounds {
             return b;
         }
@@ -588,7 +600,7 @@ impl Selection {
             }
         }
 
-        let b = if min_x > max_x {
+        if min_x > max_x {
             Rect::default()
         } else {
             Rect::new(
@@ -597,11 +609,7 @@ impl Selection {
                 (max_x - min_x + 1) as u32,
                 (max_y - min_y + 1) as u32,
             )
-        };
-        self.cached_bounds = Some(b);
-        // The scan just answered both questions.
-        self.cached_empty.set(Some(b.is_empty()));
-        b
+        }
     }
 
     /// Trace the selection boundary as closed loops of pixel-corner points, in

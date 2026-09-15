@@ -22,10 +22,12 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QSlider>
 #include <QTabWidget>
 #include <QDoubleSpinBox>
 #include <QImage>
+#include <QLabel>
 #include <QSignalSpy>
 #include <QTest>
 
@@ -52,6 +54,17 @@ private slots:
     void colorHalftoneOpensOnTheStandardPressAngles();
     void aSeparatorDoesNotShiftWhatAListMeans();
     void pointillizeTakesItsGroundFromTheDocument();
+    void lensFlarePutsItsCrosshairAfterItsTwoControls();
+    void aFlarePreviewShowsTheWholePictureNotACrop();
+    void lightingEffectsFillsItsSlotsInPanelOrder();
+    void lightingGreysOutWhatDoesNotApplyToThisLamp();
+    void diffuseOffersItsFourModesAndNothingElse();
+    void embossCollectsAngleThenHeightThenAmount();
+    void extrudeGreysOutWhatAPyramidCannotHave();
+    void tilesCollectsItsTwoNumbersThenTheFillChoice();
+    void traceContourCollectsTheLevelThenTheEdge();
+    void windCollectsTheMethodThenTheDirection();
+    void customReadsItsGridRowByRowThenScaleAndOffset();
     void flameNeedsAPathToBurnAlong();
     void aTabbedDialogStillNumbersItsControlsInOrder();
     void randomizeRollsANewSeedThatStaysPut();
@@ -499,6 +512,313 @@ void TestFilterDialog::pointillizeTakesItsGroundFromTheDocument()
         }
     }
     QVERIFY2(ground, "the gaps between the dabs are not the document's background colour");
+}
+
+void TestFilterDialog::lensFlarePutsItsCrosshairAfterItsTwoControls()
+{
+    // The crosshair is one widget filling two slots at the *end* of the list,
+    // after the two controls CS6 shows. Get that order wrong and the flare is
+    // placed by the brightness and lit by its own position.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Lens Flare"));
+    dialog.addParameter(QStringLiteral("Brightness:"), 10, 300, 143);
+    dialog.addRadioChoice(QStringLiteral("Lens Type"),
+                          {QStringLiteral("50-300mm Zoom"), QStringLiteral("35mm Prime"),
+                           QStringLiteral("105mm Prime"), QStringLiteral("Movie Prime")},
+                          {0.0, 1.0, 2.0, 3.0}, 2);
+    const int centre = dialog.addPlacementPreview();
+
+    QCOMPARE(centre, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({143.0f, 2.0f, 0.5f, 0.5f}));
+
+    // And it opens wherever it was left, not always in the middle.
+    FilterPreviewDialog resumed(&engine, QStringLiteral("Lens Flare"));
+    resumed.addParameter(QStringLiteral("Brightness:"), 10, 300, 100);
+    resumed.addRadioChoice(QStringLiteral("Lens Type"), {QStringLiteral("50-300mm Zoom")},
+                           {0.0}, 0);
+    resumed.addPlacementPreview(QPointF(0.25, 0.75));
+    QCOMPARE(resumed.parameters(), QList<float>({100.0f, 0.0f, 0.25f, 0.75f}));
+}
+
+void TestFilterDialog::aFlarePreviewShowsTheWholePictureNotACrop()
+{
+    // The question this dialog answers is where in the *frame* the flare
+    // sits, so its preview shows the picture entire — and shrunk, so that
+    // dragging the crosshair over a large photograph does not filter twenty
+    // megapixels a frame. The magnified thumbnail the other filters use
+    // cannot answer that question at all.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(20, 20, 20));
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Dark")));
+
+    const QList<float> params{100.0f, 0.0f, 0.5f, 0.5f};
+    const rust::Slice<const float> slice(params.constData(), size_t(params.size()));
+    const QImage proxy =
+        engine.filterProxyPreview(QStringLiteral("Lens Flare"), slice, 250, 250);
+    QVERIFY(!proxy.isNull());
+    QVERIFY2(proxy.width() <= 250 && proxy.height() <= 250, "the proxy was not shrunk to fit");
+    // Same shape as the layer, or the crosshair would point somewhere else.
+    QVERIFY(qAbs(double(proxy.width()) / proxy.height()
+                 - double(image.width()) / image.height())
+            < 0.02);
+    // And the flare is on it: the middle is lit, the corner is not.
+    QVERIFY(proxy.pixelColor(proxy.width() / 2, proxy.height() / 2).red() > 200);
+    QVERIFY(proxy.pixelColor(1, proxy.height() - 2).red() < 120);
+}
+
+void TestFilterDialog::lightingEffectsFillsItsSlotsInPanelOrder()
+{
+    // Nineteen slots, two of which are colour swatches filling three each and
+    // one a preview filling two. Miscount any of them and the exposure ends
+    // up in a colour channel — which still renders, and still looks like
+    // lighting, just not the lighting that was asked for.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Lighting Effects"));
+    const int type = dialog.addChoice(
+        QStringLiteral("Light Type:"),
+        {QStringLiteral("Spot"), QStringLiteral("Point"), QStringLiteral("Infinite")},
+        {0.0, 1.0, 2.0}, 1);
+    const int colour = dialog.addColorButton(QStringLiteral("Color:"), QColor(255, 200, 100));
+    const int intensity = dialog.addParameter(QStringLiteral("Intensity:"), -100, 100, 35);
+    dialog.addParameter(QStringLiteral("Hotspot:"), -100, 100, -22);
+    const int colorize = dialog.addColorButton(QStringLiteral("Colorize:"), QColor(10, 20, 30));
+    dialog.addParameter(QStringLiteral("Exposure:"), -100, 100, 15);
+    dialog.addParameter(QStringLiteral("Gloss:"), -100, 100, -13);
+    dialog.addParameter(QStringLiteral("Metallic:"), -100, 100, 41);
+    dialog.addParameter(QStringLiteral("Ambience:"), -100, 100, 44);
+    const int texture = dialog.addChoice(
+        QStringLiteral("Texture:"),
+        {QStringLiteral("None"), QStringLiteral("Red"), QStringLiteral("Green"),
+         QStringLiteral("Blue")},
+        {0.0, 1.0, 2.0, 3.0}, 2);
+    dialog.addParameter(QStringLiteral("Height:"), 0, 100, 80);
+    dialog.addParameter(QStringLiteral("Size:"), 2, 150, 60);
+    dialog.addAngleParameter(QStringLiteral("Angle:"), 120);
+    const int where = dialog.addPlacementPreview(QPointF(0.25, 0.75));
+
+    QCOMPARE(type, 0);
+    QCOMPARE(colour, 1);
+    QCOMPARE(intensity, 4);
+    QCOMPARE(colorize, 6);
+    QCOMPARE(texture, 13);
+    QCOMPARE(where, 17);
+    QCOMPARE(dialog.parameters(),
+             QList<float>({1.0f, 255.0f, 200.0f, 100.0f, 35.0f, -22.0f, 10.0f, 20.0f, 30.0f,
+                           15.0f, -13.0f, 41.0f, 44.0f, 2.0f, 80.0f, 60.0f, 120.0f, 0.25f,
+                           0.75f}));
+}
+
+void TestFilterDialog::lightingGreysOutWhatDoesNotApplyToThisLamp()
+{
+    // Only a spot has a cone to put a hotspot in, and there is no height to
+    // raise without a channel to raise it from. CS6 greys both out rather
+    // than leaving a live control that does nothing.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Lighting Effects"));
+    const int type = dialog.addChoice(
+        QStringLiteral("Light Type:"),
+        {QStringLiteral("Spot"), QStringLiteral("Point"), QStringLiteral("Infinite")},
+        {0.0, 1.0, 2.0}, 1);
+    dialog.addParameter(QStringLiteral("Hotspot:"), -100, 100, 44, 0, QString(), true,
+                        [&dialog, type] { return dialog.parameterValue(type) == 0.0f; });
+    const int texture = dialog.addChoice(
+        QStringLiteral("Texture:"), {QStringLiteral("None"), QStringLiteral("Red")}, {0.0, 1.0},
+        0);
+    dialog.addParameter(QStringLiteral("Height:"), 0, 100, 50, 0, QString(), true,
+                        [&dialog, texture] { return dialog.parameterValue(texture) != 0.0f; });
+    dialog.show();
+
+    auto rowIsLive = [&dialog](const QString &label) {
+        for (QLabel *caption : dialog.findChildren<QLabel *>()) {
+            if (caption->text() == label) {
+                return caption->isEnabled();
+            }
+        }
+        return true;
+    };
+    // Opened on a Point light with no texture: neither applies.
+    QVERIFY2(!rowIsLive(QStringLiteral("Hotspot:")), "a point light is offering a hotspot");
+    QVERIFY2(!rowIsLive(QStringLiteral("Height:")), "height is live with no texture to raise");
+
+    // Switch to a spot and the hotspot comes back.
+    for (QComboBox *box : dialog.findChildren<QComboBox *>()) {
+        if (box->count() == 3) {
+            box->setCurrentIndex(0);
+        }
+    }
+    QVERIFY2(rowIsLive(QStringLiteral("Hotspot:")), "a spot light has no hotspot control");
+    QVERIFY2(!rowIsLive(QStringLiteral("Height:")), "height woke up with no texture");
+}
+
+void TestFilterDialog::diffuseOffersItsFourModesAndNothingElse()
+{
+    // The whole of CS6's Diffuse dialog is one box of radio buttons, so the
+    // mode is parameter zero and there is no parameter one. A dialog that
+    // added a slider out of habit would send the engine a mode it never
+    // asked for.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Diffuse"));
+    const int mode = dialog.addRadioChoice(
+        QStringLiteral("Mode"),
+        {QStringLiteral("Normal"), QStringLiteral("Darken Only"),
+         QStringLiteral("Lighten Only"), QStringLiteral("Anisotropic")},
+        {0.0, 1.0, 2.0, 3.0}, 3);
+
+    QCOMPARE(mode, 0);
+    QCOMPARE(dialog.parameters(), QList<float>({3.0f}));
+}
+
+void TestFilterDialog::embossCollectsAngleThenHeightThenAmount()
+{
+    // Three numbers in CS6's order, the first of them on a wheel rather than
+    // a slider. Height and Amount are both plain numbers in the same range of
+    // sizes, so swapping them produces a picture that looks embossed and is
+    // simply wrong — the kind of mistake only the order can catch.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Emboss"));
+    const int angle = dialog.addAngleParameter(QStringLiteral("Angle:"), 135);
+    const int height = dialog.addParameter(QStringLiteral("Height:"), 1, 100, 3);
+    const int amount = dialog.addParameter(QStringLiteral("Amount:"), 1, 500, 100);
+
+    QCOMPARE(angle, 0);
+    QCOMPARE(height, 1);
+    QCOMPARE(amount, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({135.0f, 3.0f, 100.0f}));
+}
+
+void TestFilterDialog::extrudeGreysOutWhatAPyramidCannotHave()
+{
+    // Six controls, two of them tick boxes, and one of those only applies to
+    // one of the two shapes. The order matters as ever — Size and Depth are
+    // both plain numbers in overlapping ranges — and so does the greying,
+    // since a live tick box that changes nothing is worse than none.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Extrude"));
+    dialog.setPreviewPaneVisible(false);
+    const int type = dialog.addRadioChoice(
+        QStringLiteral("Type"), {QStringLiteral("Blocks"), QStringLiteral("Pyramids")},
+        {0.0, 1.0}, 1);
+    dialog.addParameter(QStringLiteral("Size:"), 2, 255, 30, 0, QString(), false);
+    dialog.addParameter(QStringLiteral("Depth:"), 1, 255, 45, 0, QString(), false);
+    dialog.addRadioChoice(QStringLiteral("Depth from"),
+                          {QStringLiteral("Random"), QStringLiteral("Level-based")}, {0.0, 1.0},
+                          1);
+    dialog.addCheckBox(QStringLiteral("Solid Front Faces"), true,
+                       [&dialog, type] { return dialog.parameterValue(type) == 0.0f; });
+    dialog.addCheckBox(QStringLiteral("Mask Incomplete Blocks"), false);
+    dialog.show();
+
+    QCOMPARE(dialog.parameters(),
+             QList<float>({1.0f, 30.0f, 45.0f, 1.0f, 1.0f, 0.0f}));
+
+    auto solidFaces = [&dialog]() -> QCheckBox * {
+        for (QCheckBox *box : dialog.findChildren<QCheckBox *>()) {
+            if (box->text() == QStringLiteral("Solid Front Faces")) {
+                return box;
+            }
+        }
+        return nullptr;
+    };
+    QVERIFY(solidFaces());
+    QVERIFY2(!solidFaces()->isEnabled(), "a pyramid is offering a solid front face");
+
+    // Back to blocks and it comes alive again.
+    for (QRadioButton *radio : dialog.findChildren<QRadioButton *>()) {
+        if (radio->text() == QStringLiteral("Blocks")) {
+            radio->click();
+        }
+    }
+    QVERIFY2(solidFaces()->isEnabled(), "blocks cannot have a solid front face");
+}
+
+void TestFilterDialog::tilesCollectsItsTwoNumbersThenTheFillChoice()
+{
+    // Two plain numbers and a box of four radios, in CS6's order. Both
+    // numbers run 1-99, so a swap sends a plausible-looking pair of values
+    // that cuts the picture the wrong way and nothing else would catch it.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Tiles"));
+    dialog.setPreviewPaneVisible(false);
+    const int count = dialog.addParameter(QStringLiteral("Number Of Tiles:"), 1, 99, 55, 0,
+                                          QString(), false);
+    const int offset = dialog.addParameter(QStringLiteral("Maximum Offset:"), 1, 99, 30, 0,
+                                           QStringLiteral("%"), false);
+    const int fill = dialog.addRadioChoice(
+        QStringLiteral("Fill Empty Area With:"),
+        {QStringLiteral("Background Color"), QStringLiteral("Foreground Color"),
+         QStringLiteral("Inverse Image"), QStringLiteral("Unaltered Image")},
+        {0.0, 1.0, 2.0, 3.0}, 2);
+    dialog.show();
+
+    QCOMPARE(count, 0);
+    QCOMPARE(offset, 1);
+    QCOMPARE(fill, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({55.0f, 30.0f, 2.0f}));
+}
+
+void TestFilterDialog::traceContourCollectsTheLevelThenTheEdge()
+{
+    // A level and which side of it to ink. Both are plain numbers to the
+    // engine, and an Edge sent as the level would ask for a contour at 1.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Trace Contour"));
+    const int level = dialog.addParameter(QStringLiteral("Level:"), 0, 255, 128);
+    const int edge = dialog.addRadioChoice(QStringLiteral("Edge"),
+                                           {QStringLiteral("Lower"), QStringLiteral("Upper")},
+                                           {0.0, 1.0}, 0);
+    dialog.show();
+
+    QCOMPARE(level, 0);
+    QCOMPARE(edge, 1);
+    QCOMPARE(dialog.parameters(), QList<float>({128.0f, 0.0f}));
+}
+
+void TestFilterDialog::windCollectsTheMethodThenTheDirection()
+{
+    // Two boxes of radios and nothing else, so the method is parameter zero
+    // and the direction parameter one. A dialog that added a slider out of
+    // habit would push the direction into a slot the engine reads as Stagger.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Wind"));
+    const int method = dialog.addRadioChoice(
+        QStringLiteral("Method"),
+        {QStringLiteral("Wind"), QStringLiteral("Blast"), QStringLiteral("Stagger")},
+        {0.0, 1.0, 2.0}, 1);
+    const int direction = dialog.addRadioChoice(
+        QStringLiteral("Direction"),
+        {QStringLiteral("From the Right"), QStringLiteral("From the Left")}, {0.0, 1.0}, 1);
+    dialog.show();
+
+    QCOMPARE(method, 0);
+    QCOMPARE(direction, 1);
+    QCOMPARE(dialog.parameters(), QList<float>({1.0f, 1.0f}));
+}
+
+void TestFilterDialog::customReadsItsGridRowByRowThenScaleAndOffset()
+{
+    // Twenty-seven slots from one control, and the engine reads the grid row
+    // by row from the top left. A grid handed over column by column would
+    // transpose every kernel anybody types in — which looks plausible for the
+    // symmetrical ones and wrong for every other.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Custom"));
+    QList<double> weights;
+    for (int i = 0; i < 25; ++i) {
+        weights.append(i);
+    }
+    const int first = dialog.addKernelGrid(5, weights, 3.0, 128.0);
+    dialog.show();
+
+    QCOMPARE(first, 0);
+    const QList<float> params = dialog.parameters();
+    QCOMPARE(params.size(), 27);
+    for (int i = 0; i < 25; ++i) {
+        QCOMPARE(params.at(i), float(i));
+    }
+    QCOMPARE(params.at(25), 3.0f);
+    QCOMPARE(params.at(26), 128.0f);
 }
 
 void TestFilterDialog::flameNeedsAPathToBurnAlong()

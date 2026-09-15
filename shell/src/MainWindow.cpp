@@ -1,5 +1,7 @@
 #include "MainWindow.h"
 
+#include "SliderPopup.h"
+
 #include "canvas/CanvasView.h"
 #include "dialogs/BlackWhiteDialog.h"
 #include "dialogs/BrightnessContrastDialog.h"
@@ -56,7 +58,9 @@
 #include "panels/ParagraphStylesPanel.h"
 #include "panels/PathsPanel.h"
 #include "panels/PropertiesPanel.h"
+#include "panels/SwatchesPanel.h"
 #include "panels/PanelHeader.h"
+#include "panels/PanelResizeGrip.h"
 #include "shortcuts/CommandRegistry.h"
 #include "tools/ToolIcons.h"
 #include "tools/ToolStrip.h"
@@ -775,9 +779,14 @@ MainWindow::MainWindow(Engine *engine, CommandRegistry *registry, QWidget *paren
     connect(m_colorPanel, &ColorPanel::foregroundChanged, this,
             [this] { refreshGradientSwatch(); });
     // The Color panel only reports the foreground; the tool strip's swatch is
-    // where the background pair is edited.
+    // where the background pair is edited — so it is also the only thing that
+    // can carry a new background colour to the engine, which the filters that
+    // paint on it (Clouds, Fibers, Pointillize) read from there.
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::backgroundChanged, this,
-            [this] { refreshGradientSwatch(); });
+            [this](const QColor &c) {
+                m_engine->setBackgroundColor(c);
+                refreshGradientSwatch();
+            });
     connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged, this,
             [this] { refreshGradientSwatch(); });
 
@@ -2058,6 +2067,40 @@ void MainWindow::createMenus()
     refreshLastFilterAction();
     filter->addSeparator();
 
+    // CS6 keeps the Artistic family in the Filter Gallery, which is not
+    // built; the Gallery's own category list is what this submenu is. Colored
+    // Pencil and Cutout are built; the rest are listed and disabled so what is
+    // missing is visible.
+    QMenu *artistic = filter->addMenu(tr("&Artistic"));
+    artistic->addAction(command(QStringLiteral("filter.coloredPencil"),
+                                tr("Colored &Pencil..."),
+                                [this] { applyFilter(QStringLiteral("Colored Pencil")); }));
+    artistic->addAction(command(QStringLiteral("filter.cutout"), tr("Cu&tout..."),
+                                [this] { applyFilter(QStringLiteral("Cutout")); }));
+    artistic->addAction(command(QStringLiteral("filter.dryBrush"), tr("&Dry Brush..."),
+                                [this] { applyFilter(QStringLiteral("Dry Brush")); }));
+    artistic->addAction(command(QStringLiteral("filter.filmGrain"), tr("&Film Grain..."),
+                                [this] { applyFilter(QStringLiteral("Film Grain")); }));
+    artistic->addAction(command(QStringLiteral("filter.fresco"), tr("F&resco..."),
+                                [this] { applyFilter(QStringLiteral("Fresco")); }));
+    artistic->addAction(command(QStringLiteral("filter.neonGlow"), tr("&Neon Glow..."),
+                                [this] { applyFilter(QStringLiteral("Neon Glow")); }));
+    artistic->addAction(command(QStringLiteral("filter.paintDaubs"), tr("Paint Dau&bs..."),
+                                [this] { applyFilter(QStringLiteral("Paint Daubs")); }));
+    artistic->addAction(command(QStringLiteral("filter.paletteKnife"), tr("Palette &Knife..."),
+                                [this] { applyFilter(QStringLiteral("Palette Knife")); }));
+    for (const QString &entry : {
+                                  tr("Plastic &Wrap..."),
+                                  tr("Poster &Edges..."), tr("Rough Pa&stels..."),
+                                  tr("Smudge St&ick..."), tr("Sp&onge..."),
+                                  tr("&Underpainting..."), tr("Water&color...")}) {
+        QAction *action = artistic->addAction(entry);
+        action->setEnabled(false);
+        action->setStatusTip(tr("%1 is not implemented")
+                                  .arg(QString(entry).remove(QLatin1Char('&'))
+                                           .remove(QStringLiteral("..."))));
+    }
+
     // CS6's Blur submenu, in its order. The three that are not here — Lens,
     // Shape and Smart Blur — are listed and disabled rather than left out:
     // Lens Blur needs a depth map to throw out of focus, Shape Blur needs the
@@ -2148,15 +2191,24 @@ void MainWindow::createMenus()
     QMenu *render = filter->addMenu(tr("&Render"));
     render->addAction(command(QStringLiteral("filter.flame"), tr("&Flame..."),
                               &MainWindow::showFlame));
-    for (const QString &entry : {tr("Pictu&re Frame..."), tr("&Tree..."),
-                                 tr("&Clouds"), tr("Di&fference Clouds"),
-                                 tr("&Fibers..."), tr("&Lens Flare..."),
-                                 tr("Li&ghting Effects...")}) {
+    render->addAction(command(QStringLiteral("filter.clouds"), tr("&Clouds"),
+                              [this] { applyFilter(QStringLiteral("Clouds")); }));
+    render->addAction(command(QStringLiteral("filter.differenceClouds"),
+                              tr("Di&fference Clouds"),
+                              [this] { applyFilter(QStringLiteral("Difference Clouds")); }));
+    render->addAction(command(QStringLiteral("filter.fibers"), tr("&Fibers..."),
+                              [this] { applyFilter(QStringLiteral("Fibers")); }));
+    render->addAction(command(QStringLiteral("filter.lensFlare"), tr("&Lens Flare..."),
+                              [this] { applyFilter(QStringLiteral("Lens Flare")); }));
+    render->addAction(command(QStringLiteral("filter.lightingEffects"),
+                              tr("Li&ghting Effects..."),
+                              [this] { applyFilter(QStringLiteral("Lighting Effects")); }));
+    for (const QString &entry : {tr("Pictu&re Frame..."), tr("&Tree...")}) {
         QAction *action = render->addAction(entry);
         action->setEnabled(false);
         action->setStatusTip(tr("%1 is not implemented")
-                                 .arg(QString(entry).remove(QLatin1Char('&'))
-                                          .remove(QStringLiteral("..."))));
+                                  .arg(QString(entry).remove(QLatin1Char('&'))
+                                           .remove(QStringLiteral("..."))));
     }
 
     // CS6's Noise submenu, in its order. Despeckle and Reduce Noise are
@@ -2176,6 +2228,49 @@ void MainWindow::createMenus()
     QAction *reduceNoise = noise->addAction(tr("&Reduce Noise..."));
     reduceNoise->setEnabled(false);
     reduceNoise->setStatusTip(tr("Reduce Noise is not implemented"));
+
+    // CS6's Stylize submenu, in its order. Diffuse, Emboss, Extrude, Find
+    // Edges, Solarize, Tiles, Trace Contour and Wind — the whole submenu is
+    // built.
+    QMenu *stylize = filter->addMenu(tr("St&ylize"));
+    stylize->addAction(command(QStringLiteral("filter.diffuse"), tr("&Diffuse..."),
+                               [this] { applyFilter(QStringLiteral("Diffuse")); }));
+    stylize->addAction(command(QStringLiteral("filter.emboss"), tr("&Emboss..."),
+                               [this] { applyFilter(QStringLiteral("Emboss")); }));
+    stylize->addAction(command(QStringLiteral("filter.extrude"), tr("E&xtrude..."),
+                               [this] { applyFilter(QStringLiteral("Extrude")); }));
+    stylize->addAction(command(QStringLiteral("filter.findEdges"), tr("&Find Edges"),
+                               [this] { applyFilter(QStringLiteral("Find Edges")); }));
+    stylize->addAction(command(QStringLiteral("filter.solarize"), tr("&Solarize"),
+                               [this] { applyFilter(QStringLiteral("Solarize")); }));
+    stylize->addAction(command(QStringLiteral("filter.tiles"), tr("&Tiles..."),
+                               [this] { applyFilter(QStringLiteral("Tiles")); }));
+    stylize->addAction(command(QStringLiteral("filter.traceContour"),
+                               tr("Trace &Contour..."),
+                               [this] { applyFilter(QStringLiteral("Trace Contour")); }));
+    stylize->addAction(command(QStringLiteral("filter.wind"), tr("&Wind..."),
+                               [this] { applyFilter(QStringLiteral("Wind")); }));
+    // CS6 keeps Glowing Edges in the Filter Gallery, which is not built. It
+    // is a Stylize filter there too, so it goes here — below a separator, so
+    // that the entries above stay CS6's submenu exactly.
+    stylize->addSeparator();
+    stylize->addAction(command(QStringLiteral("filter.glowingEdges"),
+                               tr("&Glowing Edges..."),
+                               [this] { applyFilter(QStringLiteral("Glowing Edges")); }));
+
+    // CS6's Other submenu, in its order. Custom is built; the rest are listed
+    // and disabled so what is missing is visible.
+    QMenu *other = filter->addMenu(tr("Ot&her"));
+    other->addAction(command(QStringLiteral("filter.custom"), tr("&Custom..."),
+                             [this] { applyFilter(QStringLiteral("Custom")); }));
+    for (const QString &entry : {tr("&High Pass..."), tr("&HSB/HSL"), tr("Ma&ximum..."),
+                                  tr("Mi&nimum..."), tr("&Offset...")}) {
+        QAction *action = other->addAction(entry);
+        action->setEnabled(false);
+        action->setStatusTip(tr("%1 is not implemented")
+                                  .arg(QString(entry).remove(QLatin1Char('&'))
+                                           .remove(QStringLiteral("..."))));
+    }
 
     // -- View ---------------------------------------------------------------
     QMenu *view = menuBar()->addMenu(tr("&View"));
@@ -2397,6 +2492,11 @@ void MainWindow::createToolPanel()
     m_toolsDock->setTitleBarWidget(header);
     m_toolsDock->setWidget(m_toolStrip);
     addDockWidget(Qt::LeftDockWidgetArea, m_toolsDock);
+
+    // No resize grip on this one: the tool strip's width is its column count
+    // and its height is however many tools there are, so there is nothing for
+    // a drag to set. CS6's floating Tools panel has no grip either — the
+    // chevron in its header is what changes its shape.
 
     connect(header, &PanelHeader::closeClicked, m_toolsDock, &QWidget::close);
     connect(header, &PanelHeader::collapseClicked, this, [this] {
@@ -3565,7 +3665,11 @@ void MainWindow::addBlurOptions(BlurTool tool)
                                 "whole way"));
         break;
     }
-    m_optionsBar->addWidget(strength);
+    // CS6 puts a drop-down slider beside this one, as it does beside every
+    // percentage in the options bar: the number is the quick way in and the
+    // slider is the way to feel for a value. The two go in together as one
+    // widget, or the toolbar would space them apart.
+    m_optionsBar->addWidget(SliderPopup::fieldWithArrow(strength, tr("Strength slider")));
     connect(strength, &QSpinBox::valueChanged, this, [this](int v) {
         m_blurStrength = v;
         pushBlurOptions();
@@ -5336,6 +5440,10 @@ void MainWindow::createDocks()
         // Tools dock, which never tabs with anything, uses `PanelHeader`.
         addDockWidget(area, dock);
 
+        // CS6's corner hatch, for resizing the panel once it is a window of
+        // its own. It shows and hides itself with the panel's floating state.
+        new PanelResizeGrip(dock);
+
         // The chevron on that title bar comes from `DockTitleStyle`; what it
         // does depends on which side of the toggle the panel is on, so the
         // tooltip has to follow the panel rather than be set once.
@@ -5370,12 +5478,29 @@ void MainWindow::createDocks()
     addPanel(tr("Color"), m_colorPanel, Qt::RightDockWidgetArea,
              QStringLiteral("window.color"));
 
-    // A stand-in so the Color/Swatches pair reads like CS6; real swatch
-    // management is not implemented yet.
-    auto *swatchesPlaceholder = new QLabel(tr("  Swatches"), this);
-    swatchesPlaceholder->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    m_swatchesPanel = new SwatchesPanel(this);
     QDockWidget *swatchesDock =
-        addPanel(tr("Swatches"), swatchesPlaceholder, Qt::RightDockWidgetArea);
+        addPanel(tr("Swatches"), m_swatchesPanel, Qt::RightDockWidgetArea);
+    // A swatch stands in for the two halves of the colour pair, so it goes
+    // the same way the eyedropper's pick does — through the tool strip and
+    // the Color panel both, which is what carries it to the engine.
+    connect(m_swatchesPanel, &SwatchesPanel::foregroundPicked, this,
+            [this](const QColor &c) {
+                m_colorPanel->setForegroundColor(c);
+                m_toolStrip->swatches()->setForeground(c);
+            });
+    connect(m_swatchesPanel, &SwatchesPanel::backgroundPicked, this,
+            [this](const QColor &c) {
+                m_engine->setBackgroundColor(c);
+                m_toolStrip->swatches()->setBackground(c);
+            });
+    // And a new swatch is made from the foreground colour, so the panel has
+    // to be told what that is as it changes.
+    connect(m_colorPanel, &ColorPanel::foregroundChanged, m_swatchesPanel,
+            &SwatchesPanel::setForegroundColor);
+    connect(m_toolStrip->swatches(), &ColorSwatchWidget::foregroundChanged, m_swatchesPanel,
+            &SwatchesPanel::setForegroundColor);
+    m_swatchesPanel->setForegroundColor(m_toolStrip->swatches()->foreground());
 
     m_infoPanel = new InfoPanel(m_engine, this);
     m_infoDock = addPanel(tr("Info"), m_infoPanel, Qt::RightDockWidgetArea,
@@ -6843,7 +6968,17 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         || name == QLatin1String("Twirl") || name == QLatin1String("Wave")
         || name == QLatin1String("ZigZag") || name == QLatin1String("Color Halftone")
         || name == QLatin1String("Crystallize") || name == QLatin1String("Mezzotint")
-        || name == QLatin1String("Mosaic") || name == QLatin1String("Pointillize");
+        || name == QLatin1String("Mosaic") || name == QLatin1String("Pointillize")
+        || name == QLatin1String("Fibers") || name == QLatin1String("Lens Flare")
+        || name == QLatin1String("Lighting Effects")
+        || name == QLatin1String("Diffuse") || name == QLatin1String("Emboss")
+        || name == QLatin1String("Extrude") || name == QLatin1String("Tiles")
+        || name == QLatin1String("Trace Contour") || name == QLatin1String("Wind")
+        || name == QLatin1String("Custom") || name == QLatin1String("Glowing Edges")
+        || name == QLatin1String("Colored Pencil") || name == QLatin1String("Cutout")
+        || name == QLatin1String("Dry Brush") || name == QLatin1String("Film Grain")
+        || name == QLatin1String("Fresco") || name == QLatin1String("Neon Glow")
+        || name == QLatin1String("Paint Daubs") || name == QLatin1String("Palette Knife");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -6973,6 +7108,96 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
             dialog.addParameter(tr("Cell Size:"), 2, 200, preset(0, 10.0f), 0, tr(" square"));
         } else if (name == QLatin1String("Pointillize")) {
             dialog.addParameter(tr("Cell Size"), 3, 300, preset(0, 5.0f), 0);
+        } else if (name == QLatin1String("Fibers")) {
+            // CS6's two sliders and its Randomize button, whose re-rolled
+            // seed is the third parameter. The fibres run between the
+            // document's foreground and background colours, which the engine
+            // fills in — this dialog does not ask for them.
+            dialog.addParameter(tr("Variance:"), 0, 64, preset(0, 32.0f), 0);
+            dialog.addParameter(tr("Strength:"), 1, 64, preset(1, 4.0f), 0);
+            dialog.addRandomizeButton(tr("Randomize"));
+        } else if (name == QLatin1String("Lens Flare")) {
+            // CS6's Lens Flare: the whole picture with a crosshair you drag
+            // to place the flare, a Brightness slider, and the four lenses.
+            // The crosshair fills the last two slots, so the two controls
+            // keep the positions CS6 lists them in.
+            dialog.addParameter(tr("Brightness:"), 10, 300, preset(0, 100.0f), 0,
+                                QStringLiteral("%"));
+            dialog.addRadioChoice(tr("Lens Type"),
+                                  {tr("50-300mm Zoom"), tr("35mm Prime"), tr("105mm Prime"),
+                                   tr("Movie Prime")},
+                                  {0.0, 1.0, 2.0, 3.0}, int(preset(1, 0.0f)));
+            dialog.addPlacementPreview(QPointF(preset(2, 0.5f), preset(3, 0.5f)));
+        } else if (name == QLatin1String("Extrude")) {
+            // CS6's Extrude has no preview thumbnail — it is the one Stylize
+            // dialog that shows nothing at all until you press OK — and its
+            // controls are plain fields rather than sliders.
+            dialog.setPreviewPaneVisible(false);
+            const int type =
+                dialog.addRadioChoice(tr("Type"), {tr("Blocks"), tr("Pyramids")}, {0.0, 1.0},
+                                      int(preset(0, 0.0f)));
+            dialog.addParameter(tr("Size:"), 2, 255, preset(1, 30.0f), 0, tr(" Pixels"), false);
+            dialog.addParameter(tr("Depth:"), 1, 255, preset(2, 30.0f), 0, QString(), false);
+            dialog.addRadioChoice(tr("Depth from"), {tr("Random"), tr("Level-based")},
+                                  {0.0, 1.0}, preset(3, 0.0f) != 0.0f ? 1 : 0);
+            // A pyramid has no front face to make solid, so CS6 greys this
+            // out whenever Pyramids is the shape.
+            dialog.addCheckBox(tr("Solid Front Faces"), preset(4, 0.0f) != 0.0f,
+                               [&dialog, type] { return dialog.parameterValue(type) == 0.0f; });
+            dialog.addCheckBox(tr("Mask Incomplete Blocks"), preset(5, 0.0f) != 0.0f);
+        } else if (name == QLatin1String("Emboss")) {
+            // CS6's three, in its order. The angle gets the wheel and no
+            // slider, as everywhere else an angle is asked for.
+            dialog.addAngleParameter(tr("Angle:"), preset(0, 135.0f));
+            dialog.addParameter(tr("Height:"), 1, 100, preset(1, 3.0f), 0, tr(" Pixels"));
+            dialog.addParameter(tr("Amount:"), 1, 500, preset(2, 100.0f), 0,
+                                QStringLiteral("%"));
+        } else if (name == QLatin1String("Diffuse")) {
+            // CS6's Diffuse asks for nothing but the mode: a box of four
+            // radio buttons under the preview, and no slider anywhere.
+            dialog.addRadioChoice(tr("Mode"),
+                                  {tr("Normal"), tr("Darken Only"), tr("Lighten Only"),
+                                   tr("Anisotropic")},
+                                  {0.0, 1.0, 2.0, 3.0}, int(preset(0, 0.0f)));
+        } else if (name == QLatin1String("Lighting Effects")) {
+            // CS6 runs this as a workspace of its own — a Lights panel
+            // holding several lamps, handles on the canvas to aim them, and a
+            // Presets list. What is here is its Properties panel, in the
+            // order that panel reads down the page, driving one lamp; the
+            // three controls at the foot stand in for the canvas handles.
+            const int type =
+                dialog.addChoice(tr("Light Type:"),
+                                 {tr("Spot"), tr("Point"), tr("Infinite")}, {0.0, 1.0, 2.0},
+                                 int(preset(0, 0.0f)));
+            dialog.addColorButton(tr("Color:"),
+                                  QColor(int(preset(1, 255.0f)), int(preset(2, 255.0f)),
+                                         int(preset(3, 255.0f))));
+            dialog.addParameter(tr("Intensity:"), -100, 100, preset(4, 25.0f), 0);
+            // Only a spot has a cone to put a hotspot in, so CS6 greys this
+            // out for the other two.
+            dialog.addParameter(tr("Hotspot:"), -100, 100, preset(5, 44.0f), 0, QString(), true,
+                                [&dialog, type] { return dialog.parameterValue(type) == 0.0f; });
+            dialog.addColorButton(tr("Colorize:"),
+                                  QColor(int(preset(6, 255.0f)), int(preset(7, 255.0f)),
+                                         int(preset(8, 255.0f))));
+            dialog.addParameter(tr("Exposure:"), -100, 100, preset(9, 0.0f), 0);
+            dialog.addParameter(tr("Gloss:"), -100, 100, preset(10, 0.0f), 0);
+            dialog.addParameter(tr("Metallic:"), -100, 100, preset(11, 0.0f), 0);
+            dialog.addParameter(tr("Ambience:"), -100, 100, preset(12, 0.0f), 0);
+            const int texture =
+                dialog.addChoice(tr("Texture:"),
+                                 {tr("None"), tr("Red"), tr("Green"), tr("Blue")},
+                                 {0.0, 1.0, 2.0, 3.0}, int(preset(13, 0.0f)));
+            // And no height to speak of without a channel to raise.
+            dialog.addParameter(tr("Height:"), 0, 100, preset(14, 50.0f), 0, QString(), true,
+                                [&dialog, texture] {
+                                    return dialog.parameterValue(texture) != 0.0f;
+                                });
+            dialog.addHeading(tr("Where the light falls — CS6 drags these on the canvas"));
+            dialog.addParameter(tr("Size:"), 2, 150, preset(15, 45.0f) , 0,
+                                QStringLiteral("%"));
+            dialog.addAngleParameter(tr("Angle:"), preset(16, 45.0f));
+            dialog.addPlacementPreview(QPointF(preset(17, 0.5f), preset(18, 0.5f)));
         } else if (name == QLatin1String("Color Halftone")) {
             // CS6's dialog is a set of plain fields with no preview and no
             // sliders — the effect is far too fine to judge in a thumbnail
@@ -6986,6 +7211,108 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
                                     preset(channel + 1, kDefaultScreenAngles[channel]), 0,
                                     QString(), false);
             }
+        } else if (name == QLatin1String("Colored Pencil")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Pencil Width:"), 1, 24, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Stroke Pressure:"), 0, 15, preset(1, 8.0f), 0);
+            dialog.addParameter(tr("Paper Brightness:"), 0, 50, preset(2, 25.0f), 0);
+        } else if (name == QLatin1String("Cutout")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Number of Levels:"), 2, 8, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Edge Simplicity:"), 0, 10, preset(1, 4.0f), 0);
+            dialog.addParameter(tr("Edge Fidelity:"), 1, 3, preset(2, 2.0f), 0);
+        } else if (name == QLatin1String("Dry Brush")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Brush Size:"), 0, 10, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Brush Detail:"), 0, 10, preset(1, 8.0f), 0);
+            dialog.addParameter(tr("Texture:"), 1, 3, preset(2, 2.0f), 0);
+        } else if (name == QLatin1String("Film Grain")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Grain:"), 0, 20, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Highlight Area:"), 0, 20, preset(1, 0.0f), 0);
+            dialog.addParameter(tr("Intensity:"), 0, 10, preset(2, 10.0f), 0);
+        } else if (name == QLatin1String("Fresco")) {
+            // The Filter Gallery gives Fresco Dry Brush's three sliders, over
+            // the same ranges, and opens it on a bare canvas rather than a
+            // textured one.
+            dialog.addParameter(tr("Brush Size:"), 0, 10, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Brush Detail:"), 0, 10, preset(1, 8.0f), 0);
+            dialog.addParameter(tr("Texture:"), 1, 3, preset(2, 1.0f), 0);
+        } else if (name == QLatin1String("Palette Knife")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Stroke Size:"), 1, 50, preset(0, 25.0f), 0);
+            dialog.addParameter(tr("Stroke Detail:"), 1, 3, preset(1, 3.0f), 0);
+            dialog.addParameter(tr("Softness:"), 0, 10, preset(2, 0.0f), 0);
+        } else if (name == QLatin1String("Paint Daubs")) {
+            // Two sliders and CS6's list of six brushes, in its order.
+            dialog.addParameter(tr("Brush Size:"), 1, 50, preset(0, 8.0f), 0);
+            dialog.addParameter(tr("Sharpness:"), 0, 40, preset(1, 7.0f), 0);
+            dialog.addChoice(tr("Brush Type:"),
+                             {tr("Simple"), tr("Light Rough"), tr("Dark Rough"),
+                              tr("Wide Sharp"), tr("Wide Blurry"), tr("Sparkle")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0}, int(preset(2, 0.0f)));
+        } else if (name == QLatin1String("Neon Glow")) {
+            // Two sliders and a swatch, which is all CS6 asks for. The two
+            // colours the picture is rendered between are the document's own,
+            // so the dialog does not offer them and the engine reads them off
+            // the swatches — see Engine::filter_for.
+            dialog.addParameter(tr("Glow Size:"), -24, 24, preset(0, 5.0f), 0);
+            dialog.addParameter(tr("Glow Brightness:"), 0, 50, preset(1, 15.0f), 0);
+            dialog.addColorButton(tr("Glow Color:"),
+                                  QColor(int(preset(2, 0.0f)), int(preset(3, 0.0f)),
+                                         int(preset(4, 255.0f))));
+        } else if (name == QLatin1String("Glowing Edges")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Edge Width:"), 1, 14, preset(0, 3.0f), 0);
+            dialog.addParameter(tr("Edge Brightness:"), 0, 20, preset(1, 6.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(2, 5.0f), 0);
+        } else if (name == QLatin1String("Custom")) {
+            // CS6's Custom is the kernel written out by hand: a 5x5 grid of
+            // weights, then Scale — the divisor — and Offset. It opens on the
+            // classic sharpen, which is what CS6 shows the first time.
+            QList<double> weights;
+            for (int i = 0; i < kCustomKernelSize * kCustomKernelSize; ++i) {
+                weights.append(preset(i, kDefaultCustomKernel[i]));
+            }
+            const int count = weights.size();
+            dialog.addKernelGrid(kCustomKernelSize, weights, preset(count, 1.0f),
+                                 preset(count + 1, 0.0f));
+            // CS6 keeps kernels in .acf files beside the dialog's Load and
+            // Save buttons. Nothing reads or writes that format here yet.
+            dialog.addDisabledNote(tr("Load... / Save... (.acf kernels) are not implemented"));
+        } else if (name == QLatin1String("Wind")) {
+            // CS6's Wind asks for nothing but two choices, each a titled box
+            // of radio buttons under the preview, and no number anywhere.
+            dialog.addRadioChoice(tr("Method"), {tr("Wind"), tr("Blast"), tr("Stagger")},
+                                  {0.0, 1.0, 2.0}, int(preset(0, 0.0f)));
+            dialog.addRadioChoice(tr("Direction"), {tr("From the Right"), tr("From the Left")},
+                                  {0.0, 1.0}, preset(1, 0.0f) != 0.0 ? 1 : 0);
+        } else if (name == QLatin1String("Trace Contour")) {
+            // CS6's dialog: the preview, one Level slider, and the Edge box
+            // saying which side of that level the line is drawn on.
+            dialog.addParameter(tr("Level:"), 0, 255, preset(0, 128.0f), 0);
+            dialog.addRadioChoice(tr("Edge"), {tr("Lower"), tr("Upper")}, {0.0, 1.0},
+                                  preset(1, 1.0f) != 0.0 ? 1 : 0);
+        } else if (name == QLatin1String("Tiles")) {
+            // CS6's Tiles has no preview either — two typed numbers with no
+            // slider between them, and the fill box underneath. The two
+            // swatch colours the fill box names come from the document, so
+            // the dialog does not ask for them; the engine fills them in.
+            dialog.setPreviewPaneVisible(false);
+            dialog.addParameter(tr("Number Of Tiles:"), 1, 99, preset(0, 10.0f), 0, QString(),
+                                false);
+            dialog.addParameter(tr("Maximum Offset:"), 1, 99, preset(1, 10.0f), 0,
+                                QStringLiteral("%"), false);
+            dialog.addRadioChoice(tr("Fill Empty Area With:"),
+                                  {tr("Background Color"), tr("Foreground Color"),
+                                   tr("Inverse Image"), tr("Unaltered Image")},
+                                  {0.0, 1.0, 2.0, 3.0}, int(preset(2, 0.0f)));
         } else if (name == QLatin1String("Displace")) {
             // CS6's Displace has no preview — the effect depends on a file it
             // has not asked for yet — and two boxes of radio buttons instead.
@@ -7123,7 +7450,7 @@ void MainWindow::showFlame()
     dialog.addParameter(tr("Length:"), 1, 500, preset(1, 100.0f), 0);
     dialog.addCheckBox(tr("Randomize Length"), preset(2, 0.0f) != 0.0);
     dialog.addParameter(tr("Width:"), 1, 500, preset(3, 100.0f), 0);
-    dialog.addParameter(tr("Angle:"), -180, 180, preset(4, 0.0f), 0, QStringLiteral("°"));
+    dialog.addAngleParameter(tr("Angle:"), preset(4, 0.0f));
     dialog.addParameter(tr("Interval:"), 1, 100, preset(5, 30.0f), 0);
     dialog.addCheckBox(tr("Adjust Interval for Loops"), preset(6, 1.0f) != 0.0);
     const int custom = dialog.addCheckBox(tr("Use Custom Color for Flames"),
@@ -7729,8 +8056,7 @@ void MainWindow::floatPanel(QDockWidget *dock)
         return;
     }
 
-    // A tabbed panel is only as tall as its share of the column, and the
-    // Swatches placeholder is barely taller than its own label, so floating
+    // A tabbed panel is only as tall as its share of the column, so floating
     // one at its docked size can leave a window too small to notice.
     const QSize size = dock->size().expandedTo(QSize(260, 300));
 

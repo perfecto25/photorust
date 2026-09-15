@@ -11,7 +11,10 @@ set(SHELL_TESTS
     tst_glyphspanel
     tst_keymap
     tst_layerspanel
+    tst_panelgrip
     tst_paragraphstyles
+    tst_sliderpopup
+    tst_swatchespanel
     tst_toolcursors
     tst_typeantialias
     tst_typerestyle

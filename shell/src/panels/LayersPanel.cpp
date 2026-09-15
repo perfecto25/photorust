@@ -1,5 +1,7 @@
 #include "LayersPanel.h"
 
+#include "../SliderPopup.h"
+
 #include "LayerIcons.h"
 
 #include <algorithm>
@@ -473,24 +475,6 @@ public:
     }
 };
 
-/// A slider that drops out of a spin box's arrow, the way CS6's Opacity and
-/// Fill fields work. Returned as a menu so it closes on click-away for free.
-QMenu *sliderPopup(QSpinBox *field)
-{
-    auto *menu = new QMenu(field);
-    auto *slider = new QSlider(Qt::Horizontal, menu);
-    slider->setRange(field->minimum(), field->maximum());
-    slider->setFixedWidth(120);
-    auto *action = new QWidgetAction(menu);
-    action->setDefaultWidget(slider);
-    menu->addAction(action);
-
-    QObject::connect(menu, &QMenu::aboutToShow, slider,
-                     [slider, field] { slider->setValue(field->value()); });
-    QObject::connect(slider, &QSlider::valueChanged, field, &QSpinBox::setValue);
-    return menu;
-}
-
 } // namespace
 
 /// The layer tree.
@@ -957,7 +941,7 @@ void LayersPanel::buildLockRow(QWidget *parent, QBoxLayout *into)
     arrow->setAutoRaise(true);
     arrow->setArrowType(Qt::DownArrow);
     arrow->setPopupMode(QToolButton::InstantPopup);
-    arrow->setMenu(sliderPopup(m_fillOpacity));
+    arrow->setMenu(SliderPopup::menuFor(m_fillOpacity));
     arrow->setToolTip(tr("Fill opacity slider"));
     row->addWidget(arrow);
 
@@ -998,7 +982,7 @@ void LayersPanel::buildUi()
     opacityArrow->setAutoRaise(true);
     opacityArrow->setArrowType(Qt::DownArrow);
     opacityArrow->setPopupMode(QToolButton::InstantPopup);
-    opacityArrow->setMenu(sliderPopup(m_opacity));
+    opacityArrow->setMenu(SliderPopup::menuFor(m_opacity));
     opacityArrow->setToolTip(tr("Opacity slider"));
     modeRow->addWidget(opacityArrow);
     headerLayout->addLayout(modeRow);

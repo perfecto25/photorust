@@ -7,6 +7,7 @@
 set(SHELL_SOURCES
     src/MainWindow.cpp
     src/MainWindow.h
+    src/SliderPopup.h
 
     src/canvas/CanvasView.cpp
     src/canvas/CanvasView.h
@@ -135,8 +136,12 @@ set(SHELL_SOURCES
     src/panels/PathsPanel.h
     src/panels/PropertiesPanel.cpp
     src/panels/PropertiesPanel.h
+    src/panels/SwatchesPanel.cpp
+    src/panels/SwatchesPanel.h
     src/panels/PanelHeader.cpp
     src/panels/PanelHeader.h
+    src/panels/PanelResizeGrip.cpp
+    src/panels/PanelResizeGrip.h
 
     src/shortcuts/CommandRegistry.cpp
     src/shortcuts/CommandRegistry.h

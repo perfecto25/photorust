@@ -386,6 +386,94 @@ fn sample(
     (point, ((b.0 - a.0) / len, (b.1 - a.1) / len))
 }
 
+/// Render a cloud-like fractal noise pattern onto `pixmap`.
+///
+/// When `difference` is false, replaces all pixel colours with the grayscale
+/// pattern (CS6's Clouds). When true, blends the pattern as a difference into
+/// existing content so repeating the filter darkens the result (Difference
+/// Clouds).
+pub fn clouds(pixmap: &mut Pixmap, difference: bool) {
+    if pixmap.is_empty() {
+        return;
+    }
+
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+
+    // Scale factors so the noise reads as clouds rather than fine grain.
+    // Multiple octaves at different frequencies produce the characteristic
+    // cloud look: large soft masses with smaller detail layered on top.
+    let octaves: [(f32, f32); 5] = [
+        (1.0, 0.50),
+        (2.0, 0.25),
+        (4.0, 0.125),
+        (8.0, 0.0625),
+        (16.0, 0.03125),
+    ];
+
+    let stride = pixmap.stride();
+    let data = pixmap.as_bytes_mut();
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut value = 0.0f32;
+            for &(freq, amp) in &octaves {
+                value += smooth_noise(x as f32 * freq / 128.0, y as f32 * freq / 128.0) * amp;
+            }
+
+            // Normalize to 0..255 and convert to grayscale.
+            let gray = (value * 255.0).clamp(0.0, 255.0) as u8;
+
+            let offset = (y as usize * stride) + (x as usize * 4);
+            if difference {
+                // Difference Clouds: blend the noise as a difference into
+                // existing pixels. Each pass darkens the image, which is the
+                // CS6 behavior.
+                let base_r = data[offset];
+                let base_g = data[offset + 1];
+                let base_b = data[offset + 2];
+                let base_a = data[offset + 3];
+
+                let diff_r = (base_r as i32 - gray as i32).abs() as u8;
+                let diff_g = (base_g as i32 - gray as i32).abs() as u8;
+                let diff_b = (base_b as i32 - gray as i32).abs() as u8;
+
+                data[offset] = ((diff_r as u16 + base_r as u16) >> 1) as u8;
+                data[offset + 1] = ((diff_g as u16 + base_g as u16) >> 1) as u8;
+                data[offset + 2] = ((diff_b as u16 + base_b as u16) >> 1) as u8;
+                data[offset + 3] = base_a;
+            } else {
+                data[offset] = gray;
+                data[offset + 1] = gray;
+                data[offset + 2] = gray;
+                // Preserve existing alpha.
+            }
+        }
+    }
+}
+
+/// Smooth noise in 0..1 over a plane, using hash values at each lattice
+/// point and smooth interpolation between them.
+fn smooth_noise(x: f32, y: f32) -> f32 {
+    let (xi, yi) = (x.floor(), y.floor());
+    let (fx, fy) = (x - xi, y - yi);
+    // Smoothstep for interpolation (same as flame's noise2).
+    let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+
+    let hash = |i: i32, j: i32| -> f32 {
+        let mut h = (i as u32).wrapping_mul(0x9E3779B1) ^ (j as u32).wrapping_mul(0x85EBCA77);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2545F491);
+        h ^= h >> 13;
+        (h % 65521) as f32 / 65521.0
+    };
+
+    let (i, j) = (xi as i32, yi as i32);
+    let top = hash(i, j) + (hash(i + 1, j) - hash(i, j)) * sx;
+    let bottom = hash(i, j + 1) + (hash(i + 1, j + 1) - hash(i, j + 1)) * sx;
+    top + (bottom - top) * sy
+}
+
 fn next_seed(seed: &mut u32) -> u32 {
     *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
     *seed
@@ -494,6 +582,802 @@ fn fire(strength: f32, custom: Option<Rgba8>) -> (f32, f32, f32) {
         }
     }
     (255.0, 252.0, 214.0)
+}
+
+/// Render fibres between the foreground and background colours onto `pixmap`.
+///
+/// CS6's fibres are noise **stretched down the picture**, and they are two
+/// separate things layered: broad soft *clumps*, light and dark wands tens of
+/// pixels across running a long way down, with crisp *hairs* a pixel or two
+/// across and much shorter standing on top of them. Judge it at 500%, where
+/// the hairs are still single crisp pixels over smooth clump gradients — a
+/// whole-picture view hides everything that matters here.
+///
+/// Four mistakes, all of them made on the way to this:
+///
+/// - Isotropic noise smeared downwards is soft grey blobs. The smear kills
+///   the contrast, and the grain is as coarse across as it is long.
+/// - A strand tone that is a property of its *column*, unable to vary with
+///   `y`, is right at low variance and wrong above it. By 32 the picture is
+///   short dashes in clumps, not full-height wands.
+/// - One run of octaves from wide to narrow cannot give clumps and hairs at
+///   once. Weighted wide it loses the hairs, weighted narrow it is even fur
+///   with no structure in it.
+/// - Hard edges at *every* octave is a mosaic of blocks. Only the octaves
+///   whose lattice lands on each pixel should come out crisp.
+///
+/// `variance` (0–64) is how far the fibres break up: near zero a few broad
+/// soft bands running the whole height, by the middle a thicket of hairs over
+/// clumps, at 64 short near-black-and-white spatter. It shortens both clumps
+/// and hairs and shifts the balance towards the hairs at the same time, which
+/// is the pair of things CS6's slider is seen doing. `strength` (1–64)
+/// stretches them lengthwise again. `seed` reproduces one exact arrangement
+/// so the Randomize button's result can be previewed, undone and redone.
+pub fn fibers(
+    pixmap: &mut Pixmap,
+    variance: f32,
+    strength: f32,
+    seed: u32,
+    foreground: Rgba8,
+    background: Rgba8,
+) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let strength = strength.clamp(1.0, 64.0);
+    let variance = variance.clamp(0.0, 64.0);
+    if variance <= 0.0 {
+        // Variance zero is an even blend of the two colours: nothing to
+        // randomise.
+        let mid = crate::buffer::Rgba8::new(
+            ((foreground.r as u32 + background.r as u32) / 2) as u8,
+            ((foreground.g as u32 + background.g as u32) / 2) as u8,
+            ((foreground.b as u32 + background.b as u32) / 2) as u8,
+            ((foreground.a as u32 + background.a as u32) / 2) as u8,
+        );
+        for px in pixmap.as_bytes_mut().chunks_exact_mut(4) {
+            px[0] = mid.r;
+            px[1] = mid.g;
+            px[2] = mid.b;
+            // The layer's own alpha stands, as with any nonzero variance.
+        }
+        return;
+    }
+
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+
+    // Two things are going on in a CS6 fibre picture at once, and they want
+    // separate handles. Broad soft *clumps* — light and dark wands tens of
+    // pixels across, running a long way down — and crisp *hairs* a pixel or
+    // two across and much shorter. One run of octaves from wide to narrow
+    // cannot give both: weight it towards the wide end and the hairs vanish,
+    // towards the narrow end and the picture is even fur with no structure in
+    // it.
+    //
+    // The hair octaves' lattices land on every pixel or every other one, so
+    // they come out hard-edged, while the clump octaves stay smooth
+    // gradients. That is exactly what CS6 looks like at 500% — crisp hairs
+    // over soft clumps — and making every octave hard-edged instead turns the
+    // picture into a mosaic of blocks.
+    const CLUMP_OCTAVES: usize = 3;
+    const OCTAVES: usize = 5;
+    /// How wide each octave is, in pixels: three clumps, then two hairs. The
+    /// gap between eight and two is deliberate — CS6's clumps and hairs are
+    /// separate things, not one continuous spread of sizes.
+    const BANDS: [f32; OCTAVES] = [48.0, 20.0, 8.0, 2.0, 1.0];
+
+    // How far each runs before its tone shifts, before the per-hair jitter
+    // below. Variance shortens both, strength stretches both.
+    let clump_run = (60.0 / (1.0 + variance * 0.02)) * (strength / 4.0).sqrt();
+    let hair_run = (28.0 / (1.0 + variance * 0.04)) * (strength / 4.0).sqrt();
+
+    // How much of the picture is hairs rather than clumps — the other half of
+    // what variance does. Low is a few broad soft wands, high is a thicket.
+    let hair_share = 0.20 + (variance / 64.0).powf(0.6) * 0.45;
+
+    // Where each hair starts and how long its own tone holds. Without this
+    // every hair in the picture changes tone at the same rows, on the same
+    // rhythm, and the result is corduroy — regular, and nothing like wool.
+    // One pass per column rather than per pixel: it only depends on `x`.
+    let mut shift = vec![(0.0f32, 0.0f32); width * OCTAVES];
+    shift
+        .par_chunks_exact_mut(OCTAVES)
+        .enumerate()
+        .for_each(|(x, octaves)| {
+            for (octave, cell) in octaves.iter_mut().enumerate() {
+                // Drawn from the same lattice as the octave it belongs to, so
+                // that it varies per pixel where that octave does and smoothly
+                // where it doesn't. A phase that jumped at every band edge
+                // would put back the hard step this octave is meant not to
+                // have.
+                let along = x as f32 / BANDS[octave];
+                let phase = noise2(seed ^ 0x27d4_eb2d, along, 0.0) * 512.0;
+                // Three fifths to eight fifths of the nominal length, so some
+                // hairs are stubble and others run on.
+                let length = 0.6 + noise2(seed ^ 0x1656_67b1, along, 7.0);
+                *cell = (phase, length);
+            }
+        });
+
+    let mut field = vec![0.0f32; width * height];
+    field
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, line)| {
+            for (x, cell) in line.iter_mut().enumerate() {
+                let mut part = |from: usize, to: usize, run: f32, falloff: f32| {
+                    let (mut sum, mut weight, mut total) = (0.0, 1.0, 0.0);
+                    for octave in from..to {
+                        let band = BANDS[octave];
+                        let (phase, length) = shift[x * OCTAVES + octave];
+                        sum += noise2(
+                            seed.wrapping_add(octave as u32 * 7919),
+                            x as f32 / band,
+                            (y as f32 + phase) / (run * band.sqrt() * length),
+                        ) * weight;
+                        total += weight;
+                        weight *= falloff;
+                    }
+                    sum / total
+                };
+                // Within each, the wider octave leads; between them it is
+                // `hair_share` that decides.
+                let clumps = part(0, CLUMP_OCTAVES, clump_run, 0.6);
+                let hairs = part(CLUMP_OCTAVES, OCTAVES, hair_run, 1.7);
+                *cell = clumps * (1.0 - hair_share) + hairs * hair_share;
+            }
+        });
+
+    // A sum of noises sits in a narrow band around the middle of the range;
+    // left as is that is the grey mush, not fibres. Stretch what is actually
+    // there out to the full range, letting the extremes clip the way CS6's
+    // do, and let variance decide how hard.
+    let count = field.len() as f32;
+    let mean = field.iter().sum::<f32>() / count;
+    let spread = (field.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / count)
+        .sqrt()
+        .max(f32::EPSILON);
+    let contrast = 0.55 + (variance / 64.0).sqrt() * 0.95;
+    // Two and a bit deviations either side of the mean fills the range.
+    let stretch = contrast / (4.4 * spread);
+
+    let (fr, fg, fbc) = (
+        foreground.r as f32,
+        foreground.g as f32,
+        foreground.b as f32,
+    );
+    let (br, bg, bb) = (
+        background.r as f32,
+        background.g as f32,
+        background.b as f32,
+    );
+
+    let stride = pixmap.stride();
+    let bytes = pixmap.as_bytes_mut();
+    bytes
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(row, out)| {
+            for x in 0..width {
+                let value = field[row * width + x];
+                let value = (0.5 + (value - mean) * stretch).clamp(0.0, 1.0);
+                let i = x * 4;
+                out[i] = (br + (fr - br) * value) as u8;
+                out[i + 1] = (bg + (fg - bg) * value) as u8;
+                out[i + 2] = (bb + (fbc - bb) * value) as u8;
+                // The layer's alpha is left standing, as CS6 Fibers does.
+            }
+        });
+}
+
+/// CS6's four lenses, in the order its Lens Flare dialog lists them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LensType {
+    /// The busiest of the four, and CS6's default: a modest core, a long
+    /// string of coloured ghosts down the axis, and the hexagonal aperture
+    /// showing in them.
+    #[default]
+    Zoom50To300,
+    /// A wide lens: a big soft core with long rays and few ghosts.
+    Prime35,
+    /// A long lens: a tight hot core, short rays, barely any ghosts.
+    Prime105,
+    /// Anamorphic — the horizontal blue streak a cinema lens throws.
+    MoviePrime,
+}
+
+impl LensType {
+    pub fn from_i32(value: i32) -> LensType {
+        match value {
+            1 => LensType::Prime35,
+            2 => LensType::Prime105,
+            3 => LensType::MoviePrime,
+            _ => LensType::Zoom50To300,
+        }
+    }
+}
+
+/// One of the discs of light strung along the axis of a flare.
+///
+/// They are the reflections between the elements of the lens, which is why
+/// they line up: each is an image of the aperture, thrown back through the
+/// middle of the frame to the far side.
+struct Ghost {
+    /// Where it sits on the line from the flare through the middle of the
+    /// frame — 0 is the flare itself, 1 the centre of the picture, 2 the
+    /// point opposite.
+    at: f32,
+    /// Its size, as a fraction of the half-diagonal.
+    radius: f32,
+    tint: (f32, f32, f32),
+    strength: f32,
+    /// A ring of light rather than a filled disc, which is what the larger
+    /// ones in a real flare are.
+    ring: bool,
+}
+
+/// Everything that distinguishes one of CS6's four lenses from the others.
+struct Lens {
+    /// The hot core and the soft glow around it, as fractions of the
+    /// half-diagonal.
+    core: f32,
+    glow: f32,
+    glow_strength: f32,
+    /// How many rays come off the core, how far they reach and how much
+    /// light they carry.
+    rays: u32,
+    ray_length: f32,
+    ray_strength: f32,
+    /// The anamorphic streak: how far it runs sideways, how thick it is, and
+    /// how bright. Zero for the three stills lenses.
+    streak: f32,
+    streak_strength: f32,
+    /// The ring thrown around the core.
+    halo: f32,
+    halo_strength: f32,
+    ghosts: &'static [Ghost],
+}
+
+const ZOOM_GHOSTS: &[Ghost] = &[
+    Ghost { at: -0.22, radius: 0.030, tint: (1.00, 0.86, 0.55), strength: 0.30, ring: false },
+    Ghost { at: 0.34, radius: 0.020, tint: (0.55, 0.85, 1.00), strength: 0.24, ring: false },
+    Ghost { at: 0.56, radius: 0.046, tint: (0.60, 1.00, 0.75), strength: 0.18, ring: false },
+    Ghost { at: 0.78, radius: 0.028, tint: (1.00, 0.70, 0.45), strength: 0.26, ring: false },
+    Ghost { at: 1.00, radius: 0.062, tint: (0.70, 0.75, 1.00), strength: 0.14, ring: true },
+    Ghost { at: 1.22, radius: 0.034, tint: (1.00, 0.55, 0.55), strength: 0.22, ring: false },
+    Ghost { at: 1.46, radius: 0.092, tint: (0.50, 0.80, 1.00), strength: 0.12, ring: true },
+    Ghost { at: 1.72, radius: 0.050, tint: (1.00, 0.85, 0.40), strength: 0.16, ring: false },
+];
+
+const PRIME35_GHOSTS: &[Ghost] = &[
+    Ghost { at: 0.45, radius: 0.036, tint: (0.65, 0.90, 1.00), strength: 0.18, ring: false },
+    Ghost { at: 0.95, radius: 0.078, tint: (0.85, 0.70, 1.00), strength: 0.12, ring: true },
+    Ghost { at: 1.38, radius: 0.056, tint: (1.00, 0.75, 0.50), strength: 0.16, ring: false },
+];
+
+const PRIME105_GHOSTS: &[Ghost] = &[
+    Ghost { at: 0.62, radius: 0.022, tint: (0.70, 0.95, 1.00), strength: 0.14, ring: false },
+    Ghost { at: 1.12, radius: 0.040, tint: (1.00, 0.80, 0.60), strength: 0.10, ring: true },
+];
+
+const MOVIE_GHOSTS: &[Ghost] = &[
+    Ghost { at: 0.70, radius: 0.030, tint: (0.60, 0.80, 1.00), strength: 0.16, ring: false },
+    Ghost { at: 1.26, radius: 0.062, tint: (0.55, 0.75, 1.00), strength: 0.10, ring: true },
+];
+
+impl LensType {
+    fn lens(self) -> Lens {
+        match self {
+            LensType::Zoom50To300 => Lens {
+                core: 0.013,
+                glow: 0.17,
+                glow_strength: 0.55,
+                rays: 6,
+                ray_length: 0.55,
+                ray_strength: 0.22,
+                streak: 0.0,
+                streak_strength: 0.0,
+                halo: 0.30,
+                halo_strength: 0.12,
+                ghosts: ZOOM_GHOSTS,
+            },
+            LensType::Prime35 => Lens {
+                core: 0.019,
+                glow: 0.27,
+                glow_strength: 0.78,
+                rays: 8,
+                ray_length: 0.85,
+                ray_strength: 0.32,
+                streak: 0.0,
+                streak_strength: 0.0,
+                halo: 0.22,
+                halo_strength: 0.10,
+                ghosts: PRIME35_GHOSTS,
+            },
+            LensType::Prime105 => Lens {
+                core: 0.010,
+                glow: 0.12,
+                glow_strength: 0.62,
+                rays: 4,
+                ray_length: 0.34,
+                ray_strength: 0.12,
+                streak: 0.0,
+                streak_strength: 0.0,
+                halo: 0.18,
+                halo_strength: 0.08,
+                ghosts: PRIME105_GHOSTS,
+            },
+            LensType::MoviePrime => Lens {
+                core: 0.012,
+                glow: 0.14,
+                glow_strength: 0.50,
+                rays: 0,
+                ray_length: 0.0,
+                ray_strength: 0.0,
+                // The signature of the four: light smeared right across the
+                // frame in a thin blue bar.
+                streak: 1.30,
+                streak_strength: 0.55,
+                halo: 0.16,
+                halo_strength: 0.06,
+                ghosts: MOVIE_GHOSTS,
+            },
+        }
+    }
+}
+
+/// Throw a lens flare onto `pixmap` — Filter ▸ Render ▸ Lens Flare.
+///
+/// `center` is where the sun is, in fractions of the width and height, which
+/// is how the dialog's draggable crosshair hands it over and what keeps it
+/// meaning the same thing on a proxy as on the full image. `brightness` is
+/// CS6's 10–300%.
+///
+/// This is light *added* to the picture rather than a filter of it: nothing
+/// here reads the pixel it is writing to except to add to it. Alpha is left
+/// alone — a flare does not make a transparent layer opaque.
+///
+/// Deliberately not on the GPU. It is per-pixel work of exactly the shape a
+/// shader wants, but it runs once when the user presses OK, and the result is
+/// needed straight back on the CPU to become the layer — so the upload and
+/// readback would be most of the time spent, which is the same trap
+/// documented for compositing in `docs/gpu-migration.md`. The dialog's live
+/// preview goes through a proxy a few hundred pixels across, which is far
+/// below `MIN_GPU_PIXELS` anyway.
+pub fn lens_flare(pixmap: &mut Pixmap, center: (f32, f32), brightness: f32, kind: LensType) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let lens = kind.lens();
+    let gain = brightness.clamp(10.0, 300.0) / 100.0;
+
+    let width = pixmap.width() as f32;
+    let height = pixmap.height() as f32;
+    // Every size in a lens is a fraction of this, so that a flare on a proxy
+    // and the same flare on the full image are the same picture.
+    let span = 0.5 * (width * width + height * height).sqrt();
+
+    let flare = (center.0 * width, center.1 * height);
+    let middle = (width * 0.5, height * 0.5);
+    // The axis the ghosts are strung along: from the flare through the middle
+    // of the frame and out the other side.
+    let axis = (middle.0 - flare.0, middle.1 - flare.1);
+
+    let stride = pixmap.stride();
+    let row_width = pixmap.width() as usize;
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let py = row as f32 + 0.5;
+            for x in 0..row_width {
+                let px = x as f32 + 0.5;
+                let (dx, dy) = (px - flare.0, py - flare.1);
+                let distance = (dx * dx + dy * dy).sqrt();
+
+                let mut light = (0.0f32, 0.0f32, 0.0f32);
+
+                // The core, and the glow it sits in. An inverse square rather
+                // than a bell curve: it has to be blinding in the middle and
+                // still faintly there a long way out, which a bell curve
+                // reaches zero far too quickly to do.
+                let core_radius = lens.core * span;
+                let core = 1.0 / (1.0 + (distance / core_radius).powi(2));
+                add(&mut light, (1.00, 0.98, 0.94), core);
+                let glow = (-(distance / (lens.glow * span)).powi(2)).exp();
+                add(&mut light, (1.00, 0.95, 0.86), glow * lens.glow_strength);
+
+                // The ring thrown around it.
+                let ring = (distance - lens.halo * span) / (0.08 * span);
+                add(&mut light, (0.92, 0.76, 1.00), (-ring * ring).exp() * lens.halo_strength);
+
+                // Rays. One atan2 for all of them, and none at all for the
+                // lens that has none.
+                if lens.rays > 0 {
+                    let angle = dy.atan2(dx);
+                    let spokes = lens.rays as f32;
+                    // How far round we are between one ray and the next, as
+                    // -0.5..0.5 — the cheap way to ask "how near a ray is
+                    // this" without walking the list of them.
+                    let between =
+                        (angle * spokes / std::f32::consts::TAU + 0.5).fract() - 0.5;
+                    let near = (-(between * 14.0).powi(2)).exp();
+                    let reach = (-(distance / (lens.ray_length * span)).powi(2)).exp();
+                    add(&mut light, (1.00, 0.93, 0.80), near * reach * lens.ray_strength);
+                }
+
+                // The anamorphic streak: long sideways, thin the other way.
+                if lens.streak_strength > 0.0 {
+                    let along = (-(dx / (lens.streak * span)).powi(2)).exp();
+                    let across = (-(dy / (0.012 * span)).powi(2)).exp();
+                    add(&mut light, (0.55, 0.72, 1.00), along * across * lens.streak_strength);
+                }
+
+                for ghost in lens.ghosts {
+                    let at = (flare.0 + axis.0 * ghost.at, flare.1 + axis.1 * ghost.at);
+                    let (gx, gy) = (px - at.0, py - at.1);
+                    let radius = ghost.radius * span;
+                    if ghost.ring {
+                        let edge = ((gx * gx + gy * gy).sqrt() - radius) / (0.3 * radius);
+                        add(&mut light, ghost.tint, (-edge * edge).exp() * ghost.strength);
+                    } else {
+                        // Shaped by the aperture, not round: an iris is a
+                        // hexagon and its reflections show it.
+                        let shape = aperture(gx, gy) / radius;
+                        let disc = (1.0 - shape * shape).max(0.0);
+                        add(&mut light, ghost.tint, disc * disc * ghost.strength);
+                    }
+                }
+
+                let i = x * 4;
+                for (channel, amount) in [light.0, light.1, light.2].into_iter().enumerate() {
+                    let lit = out[i + channel] as f32 + amount * gain * 255.0;
+                    out[i + channel] = lit.clamp(0.0, 255.0) as u8;
+                }
+                // Alpha stands.
+            }
+        });
+}
+
+fn add(light: &mut (f32, f32, f32), tint: (f32, f32, f32), amount: f32) {
+    light.0 += tint.0 * amount;
+    light.1 += tint.1 * amount;
+    light.2 += tint.2 * amount;
+}
+
+/// Distance from the middle of a hexagonal aperture, measured so that the six
+/// flat sides are all one unit away.
+///
+/// Three dot products rather than the `atan2` the shape suggests: this runs
+/// for every ghost at every pixel, and a ghost being slightly hexagonal is
+/// not worth an inverse trig call eight times a pixel.
+fn aperture(x: f32, y: f32) -> f32 {
+    // Normals of the three pairs of parallel sides, at 0°, 60° and 120°.
+    const COS60: f32 = 0.5;
+    const SIN60: f32 = 0.866_025_4;
+    let flat = x.abs();
+    let left = (x * COS60 + y * SIN60).abs();
+    let right = (x * COS60 - y * SIN60).abs();
+    // Rounded off a little towards a circle: a real ghost's corners are soft.
+    let hex = flat.max(left).max(right);
+    let round = (x * x + y * y).sqrt();
+    hex * 0.65 + round * 0.35
+}
+
+/// The three lamps CS6's Lighting Effects offers, in the order its Light Type
+/// list gives them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LightType {
+    /// A cone thrown at the picture from off to one side: a bright middle
+    /// falling away to nothing at the edge of an ellipse.
+    #[default]
+    Spot,
+    /// A bulb hung over the picture, throwing light out in every direction
+    /// and falling off with distance.
+    Point,
+    /// The sun: parallel rays from one direction, the same everywhere, with
+    /// no falloff at all.
+    Infinite,
+}
+
+impl LightType {
+    pub fn from_i32(value: i32) -> LightType {
+        match value {
+            1 => LightType::Point,
+            2 => LightType::Infinite,
+            _ => LightType::Spot,
+        }
+    }
+}
+
+/// Which channel is read as a height map — CS6's Texture list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TextureChannel {
+    #[default]
+    None,
+    Red,
+    Green,
+    Blue,
+}
+
+impl TextureChannel {
+    pub fn from_i32(value: i32) -> TextureChannel {
+        match value {
+            1 => TextureChannel::Red,
+            2 => TextureChannel::Green,
+            3 => TextureChannel::Blue,
+            _ => TextureChannel::None,
+        }
+    }
+}
+
+/// Everything CS6's Lighting Effects Properties panel collects, for one lamp.
+///
+/// One lamp, not a list of them: CS6 keeps a Lights panel and will stack
+/// several, and this is the part of that feature not built — see the note on
+/// [`lighting_effects`]. A list here would have to give up `Copy` on `Filter`,
+/// which every caller of a filter relies on, so it is a change to make when
+/// the panel that needs it arrives rather than in advance of it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Lighting {
+    pub kind: LightType,
+    /// The lamp's own colour, and how hard it burns (-100 to 100). Negative
+    /// intensity takes light *away*, as CS6's does.
+    pub color: Rgba8,
+    pub intensity: f32,
+    /// How much of a spot's cone is at full brightness before it starts to
+    /// fall away (-100 to 100). Read only for a spot.
+    pub hotspot: f32,
+    /// The colour of the light that is there without any lamp, and how much
+    /// of it (-100 to 100).
+    pub colorize: Rgba8,
+    pub ambience: f32,
+    /// A stop control over the whole result (-100 to 100).
+    pub exposure: f32,
+    /// How sharp the highlight is (-100 matte to 100 shiny) and whose colour
+    /// it takes (-100 plastic, the lamp's, to 100 metallic, the surface's).
+    pub gloss: f32,
+    pub metallic: f32,
+    /// The channel read as a height map, and how tall it stands (0 to 100).
+    pub texture: TextureChannel,
+    pub height: f32,
+    /// Where the lamp is and how far it reaches, as fractions of the frame,
+    /// and which way it points in degrees. In CS6 these are the handles you
+    /// drag on the canvas rather than numbers in the panel.
+    pub center: (f32, f32),
+    pub size: f32,
+    pub angle: f32,
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        // CS6's defaults for a new Spot light.
+        Self {
+            kind: LightType::Spot,
+            color: Rgba8::WHITE,
+            intensity: 25.0,
+            hotspot: 44.0,
+            colorize: Rgba8::WHITE,
+            ambience: 0.0,
+            exposure: 0.0,
+            gloss: 0.0,
+            metallic: 0.0,
+            texture: TextureChannel::None,
+            height: 50.0,
+            center: (0.5, 0.5),
+            size: 0.45,
+            angle: 45.0,
+        }
+    }
+}
+
+/// Light the picture as though a lamp were shining on it — Filter ▸ Render ▸
+/// Lighting Effects.
+///
+/// This is not light *added* to the picture the way a flare is. The picture is
+/// treated as a surface and re-lit: what a pixel comes out as is what it
+/// reflects, so an unlit corner goes black however bright it started, and
+/// that is the whole character of the filter.
+///
+/// The shading is the textbook one — ambient, diffuse by `N·L`, and a
+/// specular highlight — with the normal `N` read off whichever channel the
+/// Texture list names. With no texture the surface is flat and only the
+/// lamp's own falloff shapes the light.
+///
+/// **What is not built**: CS6 runs this as a whole workspace — a Lights panel
+/// holding several lamps at once, handles dragged on the canvas to aim them,
+/// and a Presets list. This is one lamp, set from a dialog. The shading below
+/// would take a list of lamps with no change to its shape; it is the panel
+/// and the on-canvas handles that are missing.
+///
+/// Deliberately not on the GPU, for the same reason as [`lens_flare`]: it is
+/// per-pixel work of the shape a shader likes, but it runs once on OK and the
+/// result is wanted straight back on the CPU, so the trip would cost more
+/// than the arithmetic. See `docs/gpu-migration.md`.
+pub fn lighting_effects(pixmap: &mut Pixmap, opt: Lighting) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    let (fw, fh) = (width as f32, height as f32);
+
+    // Sizes are fractions of the half-diagonal, as with the flare, so that
+    // the dialog's shrunk preview is the same picture as the full render.
+    let span = 0.5 * (fw * fw + fh * fh).sqrt();
+    let reach = (opt.size.clamp(0.02, 3.0)) * span;
+    let at = (opt.center.0 * fw, opt.center.1 * fh);
+    let heading = opt.angle.to_radians();
+
+    // Where the lamp hangs, in three dimensions: the picture is the z=0
+    // plane and the lamp is above it. A spot is pushed off to one side as
+    // well, which is what gives it a lit near edge and a dark far one.
+    let lamp = match opt.kind {
+        LightType::Spot => (
+            at.0 + heading.cos() * reach * 0.55,
+            at.1 + heading.sin() * reach * 0.55,
+            reach * 0.85,
+        ),
+        LightType::Point => (at.0, at.1, reach * 0.7),
+        // An infinite light has no position at all; this is never read.
+        LightType::Infinite => (at.0, at.1, reach),
+    };
+    // The one direction an infinite light comes from, worked out once.
+    let sun = {
+        let elevation = 50.0f32.to_radians();
+        let flat = elevation.cos();
+        normalize((
+            -heading.cos() * flat,
+            -heading.sin() * flat,
+            elevation.sin(),
+        ))
+    };
+
+    // How much of the cone is at full brightness before it falls away.
+    let hotspot = ((opt.hotspot.clamp(-100.0, 100.0) + 100.0) / 200.0).clamp(0.0, 0.95);
+
+    // CS6's 25 is a lamp that leaves the picture about as bright as it found
+    // it, which is what makes 25 the default rather than 100.
+    let strength = opt.intensity.clamp(-100.0, 100.0) / 25.0;
+    let ambient = opt.ambience.clamp(-100.0, 100.0) / 100.0;
+    // Exposure in stops: fifty points either way is twice or half the light.
+    let exposure = (opt.exposure.clamp(-100.0, 100.0) / 50.0).exp2();
+
+    // A highlight only at all once Gloss is positive. At CS6's default of
+    // zero, a flat untextured surface shows none — every pixel would face
+    // the lamp equally and the picture would come back washed white.
+    let shine = (opt.gloss.clamp(-100.0, 100.0) / 100.0).max(0.0).powf(1.5);
+    let tightness = 2.0f32.powf(1.0 + (opt.gloss.clamp(-100.0, 100.0) + 100.0) / 200.0 * 6.0);
+    // Plastic reflects the lamp's colour, metal its own.
+    let metal = ((opt.metallic.clamp(-100.0, 100.0) + 100.0) / 200.0).clamp(0.0, 1.0);
+
+    let lamp_color = (
+        opt.color.r as f32 / 255.0,
+        opt.color.g as f32 / 255.0,
+        opt.color.b as f32 / 255.0,
+    );
+    let fill_color = (
+        opt.colorize.r as f32 / 255.0,
+        opt.colorize.g as f32 / 255.0,
+        opt.colorize.b as f32 / 255.0,
+    );
+
+    // The height map, read out before anything is written: a normal needs the
+    // neighbours of the pixel it belongs to, and those are about to change.
+    let relief = (opt.texture != TextureChannel::None).then(|| {
+        let channel = match opt.texture {
+            TextureChannel::Red => 0,
+            TextureChannel::Green => 1,
+            _ => 2,
+        };
+        let mut map = vec![0.0f32; width * height];
+        for (i, cell) in map.iter_mut().enumerate() {
+            *cell = pixmap.as_bytes()[i * 4 + channel] as f32 / 255.0;
+        }
+        map
+    });
+    // How steeply the height map stands. Scaled against the frame so that a
+    // texture keeps its relief on the dialog's proxy as well as full size.
+    let relief_scale = opt.height.clamp(0.0, 100.0) / 100.0 * span * 0.05;
+
+    let stride = pixmap.stride();
+    let bytes = pixmap.as_bytes_mut();
+    bytes
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let py = row as f32 + 0.5;
+            for x in 0..width {
+                let px = x as f32 + 0.5;
+
+                // The surface normal. Flat unless a channel is standing in
+                // as a height map, in which case the slope either side of
+                // this pixel tilts it.
+                let normal = match &relief {
+                    None => (0.0, 0.0, 1.0),
+                    Some(map) => {
+                        let at = |sx: usize, sy: usize| map[sy * width + sx];
+                        let (left, right) = (x.saturating_sub(1), (x + 1).min(width - 1));
+                        let (up, down) = (row.saturating_sub(1), (row + 1).min(height - 1));
+                        normalize((
+                            (at(left, row) - at(right, row)) * relief_scale,
+                            (at(x, up) - at(x, down)) * relief_scale,
+                            1.0,
+                        ))
+                    }
+                };
+
+                // Where the light is coming from, and how much of it reaches
+                // here.
+                let (to_lamp, falloff) = match opt.kind {
+                    LightType::Infinite => (sun, 1.0),
+                    LightType::Point => {
+                        let away = ((px - at.0).powi(2) + (py - at.1).powi(2)).sqrt() / reach;
+                        (
+                            normalize((lamp.0 - px, lamp.1 - py, lamp.2)),
+                            (1.0 - away * away).max(0.0),
+                        )
+                    }
+                    LightType::Spot => {
+                        let away = ((px - at.0).powi(2) + (py - at.1).powi(2)).sqrt() / reach;
+                        // Flat across the hotspot, then easing off to nothing
+                        // at the edge of the cone rather than stopping dead.
+                        let edge = if away <= hotspot {
+                            1.0
+                        } else {
+                            let t = ((1.0 - away) / (1.0 - hotspot)).clamp(0.0, 1.0);
+                            t * t * (3.0 - 2.0 * t)
+                        };
+                        (normalize((lamp.0 - px, lamp.1 - py, lamp.2)), edge)
+                    }
+                };
+
+                let facing = dot(normal, to_lamp).max(0.0);
+                let diffuse = facing * falloff * strength;
+
+                // Halfway between the lamp and the eye, which looks straight
+                // down at the picture.
+                let highlight = if shine > 0.0 && falloff > 0.0 {
+                    let half = normalize((to_lamp.0, to_lamp.1, to_lamp.2 + 1.0));
+                    dot(normal, half).max(0.0).powf(tightness) * falloff * shine * strength.abs()
+                } else {
+                    0.0
+                };
+
+                let i = x * 4;
+                let surface = (
+                    out[i] as f32 / 255.0,
+                    out[i + 1] as f32 / 255.0,
+                    out[i + 2] as f32 / 255.0,
+                );
+                let lit = [
+                    (fill_color.0 * ambient + lamp_color.0 * diffuse, surface.0, lamp_color.0),
+                    (fill_color.1 * ambient + lamp_color.1 * diffuse, surface.1, lamp_color.1),
+                    (fill_color.2 * ambient + lamp_color.2 * diffuse, surface.2, lamp_color.2),
+                ];
+                for (channel, (light, own, lamp_channel)) in lit.into_iter().enumerate() {
+                    // Plastic at one end of Metallic, metal at the other.
+                    let spec = highlight * (lamp_channel * (1.0 - metal) + own * metal);
+                    let value = (own * light + spec) * exposure;
+                    out[i + channel] = (value * 255.0).clamp(0.0, 255.0) as u8;
+                }
+                // Alpha stands: relighting a layer does not change its shape.
+            }
+        });
+}
+
+fn dot(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    a.0 * b.0 + a.1 * b.1 + a.2 * b.2
+}
+
+fn normalize(v: (f32, f32, f32)) -> (f32, f32, f32) {
+    let length = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+    if length <= f32::EPSILON {
+        return (0.0, 0.0, 1.0);
+    }
+    (v.0 / length, v.1 / length, v.2 / length)
 }
 
 /// A tongue's contribution at one point, from 0 (nothing) to 1 (its heart).
@@ -833,5 +1717,514 @@ mod tests {
             plain,
             spacing
         );
+    }
+
+    #[test]
+    fn clouds_is_deterministic() {
+        let make = || {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(128, 128, 128, 255));
+            clouds(&mut pm, false);
+            pm
+        };
+        assert_eq!(make().as_bytes(), make().as_bytes());
+    }
+
+    #[test]
+    fn clouds_is_grayscale() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(0, 0, 0, 255));
+        clouds(&mut pm, false);
+        for y in 0..32 {
+            for x in 0..32 {
+                let p = pm.get(x as i32, y as i32);
+                assert_eq!(p.r, p.g);
+                assert_eq!(p.g, p.b);
+            }
+        }
+    }
+
+    #[test]
+    fn clouds_preserves_alpha() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(100, 100, 100, 200));
+        clouds(&mut pm, false);
+        for y in 0..32 {
+            for x in 0..32 {
+                assert_eq!(pm.get(x as i32, y as i32).a, 200);
+            }
+        }
+    }
+
+    #[test]
+    fn clouds_produces_variety() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::new(128, 128, 128, 255));
+        clouds(&mut pm, false);
+        let values: std::collections::HashSet<u8> = pm.as_bytes()
+            .chunks_exact(4)
+            .map(|p| p[0])
+            .collect();
+        assert!(values.len() > 10, "clouds produced too few distinct values: {}", values.len());
+    }
+
+    #[test]
+    fn difference_clouds_differs_from_clouds() {
+        let mut pm_clouds = Pixmap::filled(32, 32, Rgba8::new(128, 128, 128, 255));
+        let mut pm_diff = Pixmap::filled(32, 32, Rgba8::new(128, 128, 128, 255));
+        clouds(&mut pm_clouds, false);
+        clouds(&mut pm_diff, true);
+        assert_ne!(pm_clouds.as_bytes(), pm_diff.as_bytes());
+    }
+
+    #[test]
+    fn empty_pixmap_clouds_does_not_panic() {
+        let mut pm = Pixmap::new(0, 0);
+        clouds(&mut pm, false);
+        clouds(&mut pm, true);
+    }
+
+    /// Same seed, same fibres — the property the Randomize button and undo
+    /// both depend on.
+    #[test]
+    fn fibers_are_deterministic_per_seed() {
+        let render = |seed| {
+            let mut pm = Pixmap::filled(48, 48, Rgba8::BLACK);
+            fibers(&mut pm, 32.0, 4.0, seed, Rgba8::new(255, 0, 0, 255), Rgba8::new(0, 0, 255, 255));
+            pm
+        };
+        assert_eq!(render(7).as_bytes(), render(7).as_bytes());
+        assert_ne!(render(7).as_bytes(), render(8).as_bytes());
+    }
+
+    #[test]
+    fn fibers_blend_between_the_two_swatch_colours() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::BLACK);
+        fibers(&mut pm, 32.0, 8.0, 3, Rgba8::new(255, 0, 0, 255), Rgba8::new(0, 0, 255, 255));
+        for p in pm.as_bytes().chunks_exact(4) {
+            // A blend of red and blue is always at least as blue as it is
+            // green: any green in there would mean the swatches were ignored.
+            assert!(p[2] >= p[1], "a fibre pixel came out green");
+            assert!(p[0] >= p[1] || p[2] >= p[1], "a pixel fell outside the red-blue blend");
+        }
+    }
+
+    /// Strands stand beside each other with a clean edge between them rather
+    /// than fading into one another. This is what holds up under a 500% zoom,
+    /// where CS6's fibres are still crisp single pixels: interpolating across
+    /// as well as along, which is what ordinary lattice noise does, leaves a
+    /// soft smear that only passes at a distance.
+    #[test]
+    fn fibers_have_hard_edges_between_strands() {
+        let mut pm = Pixmap::filled(256, 256, Rgba8::BLACK);
+        fibers(&mut pm, 32.0, 4.0, 3, Rgba8::BLACK, Rgba8::WHITE);
+        let (mut steep, mut steps) = (0u32, 0u32);
+        for y in 0..256 {
+            for x in 0..255 {
+                let (a, b) = (pm.get(x, y).r as i32, pm.get(x + 1, y).r as i32);
+                if (a - b).abs() > 64 {
+                    steep += 1;
+                }
+                steps += 1;
+            }
+        }
+        assert!(
+            steep * 5 > steps,
+            "strands are smeared into one another: only {steep} of {steps} \
+             sideways steps are a clean jump"
+        );
+    }
+
+    /// And variance shortens them. Low down the slider a strand runs the
+    /// whole height; by the top the picture is short broken dashes. Getting
+    /// this backwards — a strand whose tone cannot vary down its column at
+    /// all — leaves every setting looking like the bottom of the slider.
+    #[test]
+    fn fibers_break_up_as_variance_climbs() {
+        let column_travel = |variance: f32| {
+            let mut pm = Pixmap::filled(96, 192, Rgba8::BLACK);
+            fibers(&mut pm, variance, 4.0, 11, Rgba8::BLACK, Rgba8::WHITE);
+            let mut diffs = 0u64;
+            for x in 0..96 {
+                for y in 0..191 {
+                    let (a, b) = (pm.get(x, y).r as i32, pm.get(x, y + 1).r as i32);
+                    diffs += (a - b).unsigned_abs() as u64;
+                }
+            }
+            diffs
+        };
+        let (low, high) = (column_travel(8.0), column_travel(48.0));
+        assert!(
+            high > low * 2,
+            "variance did not break the fibres up: {low} at 8 vs {high} at 48"
+        );
+    }
+
+    #[test]
+    fn fibers_stretch_with_strength() {
+        // Higher strength: a column of pixels stays the same colour for
+        // longer. Measured as how much a randomly-picked column varies down
+        // its length — more strength, less variation along it.
+        let column_travel = |strength: f32| {
+            let mut pm = Pixmap::filled(64, 128, Rgba8::BLACK);
+            fibers(&mut pm, 48.0, strength, 5, Rgba8::BLACK, Rgba8::WHITE);
+            let mut diffs = 0u64;
+            for y in 0..127 {
+                let a = pm.get(10, y);
+                let b = pm.get(10, y + 1);
+                diffs += (a.r as i32 - b.r as i32).abs() as u64;
+            }
+            diffs
+        };
+        assert!(
+            column_travel(48.0) < column_travel(1.0),
+            "strength did not stretch the fibres lengthwise"
+        );
+    }
+
+    /// A strand runs the whole height of the picture: a step sideways changes
+    /// the tone far more than a step down does. Isotropic noise, which is what
+    /// this filter used to lay down, scores about even on the two and reads as
+    /// grey cloud rather than as fibres.
+    #[test]
+    fn fibers_run_down_the_picture_not_across_it() {
+        let mut pm = Pixmap::filled(128, 128, Rgba8::BLACK);
+        fibers(&mut pm, 12.0, 4.0, 5, Rgba8::BLACK, Rgba8::WHITE);
+        let (mut across, mut down) = (0u64, 0u64);
+        for y in 0..127i32 {
+            for x in 0..127i32 {
+                let here = pm.get(x, y).r as i32;
+                across += (here - pm.get(x + 1, y).r as i32).unsigned_abs() as u64;
+                down += (here - pm.get(x, y + 1).r as i32).unsigned_abs() as u64;
+            }
+        }
+        assert!(
+            across > down * 4,
+            "fibres are not lengthwise: {across} across vs {down} down"
+        );
+    }
+
+    /// And they go the whole way between the two colours. A field of noise
+    /// sits in a narrow band about its mean unless it is stretched, and an
+    /// unstretched one is the grey mush this filter used to produce.
+    #[test]
+    fn fibers_reach_both_colours() {
+        let mut pm = Pixmap::filled(128, 128, Rgba8::BLACK);
+        fibers(&mut pm, 12.0, 4.0, 2, Rgba8::BLACK, Rgba8::WHITE);
+        let tones: Vec<u8> = pm.as_bytes().chunks_exact(4).map(|p| p[0]).collect();
+        assert!(tones.iter().copied().min().unwrap() < 16, "no fibre went dark");
+        assert!(tones.iter().copied().max().unwrap() > 239, "no fibre went light");
+    }
+
+    #[test]
+    fn fibers_preserve_alpha() {
+        let mut pm = Pixmap::filled(16, 16, Rgba8::new(0, 0, 0, 123));
+        fibers(&mut pm, 32.0, 4.0, 1, Rgba8::BLACK, Rgba8::WHITE);
+        assert!(pm.as_bytes().chunks_exact(4).all(|p| p[3] == 123));
+    }
+
+    #[test]
+    fn fibers_on_an_empty_pixmap_do_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        fibers(&mut pm, 32.0, 4.0, 1, Rgba8::BLACK, Rgba8::WHITE);
+    }
+
+    /// A flare on a dark frame, for the tests below to read.
+    fn flare(width: u32, height: u32, at: (f32, f32), brightness: f32, lens: LensType) -> Pixmap {
+        let mut pm = Pixmap::filled(width, height, Rgba8::new(20, 20, 20, 255));
+        lens_flare(&mut pm, at, brightness, lens);
+        pm
+    }
+
+    #[test]
+    fn a_flare_burns_brightest_where_it_is_put() {
+        let pm = flare(240, 180, (0.5, 0.5), 100.0, LensType::Zoom50To300);
+        assert_eq!(pm.get(120, 90).r, 255, "the middle of the flare is not blown out");
+        // The far corner is off the axis, so no ghost lands on it either.
+        assert!(pm.get(4, 174).r < 90, "the flare lit the whole frame");
+    }
+
+    #[test]
+    fn a_flare_goes_where_it_is_told() {
+        let pm = flare(240, 180, (0.25, 0.25), 100.0, LensType::Zoom50To300);
+        let here = pm.get(60, 45).r;
+        // The opposite corner along the diagonal is where the ghosts fall, so
+        // compare against a corner off that axis instead.
+        let elsewhere = pm.get(180, 45).r;
+        assert!(here > elsewhere + 100, "{here} at the flare, {elsewhere} away from it");
+    }
+
+    #[test]
+    fn brightness_scales_the_light_a_flare_adds() {
+        // Read off the axis and away from the blown-out core, where there is
+        // room for the difference to show.
+        let sample = |brightness| flare(240, 180, (0.2, 0.2), brightness, LensType::Prime35)
+            .get(150, 40)
+            .r as i32;
+        let (dim, bright) = (sample(25.0), sample(300.0));
+        assert!(bright > dim, "brightness did not raise the flare: {dim} then {bright}");
+    }
+
+    /// The ghosts are reflections thrown back through the middle of the frame,
+    /// so they land on the line from the flare through the centre and out the
+    /// far side — not scattered anywhere else.
+    #[test]
+    fn the_ghosts_line_up_through_the_middle_of_the_frame() {
+        // On black, so what is measured is the light the flare added and
+        // nothing else.
+        let mut pm = Pixmap::filled(400, 300, Rgba8::BLACK);
+        lens_flare(&mut pm, (0.12, 0.5), 100.0, LensType::Zoom50To300);
+        // The right-hand half of the picture, along the axis and well off it.
+        let brightness = |row: i32| -> u64 {
+            (200..400).map(|x| pm.get(x, row).r as u64).sum()
+        };
+        let along = brightness(150);
+        let across = brightness(30);
+        assert!(
+            along > across * 2,
+            "the ghosts did not follow the axis: {along} along it, {across} off it"
+        );
+    }
+
+    #[test]
+    fn the_four_lenses_throw_different_flares() {
+        let each: Vec<Vec<u8>> = [
+            LensType::Zoom50To300,
+            LensType::Prime35,
+            LensType::Prime105,
+            LensType::MoviePrime,
+        ]
+        .into_iter()
+        .map(|lens| flare(160, 120, (0.5, 0.4), 100.0, lens).as_bytes().to_vec())
+        .collect();
+        for (i, one) in each.iter().enumerate() {
+            for other in each.iter().skip(i + 1) {
+                assert_ne!(one, other, "two lenses threw the same flare");
+            }
+        }
+    }
+
+    /// A flare is light added to the picture, not a picture of its own: it
+    /// must not make a transparent layer opaque.
+    #[test]
+    fn a_flare_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::new(10, 10, 10, 77));
+        lens_flare(&mut pm, (0.5, 0.5), 300.0, LensType::Prime35);
+        assert!(pm.as_bytes().chunks_exact(4).all(|p| p[3] == 77));
+    }
+
+    /// The dialog's preview filters a shrunk proxy rather than the layer, which
+    /// is only honest because a flare is placed and sized as a fraction of the
+    /// frame. If that ever stops being true the preview starts lying about
+    /// where the flare will land.
+    #[test]
+    fn a_flare_is_the_same_picture_at_any_size() {
+        let big = flare(600, 400, (0.7, 0.3), 100.0, LensType::Zoom50To300);
+        let small = flare(150, 100, (0.7, 0.3), 100.0, LensType::Zoom50To300);
+        let mut worst = 0i32;
+        for y in 0..100 {
+            for x in 0..150 {
+                // A proxy pixel stands for the four-by-four block of full-size
+                // pixels under it, so that is what it has to agree with —
+                // comparing single pixels would only measure how steeply the
+                // core falls off between one sample and the next.
+                let mut block = 0i32;
+                let mut blown = false;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let level = big.get(x * 4 + dx, y * 4 + dy).r as i32;
+                        blown |= level >= 250;
+                        block += level;
+                    }
+                }
+                // Where the flare has blown out, averaging sixteen clipped
+                // pixels is not the same thing as clipping their average, and
+                // no amount of care about the geometry will make it so. That
+                // is white either way; it is everywhere else that has to
+                // agree.
+                if blown {
+                    continue;
+                }
+                let mean = block / 16;
+                worst = worst.max((mean - small.get(x, y).r as i32).abs());
+            }
+        }
+        // Twenty rather than a handful: the core and the rays are peaked
+        // enough that a mean of sixteen samples sits measurably above a single
+        // one taken through the middle of them, whatever the geometry does.
+        // A flare that was sized in pixels rather than in fractions of the
+        // frame would be out by ten times this.
+        assert!(worst <= 20, "proxy and full size disagree by {worst} levels");
+    }
+
+    #[test]
+    fn a_flare_on_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        lens_flare(&mut pm, (0.5, 0.5), 100.0, LensType::Zoom50To300);
+    }
+
+    /// An evenly-toned frame, so that what comes back is the lighting and
+    /// nothing the picture brought with it.
+    fn under(light: Lighting) -> Pixmap {
+        let mut pm = Pixmap::filled(240, 180, Rgba8::new(160, 160, 160, 255));
+        lighting_effects(&mut pm, light);
+        pm
+    }
+
+    /// A lamp does not *add* light the way a flare does — it decides what the
+    /// picture reflects. Outside a spot's cone, with no ambient light, there
+    /// is nothing to reflect and the picture goes black however bright it
+    /// started.
+    #[test]
+    fn a_spot_lights_its_cone_and_leaves_the_rest_dark() {
+        let pm = under(Lighting::default());
+        assert!(pm.get(120, 90).r > 120, "the middle of the cone is not lit");
+        assert!(pm.get(4, 4).r < 12, "outside the cone did not go dark");
+    }
+
+    /// Ambience is the light that is there without any lamp, so it is what
+    /// brings the unlit corners back.
+    #[test]
+    fn ambience_lifts_what_the_lamp_does_not_reach() {
+        let dark = under(Lighting::default()).get(4, 4).r;
+        let lifted = under(Lighting {
+            ambience: 50.0,
+            ..Lighting::default()
+        })
+        .get(4, 4)
+        .r;
+        assert!(lifted > dark + 40, "{dark} unlit, {lifted} with ambience");
+    }
+
+    /// The sun reaches everywhere equally: no falloff, no hotspot, no dark
+    /// corners.
+    #[test]
+    fn an_infinite_light_falls_evenly_across_the_frame() {
+        let pm = under(Lighting {
+            kind: LightType::Infinite,
+            ..Lighting::default()
+        });
+        let middle = pm.get(120, 90).r as i32;
+        let corner = pm.get(4, 4).r as i32;
+        assert!((middle - corner).abs() <= 1, "{middle} in the middle, {corner} in the corner");
+    }
+
+    /// A point light falls off with distance from where it hangs; a spot has
+    /// a flat hotspot before it starts to. Reading across the two at the same
+    /// place is what tells them apart.
+    #[test]
+    fn a_point_light_falls_off_where_a_spots_hotspot_is_still_flat() {
+        let point = under(Lighting {
+            kind: LightType::Point,
+            ..Lighting::default()
+        });
+        let spot = under(Lighting {
+            hotspot: 80.0,
+            ..Lighting::default()
+        });
+        let fade = |pm: &Pixmap| pm.get(120, 90).r as i32 - pm.get(120, 130).r as i32;
+        assert!(
+            fade(&point) > fade(&spot),
+            "the point light did not fall off faster than the spot's hotspot"
+        );
+    }
+
+    #[test]
+    fn intensity_and_exposure_both_turn_the_light_up() {
+        let middle = |light: Lighting| under(light).get(120, 90).r as i32;
+        let base = Lighting {
+            intensity: 10.0,
+            ..Lighting::default()
+        };
+        assert!(middle(Lighting { intensity: 20.0, ..base }) > middle(base));
+        assert!(middle(Lighting { exposure: 50.0, ..base }) > middle(base));
+        // And negative intensity takes light away rather than adding it.
+        assert!(middle(Lighting { intensity: -25.0, ..base }) < middle(base));
+    }
+
+    /// Without a texture every pixel faces the lamp alike, so a highlight
+    /// would be a flat white wash over the whole cone. CS6 shows none at its
+    /// default Gloss, and neither does this.
+    #[test]
+    fn a_texture_is_what_gives_the_light_something_to_catch() {
+        let shiny = Lighting {
+            gloss: 80.0,
+            intensity: 40.0,
+            ..Lighting::default()
+        };
+        let flat = under(shiny);
+        // A raised channel, for the same light to catch on.
+        let mut bumpy = Pixmap::filled(240, 180, Rgba8::new(160, 160, 160, 255));
+        for y in 0..180 {
+            for x in 0..240 {
+                let ridge = if (x / 8) % 2 == 0 { 40 } else { 200 };
+                bumpy.set(x, y, Rgba8::new(160, ridge, 160, 255));
+            }
+        }
+        lighting_effects(
+            &mut bumpy,
+            Lighting {
+                texture: TextureChannel::Green,
+                height: 90.0,
+                ..shiny
+            },
+        );
+        // Flat: neighbouring pixels in the cone are shaded alike. Bumpy: the
+        // slopes catch the light and the ridges do not.
+        let spread = |pm: &Pixmap| {
+            let (mut low, mut high) = (255i32, 0i32);
+            for x in 100..140 {
+                let level = pm.get(x, 90).g as i32;
+                low = low.min(level);
+                high = high.max(level);
+            }
+            high - low
+        };
+        assert!(
+            spread(&bumpy) > spread(&flat) + 30,
+            "the texture did not shape the light: {} flat, {} bumpy",
+            spread(&flat),
+            spread(&bumpy)
+        );
+    }
+
+    #[test]
+    fn lighting_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::new(200, 200, 200, 90));
+        lighting_effects(&mut pm, Lighting::default());
+        assert!(pm.as_bytes().chunks_exact(4).all(|p| p[3] == 90));
+    }
+
+    /// Same reasoning as the flare: the dialog previews a shrunk proxy, so
+    /// the lamp has to be placed and sized as a fraction of the frame.
+    #[test]
+    fn a_lamp_is_the_same_light_at_any_size() {
+        let render = |w: u32, h: u32| {
+            let mut pm = Pixmap::filled(w, h, Rgba8::new(160, 160, 160, 255));
+            lighting_effects(
+                &mut pm,
+                Lighting {
+                    center: (0.35, 0.6),
+                    ..Lighting::default()
+                },
+            );
+            pm
+        };
+        let (big, small) = (render(600, 400), render(150, 100));
+        let mut worst = 0i32;
+        for y in 0..100 {
+            for x in 0..150 {
+                let mut block = 0i32;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        block += big.get(x * 4 + dx, y * 4 + dy).r as i32;
+                    }
+                }
+                worst = worst.max((block / 16 - small.get(x, y).r as i32).abs());
+            }
+        }
+        assert!(worst <= 8, "proxy and full size disagree by {worst} levels");
+    }
+
+    #[test]
+    fn lighting_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        lighting_effects(&mut pm, Lighting::default());
     }
 }

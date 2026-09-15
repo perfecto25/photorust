@@ -210,6 +210,13 @@ QWidget#panelTitleBar QToolButton#panelTitleBarButton:hover {
     background-color: #5e5e5e;
 }
 
+/* CS6's corner hatch on a floating panel. It draws its own strokes and lets
+   the panel footer show through around them, so the global QWidget background
+   above must not fill it in. */
+QWidget#panelResizeGrip {
+    background: transparent;
+}
+
 /* The brush preset picker. A floating panel, so it carries its own border —
    nothing else frames a Qt::Popup. */
 QWidget#brushPicker {
@@ -512,6 +519,43 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
     border-left: 3px solid transparent;
     border-right: 3px solid transparent;
     border-top: 3px solid #d4d4d4;
+}
+
+/* A spin box with a drop-down slider beside it shows no arrows of its own.
+   `setButtonSymbols(NoButtons)` does not settle it: a sub-control the theme
+   has given a width and a background is drawn whether or not the widget asked
+   for buttons, so it would end up with two arrows and only one of them live.
+   See shell/src/SliderPopup.h. */
+QSpinBox[sliderPopup="true"]::up-button,
+QSpinBox[sliderPopup="true"]::down-button,
+QDoubleSpinBox[sliderPopup="true"]::up-button,
+QDoubleSpinBox[sliderPopup="true"]::down-button {
+    width: 0px;
+    border: none;
+    background: transparent;
+}
+
+/* The arrow itself: a small boxed button hard against the field, as CS6 draws
+   it, rather than a bare triangle floating beside it. */
+QToolButton#sliderArrow {
+    background-color: #4a4a4a;
+    border: 1px solid #2a2a2a;
+    border-radius: 2px;
+    min-width: 13px;
+    max-width: 13px;
+    padding: 0px;
+    /* Overlapping the field's border by a pixel, so the pair reads as one
+       control rather than as two boxes that happen to touch. */
+    margin-left: -1px;
+}
+
+QToolButton#sliderArrow:hover {
+    background-color: #5e5e5e;
+}
+
+QToolButton#sliderArrow::menu-indicator {
+    image: none;
+    width: 0px;
 }
 
 /* ------------------------------------------------------------- buttons --- */

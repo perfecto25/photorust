@@ -237,6 +237,37 @@ If an operation does not fit the GPU, say so in a comment where the next person
 will look, and why. "Considered and rejected, because flood fill is sequential"
 is a useful thing to find; silence is not.
 
+### Look at the result on a photograph
+
+A filter can pass every test it has and still look nothing like CS6's. Tests
+pin down what the sliders *mean* — more pressure lays more colour, a wider
+brush paints broader patches — and none of them notices that the whole picture
+came out washed out. **Run new or changed pixel work over a real photograph and
+look at it before calling it done.**
+
+The samples are in **`samples/`**. `flower.jpg` is the reference the Artistic
+filters are matched against, and the one to use unless there is a reason not
+to — the CS6 screenshots being compared with are of that photograph. There are
+also `horse-3.jpg`, `fighterjet.jpg` and `tokyo.jpeg` for variety.
+
+The engine has no image decoder — it takes pixels from the shell, which has
+Qt's — so `core/examples/filter_sample.rs` speaks raw RGBA and the ends are
+whatever is to hand:
+
+```bash
+python3 -c "from PIL import Image; im = Image.open('samples/flower.jpg').convert('RGBA'); \
+    open('/tmp/in.raw','wb').write(im.tobytes()); print(im.size)"     # → (597, 900)
+cd core && cargo run --release --example filter_sample -- \
+    /tmp/in.raw 597 900 /tmp/out.raw "Dry Brush" 2 8 2                # menu name, dialog order
+python3 -c "from PIL import Image; \
+    Image.frombytes('RGBA',(597,900),open('/tmp/out.raw','rb').read()).save('/tmp/out.png')"
+```
+
+Compare against CS6's output **at the same slider values** — a filter that is
+close but flat, washed out or over-saturated is usually one constant, not a
+wrong algorithm. This is a check on the pixels; the GUI around them is the
+user's to try.
+
 ---
 
 ## 8. Known hard problems (don't underestimate these)
@@ -288,3 +319,7 @@ is a useful thing to find; silence is not.
   then apply the checklist in §7 before calling it done. "It works on the CPU"
   is not a finished feature for anything that touches more than a few thousand
   pixels.
+
+### Sample images
+
+sample images are in samples folder, primary test image is flower.jpg

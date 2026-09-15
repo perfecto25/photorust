@@ -9,17 +9,24 @@
 //!   destructively to a [`Pixmap`].
 
 pub mod adjust;
+pub mod artistic;
 pub mod convolve;
 pub mod distort;
 pub mod pixelate;
 pub mod render;
+pub mod stylize;
 
 pub use adjust::Adjustment;
-pub use convolve::{gaussian_blur, sharpen, sharpen_edges, sharpen_more, unsharp_mask, Kernel,
-                   RadialQuality, SharpenRemove};
+pub use convolve::{custom_default, gaussian_blur, sharpen, sharpen_edges, sharpen_more,
+                   unsharp_mask, Kernel, RadialQuality, SharpenRemove, CUSTOM_SIZE,
+                   CUSTOM_WEIGHTS};
 pub use distort::{EdgeMode, RippleSize, SpherizeMode, WaveKind, ZigZagStyle, SHEAR_POINTS};
 pub use pixelate::{MezzotintType, ScreenAngles, DEFAULT_SCREEN_ANGLES};
-pub use render::{FlameOptions, FlameShape, FlameStyle, FlameType};
+pub use artistic::DaubBrush;
+pub use stylize::{ContourEdge, DiffuseMode, ExtrudeOptions, ExtrudeType, TileFill, TileOptions,
+                  WindMethod};
+pub use render::{FlameOptions, FlameShape, FlameStyle, FlameType, LensType, Lighting,
+                 LightType, TextureChannel};
 
 use crate::buffer::Pixmap;
 
@@ -158,6 +165,143 @@ pub enum Filter {
     /// Blurs within a region but not across its edges: a neighbour counts
     /// only if it is within `threshold` of the centre pixel.
     SurfaceBlur { radius: u32, threshold: u32 },
+    /// Generate a grayscale cloud-like fractal noise pattern. `difference`
+    /// blends into existing pixels rather than replacing them — CS6's
+    /// Filter ▸ Render ▸ Clouds and Difference Clouds.
+    Clouds { difference: bool },
+    /// Long streaks drawn between the foreground and background colours —
+    /// Filter ▸ Render ▸ Fibers. `variance` (CS6's 0–64) is how much the
+    /// fibres swing and how fine they break up, `strength` (1–64) how far
+    /// each streak runs, and `seed` is what the Randomize button re-rolls. The colours are the
+    /// document's foreground and background — the dialog does not ask for
+    /// them, so the bridge fills them in; see `Engine::filter_for`.
+    Fibers {
+        variance: f32,
+        strength: f32,
+        seed: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// Light thrown into the picture by the lens it was taken with —
+    /// Filter ▸ Render ▸ Lens Flare. `center` is where the sun is, in
+    /// fractions of the width and height, which is what the dialog's
+    /// draggable crosshair sets; `brightness` is CS6's 10–300%; `lens` is
+    /// which of its four lenses threw it.
+    LensFlare {
+        center: (f32, f32),
+        brightness: f32,
+        lens: render::LensType,
+    },
+    /// Re-light the picture as though a lamp were shining on it — Filter ▸
+    /// Render ▸ Lighting Effects. One lamp rather than CS6's panel of them;
+    /// see [`render::Lighting`].
+    Lighting { light: render::Lighting },
+    /// Shuffle each pixel with one of its neighbours — Filter ▸ Stylize ▸
+    /// Diffuse. The mode decides which neighbour wins, and Anisotropic is the
+    /// odd one that smooths along edges instead of shuffling at all.
+    Diffuse { mode: stylize::DiffuseMode },
+    /// Stamp the picture into metal — Filter ▸ Stylize ▸ Emboss. `angle` is
+    /// where the light comes from in degrees, `height` how thick the relief
+    /// stands in pixels, and `amount` CS6's 1–500%.
+    Emboss {
+        angle: f32,
+        height: f32,
+        amount: f32,
+    },
+    /// Break the picture into towers standing out of the frame — Filter ▸
+    /// Stylize ▸ Extrude.
+    Extrude { options: stylize::ExtrudeOptions },
+    /// Draw the picture's edges as dark lines on white — Filter ▸ Stylize ▸
+    /// Find Edges. Takes no parameters, as in CS6.
+    FindEdges,
+    /// Fold the tonal range back on itself — Filter ▸ Stylize ▸ Solarize.
+    /// Takes no parameters, as in CS6.
+    Solarize,
+    /// Cut the picture into squares and nudge each off where it was — Filter ▸
+    /// Stylize ▸ Tiles. The two swatch colours in `options` come from the
+    /// document rather than the dialog; the bridge fills them in.
+    Tiles { options: stylize::TileOptions },
+    /// Draw the line where each channel crosses a brightness — Filter ▸
+    /// Stylize ▸ Trace Contour.
+    TraceContour { level: u8, edge: stylize::ContourEdge },
+    /// The convolution the user writes out by hand — Filter ▸ Other ▸ Custom.
+    /// `weights` reads row by row from the top left of CS6's 5×5 grid,
+    /// `scale` divides the total and `offset` is added to it.
+    Custom {
+        weights: [f32; CUSTOM_WEIGHTS],
+        scale: f32,
+        offset: f32,
+    },
+    /// The picture redrawn in pencil on paper — CS6's Colored Pencil, which
+    /// it keeps in the Filter Gallery rather than in the Filter menu.
+    ColoredPencil {
+        width: u32,
+        pressure: u32,
+        paper: u32,
+    },
+    /// The picture rebuilt out of pieces of coloured paper — CS6's Cutout,
+    /// another of the Filter Gallery's.
+    Cutout {
+        levels: u32,
+        simplicity: u32,
+        fidelity: u32,
+    },
+    /// The picture repainted with a stiff, half-dry brush — CS6's Dry Brush,
+    /// another of the Filter Gallery's.
+    DryBrush {
+        size: u32,
+        detail: u32,
+        texture: u32,
+    },
+    /// The picture as a fast film would have taken it — CS6's Film Grain,
+    /// another of the Filter Gallery's.
+    FilmGrain {
+        grain: u32,
+        highlight_area: u32,
+        intensity: u32,
+    },
+    /// The picture laid into wet plaster — CS6's Fresco, which shares Dry
+    /// Brush's three sliders.
+    Fresco {
+        size: u32,
+        detail: u32,
+        texture: u32,
+    },
+    /// The picture repainted in daubs of one colour — CS6's Paint Daubs.
+    PaintDaubs {
+        size: u32,
+        sharpness: u32,
+        brush: artistic::DaubBrush,
+    },
+    /// The picture spread with a knife — CS6's Palette Knife.
+    PaletteKnife {
+        size: u32,
+        detail: u32,
+        softness: u32,
+    },
+    /// The picture lit by a tube of one colour — CS6's Neon Glow. Only `glow`
+    /// comes from the dialog; the two the picture is rendered between are the
+    /// document's swatches, which the bridge fills in.
+    NeonGlow {
+        size: i32,
+        brightness: u32,
+        glow: crate::buffer::Rgba8,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture's edges lit up on a black ground — CS6's Glowing Edges,
+    /// which it keeps in the Filter Gallery rather than the Stylize submenu.
+    GlowingEdges {
+        width: u32,
+        brightness: u32,
+        smoothness: u32,
+    },
+    /// Blow the picture sideways off its edges — Filter ▸ Stylize ▸ Wind.
+    /// `from_right` is CS6's Direction, naming the side the wind comes from.
+    Wind {
+        method: stylize::WindMethod,
+        from_right: bool,
+    },
 }
 
 impl Filter {
@@ -194,6 +338,29 @@ impl Filter {
             Filter::MotionBlur { .. } => "Motion Blur",
             Filter::RadialBlur { .. } => "Radial Blur",
             Filter::SurfaceBlur { .. } => "Surface Blur",
+            Filter::Clouds { difference: false } => "Clouds",
+            Filter::Clouds { difference: true } => "Difference Clouds",
+            Filter::Fibers { .. } => "Fibers",
+            Filter::LensFlare { .. } => "Lens Flare",
+            Filter::Lighting { .. } => "Lighting Effects",
+            Filter::Diffuse { .. } => "Diffuse",
+            Filter::Emboss { .. } => "Emboss",
+            Filter::Extrude { .. } => "Extrude",
+            Filter::FindEdges => "Find Edges",
+            Filter::Solarize => "Solarize",
+            Filter::Tiles { .. } => "Tiles",
+            Filter::TraceContour { .. } => "Trace Contour",
+            Filter::Wind { .. } => "Wind",
+            Filter::Custom { .. } => "Custom",
+            Filter::GlowingEdges { .. } => "Glowing Edges",
+            Filter::ColoredPencil { .. } => "Colored Pencil",
+            Filter::Cutout { .. } => "Cutout",
+            Filter::DryBrush { .. } => "Dry Brush",
+            Filter::FilmGrain { .. } => "Film Grain",
+            Filter::Fresco { .. } => "Fresco",
+            Filter::NeonGlow { .. } => "Neon Glow",
+            Filter::PaintDaubs { .. } => "Paint Daubs",
+            Filter::PaletteKnife { .. } => "Palette Knife",
         }
     }
 
@@ -328,6 +495,186 @@ impl Filter {
                 ridges: p2.max(1.0) as u32,
                 style: ZigZagStyle::from_i32(p3 as i32),
             },
+            // In the order CS6's Properties panel reads down the page, with
+            // the three the panel does not have — where the lamp is, how far
+            // it reaches and which way it points, all handles on the canvas
+            // there — on the end.
+            "Lighting Effects" => {
+                let fallback = render::Lighting::default();
+                let at = |i: usize, or: f32| p.get(i).copied().unwrap_or(or);
+                let colour = |i: usize| {
+                    crate::buffer::Rgba8::new(
+                        at(i, 255.0).clamp(0.0, 255.0) as u8,
+                        at(i + 1, 255.0).clamp(0.0, 255.0) as u8,
+                        at(i + 2, 255.0).clamp(0.0, 255.0) as u8,
+                        255,
+                    )
+                };
+                Filter::Lighting {
+                    light: render::Lighting {
+                        kind: render::LightType::from_i32(at(0, 0.0) as i32),
+                        color: colour(1),
+                        intensity: at(4, fallback.intensity).clamp(-100.0, 100.0),
+                        hotspot: at(5, fallback.hotspot).clamp(-100.0, 100.0),
+                        colorize: colour(6),
+                        exposure: at(9, 0.0).clamp(-100.0, 100.0),
+                        gloss: at(10, 0.0).clamp(-100.0, 100.0),
+                        metallic: at(11, 0.0).clamp(-100.0, 100.0),
+                        ambience: at(12, 0.0).clamp(-100.0, 100.0),
+                        texture: render::TextureChannel::from_i32(at(13, 0.0) as i32),
+                        height: at(14, fallback.height).clamp(0.0, 100.0),
+                        // The dialog offers this as a percentage of the
+                        // frame, which is a size a person can think in; the
+                        // engine wants the fraction.
+                        size: (at(15, fallback.size * 100.0) / 100.0).clamp(0.02, 3.0),
+                        angle: at(16, fallback.angle),
+                        center: (
+                            at(17, 0.5).clamp(0.0, 1.0),
+                            at(18, 0.5).clamp(0.0, 1.0),
+                        ),
+                    },
+                }
+            }
+            "Diffuse" => Filter::Diffuse {
+                mode: stylize::DiffuseMode::from_i32(p1 as i32),
+            },
+            "Find Edges" => Filter::FindEdges,
+            "Solarize" => Filter::Solarize,
+            // The grid row by row, then Scale and Offset — the order the
+            // dialog reads down the page. A field left empty is zero, which
+            // is what an absent parameter already reads as.
+            "Custom" => {
+                let mut weights = [0.0f32; CUSTOM_WEIGHTS];
+                for (i, w) in weights.iter_mut().enumerate() {
+                    *w = at(i);
+                }
+                Filter::Custom {
+                    weights,
+                    scale: at(CUSTOM_WEIGHTS),
+                    offset: at(CUSTOM_WEIGHTS + 1),
+                }
+            }
+            "Colored Pencil" => Filter::ColoredPencil {
+                width: p1.max(0.0) as u32,
+                pressure: p2.max(0.0) as u32,
+                paper: p3.max(0.0) as u32,
+            },
+            "Cutout" => Filter::Cutout {
+                levels: p1.max(0.0) as u32,
+                simplicity: p2.max(0.0) as u32,
+                fidelity: p3.max(0.0) as u32,
+            },
+            "Dry Brush" => Filter::DryBrush {
+                size: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                texture: p3.max(0.0) as u32,
+            },
+            "Film Grain" => Filter::FilmGrain {
+                grain: p1.max(0.0) as u32,
+                highlight_area: p2.max(0.0) as u32,
+                intensity: p3.max(0.0) as u32,
+            },
+            "Fresco" => Filter::Fresco {
+                size: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                texture: p3.max(0.0) as u32,
+            },
+            "Palette Knife" => Filter::PaletteKnife {
+                size: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                softness: p3.max(0.0) as u32,
+            },
+            "Paint Daubs" => Filter::PaintDaubs {
+                size: p1.max(0.0) as u32,
+                sharpness: p2.max(0.0) as u32,
+                brush: artistic::DaubBrush::from_i32(p3 as i32),
+            },
+            // The swatch fills three slots after the two sliders, as every
+            // colour button does. The two the picture is rendered between are
+            // the document's, so they are left at black and white here and the
+            // bridge puts the real ones in.
+            "Neon Glow" => Filter::NeonGlow {
+                size: p1 as i32,
+                brightness: p2.max(0.0) as u32,
+                glow: crate::buffer::Rgba8::new(
+                    p3.clamp(0.0, 255.0) as u8,
+                    p4.clamp(0.0, 255.0) as u8,
+                    p5.clamp(0.0, 255.0) as u8,
+                    255,
+                ),
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Glowing Edges" => Filter::GlowingEdges {
+                width: p1.max(0.0) as u32,
+                brightness: p2.max(0.0) as u32,
+                smoothness: p3.max(0.0) as u32,
+            },
+            "Wind" => Filter::Wind {
+                method: stylize::WindMethod::from_i32(p1 as i32),
+                from_right: p2 == 0.0,
+            },
+            "Trace Contour" => Filter::TraceContour {
+                level: p1.clamp(0.0, 255.0) as u8,
+                edge: stylize::ContourEdge::from_i32(p2 as i32),
+            },
+            // In the order CS6's dialog reads down: the two numbers, then the
+            // fill box. The colours come from the document, not the dialog.
+            "Tiles" => {
+                let fallback = stylize::TileOptions::default();
+                let at = |i: usize, or: f32| p.get(i).copied().unwrap_or(or);
+                Filter::Tiles {
+                    options: stylize::TileOptions {
+                        count: at(0, fallback.count as f32).clamp(1.0, 99.0) as u32,
+                        offset: at(1, fallback.offset as f32).clamp(1.0, 99.0) as u32,
+                        fill: stylize::TileFill::from_i32(at(2, 0.0) as i32),
+                        ..fallback
+                    },
+                }
+            }
+            "Emboss" => Filter::Emboss {
+                angle: p1,
+                height: if p.len() > 1 { p2.clamp(1.0, 100.0) } else { 3.0 },
+                amount: if p.len() > 2 { p3.clamp(1.0, 500.0) } else { 100.0 },
+            },
+            // In the order CS6's dialog reads down the box: the shape, then
+            // the grid's square, then how far the towers stand and what
+            // decides it, then the two tick boxes.
+            "Extrude" => {
+                let fallback = stylize::ExtrudeOptions::default();
+                let at = |i: usize, or: f32| p.get(i).copied().unwrap_or(or);
+                Filter::Extrude {
+                    options: stylize::ExtrudeOptions {
+                        kind: stylize::ExtrudeType::from_i32(at(0, 0.0) as i32),
+                        size: at(1, fallback.size as f32).clamp(2.0, 255.0) as u32,
+                        depth: at(2, fallback.depth).clamp(1.0, 255.0),
+                        level_based: at(3, 0.0) != 0.0,
+                        solid_front: at(4, 0.0) != 0.0,
+                        mask_incomplete: at(5, 0.0) != 0.0,
+                    },
+                }
+            }
+            "Clouds" => Filter::Clouds { difference: false },
+            "Difference Clouds" => Filter::Clouds { difference: true },
+            // The colours come from the document, not the dialog; the bridge
+            // fills them in, like Pointillize's background above.
+            "Fibers" => Filter::Fibers {
+                variance: p1.clamp(0.0, 64.0),
+                strength: p2.clamp(1.0, 64.0),
+                seed: p3 as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            // The centre comes from the dialog's crosshair rather than a
+            // slider, which is why it trails the two controls CS6 lists.
+            "Lens Flare" => Filter::LensFlare {
+                brightness: p1.clamp(10.0, 300.0),
+                lens: render::LensType::from_i32(p2 as i32),
+                center: (
+                    p.get(2).copied().unwrap_or(0.5).clamp(0.0, 1.0),
+                    p.get(3).copied().unwrap_or(0.5).clamp(0.0, 1.0),
+                ),
+            },
             _ => return None,
         })
     }
@@ -395,6 +742,94 @@ impl Filter {
             Filter::Facet => Some(1),
             Filter::Fragment => Some(4),
             Filter::Average | Filter::RadialBlur { .. } => None,
+            // Cloud noise is seeded from pixel coordinates, so a crop would
+            // generate a different pattern from the whole image.
+            Filter::Clouds { .. } => None,
+            // The fibres are seeded over the whole canvas as well.
+            Filter::Fibers { .. } => None,
+            // The flare is placed as a fraction of the whole frame and sized
+            // against its diagonal, so a crop has no answer of its own.
+            Filter::LensFlare { .. } => None,
+            // The lamp is placed the same way.
+            Filter::Lighting { .. } => None,
+            // A pixel reaches one step for the neighbour it swaps with.
+            // Anisotropic reaches further, because it runs that step several
+            // times over and each pass reads what the last one left — get
+            // this wrong and a preview is right in the middle and wrong at
+            // its edges, which is exactly where nobody looks.
+            Filter::Diffuse { mode } => Some(match mode {
+                stylize::DiffuseMode::Anisotropic => stylize::ANISOTROPIC_REACH,
+                _ => 1,
+            }),
+            // Half the height each way, plus the softening pass that runs
+            // before it, which is half the height again.
+            Filter::Emboss { height, .. } => Some(height.clamp(1.0, 100.0).ceil() as u32 + 1),
+            // A tower is thrown outwards by a fraction of how far it already
+            // is from the middle of the frame, so what lands on a pixel can
+            // have come from anywhere in the picture. No crop answers for it.
+            Filter::Extrude { .. } => None,
+            // A 3×3 Sobel reads one pixel out, so a crop padded by that much
+            // answers for a region exactly.
+            Filter::FindEdges => Some(1),
+            // A pixel's new colour depends on nothing but its old one, so a
+            // crop of any region answers for itself with no padding at all.
+            Filter::Solarize => Some(0),
+            // The grid is laid on the layer's own corner, so a crop would
+            // start it somewhere else and its tiles would not line up with
+            // the ones either side of the region.
+            Filter::Tiles { .. } => None,
+            // One step out for the neighbour it is compared against, so a
+            // crop padded by that much answers for a region exactly.
+            Filter::TraceContour { .. } => Some(1),
+            // A streak's length is seeded from where it starts, so a crop
+            // taken out of the layer would be at different coordinates and
+            // would blow differently from the picture the user is about to
+            // get. Whole layer, with Add Noise and the rest of the seeded
+            // family.
+            Filter::Wind { .. } => None,
+            // Half of the 5×5 grid, so a crop padded by that much answers
+            // for a region exactly.
+            Filter::Custom { .. } => Some((CUSTOM_SIZE / 2) as u32),
+            // Three sigma of the smoothing blur, one more for the Sobel on
+            // top of it, and then however far the edge is widened.
+            Filter::GlowingEdges {
+                width, smoothness, ..
+            } => Some(stylize::glow_reach(width, smoothness)),
+            // The hatch is laid on the canvas, so a crop would land on a
+            // different part of it and its strokes would not line up with
+            // the ones either side.
+            Filter::ColoredPencil { .. } => None,
+            // A piece of paper is however far it reaches — a background can
+            // run the whole width of the picture — and its colour is the mean
+            // of all of it. A crop would cut the piece in two and paint the
+            // halves differently.
+            Filter::Cutout { .. } => None,
+            // The brush itself reaches a bounded way — three times its half
+            // width, for the load, the roughness under it and the roughness's
+            // own averaging — but the canvas it paints on is laid over the
+            // frame, so a crop would take its grain from somewhere else. With
+            // the hatch and the seeded family.
+            Filter::DryBrush { .. } => None,
+            // Every pixel answers for itself and reaches nowhere — but the
+            // grain is seeded from where the pixel is, so a crop taken out of
+            // the layer would be at different coordinates and would come back
+            // on different film. With Add Noise and the rest of the seeded
+            // family.
+            Filter::FilmGrain { .. } => None,
+            // The dabs reach a bounded way, but the plaster's own surface is
+            // laid over the frame — with the canvas under Dry Brush, and for
+            // the same reason.
+            Filter::Fresco { .. } => None,
+            // The cells are laid on the canvas, so a crop would land on a
+            // different part of the lattice and its joins would not line up
+            // with the ones either side — with Crystallize, whose cells these
+            // are.
+            Filter::PaletteKnife { .. } => None,
+            // The daub reaches its own width, and what goes back on top of it
+            // reaches no further than the daub it was taken from.
+            Filter::PaintDaubs { size, .. } => Some(((size as f32 * 0.5 * 1.6).ceil() as u32).max(1)),
+            // Three sigma of the blur that spreads the picture's own light.
+            Filter::NeonGlow { size, .. } => Some((size.unsigned_abs() * 3).max(1)),
         }
     }
 
@@ -480,6 +915,84 @@ impl Filter {
             Filter::Facet => pixelate::facet(pixmap),
             Filter::Fragment => pixelate::fragment(pixmap),
             Filter::Mezzotint { kind } => pixelate::mezzotint(pixmap, kind),
+            Filter::Clouds { difference } => render::clouds(pixmap, difference),
+            Filter::Fibers {
+                variance,
+                strength,
+                seed,
+                foreground,
+                background,
+            } => render::fibers(pixmap, variance, strength, seed, foreground, background),
+            Filter::LensFlare {
+                center,
+                brightness,
+                lens,
+            } => render::lens_flare(pixmap, center, brightness, lens),
+            Filter::Lighting { light } => render::lighting_effects(pixmap, light),
+            Filter::Diffuse { mode } => stylize::diffuse(pixmap, mode),
+            Filter::Emboss {
+                angle,
+                height,
+                amount,
+            } => stylize::emboss(pixmap, angle, height, amount),
+            Filter::Extrude { options } => stylize::extrude(pixmap, options),
+            Filter::FindEdges => stylize::find_edges(pixmap),
+            Filter::Solarize => stylize::solarize(pixmap),
+            Filter::Tiles { options } => stylize::tiles(pixmap, options),
+            Filter::TraceContour { level, edge } => stylize::trace_contour(pixmap, level, edge),
+            Filter::Wind { method, from_right } => stylize::wind(pixmap, method, from_right),
+            Filter::GlowingEdges {
+                width,
+                brightness,
+                smoothness,
+            } => stylize::glowing_edges(pixmap, width, brightness, smoothness),
+            Filter::ColoredPencil {
+                width,
+                pressure,
+                paper,
+            } => artistic::colored_pencil(pixmap, width, pressure, paper),
+            Filter::Cutout {
+                levels,
+                simplicity,
+                fidelity,
+            } => artistic::cutout(pixmap, levels, simplicity, fidelity),
+            Filter::DryBrush {
+                size,
+                detail,
+                texture,
+            } => artistic::dry_brush(pixmap, size, detail, texture),
+            Filter::FilmGrain {
+                grain,
+                highlight_area,
+                intensity,
+            } => artistic::film_grain(pixmap, grain, highlight_area, intensity),
+            Filter::Fresco {
+                size,
+                detail,
+                texture,
+            } => artistic::fresco(pixmap, size, detail, texture),
+            Filter::PaletteKnife {
+                size,
+                detail,
+                softness,
+            } => artistic::palette_knife(pixmap, size, detail, softness),
+            Filter::PaintDaubs {
+                size,
+                sharpness,
+                brush,
+            } => artistic::paint_daubs(pixmap, size, sharpness, brush),
+            Filter::NeonGlow {
+                size,
+                brightness,
+                glow,
+                foreground,
+                background,
+            } => artistic::neon_glow(pixmap, size, brightness, glow, foreground, background),
+            Filter::Custom {
+                weights,
+                scale,
+                offset,
+            } => convolve::custom(pixmap, &weights, scale, offset),
         }
     }
 }
@@ -632,5 +1145,219 @@ mod tests {
         for f in all {
             assert!(!f.name().is_empty());
         }
+    }
+
+    /// The dialog hands over a flat list of numbers, and the order it puts
+    /// them in is a contract between the two sides — Lens Flare's crosshair
+    /// fills the last two slots, after the two controls CS6 lists.
+    #[test]
+    fn a_lens_flare_reads_its_dialog_in_order() {
+        let flare = Filter::from_menu_name("Lens Flare", &[143.0, 2.0, 0.25, 0.75]);
+        assert_eq!(
+            flare,
+            Some(Filter::LensFlare {
+                brightness: 143.0,
+                lens: LensType::Prime105,
+                center: (0.25, 0.75),
+            })
+        );
+        // What the dialog did not offer reads as the middle of the frame, not
+        // as a flare jammed into the top-left corner.
+        assert_eq!(
+            Filter::from_menu_name("Lens Flare", &[100.0, 0.0]),
+            Some(Filter::LensFlare {
+                brightness: 100.0,
+                lens: LensType::Zoom50To300,
+                center: (0.5, 0.5),
+            })
+        );
+    }
+
+    /// Diffuse's four modes are the whole of its dialog, and an unknown
+    /// number has to read as the one CS6 opens on rather than as nothing.
+    #[test]
+    fn diffuse_reads_the_mode_its_dialog_chose() {
+        for (chosen, expected) in [
+            (0.0, DiffuseMode::Normal),
+            (1.0, DiffuseMode::DarkenOnly),
+            (2.0, DiffuseMode::LightenOnly),
+            (3.0, DiffuseMode::Anisotropic),
+            (9.0, DiffuseMode::Normal),
+        ] {
+            assert_eq!(
+                Filter::from_menu_name("Diffuse", &[chosen]),
+                Some(Filter::Diffuse { mode: expected })
+            );
+        }
+        assert_eq!(
+            Filter::from_menu_name("Diffuse", &[]),
+            Some(Filter::Diffuse {
+                mode: DiffuseMode::Normal
+            })
+        );
+    }
+
+    /// Emboss's three numbers, and what an unasked-for one falls back to.
+    /// CS6 opens on 135°, three pixels and 100%, which is also what a repeat
+    /// with no dialog has to use.
+    #[test]
+    fn emboss_reads_angle_then_height_then_amount() {
+        assert_eq!(
+            Filter::from_menu_name("Emboss", &[45.0, 8.0, 250.0]),
+            Some(Filter::Emboss {
+                angle: 45.0,
+                height: 8.0,
+                amount: 250.0
+            })
+        );
+        assert_eq!(
+            Filter::from_menu_name("Emboss", &[]),
+            Some(Filter::Emboss {
+                angle: 0.0,
+                height: 3.0,
+                amount: 100.0
+            })
+        );
+        // A taller relief reads further, so its preview has to crop wider.
+        let reach = |height| {
+            Filter::Emboss {
+                angle: 0.0,
+                height,
+                amount: 100.0,
+            }
+            .reach()
+        };
+        assert!(reach(20.0) > reach(3.0));
+    }
+
+    /// Extrude's six, in the order its dialog reads down the box. Size and
+    /// Depth are both plain numbers in overlapping ranges, so a swap between
+    /// them produces a picture that still looks extruded and is simply not
+    /// the one that was asked for.
+    #[test]
+    fn extrude_reads_its_dialog_in_order() {
+        assert_eq!(
+            Filter::from_menu_name("Extrude", &[1.0, 12.0, 200.0, 1.0, 1.0, 1.0]),
+            Some(Filter::Extrude {
+                options: ExtrudeOptions {
+                    kind: ExtrudeType::Pyramids,
+                    size: 12,
+                    depth: 200.0,
+                    level_based: true,
+                    solid_front: true,
+                    mask_incomplete: true,
+                }
+            })
+        );
+        // Nothing collected is CS6's opening state: blocks, 30 and 30, thrown
+        // at random, neither box ticked.
+        assert_eq!(
+            Filter::from_menu_name("Extrude", &[]),
+            Some(Filter::Extrude {
+                options: ExtrudeOptions::default()
+            })
+        );
+        // A tower is thrown by a fraction of how far it already is from the
+        // middle, so no crop can answer for a region of it on its own.
+        assert_eq!(
+            Filter::Extrude {
+                options: ExtrudeOptions::default()
+            }
+            .reach(),
+            None
+        );
+    }
+
+    /// Find Edges takes nothing, as in CS6, and still needs a name for the
+    /// History panel and a reach for a cropped preview.
+    #[test]
+    fn find_edges_takes_no_parameters() {
+        assert_eq!(
+            Filter::from_menu_name("Find Edges", &[]),
+            Some(Filter::FindEdges)
+        );
+        assert_eq!(Filter::FindEdges.name(), "Find Edges");
+        assert_eq!(Filter::FindEdges.reach(), Some(1));
+    }
+
+    /// Solarize takes nothing either, and reads no neighbours, so a region
+    /// needs no padding round it.
+    #[test]
+    fn solarize_takes_no_parameters() {
+        assert_eq!(
+            Filter::from_menu_name("Solarize", &[]),
+            Some(Filter::Solarize)
+        );
+        assert_eq!(Filter::Solarize.name(), "Solarize");
+        assert_eq!(Filter::Solarize.reach(), Some(0));
+    }
+
+    /// Anisotropic runs its pass several times over, so it reads further than
+    /// the one step the other three do. A preview crops to the reach, so a
+    /// reach that is too small shows a seam a few pixels inside the
+    /// thumbnail's edge — and nothing at all wrong in the middle.
+    #[test]
+    fn anisotropic_reaches_further_than_the_other_modes() {
+        let reach = |mode| Filter::Diffuse { mode }.reach();
+        assert_eq!(reach(DiffuseMode::Normal), Some(1));
+        assert_eq!(reach(DiffuseMode::DarkenOnly), Some(1));
+        assert_eq!(
+            reach(DiffuseMode::Anisotropic),
+            Some(crate::filters::stylize::ANISOTROPIC_REACH)
+        );
+        assert!(crate::filters::stylize::ANISOTROPIC_REACH > 1);
+    }
+
+    /// Nineteen numbers in one flat list, read back into the panel CS6 shows.
+    /// Two colours in the middle of it fill three slots each, which is where
+    /// a miscount would put the exposure into the blue channel and never be
+    /// noticed by anything but this.
+    #[test]
+    fn lighting_effects_reads_its_panel_in_order() {
+        let panel = [
+            1.0, // Light Type: Point
+            255.0, 200.0, 100.0, // Color
+            35.0,  // Intensity
+            -22.0, // Hotspot
+            10.0, 20.0, 30.0, // Colorize
+            15.0,  // Exposure
+            -13.0, // Gloss
+            41.0,  // Metallic
+            44.0,  // Ambience
+            2.0,   // Texture: Green
+            80.0,  // Height
+            60.0,  // Size, as a percentage of the frame
+            120.0, // Angle
+            0.25, 0.75, // Where the lamp stands
+        ];
+        assert_eq!(
+            Filter::from_menu_name("Lighting Effects", &panel),
+            Some(Filter::Lighting {
+                light: Lighting {
+                    kind: LightType::Point,
+                    color: Rgba8::new(255, 200, 100, 255),
+                    intensity: 35.0,
+                    hotspot: -22.0,
+                    colorize: Rgba8::new(10, 20, 30, 255),
+                    exposure: 15.0,
+                    gloss: -13.0,
+                    metallic: 41.0,
+                    ambience: 44.0,
+                    texture: TextureChannel::Green,
+                    height: 80.0,
+                    size: 0.6,
+                    angle: 120.0,
+                    center: (0.25, 0.75),
+                },
+            })
+        );
+        // An empty list is CS6's opening spot light rather than a lamp with
+        // no colour, no size and nothing to shine on.
+        assert_eq!(
+            Filter::from_menu_name("Lighting Effects", &[]),
+            Some(Filter::Lighting {
+                light: Lighting::default()
+            })
+        );
     }
 }

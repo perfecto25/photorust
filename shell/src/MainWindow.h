@@ -31,6 +31,7 @@ class ToolStrip;
 class QLineEdit;
 class QComboBox;
 class QDockWidget;
+class SwatchesPanel;
 class QKeyEvent;
 class QMenu;
 class QTabBar;
@@ -222,6 +223,21 @@ private:
     /// same numbers a four-colour press uses; `DEFAULT_SCREEN_ANGLES` in the
     /// engine.
     static constexpr float kDefaultScreenAngles[4] = {108.0f, 162.0f, 90.0f, 45.0f};
+
+    /// The side of Custom's kernel grid. Must match `CUSTOM_SIZE` in the
+    /// engine, which reads the weights row by row from the top left.
+    static constexpr int kCustomKernelSize = 5;
+
+    /// What Custom's grid opens with: the classic sharpen, a 5 in the middle
+    /// pulling against a -1 on each of its four sides. `custom_default()` in
+    /// the engine, read row by row.
+    static constexpr float kDefaultCustomKernel[kCustomKernelSize * kCustomKernelSize] = {
+        0, 0, 0, 0, 0,
+        0, 0, -1, 0, 0,
+        0, -1, 5, -1, 0,
+        0, 0, -1, 0, 0,
+        0, 0, 0, 0, 0,
+    };
 
     /// Let the View menu's zoom shortcuts through to the canvas while a dialog
     /// is open, as Photoshop's dialogs do. Returns whether the key was one of
@@ -517,6 +533,7 @@ private:
     ColorPanel *m_colorPanel = nullptr;
     HistoryPanel *m_historyPanel = nullptr;
     InfoPanel *m_infoPanel = nullptr;
+    SwatchesPanel *m_swatchesPanel = nullptr;
     QDockWidget *m_infoDock = nullptr;
     PropertiesPanel *m_propertiesPanel = nullptr;
     /// Held so a new adjustment layer can raise it, as CS6 does.
