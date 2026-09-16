@@ -3025,10 +3025,96 @@ impl Document {
         self.stroke.as_ref().map_or(Rect::default(), |m| m.dirty())
     }
 
+    /// Composite just the part of the in-progress stroke that has been added
+    /// since the last call, as a patch the caller can blit over what it already
+    /// has on screen.
+    ///
+    /// This is the live-preview path for a drag. [`Self::preview_stroke`]
+    /// re-composites the whole document, which on a large image takes long
+    /// enough per mouse-move that the pointer's events get compressed and the
+    /// stroke arrives as a polygon; a dab's bounding box is a few hundred
+    /// pixels and costs essentially nothing.
+    ///
+    /// `None` means there is nothing to repaint — no stroke, or the pointer has
+    /// not moved far enough to place a dab.
+    pub fn preview_stroke_patch(
+        &mut self,
+        color: Rgba8,
+        opacity: f32,
+    ) -> Option<compositor::CompositeResult> {
+        // Quick Mask paints into the selection rather than the layer, and its
+        // preview is a veil over the whole composite; there is no patch to cut
+        // out of that, so those strokes stay on the full-document path.
+        if self.quick_mask {
+            return None;
+        }
+        let region = self.stroke.as_mut()?.take_pending();
+        let region = region.intersect(&Rect::from_size(self.width, self.height));
+        if region.is_empty() {
+            return None;
+        }
+
+        let id = self.active_layer;
+
+        // The stroke is composited onto the real layer and then put back,
+        // rather than onto a copy of the stack. Copying the stack was the other
+        // half of what made this slow — at 23MB a layer it is not something to
+        // do per mouse-move — and nothing can observe the document in between,
+        // since the restore is unconditional and on the same path. `blit` is
+        // byte-exact at matching depth, so a 16-bit layer comes back untouched.
+        let (saved, backup) = {
+            let layer = self.stack.by_id_mut(id)?;
+            let offset = layer.offset;
+            let lock = layer.lock_transparency;
+            let saved = Rect::new(
+                region.x - offset.0,
+                region.y - offset.1,
+                region.width,
+                region.height,
+            )
+            .intersect(&layer.pixels.rect());
+            let backup = layer.pixels.crop(saved);
+
+            let mask = self.stroke.as_ref().expect("checked above");
+            let selection = Some(&self.selection).filter(|sel| !sel.is_empty());
+            match self.clone.as_ref() {
+                Some(clone) => mask.composite_source_region_onto(
+                    &mut layer.pixels,
+                    &clone.source,
+                    clone.offset,
+                    opacity,
+                    offset,
+                    selection,
+                    lock,
+                    region,
+                ),
+                None => mask.composite_region_onto(
+                    &mut layer.pixels,
+                    color,
+                    opacity,
+                    offset,
+                    selection,
+                    lock,
+                    region,
+                ),
+            };
+            (saved, backup)
+        };
+
+        let patch = compositor::composite_patch(&self.stack, self.width, self.height, region);
+
+        if let Some(layer) = self.stack.by_id_mut(id) {
+            layer.pixels.blit(&backup, saved.x, saved.y);
+        }
+        Some(patch)
+    }
+
     /// Composite the in-progress stroke onto the active layer *without*
     /// finishing it. Used to show the stroke live as the user drags.
     ///
     /// Returns a preview of the full document with the stroke applied.
+    /// Prefer [`Self::preview_stroke_patch`] during a drag; this is for the
+    /// cases it does not cover — Quick Mask, and the first frame of a stroke.
     pub fn preview_stroke(&self, color: Rgba8, opacity: f32) -> Option<Pixmap> {
         let mask = self.stroke.as_ref()?;
         let layer = self.active_layer()?;
@@ -3069,9 +3155,12 @@ impl Document {
     /// Finish the stroke, baking it into the active layer and recording one
     /// history state for the whole thing.
     pub fn end_stroke(&mut self, color: Rgba8, opacity: f32) -> Rect {
-        let Some(mask) = self.stroke.take() else {
+        let Some(mut mask) = self.stroke.take() else {
             return Rect::default();
         };
+        // Smoothing leaves paint half a sample behind the cursor; this is where
+        // the stroke catches up with where the pointer was let go.
+        mask.finish();
         self.stroke_undo_base = None;
 
         if mask.is_empty() {
@@ -3118,11 +3207,12 @@ impl Document {
     /// Finish a Clone Stamp stroke, copying the snapshot through the stroke's
     /// coverage and recording one history state for the whole thing.
     pub fn end_clone_stroke(&mut self, opacity: f32) -> Rect {
-        let (Some(mask), Some(clone)) = (self.stroke.take(), self.clone.take()) else {
+        let (Some(mut mask), Some(clone)) = (self.stroke.take(), self.clone.take()) else {
             self.stroke = None;
             self.clone = None;
             return Rect::default();
         };
+        mask.finish();
         self.stroke_undo_base = None;
         if mask.is_empty() {
             return Rect::default();
@@ -3185,9 +3275,10 @@ impl Document {
     where
         F: FnOnce(&mut Pixmap, Rect, &[f32]) -> Rect,
     {
-        let Some(mask) = self.stroke.take() else {
+        let Some(mut mask) = self.stroke.take() else {
             return Rect::default();
         };
+        mask.finish();
         self.stroke_undo_base = None;
 
         if mask.is_empty() {
@@ -7213,6 +7304,9 @@ impl Document {
             if *closed {
                 mask.extend(brush, x0, y0, 1.0);
             }
+            // Each subpath is a stroke in its own right and has to reach its
+            // own last point before the next `begin` resets the path state.
+            mask.finish();
         }
 
         let selection_empty = self.selection.is_empty();
@@ -9030,6 +9124,114 @@ mod tests {
         let preview = d.preview_stroke(Rgba8::opaque(255, 0, 0), 1.0).expect("no preview");
         assert_eq!(preview.get(60, 20), Rgba8::opaque(10, 200, 10),
                    "the preview painted the foreground colour instead of the source");
+    }
+
+    /// Drive a stroke and reassemble the canvas from the patches alone, the
+    /// way the shell does: start from the composite before the stroke, then
+    /// blit each mouse-move's patch over it.
+    fn canvas_from_patches(d: &mut Document, color: Rgba8, points: &[(f32, f32)]) -> Pixmap {
+        let mut canvas = d.composite();
+        for &(x, y) in points {
+            let brush = Brush { size: 12.0, hardness: 0.6, ..Brush::default() };
+            d.extend_stroke(&brush, x, y, 1.0);
+            if let Some(patch) = d.preview_stroke_patch(color, 1.0) {
+                canvas.blit(&patch.pixels, patch.dirty.x, patch.dirty.y);
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn a_patched_preview_matches_the_whole_document_preview() {
+        // The patch path exists only to be faster, so the one thing that must
+        // hold is that it draws the same pixels. A disagreement here is a
+        // subtly wrong canvas, not a crash.
+        let color = Rgba8::opaque(220, 30, 30);
+        let points = [(14.0, 20.0), (22.0, 26.0), (33.0, 24.0), (45.0, 31.0), (58.0, 22.0)];
+        let brush = Brush { size: 12.0, hardness: 0.6, ..Brush::default() };
+
+        let mut patched = Document::new(80, 50, Rgba8::WHITE);
+        patched.begin_stroke(&brush, 10.0, 20.0, 1.0);
+        let from_patches = canvas_from_patches(&mut patched, color, &points);
+
+        let mut whole = Document::new(80, 50, Rgba8::WHITE);
+        whole.begin_stroke(&brush, 10.0, 20.0, 1.0);
+        for &(x, y) in &points {
+            whole.extend_stroke(&brush, x, y, 1.0);
+        }
+        let from_whole = whole.preview_stroke(color, 1.0).expect("no preview");
+
+        for y in 0..50 {
+            for x in 0..80 {
+                assert_eq!(
+                    from_patches.get(x, y),
+                    from_whole.get(x, y),
+                    "patched preview differs at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn previewing_by_patch_leaves_the_layer_untouched() {
+        // The patch composites onto the real layer and puts it back. If the
+        // restore were wrong the stroke would bake itself in early, and undo
+        // would have nothing to go back to.
+        let mut d = Document::new(60, 40, Rgba8::WHITE);
+        let before = d.active_layer().expect("no layer").pixels.clone();
+
+        let brush = Brush { size: 10.0, ..Brush::default() };
+        d.begin_stroke(&brush, 10.0, 20.0, 1.0);
+        for x in (14..50).step_by(6) {
+            d.extend_stroke(&brush, x as f32, 20.0, 1.0);
+            d.preview_stroke_patch(Rgba8::BLACK, 1.0);
+        }
+
+        let after = &d.active_layer().expect("no layer").pixels;
+        assert_eq!(before.as_bytes(), after.as_bytes(), "the preview left paint behind");
+    }
+
+    #[test]
+    fn a_patch_covers_only_what_is_new() {
+        // The whole point: a long stroke must not repaint everything it has
+        // covered so far on every mouse-move.
+        let mut d = Document::new(400, 80, Rgba8::WHITE);
+        let brush = Brush { size: 10.0, ..Brush::default() };
+        d.begin_stroke(&brush, 10.0, 40.0, 1.0);
+        d.preview_stroke_patch(Rgba8::BLACK, 1.0);
+
+        for x in (20..380).step_by(10) {
+            d.extend_stroke(&brush, x as f32, 40.0, 1.0);
+            let patch = d.preview_stroke_patch(Rgba8::BLACK, 1.0).expect("no patch");
+            assert!(
+                patch.dirty.width < 40,
+                "a 10px step repainted {}px of canvas",
+                patch.dirty.width
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_composites_the_layers_above_the_one_being_painted() {
+        // The patch is a composite, not the active layer's pixels: a layer on
+        // top of the one being painted still covers the stroke.
+        let mut d = Document::new(60, 40, Rgba8::WHITE);
+        let id = d.layers_mut_raw().allocate_id();
+        d.layers_mut_raw()
+            .push(Layer::new_filled(id, "Lid", 60, 40, Rgba8::opaque(0, 0, 255)));
+        d.commit("Setup");
+
+        let brush = Brush { size: 12.0, hardness: 1.0, ..Brush::default() };
+        d.begin_stroke(&brush, 10.0, 20.0, 1.0);
+        d.extend_stroke(&brush, 40.0, 20.0, 1.0);
+        let patch = d.preview_stroke_patch(Rgba8::opaque(255, 0, 0), 1.0).expect("no patch");
+
+        let (px, py) = (25 - patch.dirty.x, 20 - patch.dirty.y);
+        assert_eq!(
+            patch.pixels.get(px, py),
+            Rgba8::opaque(0, 0, 255),
+            "the stroke showed through the layer covering it"
+        );
     }
 
     #[test]

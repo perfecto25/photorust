@@ -74,6 +74,61 @@ pub fn composite_region(
     }
 }
 
+/// Composite only `region`, returning a `region`-sized image.
+///
+/// The twin of [`composite_region`], for callers that want the patch on its own
+/// rather than a whole canvas with a hole punched in it. A brush stroke's live
+/// preview repaints one dab's bounding box per mouse event, and at that size
+/// allocating and zeroing a full-canvas buffer costs far more than compositing
+/// the pixels that changed — on a 2816x2112 document it was most of the 74ms
+/// each mouse-move used to take, which starved the stroke of input samples and
+/// left visible corners between them.
+pub fn composite_patch(
+    stack: &LayerStack,
+    width: u32,
+    height: u32,
+    region: Rect,
+) -> CompositeResult {
+    let canvas = Rect::from_size(width, height);
+    let region = region.intersect(&canvas);
+
+    if region.is_empty() || stack.is_empty() {
+        return CompositeResult {
+            pixels: Pixmap::new(region.width.max(1), region.height.max(1)),
+            dirty: region,
+        };
+    }
+
+    let mut out = Pixmap::new(region.width, region.height);
+    let layers = stack.as_slice();
+    let effects = render_effects(layers, width, height, region);
+    let tiles = fill_tiles(layers);
+    let stride = out.stride();
+    let span = region.width as usize * 4;
+    let start = region.x as usize * 4;
+    let row_bytes = width as usize * 4;
+
+    // `composite_row` indexes its output by absolute x, so each worker gets a
+    // canvas-width scratch row and the patch's span is copied out of it. One
+    // 11KB allocation per rayon thread, not per row.
+    out.as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each_init(
+            || vec![0u8; row_bytes],
+            |scratch, (i, row)| {
+                let y = region.y + i as i32;
+                composite_row(layers, &effects, &tiles, canvas, y, region, scratch);
+                row.copy_from_slice(&scratch[start..start + span]);
+            },
+        );
+
+    CompositeResult {
+        pixels: out,
+        dirty: region,
+    }
+}
+
 /// Composite a single pixel.
 ///
 /// For the colour pickers and the Info panel, which ask one pixel at a time

@@ -250,6 +250,30 @@ QPointF CanvasView::documentToWidget(const QPointF &pos) const
         QPointF(pos.x() * m_zoom + origin.x(), pos.y() * m_zoom + origin.y()));
 }
 
+QRect CanvasView::documentToWidget(const QRect &rect) const
+{
+    if (rect.isEmpty()) {
+        return QRect();
+    }
+    // The corners are mapped and bounded rather than the rectangle scaled, so
+    // a turned view still gives an area that covers the whole of it.
+    const QPointF corners[4] = {
+        documentToWidget(QPointF(rect.left(), rect.top())),
+        documentToWidget(QPointF(rect.right() + 1, rect.top())),
+        documentToWidget(QPointF(rect.right() + 1, rect.bottom() + 1)),
+        documentToWidget(QPointF(rect.left(), rect.bottom() + 1)),
+    };
+    qreal left = corners[0].x(), right = corners[0].x();
+    qreal top = corners[0].y(), bottom = corners[0].y();
+    for (const QPointF &c : corners) {
+        left = qMin(left, c.x());
+        right = qMax(right, c.x());
+        top = qMin(top, c.y());
+        bottom = qMax(bottom, c.y());
+    }
+    return QRectF(left, top, right - left, bottom - top).toAlignedRect();
+}
+
 void CanvasView::zoomToRect(const QRectF &docRect)
 {
     if (docRect.width() <= 0.0 || docRect.height() <= 0.0 || width() <= 0 || height() <= 0) {
@@ -1196,6 +1220,7 @@ bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
     if (m_cloneTool == CloneType::PatternStamp) {
         if (m_engine->beginPatternStroke(float(doc.x()), float(doc.y()), 1.0f)) {
             m_dragging = true;
+            m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
             m_image = m_engine->previewImage();
             update();
         } else {
@@ -1240,6 +1265,7 @@ bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
 
     if (m_engine->beginCloneStroke(float(doc.x()), float(doc.y()), 1.0f)) {
         m_dragging = true;
+        m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
         m_image = m_engine->previewImage();
         update();
     } else {
@@ -3384,12 +3410,45 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         // A tablet would supply real pressure here; a mouse reports full.
         if (m_engine->beginStroke(float(doc.x()), float(doc.y()), 1.0f)) {
             m_dragging = true;
+            m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
+            // The full composite once, as the base the per-move patches are
+            // drawn over.
             m_image = m_engine->previewImage();
             update();
         } else {
             reportIfLocked();
         }
     }
+}
+
+bool CanvasView::applyStrokePatch()
+{
+    if (!m_engine || m_image.isNull()) {
+        return false;
+    }
+    const QImage patch = m_engine->strokePatch();
+    if (patch.isNull()) {
+        return false;
+    }
+    // `strokePatchRect` describes the patch just returned, so it is read after
+    // it and not before.
+    const QRect docRect = m_engine->strokePatchRect();
+    if (docRect.isEmpty() || !m_image.rect().contains(docRect)
+        || patch.size() != docRect.size()) {
+        return false;
+    }
+
+    QPainter painter(&m_image);
+    // The patch is the finished composite for that rectangle, not paint to lay
+    // over what is there — the layers above the stroke are already in it.
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.drawImage(docRect.topLeft(), patch);
+    painter.end();
+
+    // A margin, because the canvas image is drawn scaled and a document pixel
+    // at the edge of the patch can bleed into the neighbouring screen one.
+    update(documentToWidget(docRect).adjusted(-2, -2, 2, 2));
+    return true;
 }
 
 void CanvasView::mouseMoveEvent(QMouseEvent *event)
@@ -3947,9 +4006,16 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
             }
         } else if (toolPaints(m_tool)) {
             m_engine->extendStroke(float(doc.x()), float(doc.y()), 1.0f);
-            // Show the stroke live without committing it to the layer.
-            m_image = m_engine->previewImage();
-            update();
+            // Show the stroke live without committing it to the layer. Only
+            // the part just painted is redrawn: re-compositing the document on
+            // every move costs tens of milliseconds on a large image, and the
+            // pointer's events get compressed away while it happens.
+            if (m_strokeNeedsFullPreview) {
+                m_image = m_engine->previewImage();
+                update();
+            } else {
+                applyStrokePatch();
+            }
         }
     }
 

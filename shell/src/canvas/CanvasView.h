@@ -302,6 +302,21 @@ public:
     QTransform viewTransform() const;
     /// Convert a document point to widget space.
     QPointF documentToWidget(const QPointF &pos) const;
+    /// The widget area a document rectangle covers, under the current zoom,
+    /// pan and view rotation.
+    QRect documentToWidget(const QRect &rect) const;
+
+    /// Draw the newest part of the stroke in progress over the canvas image,
+    /// repainting only where it landed.
+    ///
+    /// Re-compositing the whole document per mouse-move is what used to make
+    /// strokes on a large image come out angular: the event loop fell far
+    /// enough behind that Qt compressed the pointer's moves, and the brush was
+    /// handed a handful of widely spaced positions to join up.
+    ///
+    /// Returns false if there was no patch to draw, which includes the pointer
+    /// not having moved far enough to place a dab.
+    bool applyStrokePatch();
 
     /// The Type options bar's settings: font, the style name it was chosen by
     /// ("Bold Italic" and so on — kept alongside the resolved font because it
@@ -923,6 +938,10 @@ private:
 
     // -- interaction state --
     bool m_dragging = false;
+    /// Whether the stroke in progress has to be previewed a whole document at
+    /// a time. Asked once when the stroke begins, since it cannot change while
+    /// one is being drawn.
+    bool m_strokeNeedsFullPreview = false;
     bool m_panning = false;
     /// True while space is held, which temporarily activates the Hand tool.
     bool m_spacePanOverride = false;
