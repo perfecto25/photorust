@@ -14,6 +14,7 @@ pub mod convolve;
 pub mod distort;
 pub mod pixelate;
 pub mod render;
+pub mod segment;
 pub mod stylize;
 
 pub use adjust::Adjustment;

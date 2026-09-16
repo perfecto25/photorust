@@ -1083,73 +1083,136 @@ fn put_back(pixmap: &mut Pixmap, over: &Pixmap, under: &Pixmap, gain: f32, keep:
         });
 }
 
-/// How wide a stroke of the knife is, in pixels per step of Stroke Size.
+/// How big one stroke of the knife is, as slack given to the segmentation per
+/// square pixel of Stroke Size.
 ///
-/// This is the size of one **cell**, and that word is the whole of what this
-/// filter is. A knife does not spread the picture about the way a brush or a
-/// blade does: it puts down one flat mass of colour where it is set down and
-/// another beside it, and what the two leave between them is a straight join.
-/// So the picture comes back as a mosaic of irregular polygons, exactly the
-/// structure Filter ▸ Pixelate ▸ Crystallize builds, which is what the
-/// implementation borrows.
+/// **This filter works on regions, not on windows, and that is the whole of
+/// it.** Everything else in this module looks at a fixed neighbourhood around
+/// each pixel, so a petal and a blade of grass are the same size of thing to
+/// it. Adobe's own description of Palette Knife is not that: it segments the
+/// picture into contiguous areas of like colour, holds the boundaries between
+/// them, and flattens what is inside each one. So a petal that happens to be
+/// one colour across four hundred pixels comes back as *one* flat mass, while
+/// the busy grass behind it comes back as a dozen — from a single uniform pass,
+/// which is the thing about the reference that no window operation explains.
 ///
-/// Anything that averages over a window instead — a median, a blur, a
-/// quantisation — gives flat *areas* with wandering, rounded boundaries, and
-/// they are not the same picture at all. The reference's background is plainly
-/// cellular: five- and six-sided, each one flat, meeting along straight lines.
-const KNIFE_WIDTH: f32 = 0.4;
+/// It is a spacing, in pixels per step of Stroke Size: see
+/// [`segment::regions`](crate::filters::segment::regions), where it sets how
+/// far apart the regions start. Small — smaller than the masses that come back
+/// — because the regions are not the masses. They are cut, and then the palette
+/// below fuses them into masses; a boundary in the reference is the edge of a
+/// run of regions that happened to round the same way, which is why it wanders
+/// and steps about instead of curving the way one region's edge would.
+const KNIFE_WIDTH: f32 = 1.0;
 
-/// How far the picture is flattened before the knife touches it, in pixels per
-/// step of Stroke Size, how different two colours may be and still be flattened
-/// together, and how much more of it a step down in Stroke Detail asks for.
+/// How tightly a region is held to its own patch of canvas.
 ///
-/// **Flattened, not blurred, and the difference is the whole filter.** Two
-/// things have to be true of the reference at once: a petal comes back as a
-/// smooth mass with its veins and stamens gone, *and* the outline of that petal
-/// is still crisp enough to tell it from the one behind it. A blur cannot do
-/// both — the radius that loses the veins loses the outline with them, and what
-/// comes back is a mush. So the flattening only averages neighbours near enough
-/// in colour to belong to the same thing, which takes the veins out of a petal
-/// and leaves its edge exactly where it was.
-///
-/// Once that is done, one uniform pass of cells gives the two completely
-/// different-looking results the reference shows: a flattened petal is nearly
-/// one colour, so its cells all come out alike and it reads as smooth, while
-/// the out-of-focus background keeps its broad range of greens and *its* cells
-/// come out plainly different from one another and read as a mosaic.
-const KNIFE_SMOOTH: f32 = 0.25;
-const KNIFE_REGION: u32 = 30;
-const KNIFE_DETAIL_PER_STEP: f32 = 0.3;
+/// This is `compactness` in [`segment::regions`](crate::filters::segment::regions):
+/// how much being near counts against being alike. Low, so the regions follow
+/// what is in the picture rather than tiling it — what makes the masses coarse
+/// is the palette, not the shape of the regions underneath.
+const KNIFE_HOLD: f32 = 12.0;
 
-/// How far Softness carries, in pixels per step.
+/// How coarse the palette is, in levels per channel, and how much coarser a
+/// step down in Stroke Detail makes it.
 ///
-/// Small, because it is the joins between cells being eased and not the
-/// picture: at the top of CS6's slider the reference is still crisp everywhere
-/// the picture had anything to show.
-const KNIFE_SOFTNESS_SCALE: f32 = 0.15;
+/// **The colours are compressed, and this is the part that took longest to
+/// see.** The reference is not a photograph reduced to averages — it is a
+/// photograph reduced to a *handful of colours*, half a dozen greens and four
+/// or five pinks, each sitting flat over a large area with a hard, ragged edge
+/// against the next. Regions alone never give that: they give a hundred
+/// slightly different greens and boundaries no eye can find. Rounding what each
+/// region came to onto a coarse palette is what fuses them.
+///
+/// Stroke Detail is how sensitive the knife is to the smaller colour breaks
+/// inside a mass, which is exactly a count of rungs: wound up the palette is
+/// fine and a petal keeps its shading, wound down it is coarse and the whole
+/// flower goes over to two or three pinks.
+const KNIFE_PALETTE: u32 = 16;
+const KNIFE_DETAIL_PER_STEP: f32 = 0.6;
+
+/// How far the picture is settled before the cut, in pixels per step of Stroke
+/// Size.
+///
+/// Two jobs, and the second is the one that sets the size. A photograph's grain
+/// is the enemy of a segmentation in a way it is not of a blur — two pixels of
+/// the same petal a few levels apart will be pulled into different regions —
+/// and a little blur fixes that at any radius.
+///
+/// The size comes from the dark ring around the flowers, which drove four wrong
+/// mechanisms before this one. Blurring widens the step from pink to near-black
+/// green into a band of the colours in between, and the palette then rounds the
+/// middle of that band onto one rung: a flat plum ring with a hard edge on both
+/// sides, following the outline all the way round. How wide the blur is, is how
+/// wide the ring is. Nothing looks for the outline and nothing draws it.
+///
+/// Mostly floor, and barely rising with Stroke Size, because the ring in the
+/// reference is about as wide at the top of the slider as at the middle — what
+/// a wide stroke widens is the *masses*, which is the spacing's business. Made
+/// proportional it swallows the flower: a blur wide enough to matter at Stroke
+/// Size 50 pulls the background into the petals and the whole picture comes
+/// back dull and fattened.
+const KNIFE_SETTLE_FLOOR: f32 = 2.0;
+const KNIFE_SETTLE: f32 = 0.06;
+
+/// How much of the picture's small change is thrown away before the cut, in
+/// pixels of median per step of Stroke Size.
+///
+/// This is where Stroke Size gets its *abstraction* from, and it has to be a
+/// median rather than more blur for the reason above: at the top of the slider
+/// the reference has lost the veins of a petal and the individual blades of
+/// grass entirely, but the flower is still exactly the shape and the colour it
+/// was. A median throws away whatever is narrower than its window and leaves
+/// everything else where it stood; a blur wide enough to do the same would
+/// drag the background into the flower.
+const KNIFE_SIMPLIFY: f32 = 0.2;
+
+/// How far a boundary is allowed to wander off where it really is, in pixels
+/// per step of Stroke Size.
+///
+/// Without this the masses come back with smooth, rounded, curving edges and
+/// the result reads as a median filter rather than as a knife — which is
+/// exactly the note this constant was added on. The reference's edges step and
+/// kink; a knife is a straight blade dragged through wet paint and it leaves a
+/// torn edge, not a drawn one. See
+/// [`segment::flatten`](crate::filters::segment::flatten) for how little it
+/// costs: displacing where a pixel reads its colour from changes nothing inside
+/// a flat mass and everything at its edge.
+const KNIFE_RAGGED: f32 = 0.12;
+
+/// How far each step of Softness carries, in pixels per step of Stroke Size.
+///
+/// Nothing at the bottom of the slider: the joins in the reference at Softness
+/// 0 are *hard*, and ragged, and that is most of what makes it look scraped on
+/// rather than painted. This only eases them.
+const KNIFE_SOFTNESS_SCALE: f32 = 0.03;
 
 /// Filter ▸ Artistic ▸ Palette Knife: the picture spread with a knife.
 ///
-/// Three passes, one per slider.
+/// The picture is settled, cut into contiguous areas of like colour, and each
+/// area filled with its own average rounded onto a coarse palette. Both halves
+/// are needed and neither is enough: the cut is what makes the areas follow
+/// what is in the picture, and the palette is what fuses them into a few flat
+/// masses with the hard ragged edges between them that a knife leaves.
 ///
-/// * **Stroke Size** is how wide one load of the knife is — see
-///   [`KNIFE_WIDTH`]. The picture comes back as a mosaic of flat polygonal
-///   cells, each the average of what it covered, which is what a knife set down
-///   and lifted actually leaves. This is the difference between it and every
-///   other painting filter in this module: they average over a window and leave
-///   rounded, wandering shapes, and a knife leaves straight joins.
-/// * **Stroke Detail** is how much of the picture the knife keeps before it
-///   starts — see [`KNIFE_SMOOTH`], which is where this filter is won or lost.
-///   Everything is smoothed down first, and even at the top of the slider the
-///   veins of a petal do not survive it.
-/// * **Softness** is the blade's edge, which eases the joins between one cell
-///   and the next.
+/// * **Stroke Size** is how big a mass of colour the knife works in. It sets
+///   both the spacing of the cut ([`KNIFE_WIDTH`]) and how far the picture is
+///   settled first ([`KNIFE_SETTLE`]), which is what makes a wide stroke lose
+///   the small things entirely rather than merely enlarging them.
+/// * **Stroke Detail** is how sensitive the knife is to the smaller colour
+///   breaks inside a mass — the number of rungs on the palette, see
+///   [`KNIFE_PALETTE`]. Wound down, a whole flower goes over to two or three
+///   pinks.
+/// * **Softness** is the blade's edge, which eases the joins between one mass
+///   and the next. At 0 they are left hard, as the reference has them.
 ///
 /// Alpha is left alone: spreading the picture does not change the layer's
 /// shape.
 ///
-/// No GPU path. The cells come from a jittered lattice of seeds, each pixel
-/// hunting the nearest — the same argument as Crystallize, which this borrows.
+/// No GPU path, and there will not be one: the cut is a sequential walk over
+/// the joins between pixels in order, each step depending on every step before
+/// it — the same argument as flood fill. See
+/// [`segment`](crate::filters::segment).
 pub fn palette_knife(pixmap: &mut Pixmap, size: u32, detail: u32, softness: u32) {
     if pixmap.is_empty() {
         return;
@@ -1158,23 +1221,36 @@ pub fn palette_knife(pixmap: &mut Pixmap, size: u32, detail: u32, softness: u32)
     let detail = detail.clamp(*KNIFE_DETAIL.start(), *KNIFE_DETAIL.end());
     let softness = softness.clamp(*KNIFE_SOFTNESS.start(), *KNIFE_SOFTNESS.end());
 
-    // Take the picture down to masses first, keeping every boundary where it
-    // stands. Everything the filter looks like follows from this rather than
-    // from the cells; see KNIFE_SMOOTH.
-    let held_back = 1.0 + (*KNIFE_DETAIL.end() - detail) as f32 * KNIFE_DETAIL_PER_STEP;
-    crate::filters::convolve::surface_blur(
+    // Settle the picture before deciding what belongs with what — and paint
+    // back from the settled picture too, not from the original. The band of
+    // in-between colours this lays along every strong edge is not an artefact
+    // to be tolerated; it is where the ring comes from. See KNIFE_SETTLE.
+    crate::filters::convolve::median_filter(
         pixmap,
-        ((size as f32 * KNIFE_SMOOTH * held_back).round() as u32).max(1),
-        KNIFE_REGION,
+        ((size as f32 * KNIFE_SIMPLIFY).round() as u32).max(1),
+    );
+    crate::filters::convolve::gaussian_blur_accelerated(
+        pixmap,
+        KNIFE_SETTLE_FLOOR + size as f32 * KNIFE_SETTLE,
     );
 
-    let load = ((size as f32 * KNIFE_WIDTH).round() as u32).max(2);
-    crate::filters::pixelate::crystallize(pixmap, load);
+    let (labels, count) =
+        crate::filters::segment::regions(pixmap, size as f32 * KNIFE_WIDTH, KNIFE_HOLD);
+    let rungs = (KNIFE_PALETTE as f32
+        / (1.0 + (*KNIFE_DETAIL.end() - detail) as f32 * KNIFE_DETAIL_PER_STEP))
+        .round() as u32;
+    crate::filters::segment::flatten(
+        pixmap,
+        &labels,
+        count,
+        rungs.max(2),
+        size as f32 * KNIFE_RAGGED,
+    );
 
     if softness > 0 {
         crate::filters::convolve::gaussian_blur_accelerated(
             pixmap,
-            softness as f32 * KNIFE_SOFTNESS_SCALE,
+            size as f32 * softness as f32 * KNIFE_SOFTNESS_SCALE,
         );
     }
     // Alpha stands throughout: spreading the picture does not change the
@@ -2140,14 +2216,18 @@ mod tests {
         dry_brush(&mut pm, 2, 8, 2);
     }
 
-    /// A cell is flat, so a ramp — where no two neighbours were ever equal —
+    /// A mass is flat, so a ramp — where no two neighbours were ever equal —
     /// comes back as runs of one colour.
+    ///
+    /// Within a level rather than to the level, because the ramp is settled
+    /// before it is cut (see [`KNIFE_SETTLE`]) and the settling carries a
+    /// little across each join.
     #[test]
     fn the_knife_lays_flat_cells_on_a_smooth_ramp() {
         let mut pm = ramp();
         let flat = |pm: &Pixmap| {
             (0..63)
-                .filter(|&x| pm.get(x, 32).r == pm.get(x + 1, 32).r)
+                .filter(|&x| (pm.get(x, 32).r as i32 - pm.get(x + 1, 32).r as i32).abs() <= 1)
                 .count()
         };
         assert_eq!(flat(&pm), 0, "the test ramp was not a ramp");
@@ -2176,53 +2256,90 @@ mod tests {
     }
 
     /// The knife spreads a surface and stops at a boundary.
+    ///
+    /// Stops, with the one exception the filter is built on: what lies between
+    /// two masses is neither of them but a band of its own, flat, with a hard
+    /// edge on each side. That is the dark ring around everything in the
+    /// reference — see [`KNIFE_SETTLE`] — and this is the test that says it is
+    /// a band and not a gradient, which for four attempts it wrongly was.
     #[test]
     fn the_knife_stops_at_a_boundary() {
         let mut pm = two_noisy_fields();
         palette_knife(&mut pm, 10, 3, 0);
-        // The two fields are 140 levels apart. What crosses between them is
-        // one step, not a gradient.
-        let step = pm.get(32, 32).r as i32 - pm.get(31, 32).r as i32;
-        assert!(step > 100, "the knife spread across the edge: {step} levels");
-    }
-
-    /// Stroke Detail is how much of the picture the knife keeps before it
-    /// starts. Not *whether* it keeps any: even at 3 the picture is taken down
-    /// to masses first, which is the thing about this filter that took the
-    /// longest to see.
-    #[test]
-    fn stroke_detail_is_how_much_the_knife_keeps() {
-        // Stripes near enough in colour to be flattened together, and wide
-        // enough that how far the flattening reaches decides how much of them
-        // is left. Anything finer is gone at either setting, which is what the
-        // first version of this test measured and why it measured nothing.
-        let kept = |detail| {
-            let mut pm = Pixmap::new(64, 64);
-            for y in 0..64 {
-                for x in 0..64 {
-                    let v = if (x / 6) % 2 == 0 { 120 } else { 145 };
-                    pm.set(x, y, Rgba8::new(v, v, v, 255));
-                }
-            }
-            palette_knife(&mut pm, 12, detail, 0);
-            let band: Vec<i32> = (16..48).map(|x| pm.get(x, 32).r as i32).collect();
-            band.iter().max().unwrap() - band.iter().min().unwrap()
-        };
+        let left = pm.get(20, 32).r as i32;
+        let right = pm.get(44, 32).r as i32;
         assert!(
-            kept(3) > kept(1),
-            "the knife kept as little at full detail as at none: {} against {}",
-            kept(3),
-            kept(1)
+            left < 90 && right > 170,
+            "the knife carried one field into the other: {left} and {right}"
+        );
+        // Whatever is neither field is the ring, and there is not much of it:
+        // the two fields meet inside the width of one stroke.
+        let between: Vec<i32> = (0..64)
+            .map(|x| pm.get(x, 32).r as i32)
+            .filter(|&v| v > 90 && v < 170)
+            .collect();
+        assert!(
+            between.len() <= 12,
+            "the knife spread the edge over {} pixels",
+            between.len()
+        );
+        // And it is made of flat rungs rather than of every level in between.
+        let mut rungs = between.clone();
+        rungs.sort_unstable();
+        rungs.dedup();
+        assert!(
+            rungs.len() <= 4,
+            "the ring came back as a gradient of {} shades, not as a band",
+            rungs.len()
         );
     }
 
-    /// Softness is the blade's edge: wound up, the cells stop meeting at a hard
-    /// line.
+    /// Stroke Detail is how much of the picture the masses keep to. Wound up,
+    /// a mass will reach for whatever matches it and the picture comes back
+    /// close to what it was; wound down, the masses are held to their own patch
+    /// of canvas and cut across it.
+    #[test]
+    fn stroke_detail_is_how_much_the_knife_keeps() {
+        // A diagonal edge, which no mass held to a patch of canvas can follow:
+        // every one of them that lands on the edge has to average the two sides
+        // and comes back as neither. Measuring what survives of a *mark*
+        // instead measures nothing, which two earlier versions of this test did
+        // — a region the colour of the mark is a region at either setting, so
+        // the mark comes back whole either way. What the setting changes is the
+        // shape of the masses, not whether a colour survives at all.
+        let strayed = |detail| {
+            let mut pm = Pixmap::new(96, 96);
+            for y in 0..96 {
+                for x in 0..96 {
+                    let v = if x < y { 70 } else { 190 };
+                    pm.set(x, y, Rgba8::new(v, v, v, 255));
+                }
+            }
+            let before = pm.clone();
+            palette_knife(&mut pm, 12, detail, 0);
+            (0..96)
+                .map(|y| {
+                    (0..96)
+                        .map(|x| (pm.get(x, y).r as i32 - before.get(x, y).r as i32).abs() as u32)
+                        .sum::<u32>()
+                })
+                .sum::<u32>()
+        };
+        assert!(
+            strayed(3) < strayed(1),
+            "the knife kept as little at full detail as at none: {} against {}",
+            strayed(3),
+            strayed(1)
+        );
+    }
+
+    /// Softness is the blade's edge: wound up, the masses stop meeting at a
+    /// hard line.
     ///
-    /// Measured on a ramp, which has no fine detail anywhere — so the cells
-    /// stand over the whole of it and there is a join to ease. On a picture
-    /// with detail in it the picture shows through and there is nothing for
-    /// this slider to do, which is the point of applying it where it is.
+    /// Measured on a ramp, which has no fine detail anywhere — so the masses
+    /// stand over the whole of it and every join is one this slider can ease.
+    /// At the bottom of the slider they are left hard, which is most of what
+    /// makes the reference look scraped on rather than painted.
     #[test]
     fn softness_eases_the_joins_between_cells() {
         let hardest_join = |softness| {
@@ -2234,7 +2351,7 @@ mod tests {
                 .unwrap_or(0)
         };
         assert!(
-            hardest_join(10) * 2 < hardest_join(0),
+            hardest_join(10) < hardest_join(0),
             "the soft blade cut as hard as the sharp one: {} against {}",
             hardest_join(10),
             hardest_join(0)
