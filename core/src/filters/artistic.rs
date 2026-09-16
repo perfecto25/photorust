@@ -1152,8 +1152,8 @@ const KNIFE_DETAIL_PER_STEP: f32 = 0.6;
 /// proportional it swallows the flower: a blur wide enough to matter at Stroke
 /// Size 50 pulls the background into the petals and the whole picture comes
 /// back dull and fattened.
-const KNIFE_SETTLE_FLOOR: f32 = 2.0;
-const KNIFE_SETTLE: f32 = 0.06;
+const KNIFE_SETTLE_FLOOR: f32 = 1.0;
+const KNIFE_SETTLE: f32 = 0.03;
 
 /// How much of the picture's small change is thrown away before the cut, in
 /// pixels of median per step of Stroke Size.
@@ -1166,6 +1166,36 @@ const KNIFE_SETTLE: f32 = 0.06;
 /// everything else where it stood; a blur wide enough to do the same would
 /// drag the background into the flower.
 const KNIFE_SIMPLIFY: f32 = 0.2;
+
+/// How much longer than wide one stroke is.
+///
+/// A knife is a blade, and what a blade leaves is longer than it is wide —
+/// every stroke in a real palette-knife painting is a slab dragged in one
+/// direction, not a dab. Round masses come back reading as cobbles however
+/// well their colours are judged, which is what this was added to fix.
+///
+/// Which way each one runs is worked out from the picture rather than chosen:
+/// see [`segment::regions`](crate::filters::segment::regions).
+const KNIFE_STROKE: f32 = 2.2;
+
+/// How many coats go on, and how much finer each is than the one under it.
+///
+/// **Oil laid on with a knife is built up, not laid down.** A painting of one
+/// is a broad coat that covers the canvas and gets the masses right, and then
+/// smaller strokes worked into the parts of it that had something to say —
+/// the poppies over the field, the light on the water. One coat, however well
+/// cut, gives a picture where a petal and a whole hillside are the same size of
+/// thing, because they were both painted at the same size of stroke.
+///
+/// Two coats, because the third adds work and very little paint: by then what
+/// the second missed is a pixel here and there. Where each coat goes is
+/// [`where_it_matters`].
+const COATS: usize = 2;
+const KNIFE_FINER: f32 = 0.45;
+
+/// Under a pixel, to take the stairs off a torn edge without softening the
+/// tear. See where it is used for why a torn edge has stairs at all.
+const KNIFE_NO_STAIRS: f32 = 0.7;
 
 /// How far a boundary is allowed to wander off where it really is, in pixels
 /// per step of Stroke Size.
@@ -1186,6 +1216,264 @@ const KNIFE_RAGGED: f32 = 0.12;
 /// 0 are *hard*, and ragged, and that is most of what makes it look scraped on
 /// rather than painted. This only eases them.
 const KNIFE_SOFTNESS_SCALE: f32 = 0.03;
+
+/// How thickly the paint stands, how far its edge falls away, how much the
+/// load varies from one stroke to the next, and where the light comes from.
+///
+/// **This is what makes it a palette knife and not a poster.** A real knife
+/// painting is not flat colour: every stroke is a slab of paint standing a
+/// millimetre or two off the canvas, so it has a lit edge on one side, a shadow
+/// on the other, and a ridge of surplus paint where the blade lifted. Take the
+/// relief away and the same picture reads as printed rather than laid on, which
+/// is the note this pass was added on.
+///
+/// The light comes from the upper left because that is where it comes from in
+/// every painting of one: it is the convention a viewer reads relief by, and
+/// lighting from below makes the strokes read as dents instead.
+///
+/// The shoulder is a fraction of the stroke rather than a fixed distance —
+/// a wide stroke carries more paint and its edge falls away further — and the
+/// load is what stops the surface reading as machined: a knife picks up a
+/// different amount of paint every time it goes back to the palette.
+const PAINT_THICK: f32 = 0.16;
+const PAINT_SHOULDER: f32 = 0.3;
+const PAINT_LOAD: f32 = 0.5;
+const PAINT_LIGHT: (f32, f32) = (-0.7, -0.7);
+
+/// How deep the ridges the blade drags through a stroke are, and how far apart.
+///
+/// The pitch is a fraction of the stroke's width, so a wide stroke gets a few
+/// broad ridges rather than a wide stroke's worth of fine ones. They run
+/// *along* the stroke, which is why the orientation of each mass has to be
+/// worked out before they can be laid: ridges running the wrong way across a
+/// stroke read as corrugation, not as paint.
+const PAINT_DRAG: f32 = 0.15;
+const PAINT_DRAG_PITCH: f32 = 0.5;
+
+/// How different a coat has to have left the picture before another one is
+/// worked into it, in levels, and how different before it is worked in fully.
+///
+/// Low enough that anything the broad coat plainly lost gets gone back over,
+/// high enough that the whole canvas does not — a second coat laid everywhere
+/// buries the first and there was no point laying it.
+const PAINT_MISS_LOW: f32 = 10.0;
+const PAINT_MISS_HIGH: f32 = 17.0;
+
+/// Three box passes make a good enough Gaussian, and this one is over a height
+/// field that nothing but the lighting will ever see.
+fn soften(field: &mut [f32], width: usize, height: usize, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    let mut scratch = vec![0.0f32; field.len()];
+    for _ in 0..3 {
+        // Across, then down. A box blur is separable for the same reason a
+        // Gaussian is.
+        scratch.copy_from_slice(field);
+        field
+            .par_chunks_exact_mut(width)
+            .enumerate()
+            .for_each(|(y, line)| {
+                let row = &scratch[y * width..(y + 1) * width];
+                for (x, slot) in line.iter_mut().enumerate() {
+                    let from = x.saturating_sub(radius);
+                    let to = (x + radius + 1).min(width);
+                    *slot = row[from..to].iter().sum::<f32>() / (to - from) as f32;
+                }
+            });
+        scratch.copy_from_slice(field);
+        field
+            .par_chunks_exact_mut(width)
+            .enumerate()
+            .for_each(|(y, line)| {
+                let from = y.saturating_sub(radius);
+                let to = (y + radius + 1).min(height);
+                for (x, slot) in line.iter_mut().enumerate() {
+                    let mut total = 0.0;
+                    for row in from..to {
+                        total += scratch[row * width + x];
+                    }
+                    *slot = total / (to - from) as f32;
+                }
+            });
+    }
+}
+
+/// Smooth noise along one number, for the ridges the blade drags.
+fn furrow(t: f32, salt: u32) -> f32 {
+    let cell = t.floor();
+    let step = t - cell;
+    let ease = step * step * (3.0 - 2.0 * step);
+    let at = |c: f32| noise(c as i32, salt as i32) * 2.0 - 1.0;
+    at(cell) + (at(cell + 1.0) - at(cell)) * ease
+}
+
+/// Stand the paint off the canvas and light it.
+///
+/// Every mass becomes a slab: thickest in the middle, falling away to nothing
+/// at its edge, standing a little higher or lower than its neighbours depending
+/// on how much paint the knife had on it, and furrowed along its own length by
+/// the blade. Then the whole surface is lit from the upper left, which is the
+/// only step that touches the colours — everything above it is building a
+/// height field that is never itself seen.
+///
+/// The orientation of each mass comes from its own second moments. A knife
+/// stroke is longer than it is wide and the drag runs the long way; measuring
+/// it is cheaper and steadier than guessing at the picture's own direction,
+/// because the masses are already the shape the strokes are.
+fn slab_of_paint(
+    labels: &[u32],
+    count: usize,
+    width: usize,
+    height: usize,
+    stroke: f32,
+) -> Vec<f32> {
+    if count == 0 {
+        return vec![0.0; width * height];
+    }
+
+    // Where each mass lies and which way it runs, from its own moments.
+    let mut tally = vec![0f64; count];
+    let mut sums = vec![[0f64; 5]; count];
+    for (p, &label) in labels.iter().enumerate() {
+        let k = label as usize;
+        let (x, y) = ((p % width) as f64, (p / width) as f64);
+        tally[k] += 1.0;
+        sums[k][0] += x;
+        sums[k][1] += y;
+        sums[k][2] += x * x;
+        sums[k][3] += x * y;
+        sums[k][4] += y * y;
+    }
+    let lie: Vec<(f32, f32, f32)> = (0..count)
+        .map(|k| {
+            let n = tally[k].max(1.0);
+            let (mx, my) = (sums[k][0] / n, sums[k][1] / n);
+            let xx = sums[k][2] / n - mx * mx;
+            let xy = sums[k][3] / n - mx * my;
+            let yy = sums[k][4] / n - my * my;
+            // The long axis of the mass. A round mass has no long axis and the
+            // angle it gives is arbitrary, which is harmless: the furrows have
+            // to run *some* way and on a round mass no way is wrong.
+            let angle = 0.5 * (2.0 * xy).atan2(xx - yy);
+            let load = noise(k as i32, 0x5bd1) - 0.5;
+            (angle.cos() as f32, angle.sin() as f32, load)
+        })
+        .collect();
+
+    // A slab per mass: full thickness inside, falling away at the edge. Built
+    // as an interior mask and then softened, which costs one blur and needs no
+    // distance transform.
+    let mut paint = vec![0f32; width * height];
+    paint
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, line)| {
+            for (x, slot) in line.iter_mut().enumerate() {
+                let p = y * width + x;
+                let mine = labels[p];
+                let same = (x == 0 || labels[p - 1] == mine)
+                    && (x + 1 == width || labels[p + 1] == mine)
+                    && (y == 0 || labels[p - width] == mine)
+                    && (y + 1 == height || labels[p + width] == mine);
+                *slot = if same { 1.0 } else { 0.0 };
+            }
+        });
+    soften(
+        &mut paint,
+        width,
+        height,
+        ((stroke * PAINT_SHOULDER).round() as usize).max(1),
+    );
+
+    // Then the load each stroke was carrying, and the furrows the blade left
+    // along it. Both are held down at the stroke's edge by the slab itself —
+    // there is no paint out there to stand proud or to be dragged.
+    let pitch = (stroke * PAINT_DRAG_PITCH).max(1.0);
+    paint
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, line)| {
+            for (x, slot) in line.iter_mut().enumerate() {
+                let k = labels[y * width + x] as usize;
+                let (across, along, load) = lie[k];
+                // Measured across the stroke, so the furrows run along it.
+                let over = (x as f32 * -along + y as f32 * across) / pitch;
+                let drag = furrow(over, k as u32 & 0xffff);
+                *slot *= 1.0 + load * PAINT_LOAD;
+                *slot += drag * PAINT_DRAG * *slot;
+            }
+        });
+    soften(&mut paint, width, height, 1);
+    paint
+}
+
+/// Where the coat that has just gone on missed the picture, and so where
+/// another one is worth laying.
+///
+/// This is how a painter works and it is the point of laying the paint in more
+/// than one coat: the first is a broad one that covers the canvas and gets the
+/// big shapes down, and it is *wrong* in the places where the picture had
+/// something small to say. Those are the places that get worked into, and the
+/// broad coat is left standing everywhere else. Laying the second coat
+/// everywhere instead gives back the fine cut on its own, with the coarse one
+/// buried and nothing gained from having laid it.
+fn where_it_matters(subject: &Pixmap, canvas: &Pixmap, spread: f32) -> Vec<f32> {
+    let width = subject.width() as usize;
+    let height = subject.height() as usize;
+    let (was, is) = (subject.as_bytes(), canvas.as_bytes());
+    let mut missed = vec![0f32; width * height];
+    missed
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, line)| {
+            for (x, slot) in line.iter_mut().enumerate() {
+                let i = (y * width + x) * 4;
+                *slot = (0..3)
+                    .map(|c| (was[i + c] as i32 - is[i + c] as i32).abs())
+                    .max()
+                    .unwrap_or(0) as f32;
+            }
+        });
+    // Over an area rather than a pixel: a stroke is worked into or it is not,
+    // and half of one cannot be.
+    soften(
+        &mut missed,
+        width,
+        height,
+        ((spread * 0.25).round() as usize).max(1),
+    );
+    for v in missed.iter_mut() {
+        *v = ((*v - PAINT_MISS_LOW) / (PAINT_MISS_HIGH - PAINT_MISS_LOW)).clamp(0.0, 1.0);
+    }
+    missed
+}
+
+/// Light the paint. The only step in the whole filter that turns a height back
+/// into a colour; everything before it was building the height.
+fn light_the_paint(pixmap: &mut Pixmap, depth: &[f32], lift: f32) {
+    if lift <= 0.0 {
+        return;
+    }
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    let (lx, ly) = PAINT_LIGHT;
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, line)| {
+            for (x, chunk) in line.chunks_exact_mut(4).enumerate() {
+                let at = |dx: usize, dy: usize| depth[dy * width + dx];
+                let dx = at((x + 1).min(width - 1), y) - at(x.saturating_sub(1), y);
+                let dy = at(x, (y + 1).min(height - 1)) - at(x, y.saturating_sub(1));
+                let shade = (1.0 + (dx * lx + dy * ly) * lift).clamp(0.7, 1.35);
+                for c in 0..3 {
+                    chunk[c] = (chunk[c] as f32 * shade).clamp(0.0, 255.0) as u8;
+                }
+            }
+        });
+}
 
 /// Filter ▸ Artistic ▸ Palette Knife: the picture spread with a knife.
 ///
@@ -1234,18 +1522,78 @@ pub fn palette_knife(pixmap: &mut Pixmap, size: u32, detail: u32, softness: u32)
         KNIFE_SETTLE_FLOOR + size as f32 * KNIFE_SETTLE,
     );
 
-    let (labels, count) =
-        crate::filters::segment::regions(pixmap, size as f32 * KNIFE_WIDTH, KNIFE_HOLD);
     let rungs = (KNIFE_PALETTE as f32
         / (1.0 + (*KNIFE_DETAIL.end() - detail) as f32 * KNIFE_DETAIL_PER_STEP))
-        .round() as u32;
-    crate::filters::segment::flatten(
-        pixmap,
-        &labels,
-        count,
-        rungs.max(2),
-        size as f32 * KNIFE_RAGGED,
-    );
+        .round()
+        .max(2.0) as u32;
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+
+    // What is being painted *from* stays as it was settled. Every coat is cut
+    // from it and coloured from it, so a coat laid over another is a fresh
+    // reading of the picture rather than a reading of the paint already down —
+    // which is what a painter does, and is also the only way the second coat
+    // can put back what the first one lost.
+    let subject = pixmap.clone();
+    let mut depth = vec![0f32; width * height];
+    let broad = size as f32 * KNIFE_WIDTH;
+
+    for coat in 0..COATS {
+        let stroke = broad * KNIFE_FINER.powi(coat as i32);
+        let (labels, count) =
+            crate::filters::segment::regions(&subject, stroke, KNIFE_HOLD, KNIFE_STROKE);
+
+        let mut wet = subject.clone();
+        crate::filters::segment::flatten(
+            &mut wet,
+            &labels,
+            count,
+            rungs,
+            stroke * KNIFE_RAGGED / KNIFE_WIDTH,
+        );
+
+        // The first coat covers the canvas; every one after it goes on only
+        // where the one before missed.
+        let worked = if coat == 0 {
+            vec![1.0f32; width * height]
+        } else {
+            where_it_matters(&subject, pixmap, stroke)
+        };
+
+        let fresh = wet.as_bytes().to_vec();
+        pixmap
+            .as_bytes_mut()
+            .par_chunks_exact_mut(width * 4)
+            .enumerate()
+            .for_each(|(y, line)| {
+                for (x, chunk) in line.chunks_exact_mut(4).enumerate() {
+                    let p = y * width + x;
+                    let over = worked[p];
+                    for c in 0..3 {
+                        let under = chunk[c] as f32;
+                        chunk[c] = (under + (fresh[p * 4 + c] as f32 - under) * over) as u8;
+                    }
+                }
+            });
+
+        // And the paint stacks up where it went on. A finer stroke carries
+        // less paint than a broad one, so it stands proportionally less proud
+        // — otherwise the accents shout over the coat they were laid on.
+        let slab = slab_of_paint(&labels, count, width, height, stroke);
+        let carried = stroke / broad;
+        depth
+            .par_iter_mut()
+            .zip(slab.par_iter().zip(worked.par_iter()))
+            .for_each(|(total, (&this, &over))| *total += this * over * carried);
+    }
+
+    // Take the stairs off the edges. Displacing where a pixel reads its colour
+    // from is done in whole pixels, so a torn boundary comes back climbing in
+    // single-pixel steps — ragged at arm's length and *pixelated* up close,
+    // which is the note this was added on. Under a pixel of blur reads as a
+    // torn edge rather than as a stepped one and costs nothing else: there is
+    // nothing this small anywhere else in the picture by now.
+    crate::filters::convolve::gaussian_blur(pixmap, KNIFE_NO_STAIRS);
 
     if softness > 0 {
         crate::filters::convolve::gaussian_blur_accelerated(
@@ -1253,6 +1601,12 @@ pub fn palette_knife(pixmap: &mut Pixmap, size: u32, detail: u32, softness: u32)
             size as f32 * softness as f32 * KNIFE_SOFTNESS_SCALE,
         );
     }
+
+    // Last, because it is the only pass that is about the paint rather than
+    // about the picture. Softness thins the paint as well as easing the joins:
+    // a stroke laid on thin has no edge to catch the light.
+    let left = 1.0 - softness as f32 / *KNIFE_SOFTNESS.end() as f32;
+    light_the_paint(pixmap, &depth, left * PAINT_THICK * broad);
     // Alpha stands throughout: spreading the picture does not change the
     // layer's shape. Every pass above leaves it alone.
 }
@@ -2216,42 +2570,102 @@ mod tests {
         dry_brush(&mut pm, 2, 8, 2);
     }
 
-    /// A mass is flat, so a ramp — where no two neighbours were ever equal —
-    /// comes back as runs of one colour.
+    /// A ramp — where every step was the same size as the last — comes back as
+    /// masses: long stretches that barely climb at all, and hard joins between
+    /// them.
     ///
-    /// Within a level rather than to the level, because the ramp is settled
-    /// before it is cut (see [`KNIFE_SETTLE`]) and the settling carries a
-    /// little across each join.
+    /// Not as *runs of one colour*, which is what this measured before the
+    /// paint was given any thickness. One mass is one colour of pigment, but
+    /// the paint it is made of is a slab with a lit side and a shaded one (see
+    /// [`lay_the_paint_on`]), so the values inside it drift by a level or two.
+    /// What survives the lighting is the shape of the climb: flat-ish, then a
+    /// step, then flat-ish again.
     #[test]
-    fn the_knife_lays_flat_cells_on_a_smooth_ramp() {
+    fn the_knife_lays_a_smooth_ramp_on_in_masses() {
         let mut pm = ramp();
-        let flat = |pm: &Pixmap| {
+        let steps = |pm: &Pixmap| -> Vec<i32> {
             (0..63)
-                .filter(|&x| (pm.get(x, 32).r as i32 - pm.get(x + 1, 32).r as i32).abs() <= 1)
-                .count()
+                .map(|x| (pm.get(x + 1, 32).r as i32 - pm.get(x, 32).r as i32).abs())
+                .collect()
         };
-        assert_eq!(flat(&pm), 0, "the test ramp was not a ramp");
+        // The ramp climbs by 4 a pixel, everywhere, with no joins in it.
+        assert!(steps(&pm).iter().all(|&d| d == 4));
+
         palette_knife(&mut pm, 25, 3, 0);
+        let after = steps(&pm);
+        // Afterwards the climb is not spread evenly: most of it happens at a
+        // few hard joins. Measured against the total rather than as a count of
+        // flat neighbours, because the lighting puts a slope on every mass and
+        // a count of flat ones counts the lighting instead of the paint.
+        let joins: i32 = after.iter().filter(|&&d| d > 12).sum();
+        let total: i32 = after.iter().sum();
         assert!(
-            flat(&pm) > 40,
-            "only {} of 63 neighbours came back flat",
-            flat(&pm)
+            joins * 2 > total,
+            "the ramp came back climbing evenly: {joins} of {total} levels crossed at a join"
+        );
+        let hardest = *after.iter().max().unwrap();
+        assert!(
+            hardest > 20,
+            "the masses met at a step of only {hardest} levels"
         );
     }
 
-    /// A wide knife works in fewer, bigger masses of colour than a fine one.
+    /// A wide knife works in bigger masses of colour than a fine one, and so
+    /// leaves the picture further from where it started.
+    ///
+    /// Measured as how far it strays rather than as a count of masses, of
+    /// colours or of joins, all three of which were tried. Colours count the
+    /// lighting now that the paint has thickness. Joins count nothing at all at
+    /// the fine end: a knife this small follows a ramp so closely that it
+    /// leaves no hard join anywhere, and the honest comparison came out 14
+    /// against 0 the wrong way round.
     #[test]
-    fn a_wider_knife_carries_fewer_colours() {
-        let carried = |size| {
-            let mut pm = ramp();
+    fn a_wider_knife_strays_further_from_the_picture() {
+        let strayed = |size| {
+            let before = ramp();
+            let mut pm = before.clone();
             palette_knife(&mut pm, size, 3, 0);
-            shades(&pm).len()
+            (0..64)
+                .map(|y| {
+                    (0..64)
+                        .map(|x| (pm.get(x, y).r as i32 - before.get(x, y).r as i32).abs() as u32)
+                        .sum::<u32>()
+                })
+                .sum::<u32>()
         };
         assert!(
-            carried(50) < carried(2),
-            "a wide knife carried as many colours as a fine one: {} against {}",
-            carried(50),
-            carried(2)
+            strayed(50) > strayed(2),
+            "a wide knife stayed as close to the picture as a fine one: {} against {}",
+            strayed(50),
+            strayed(2)
+        );
+    }
+
+    /// The paint stands off the canvas. A field of one flat colour has nothing
+    /// in it to find and still comes back with light and shade in it, because
+    /// what is being lit is the paint and not the picture.
+    ///
+    /// This is the difference between a knife painting and a poster, and it is
+    /// the one thing no amount of work on the *colours* was ever going to give.
+    #[test]
+    fn the_paint_stands_off_the_canvas() {
+        let range = |softness| {
+            let mut pm = Pixmap::filled(96, 96, Rgba8::new(140, 140, 140, 255));
+            palette_knife(&mut pm, 12, 3, softness);
+            let band: Vec<i32> = (16..80).map(|x| pm.get(x, 48).r as i32).collect();
+            band.iter().max().unwrap() - band.iter().min().unwrap()
+        };
+        assert!(
+            range(0) > 20,
+            "a flat field came back flat: {} levels across it",
+            range(0)
+        );
+        // Laid on thin, it has no edge to catch the light.
+        assert!(
+            range(10) < range(0),
+            "thin paint caught as much light as thick: {} against {}",
+            range(10),
+            range(0)
         );
     }
 

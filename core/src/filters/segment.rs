@@ -44,6 +44,76 @@ struct Seed {
     y: f32,
 }
 
+/// Which way the picture runs at each seed, as a unit vector.
+///
+/// From the structure tensor: the gradients over a window around the seed are
+/// summed as `gx²`, `gx·gy` and `gy²`, and the direction the *gradient* mostly
+/// points in falls out of them. What is wanted is the direction across that —
+/// along the edge, not up it — because a stroke laid along a petal's outline
+/// describes the petal and one laid across it rubs the outline out.
+///
+/// Where there is no edge to speak of there is no direction either, and the
+/// tensor's answer in a flat area is not weakly-preferred but *arbitrary* — all
+/// three sums go to zero together and what comes back is whichever way the
+/// rounding happened to fall. Taking it at face value tiles a whole flat
+/// background with strokes at exactly the same angle, which reads as corduroy.
+/// So below a threshold of coherence the seed is given a direction of its own
+/// instead, and the background comes back stroked every which way, as a painter
+/// working an unimportant area would leave it.
+fn lie_of_the_land(pixmap: &Pixmap, seeds: &[Seed], spacing: f32) -> Vec<(f32, f32)> {
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let px = pixmap.as_bytes();
+    let grey = |x: i32, y: i32| -> f32 {
+        let i = (y.clamp(0, height - 1) * width + x.clamp(0, width - 1)) as usize * 4;
+        px[i] as f32 * 0.299 + px[i + 1] as f32 * 0.587 + px[i + 2] as f32 * 0.114
+    };
+    let look = (spacing * 0.75).round() as i32;
+
+    seeds
+        .par_iter()
+        .enumerate()
+        .map(|(k, seed)| {
+            let (cx, cy) = (seed.x as i32, seed.y as i32);
+            let (mut xx, mut xy, mut yy) = (0.0f32, 0.0f32, 0.0f32);
+            // Every other pixel in each direction: a direction is a coarse
+            // thing and this is a quarter of the work.
+            let mut y = cy - look;
+            while y <= cy + look {
+                let mut x = cx - look;
+                while x <= cx + look {
+                    let gx = grey(x + 1, y) - grey(x - 1, y);
+                    let gy = grey(x, y + 1) - grey(x, y - 1);
+                    xx += gx * gx;
+                    xy += gx * gy;
+                    yy += gy * gy;
+                    x += 2;
+                }
+                y += 2;
+            }
+            let spread = ((xx - yy) * (xx - yy) + 4.0 * xy * xy).sqrt();
+            let coherence = spread / (xx + yy + 1.0);
+            let angle = if coherence > COHERENT {
+                // Turned a quarter turn off the gradient, onto the edge.
+                0.5 * (2.0 * xy).atan2(xx - yy) + std::f32::consts::FRAC_PI_2
+            } else {
+                wobble(seed.x as i32, seed.y as i32, (spacing as i32 * 3).max(2), 7)
+                    * std::f32::consts::PI
+            };
+            (angle.cos(), angle.sin())
+        })
+        .collect()
+}
+
+/// How much of one direction there has to be in a patch of picture before it
+/// counts as running that way at all.
+///
+/// Low: a petal's outline against the grass is emphatic and anything faint is
+/// better off stroked at a direction of its own. Raising it turns more of the
+/// picture over to the wandering direction and the strokes stop describing
+/// anything.
+const COHERENT: f32 = 0.35;
+
 /// Cut `pixmap` into regions and return which region each pixel fell in,
 /// numbered from zero, along with how many there were.
 ///
@@ -56,7 +126,17 @@ struct Seed {
 ///   way to take in something the same colour, leaving shapes that follow what
 ///   is in the picture; high, and the regions come back as tidy blocks with the
 ///   picture's own boundaries cut across.
-pub(crate) fn regions(pixmap: &Pixmap, spacing: f32, compactness: f32) -> (Vec<u32>, usize) {
+/// * `elongation` is how much longer than wide a region is allowed to come
+///   back, and which way it runs is not a free choice — each region takes the
+///   lie of the picture where it sits, measured in [`lie_of_the_land`], so the
+///   regions run along an edge rather than across it. At 1 they are round and
+///   none of that is worked out.
+pub(crate) fn regions(
+    pixmap: &Pixmap,
+    spacing: f32,
+    compactness: f32,
+    elongation: f32,
+) -> (Vec<u32>, usize) {
     let width = pixmap.width() as usize;
     let height = pixmap.height() as usize;
     if width == 0 || height == 0 {
@@ -88,6 +168,14 @@ pub(crate) fn regions(pixmap: &Pixmap, spacing: f32, compactness: f32) -> (Vec<u
     let pull = (compactness / step) * (compactness / step);
     let mut labels = vec![0u32; width * height];
 
+    // Which way each region runs, and how far it may reach to do it. A region
+    // stretched along its own axis can be claimed by a seed further away than
+    // its own cell, so the search has to widen with it or the far end of the
+    // stroke goes to a neighbour and the stretch never happens.
+    let stretch = elongation.max(1.0);
+    let lie = lie_of_the_land(pixmap, &seeds, step);
+    let reach = stretch.ceil() as isize;
+
     for round in 0..ROUNDS {
         // Every pixel picks its own seed, which is why this is the parallel
         // half: the nine candidates are read-only for the length of the round.
@@ -102,8 +190,8 @@ pub(crate) fn regions(pixmap: &Pixmap, spacing: f32, compactness: f32) -> (Vec<u
                     let (r, g, b) = (px[i] as f32, px[i + 1] as f32, px[i + 2] as f32);
                     let mut best = f32::MAX;
                     let mut best_seed = 0u32;
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
+                    for dy in -reach..=reach {
+                        for dx in -reach..=reach {
                             let (cx, cy) = (cell_x + dx, cell_y + dy);
                             if cx < 0 || cy < 0 || cx >= cols as isize || cy >= rows as isize {
                                 continue;
@@ -112,8 +200,15 @@ pub(crate) fn regions(pixmap: &Pixmap, spacing: f32, compactness: f32) -> (Vec<u
                             let seed = seeds[k];
                             let (dr, dg, db) = (r - seed.r, g - seed.g, b - seed.b);
                             let (sx, sy) = (x as f32 - seed.x, y as f32 - seed.y);
+                            // In the region's own frame: cheap along its
+                            // length, dear across it. The two scalings are
+                            // reciprocal so that stretching a region does not
+                            // also enlarge it.
+                            let (cos, sin) = lie[k];
+                            let along = (sx * cos + sy * sin) / stretch;
+                            let across = (sy * cos - sx * sin) * stretch;
                             let apart = dr * dr + dg * dg + db * db
-                                + (sx * sx + sy * sy) * pull;
+                                + (along * along + across * across) * pull;
                             if apart < best {
                                 best = apart;
                                 best_seed = k as u32;
@@ -313,7 +408,7 @@ mod tests {
     #[test]
     fn a_region_does_not_straddle_a_hard_edge() {
         let pm = two_fields(64);
-        let (labels, _) = regions(&pm, 16.0, 10.0);
+        let (labels, _) = regions(&pm, 16.0, 10.0, 1.0);
         let at = |x: usize, y: usize| labels[y * 64 + x];
         assert_eq!(at(20, 32), at(28, 32), "one flat field came back in two");
         assert_ne!(at(31, 32), at(32, 32), "a region straddled the edge");
@@ -325,7 +420,7 @@ mod tests {
     #[test]
     fn a_flat_picture_still_comes_back_in_many_regions() {
         let pm = Pixmap::filled(128, 128, Rgba8::new(90, 120, 60, 255));
-        let (_, count) = regions(&pm, 16.0, 10.0);
+        let (_, count) = regions(&pm, 16.0, 10.0, 1.0);
         assert!(
             count >= 48,
             "a flat picture came back in {count} regions at a spacing of 16"
@@ -336,8 +431,8 @@ mod tests {
     #[test]
     fn a_wider_spacing_leaves_fewer_regions() {
         let pm = two_fields(128);
-        let coarse = regions(&pm, 32.0, 10.0).1;
-        let fine = regions(&pm, 8.0, 10.0).1;
+        let coarse = regions(&pm, 32.0, 10.0, 1.0).1;
+        let fine = regions(&pm, 8.0, 10.0, 1.0).1;
         assert!(
             coarse * 4 < fine,
             "a coarse cut left about as many regions as a fine one: {coarse} against {fine}"
@@ -366,7 +461,7 @@ mod tests {
         // holding, so the straddlers come back as none either way and the
         // difference is in what shape they leave behind.
         let strain = |compactness| {
-            let (labels, count) = regions(&pm, 16.0, compactness);
+            let (labels, count) = regions(&pm, 16.0, compactness, 1.0);
             let mut flat = pm.clone();
             flatten(&mut flat, &labels, count, 255, 0.0);
             (0..64)
@@ -395,7 +490,7 @@ mod tests {
                 pm.set(x, y, Rgba8::new(v, v, v, 77));
             }
         }
-        let (labels, count) = regions(&pm, 64.0, 10.0);
+        let (labels, count) = regions(&pm, 64.0, 10.0, 1.0);
         assert_eq!(count, 1);
         flatten(&mut pm, &labels, count, 255, 0.0);
         let first = pm.get(0, 0);
@@ -421,7 +516,7 @@ mod tests {
         }
         let shades = |rungs| {
             let mut flat = pm.clone();
-            let (labels, count) = regions(&flat, 8.0, 10.0);
+            let (labels, count) = regions(&flat, 8.0, 10.0, 1.0);
             flatten(&mut flat, &labels, count, rungs, 0.0);
             let mut seen: Vec<u8> = flat.as_bytes().chunks_exact(4).map(|p| p[0]).collect();
             seen.sort_unstable();
@@ -442,7 +537,7 @@ mod tests {
     #[test]
     fn the_top_of_the_palette_is_white() {
         let mut pm = Pixmap::filled(16, 16, Rgba8::new(255, 250, 245, 255));
-        let (labels, count) = regions(&pm, 64.0, 10.0);
+        let (labels, count) = regions(&pm, 64.0, 10.0, 1.0);
         flatten(&mut pm, &labels, count, 6, 0.0);
         assert_eq!(pm.get(8, 8).r, 255);
     }
@@ -453,7 +548,7 @@ mod tests {
     #[test]
     fn a_wandering_boundary_is_ragged_and_costs_the_masses_nothing() {
         let pm = two_fields(64);
-        let (labels, count) = regions(&pm, 16.0, 10.0);
+        let (labels, count) = regions(&pm, 16.0, 10.0, 1.0);
         let torn = |wander| {
             let mut flat = pm.clone();
             flatten(&mut flat, &labels, count, 255, wander);
@@ -484,6 +579,6 @@ mod tests {
     #[test]
     fn an_empty_pixmap_has_no_regions() {
         let pm = Pixmap::new(0, 0);
-        assert_eq!(regions(&pm, 16.0, 10.0).1, 0);
+        assert_eq!(regions(&pm, 16.0, 10.0, 1.0).1, 0);
     }
 }
