@@ -2068,9 +2068,8 @@ void MainWindow::createMenus()
     filter->addSeparator();
 
     // CS6 keeps the Artistic family in the Filter Gallery, which is not
-    // built; the Gallery's own category list is what this submenu is. Colored
-    // Pencil and Cutout are built; the rest are listed and disabled so what is
-    // missing is visible.
+    // built; the Gallery's own category list is what this submenu is. All
+    // fifteen of its filters are built.
     QMenu *artistic = filter->addMenu(tr("&Artistic"));
     artistic->addAction(command(QStringLiteral("filter.coloredPencil"),
                                 tr("Colored &Pencil..."),
@@ -2089,12 +2088,40 @@ void MainWindow::createMenus()
                                 [this] { applyFilter(QStringLiteral("Paint Daubs")); }));
     artistic->addAction(command(QStringLiteral("filter.paletteKnife"), tr("Palette &Knife..."),
                                 [this] { applyFilter(QStringLiteral("Palette Knife")); }));
-    for (const QString &entry : {
-                                  tr("Plastic &Wrap..."),
-                                  tr("Poster &Edges..."), tr("Rough Pa&stels..."),
-                                  tr("Smudge St&ick..."), tr("Sp&onge..."),
-                                  tr("&Underpainting..."), tr("Water&color...")}) {
-        QAction *action = artistic->addAction(entry);
+    artistic->addAction(command(QStringLiteral("filter.plasticWrap"), tr("Plastic &Wrap..."),
+                                [this] { applyFilter(QStringLiteral("Plastic Wrap")); }));
+    artistic->addAction(command(QStringLiteral("filter.posterEdges"), tr("Poster &Edges..."),
+                                [this] { applyFilter(QStringLiteral("Poster Edges")); }));
+    artistic->addAction(command(QStringLiteral("filter.roughPastels"), tr("Rough Pa&stels..."),
+                                [this] { applyFilter(QStringLiteral("Rough Pastels")); }));
+    artistic->addAction(command(QStringLiteral("filter.smudgeStick"), tr("Smudge St&ick..."),
+                                [this] { applyFilter(QStringLiteral("Smudge Stick")); }));
+    artistic->addAction(command(QStringLiteral("filter.sponge"), tr("Sp&onge..."),
+                                [this] { applyFilter(QStringLiteral("Sponge")); }));
+    artistic->addAction(command(QStringLiteral("filter.underpainting"), tr("&Underpainting..."),
+                                [this] { applyFilter(QStringLiteral("Underpainting")); }));
+    artistic->addAction(command(QStringLiteral("filter.watercolor"), tr("Water&color..."),
+                                [this] { applyFilter(QStringLiteral("Watercolor")); }));
+
+    // CS6's Brush Strokes, which also lives in the Filter Gallery, in the
+    // Gallery's order. Accented Edges, Angled Strokes, Crosshatch and Dark
+    // Strokes are built; the rest are listed and disabled so what is missing
+    // is visible.
+    QMenu *brushStrokes = filter->addMenu(tr("Brush &Strokes"));
+    brushStrokes->addAction(command(QStringLiteral("filter.accentedEdges"),
+                                    tr("&Accented Edges..."),
+                                    [this] { applyFilter(QStringLiteral("Accented Edges")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.angledStrokes"),
+                                    tr("A&ngled Strokes..."),
+                                    [this] { applyFilter(QStringLiteral("Angled Strokes")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.crosshatch"), tr("&Crosshatch..."),
+                                    [this] { applyFilter(QStringLiteral("Crosshatch")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.darkStrokes"), tr("&Dark Strokes..."),
+                                    [this] { applyFilter(QStringLiteral("Dark Strokes")); }));
+    for (const QString &entry : {tr("&Ink Outlines..."),
+                                  tr("S&patter..."), tr("Sp&rayed Strokes..."),
+                                  tr("S&umi-e...")}) {
+        QAction *action = brushStrokes->addAction(entry);
         action->setEnabled(false);
         action->setStatusTip(tr("%1 is not implemented")
                                   .arg(QString(entry).remove(QLatin1Char('&'))
@@ -6978,7 +7005,13 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         || name == QLatin1String("Colored Pencil") || name == QLatin1String("Cutout")
         || name == QLatin1String("Dry Brush") || name == QLatin1String("Film Grain")
         || name == QLatin1String("Fresco") || name == QLatin1String("Neon Glow")
-        || name == QLatin1String("Paint Daubs") || name == QLatin1String("Palette Knife");
+        || name == QLatin1String("Paint Daubs") || name == QLatin1String("Palette Knife")
+        || name == QLatin1String("Plastic Wrap") || name == QLatin1String("Poster Edges")
+        || name == QLatin1String("Rough Pastels") || name == QLatin1String("Smudge Stick")
+        || name == QLatin1String("Sponge") || name == QLatin1String("Underpainting")
+        || name == QLatin1String("Watercolor") || name == QLatin1String("Accented Edges")
+        || name == QLatin1String("Angled Strokes") || name == QLatin1String("Crosshatch")
+        || name == QLatin1String("Dark Strokes");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -7248,6 +7281,92 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
             dialog.addParameter(tr("Stroke Size:"), 1, 50, preset(0, 25.0f), 0);
             dialog.addParameter(tr("Stroke Detail:"), 1, 3, preset(1, 3.0f), 0);
             dialog.addParameter(tr("Softness:"), 0, 10, preset(2, 0.0f), 0);
+        } else if (name == QLatin1String("Dark Strokes")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Balance:"), 0, 10, preset(0, 5.0f), 0);
+            dialog.addParameter(tr("Black Intensity:"), 0, 10, preset(1, 6.0f), 0);
+            dialog.addParameter(tr("White Intensity:"), 0, 10, preset(2, 2.0f), 0);
+        } else if (name == QLatin1String("Crosshatch")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Stroke Length:"), 3, 50, preset(0, 9.0f), 0);
+            dialog.addParameter(tr("Sharpness:"), 0, 20, preset(1, 6.0f), 0);
+            dialog.addParameter(tr("Strength:"), 1, 3, preset(2, 1.0f), 0);
+        } else if (name == QLatin1String("Angled Strokes")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Direction Balance:"), 0, 100, preset(0, 50.0f), 0);
+            dialog.addParameter(tr("Stroke Length:"), 3, 50, preset(1, 15.0f), 0);
+            dialog.addParameter(tr("Sharpness:"), 0, 10, preset(2, 3.0f), 0);
+        } else if (name == QLatin1String("Accented Edges")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Edge Width:"), 1, 14, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Edge Brightness:"), 0, 50, preset(1, 38.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(2, 5.0f), 0);
+        } else if (name == QLatin1String("Watercolor")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Brush Detail:"), 1, 14, preset(0, 9.0f), 0);
+            dialog.addParameter(tr("Shadow Intensity:"), 0, 10, preset(1, 1.0f), 0);
+            dialog.addParameter(tr("Texture:"), 1, 3, preset(2, 1.0f), 0);
+        } else if (name == QLatin1String("Underpainting")) {
+            // The Filter Gallery's two sliders, then the texture block it
+            // shares with Rough Pastels.
+            dialog.addParameter(tr("Brush Size:"), 0, 40, preset(0, 6.0f), 0);
+            dialog.addParameter(tr("Texture Coverage:"), 0, 40, preset(1, 16.0f), 0);
+            dialog.addChoice(tr("Texture:"),
+                             {tr("Brick"), tr("Burlap"), tr("Canvas"), tr("Sandstone")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(2, 2.0f)));
+            dialog.addParameter(tr("Scaling:"), 50, 200, preset(3, 100.0f), 0, tr(" %"));
+            dialog.addParameter(tr("Relief:"), 0, 50, preset(4, 4.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(5, 4.0f)));
+            dialog.addCheckBox(tr("Invert"), preset(6, 0.0f) != 0.0);
+            dialog.addDisabledNote(tr("Load Texture... is not implemented"));
+        } else if (name == QLatin1String("Sponge")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Brush Size:"), 0, 10, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Definition:"), 0, 25, preset(1, 12.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(2, 5.0f), 0);
+        } else if (name == QLatin1String("Smudge Stick")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Stroke Length:"), 0, 10, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Highlight Area:"), 0, 20, preset(1, 0.0f), 0);
+            dialog.addParameter(tr("Intensity:"), 0, 10, preset(2, 10.0f), 0);
+        } else if (name == QLatin1String("Rough Pastels")) {
+            // The Filter Gallery's two stroke sliders, then the texture block
+            // CS6 shares with Underpainting, Conte Crayon and Texturizer.
+            dialog.addParameter(tr("Stroke Length:"), 0, 40, preset(0, 6.0f), 0);
+            dialog.addParameter(tr("Stroke Detail:"), 1, 20, preset(1, 4.0f), 0);
+            dialog.addChoice(tr("Texture:"),
+                             {tr("Brick"), tr("Burlap"), tr("Canvas"), tr("Sandstone")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(2, 2.0f)));
+            dialog.addParameter(tr("Scaling:"), 50, 200, preset(3, 100.0f), 0, tr(" %"));
+            dialog.addParameter(tr("Relief:"), 0, 50, preset(4, 20.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(5, 0.0f)));
+            dialog.addCheckBox(tr("Invert"), preset(6, 0.0f) != 0.0);
+            dialog.addDisabledNote(tr("Load Texture... is not implemented"));
+        } else if (name == QLatin1String("Poster Edges")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Edge Thickness:"), 0, 10, preset(0, 2.0f), 0);
+            dialog.addParameter(tr("Edge Intensity:"), 0, 10, preset(1, 1.0f), 0);
+            dialog.addParameter(tr("Posterization:"), 0, 6, preset(2, 2.0f), 0);
+        } else if (name == QLatin1String("Plastic Wrap")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Highlight Strength:"), 0, 20, preset(0, 15.0f), 0);
+            dialog.addParameter(tr("Detail:"), 1, 15, preset(1, 9.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(2, 7.0f), 0);
         } else if (name == QLatin1String("Paint Daubs")) {
             // Two sliders and CS6's list of six brushes, in its order.
             dialog.addParameter(tr("Brush Size:"), 1, 50, preset(0, 8.0f), 0);

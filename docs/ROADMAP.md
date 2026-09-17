@@ -569,21 +569,21 @@ paint, manage layers, select, filter and undo.
     - Film Grain - done
     - Fresco - done
     - Neon Glow - done
-    - Paint Daubs - need work
-    - Palette Knife - need work
-    - Plastic Wrap
-    - Poster Edges
-    - Rough Pastels
-    - Smudge Stick
-    - Sponge
-    - Underpainting
-    - Watercolor
+    - Paint Daubs - done
+    - Palette Knife - done
+    - Plastic Wrap - done
+    - Poster Edges - done
+    - Rough Pastels - done
+    - Smudge Stick - done
+    - Sponge - done
+    - Underpainting - done
+    - Watercolor - done
     
   - Brush Strokes
-    - Accented Edges
-    - Angled Strokes
-    - Cross Hatch
-    - Dark Strokes
+    - Accented Edges - done
+    - Angled Strokes - done
+    - Crosshatch - done
+    - Dark Strokes - done
     - Ink Outlines
     - Spatter
     - Sprayed Strokes

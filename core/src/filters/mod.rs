@@ -10,12 +10,14 @@
 
 pub mod adjust;
 pub mod artistic;
+pub mod brush_strokes;
 pub mod convolve;
 pub mod distort;
 pub mod pixelate;
 pub mod render;
 pub mod segment;
 pub mod stylize;
+pub mod texture;
 
 pub use adjust::Adjustment;
 pub use convolve::{custom_default, gaussian_blur, sharpen, sharpen_edges, sharpen_more,
@@ -280,6 +282,85 @@ pub enum Filter {
         detail: u32,
         softness: u32,
     },
+    /// The picture drawn in chalk on a textured surface — CS6's Rough
+    /// Pastels.
+    RoughPastels {
+        length: u32,
+        detail: u32,
+        texture: texture::Texture,
+        scaling: u32,
+        relief: u32,
+        light: texture::Light,
+        invert: bool,
+    },
+    /// The picture laid in broadly on a textured surface — CS6's
+    /// Underpainting.
+    Underpainting {
+        size: u32,
+        coverage: u32,
+        texture: texture::Texture,
+        scaling: u32,
+        relief: u32,
+        light: texture::Light,
+        invert: bool,
+    },
+    /// The picture's boundaries drawn over it in light or dark — CS6's
+    /// Accented Edges.
+    AccentedEdges {
+        width: u32,
+        brightness: u32,
+        smoothness: u32,
+    },
+    /// The picture stroked and driven to black and white — CS6's Dark
+    /// Strokes.
+    DarkStrokes {
+        balance: u32,
+        black: u32,
+        white: u32,
+    },
+    /// The picture drawn over in strokes both ways — CS6's Crosshatch.
+    Crosshatch {
+        length: u32,
+        sharpness: u32,
+        strength: u32,
+    },
+    /// The picture repainted in diagonal strokes — CS6's Angled Strokes.
+    AngledStrokes {
+        balance: u32,
+        length: u32,
+        sharpness: u32,
+    },
+    /// The picture washed in with a wet brush — CS6's Watercolor.
+    Watercolor {
+        detail: u32,
+        shadow: u32,
+        texture: u32,
+    },
+    /// The picture dabbed on with a sponge — CS6's Sponge.
+    Sponge {
+        size: u32,
+        definition: u32,
+        smoothness: u32,
+    },
+    /// The picture's darks smudged and its lights brightened — CS6's Smudge
+    /// Stick.
+    SmudgeStick {
+        length: u32,
+        highlight: u32,
+        intensity: u32,
+    },
+    /// The picture posterized with its edges inked — CS6's Poster Edges.
+    PosterEdges {
+        thickness: u32,
+        intensity: u32,
+        posterization: u32,
+    },
+    /// The picture shrink-wrapped in glossy plastic — CS6's Plastic Wrap.
+    PlasticWrap {
+        highlight: u32,
+        detail: u32,
+        smoothness: u32,
+    },
     /// The picture lit by a tube of one colour — CS6's Neon Glow. Only `glow`
     /// comes from the dialog; the two the picture is rendered between are the
     /// document's swatches, which the bridge fills in.
@@ -362,6 +443,17 @@ impl Filter {
             Filter::NeonGlow { .. } => "Neon Glow",
             Filter::PaintDaubs { .. } => "Paint Daubs",
             Filter::PaletteKnife { .. } => "Palette Knife",
+            Filter::PlasticWrap { .. } => "Plastic Wrap",
+            Filter::PosterEdges { .. } => "Poster Edges",
+            Filter::RoughPastels { .. } => "Rough Pastels",
+            Filter::SmudgeStick { .. } => "Smudge Stick",
+            Filter::Sponge { .. } => "Sponge",
+            Filter::Watercolor { .. } => "Watercolor",
+            Filter::AccentedEdges { .. } => "Accented Edges",
+            Filter::AngledStrokes { .. } => "Angled Strokes",
+            Filter::Crosshatch { .. } => "Crosshatch",
+            Filter::DarkStrokes { .. } => "Dark Strokes",
+            Filter::Underpainting { .. } => "Underpainting",
         }
     }
 
@@ -584,6 +676,69 @@ impl Filter {
                 size: p1.max(0.0) as u32,
                 detail: p2.max(0.0) as u32,
                 softness: p3.max(0.0) as u32,
+            },
+            "Underpainting" => Filter::Underpainting {
+                size: p1.max(0.0) as u32,
+                coverage: p2.max(0.0) as u32,
+                texture: texture::Texture::from_i32(p3 as i32),
+                scaling: p4.max(0.0) as u32,
+                relief: p5.max(0.0) as u32,
+                light: texture::Light::from_i32(at(5) as i32),
+                invert: at(6) != 0.0,
+            },
+            "Dark Strokes" => Filter::DarkStrokes {
+                balance: p1.max(0.0) as u32,
+                black: p2.max(0.0) as u32,
+                white: p3.max(0.0) as u32,
+            },
+            "Crosshatch" => Filter::Crosshatch {
+                length: p1.max(0.0) as u32,
+                sharpness: p2.max(0.0) as u32,
+                strength: p3.max(0.0) as u32,
+            },
+            "Angled Strokes" => Filter::AngledStrokes {
+                balance: p1.max(0.0) as u32,
+                length: p2.max(0.0) as u32,
+                sharpness: p3.max(0.0) as u32,
+            },
+            "Accented Edges" => Filter::AccentedEdges {
+                width: p1.max(0.0) as u32,
+                brightness: p2.max(0.0) as u32,
+                smoothness: p3.max(0.0) as u32,
+            },
+            "Watercolor" => Filter::Watercolor {
+                detail: p1.max(0.0) as u32,
+                shadow: p2.max(0.0) as u32,
+                texture: p3.max(0.0) as u32,
+            },
+            "Sponge" => Filter::Sponge {
+                size: p1.max(0.0) as u32,
+                definition: p2.max(0.0) as u32,
+                smoothness: p3.max(0.0) as u32,
+            },
+            "Smudge Stick" => Filter::SmudgeStick {
+                length: p1.max(0.0) as u32,
+                highlight: p2.max(0.0) as u32,
+                intensity: p3.max(0.0) as u32,
+            },
+            "Rough Pastels" => Filter::RoughPastels {
+                length: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                texture: texture::Texture::from_i32(p3 as i32),
+                scaling: p4.max(0.0) as u32,
+                relief: p5.max(0.0) as u32,
+                light: texture::Light::from_i32(at(5) as i32),
+                invert: at(6) != 0.0,
+            },
+            "Poster Edges" => Filter::PosterEdges {
+                thickness: p1.max(0.0) as u32,
+                intensity: p2.max(0.0) as u32,
+                posterization: p3.max(0.0) as u32,
+            },
+            "Plastic Wrap" => Filter::PlasticWrap {
+                highlight: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                smoothness: p3.max(0.0) as u32,
             },
             "Paint Daubs" => Filter::PaintDaubs {
                 size: p1.max(0.0) as u32,
@@ -826,9 +981,36 @@ impl Filter {
             // with the ones either side — with Crystallize, whose cells these
             // are.
             Filter::PaletteKnife { .. } => None,
-            // The daub reaches its own width, and what goes back on top of it
-            // reaches no further than the daub it was taken from.
-            Filter::PaintDaubs { size, .. } => Some(((size as f32 * 0.5 * 1.6).ceil() as u32).max(1)),
+            Filter::PlasticWrap { smoothness, .. } => Some(artistic::plastic_wrap_reach(smoothness)),
+            Filter::PosterEdges { thickness, .. } => Some(artistic::poster_edges_reach(thickness)),
+            // The strokes' grain and the texture are laid by where on the
+            // canvas a pixel is, so a crop would get different ones.
+            Filter::RoughPastels { .. } => None,
+            // The stick's grain is laid by where on the canvas a pixel is.
+            // The grain along the strokes is laid by where on the canvas a
+            // pixel is.
+            Filter::SmudgeStick { .. } => None,
+            // The blotches are laid by where on the canvas a pixel is.
+            Filter::Sponge { .. } => None,
+            // The granulation is laid by where on the canvas a pixel is.
+            Filter::Watercolor { .. } => None,
+            // The drag along each stroke is laid by where on the canvas a
+            // pixel is.
+            Filter::AngledStrokes { .. } | Filter::Crosshatch { .. } | Filter::DarkStrokes { .. } => None,
+            Filter::AccentedEdges { width, smoothness, .. } => {
+                Some(brush_strokes::accented_edges_reach(width, smoothness))
+            }
+            // The texture is laid by where on the canvas a pixel is.
+            Filter::Underpainting { .. } => None,
+            // The Rough brushes' tooth is laid by where on the canvas a pixel
+            // is, so a crop would get different texture — with Fresco.
+            Filter::PaintDaubs { brush, .. } if brush.is_rough() => None,
+            // The daub, then what is blurred after it: Wide Blurry's softening
+            // and the sharpening's own blur, three sigma each.
+            Filter::PaintDaubs { size, brush, .. } => {
+                let (across, down) = artistic::daub_reach(size, brush);
+                Some(across + (down as f32 * 2.0 * artistic::WIDE_BLUR * 3.0).ceil() as u32 + 6)
+            }
             // Three sigma of the blur that spreads the picture's own light.
             Filter::NeonGlow { size, .. } => Some((size.unsigned_abs() * 3).max(1)),
         }
@@ -977,6 +1159,69 @@ impl Filter {
                 detail,
                 softness,
             } => artistic::palette_knife(pixmap, size, detail, softness),
+            Filter::PlasticWrap {
+                highlight,
+                detail,
+                smoothness,
+            } => artistic::plastic_wrap(pixmap, highlight, detail, smoothness),
+            Filter::PosterEdges {
+                thickness,
+                intensity,
+                posterization,
+            } => artistic::poster_edges(pixmap, thickness, intensity, posterization),
+            Filter::RoughPastels {
+                length,
+                detail,
+                texture,
+                scaling,
+                relief,
+                light,
+                invert,
+            } => artistic::rough_pastels(pixmap, length, detail, texture, scaling, relief, light, invert),
+            Filter::SmudgeStick {
+                length,
+                highlight,
+                intensity,
+            } => artistic::smudge_stick(pixmap, length, highlight, intensity),
+            Filter::Sponge {
+                size,
+                definition,
+                smoothness,
+            } => artistic::sponge(pixmap, size, definition, smoothness),
+            Filter::Watercolor {
+                detail,
+                shadow,
+                texture,
+            } => artistic::watercolor(pixmap, detail, shadow, texture),
+            Filter::AccentedEdges {
+                width,
+                brightness,
+                smoothness,
+            } => brush_strokes::accented_edges(pixmap, width, brightness, smoothness),
+            Filter::AngledStrokes {
+                balance,
+                length,
+                sharpness,
+            } => brush_strokes::angled_strokes(pixmap, balance, length, sharpness),
+            Filter::Crosshatch {
+                length,
+                sharpness,
+                strength,
+            } => brush_strokes::crosshatch(pixmap, length, sharpness, strength),
+            Filter::DarkStrokes {
+                balance,
+                black,
+                white,
+            } => brush_strokes::dark_strokes(pixmap, balance, black, white),
+            Filter::Underpainting {
+                size,
+                coverage,
+                texture,
+                scaling,
+                relief,
+                light,
+                invert,
+            } => artistic::underpainting(pixmap, size, coverage, texture, scaling, relief, light, invert),
             Filter::PaintDaubs {
                 size,
                 sharpness,

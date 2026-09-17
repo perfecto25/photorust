@@ -4,8 +4,9 @@
 //! menu. The Gallery is not built (docs/ROADMAP.md), so the filters live under
 //! a Filter ▸ Artistic submenu instead, which is where the Gallery's own
 //! category list would have put them. Colored Pencil, Cutout, Dry Brush, Film
-//! Grain, Fresco, Neon Glow, Paint Daubs and Palette Knife are built; the other
-//! seven are listed in the menu and disabled.
+//! Grain, Fresco, Neon Glow, Paint Daubs, Palette Knife, Plastic Wrap, Poster
+//! Edges, Rough Pastels, Smudge Stick, Sponge, Underpainting and Watercolor —
+//! the whole of CS6's Artistic group — are built.
 
 use crate::buffer::{Pixmap, Rgba8};
 use rayon::prelude::*;
@@ -30,37 +31,62 @@ pub const KNIFE_SIZE: std::ops::RangeInclusive<u32> = 1..=50;
 pub const KNIFE_DETAIL: std::ops::RangeInclusive<u32> = 1..=3;
 pub const KNIFE_SOFTNESS: std::ops::RangeInclusive<u32> = 0..=10;
 
+/// CS6's ranges for Plastic Wrap, which its three sliders run over.
+pub const WRAP_HIGHLIGHT: std::ops::RangeInclusive<u32> = 0..=20;
+pub const WRAP_DETAIL: std::ops::RangeInclusive<u32> = 1..=15;
+pub const WRAP_SMOOTHNESS: std::ops::RangeInclusive<u32> = 1..=15;
+
+/// CS6's ranges for Poster Edges, which its three sliders run over.
+pub const POSTER_THICKNESS: std::ops::RangeInclusive<u32> = 0..=10;
+pub const POSTER_INTENSITY: std::ops::RangeInclusive<u32> = 0..=10;
+pub const POSTER_LEVELS: std::ops::RangeInclusive<u32> = 0..=6;
+
+/// CS6's ranges for Rough Pastels' two stroke sliders. Its texture controls
+/// are [`crate::filters::texture`]'s.
+pub const PASTEL_LENGTH: std::ops::RangeInclusive<u32> = 0..=40;
+pub const PASTEL_DETAIL: std::ops::RangeInclusive<u32> = 1..=20;
+
+/// CS6's ranges for Smudge Stick, which its three sliders run over.
+pub const SMUDGE_LENGTH: std::ops::RangeInclusive<u32> = 0..=10;
+pub const SMUDGE_HIGHLIGHT: std::ops::RangeInclusive<u32> = 0..=20;
+pub const SMUDGE_INTENSITY: std::ops::RangeInclusive<u32> = 0..=10;
+
+/// CS6's ranges for Sponge, which its three sliders run over.
+pub const SPONGE_SIZE: std::ops::RangeInclusive<u32> = 0..=10;
+pub const SPONGE_DEFINITION: std::ops::RangeInclusive<u32> = 0..=25;
+pub const SPONGE_SMOOTHNESS: std::ops::RangeInclusive<u32> = 1..=15;
+
+/// CS6's ranges for Underpainting's two sliders. Its texture controls are
+/// [`crate::filters::texture`]'s.
+pub const UNDERPAINT_SIZE: std::ops::RangeInclusive<u32> = 0..=40;
+pub const UNDERPAINT_COVERAGE: std::ops::RangeInclusive<u32> = 0..=40;
+
+/// CS6's ranges for Watercolor, which its three sliders run over.
+pub const WATER_DETAIL: std::ops::RangeInclusive<u32> = 1..=14;
+pub const WATER_SHADOW: std::ops::RangeInclusive<u32> = 0..=10;
+pub const WATER_TEXTURE: std::ops::RangeInclusive<u32> = 1..=3;
+
 /// CS6's ranges for Paint Daubs. The third control is a list of brushes rather
 /// than a slider.
 pub const DAUB_SIZE: std::ops::RangeInclusive<u32> = 1..=50;
 pub const DAUB_SHARPNESS: std::ops::RangeInclusive<u32> = 0..=40;
 
-/// CS6's six Paint Daubs brushes, in the order its list gives them.
-///
-/// All six paint the same daubs. What differs is what is then done with the
-/// detail the daubing left over — see [`paint_daubs`] — which is why a list of
-/// brushes with nothing in common as *brushes* behaves like one family.
+/// CS6's six Paint Daubs brushes, in the order its list gives them. See
+/// [`paint_daubs`] for what each does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DaubBrush {
-    /// The daubs and nothing else, with what Sharpness asks for on top.
+    /// A round daub, sharpened.
     #[default]
     Simple,
-    /// The leftover detail put back hard, keeping only what lightens: the
-    /// picture comes back scrubbed and glaring, and its smooth parts break
-    /// into contours.
+    /// A textured daub with a light halo round every shape.
     LightRough,
-    /// The same, keeping only what darkens.
+    /// A textured daub with a heavy dark outline round every shape.
     DarkRough,
-    /// A broader daub, and the detail put back sharply enough to draw a line
-    /// where two daubs meet.
+    /// A daub stretched sideways, sharpened hard.
     WideSharp,
-    /// A broader daub, softened afterwards, with the detail left out.
+    /// A daub stretched sideways and softened.
     WideBlurry,
-    /// Both of the Rough brushes at once and harder than either: the picture
-    /// is scrubbed light *and* dark until what was smooth breaks into ribbons
-    /// and the edges blow out. Both directions, because the reference's
-    /// background swirls light and dark alike — one-sided, it comes back as a
-    /// silhouette rather than as a texture.
+    /// A bright, gritty daub with contour lines swirling through it.
     Sparkle,
 }
 
@@ -889,173 +915,306 @@ fn sink_into_the_plaster(pixmap: &mut Pixmap) {
         });
 }
 
-/// How wide a daub is, in pixels per step of Brush Size, and how different two
-/// colours may be before the brush treats them as different things.
+/// How far a daub reaches, in pixels either side per step of Brush Size, and
+/// how much longer than tall the two Wide brushes lay it.
 ///
-/// The second is what makes these daubs rather than a blur: a neighbour only
-/// goes into the daub if it is within this of the pixel being painted, so a
-/// daub spreads through a petal and stops dead at its outline however wide the
-/// brush is set.
-const DAUB_WIDTH: f32 = 0.9;
-const DAUB_REGION: u32 = 65;
+/// The daub is a **median**, not an average, and that is what CS6's Simple
+/// brush looks like: a median throws away anything narrower than half its
+/// window — the stamens, the veins, the points of the petals — and leaves
+/// everything broader exactly where it was, edge and all. So a petal comes
+/// back as a rounded, creamy lobe with a crisp outline, which an average
+/// (blurred edges) or an edge-preserving blur (the picture untouched, since
+/// Surface Blur keeps every fine thing that differs enough) does not give.
+const DAUB_REACH: f32 = 0.45;
+const WIDE_STRETCH: f32 = 2.0;
 
-/// How much broader the two Wide brushes are than the rest.
-const WIDE_DAUB: f32 = 1.6;
+/// Sharpness on the painting brushes: an unsharp mask over the daubs, its
+/// scale in pixels and its strength per step. This is what draws the thin
+/// dark line and light rim round each shape in CS6's Simple.
+const EDGE_SCALE: f32 = 2.0;
+const EDGE_PER_STEP: f32 = 0.2;
 
-/// What a step of Sharpness is worth to a brush that paints and to one that
-/// scrubs.
+/// Sharpness on the Rough brushes: the same mask taken on brightness, wider
+/// and much harder, and only in one direction. Dark Rough's halo on the dark
+/// side of every boundary is what becomes CS6's heavy black outline.
+const ROUGH_SCALE: f32 = 3.0;
+const ROUGH_PER_STEP: f32 = 0.5;
+
+/// The texture of the Rough brushes, in levels and in pixels of speck.
 ///
-/// The two are not the same measurement, and conflating them is the trap here.
-/// On the painting brushes Sharpness is **definition between one daub and the
-/// next** — relief at the daub's own scale, exactly as Dry Brush's Texture
-/// works. It must not be built out of the *photograph's* detail: putting that
-/// back is undoing the daubing, and a mid-slider setting then returns most of
-/// the picture and leaves the filter looking like it did nothing.
-///
-/// On the Rough brushes it is how hard what the daubing threw away is scrubbed
-/// back on, which is a different thing entirely and an order of magnitude
-/// larger. That is where the reference's texture comes from, and — where the
-/// picture was smooth and the leftovers are a level or two of gradient — its
-/// contour ribbons.
-const SHARPNESS_PER_STEP: f32 = 0.03;
-const ROUGH_PER_STEP: f32 = 0.3;
+/// Two coats. The *tooth* goes on under the daubs (except Sparkle's), so the median turns it
+/// into blotches the daubs' own shape and the mask above then works on them.
+/// The *grit* goes on last, colour by colour, and is what gives CS6's rough
+/// petals their scatter of lilac, white and deeper pink.
+const DAUB_TOOTH: f32 = 15.0;
+const DAUB_TOOTH_SCALE: f32 = 2.5;
+const DAUB_GRIT: f32 = 14.0;
+const DAUB_GRIT_SCALE: f32 = 2.0;
 
-/// What a step of Sharpness is worth to Wide Blurry, which lays neither
-/// definition nor a scrub but the grain of the paint.
-const STIPPLE_PER_STEP: f32 = 0.2;
+/// How much of the daub Wide Blurry softens it by, as a blur of this fraction
+/// of its reach.
+pub const WIDE_BLUR: f32 = 0.3;
 
-/// The scale, in pixels, at which the picture counts as *grain* — what a blur
-/// this small takes away is the finest thing it has, and nothing of its shapes.
-const GRAIN_SCALE: f32 = 1.2;
-
-/// How much wider than the daub the Rough brushes look when they ask what the
-/// broad shading here is. Wide enough that the shading itself is part of what
-/// they scrub back on, which is where the ribbons come from.
-const BROAD_SCALE: f32 = 2.0;
-
-/// Filter ▸ Artistic ▸ Paint Daubs: the picture repainted in daubs of one
-/// colour, with whatever the daubing could not hold put back on top.
+/// Filter ▸ Artistic ▸ Paint Daubs: the picture repainted in daubs, then
+/// sharpened, with the brush deciding the shape of the daub and what the
+/// sharpening looks like.
 ///
-/// Two passes, and every one of CS6's six brushes is a setting of the second.
-///
-/// 1. **The daubs.** Each pixel is averaged with the neighbours within Brush
-///    Size *that are near enough in colour to belong to the same thing* — see
-///    [`DAUB_REGION`]. A petal's inside washes together into one soft daub and
-///    its outline survives untouched, which is what the reference's Simple
-///    brush is: creamy, edgeless within a shape, and crisp at every boundary.
-/// 2. **What the daubs could not hold.** The difference between the picture and
-///    its daubs is every fine thing the first pass threw away — the grain, the
-///    veins, the stamens. Putting a little back is definition. Putting a great
-///    deal back is what the Rough brushes do, and it is worth understanding
-///    *why they look the way they do*: where the picture was smooth, the
-///    leftovers are a level or two of gradient, and multiplying that by twenty
-///    turns a gentle background into bands and ribbons. The wiggling contours
-///    all over CS6's Dark Rough and Sparkle are not a texture pasted on. They
-///    are the photograph's own gradients, amplified until they band.
-///
-/// **Brush Size** is the daub. **Sharpness** is how much goes back on. **Brush
-/// Type** decides *which* of it goes back: all of it, only what lightens, only
-/// what darkens, or none.
+/// **Brush Size** is the daub. **Sharpness** is the sharpening laid over it.
+/// **Brush Type**: Simple is the two as they are; Wide Sharp and Wide Blurry
+/// stretch the daub sideways and sharpen harder or soften it; Light Rough and
+/// Dark Rough lay a tooth and keep only the light halo or only the dark one;
+/// Sparkle draws contour lines and lights the picture up — see [`sparkle`].
 ///
 /// Alpha is left alone: repainting the picture does not change the layer's
 /// shape.
 ///
-/// No GPU path. The daubing is [`crate::filters::convolve::surface_blur`],
-/// which is a sliding histogram — sequential along each row by construction,
-/// and the reason it is fast enough to offer a fifty-pixel brush at all.
+/// No GPU path. The daubing is a median over a sliding histogram —
+/// sequential along each row by construction, and the reason a fifty-pixel
+/// brush is fast enough to offer at all.
 pub fn paint_daubs(pixmap: &mut Pixmap, size: u32, sharpness: u32, brush: DaubBrush) {
     if pixmap.is_empty() {
         return;
     }
     let size = size.clamp(*DAUB_SIZE.start(), *DAUB_SIZE.end());
-    let sharpness = sharpness.clamp(*DAUB_SHARPNESS.start(), *DAUB_SHARPNESS.end());
+    let sharpness = sharpness.clamp(*DAUB_SHARPNESS.start(), *DAUB_SHARPNESS.end()) as f32;
+    let (across, down) = daub_reach(size, brush);
+    let rough = brush.is_rough();
 
-    let wide = matches!(brush, DaubBrush::WideSharp | DaubBrush::WideBlurry);
-    let width = size as f32 * DAUB_WIDTH * if wide { WIDE_DAUB } else { 1.0 };
+    // Not under Sparkle: its contour lines need the smooth shading the tooth
+    // would break up.
+    if rough && brush != DaubBrush::Sparkle {
+        lay_tooth(pixmap, DAUB_TOOTH, DAUB_TOOTH_SCALE, 0);
+    }
+    let mut daubs = crate::filters::convolve::median_of(pixmap, across, down);
+    for (daub, original) in daubs
+        .as_bytes_mut()
+        .chunks_exact_mut(4)
+        .zip(pixmap.as_bytes().chunks_exact(4))
+    {
+        daub[3] = original[3];
+    }
+    *pixmap = daubs;
 
-    let picture = pixmap.clone();
-    crate::filters::convolve::surface_blur(pixmap, (width.round() as u32).max(1), DAUB_REGION);
-
-    let sharp = sharpness as f32;
+    let edge = sharpness * EDGE_PER_STEP;
+    let halo = sharpness * ROUGH_PER_STEP;
     match brush {
-        // The painting brushes: definition where two daubs meet, and nothing
-        // of the photograph put back.
-        DaubBrush::Simple => raise_the_paint(pixmap, width, sharp * SHARPNESS_PER_STEP),
-        DaubBrush::WideSharp => raise_the_paint(pixmap, width, sharp * SHARPNESS_PER_STEP * 2.0),
-        // A wide daub with a soft edge, which is what shows the grain of the
-        // paint rather than the shapes in it: only the finest thing the
-        // picture had goes back on, so the surface is stippled and the veins
-        // and stamens the daub took out stay out.
+        DaubBrush::Simple => sharpen(pixmap, edge),
+        DaubBrush::WideSharp => sharpen(pixmap, edge * 2.0),
         DaubBrush::WideBlurry => {
-            let mut grain = picture.clone();
-            crate::filters::convolve::gaussian_blur_accelerated(&mut grain, GRAIN_SCALE);
-            put_back(
-                pixmap,
-                &picture,
-                &grain,
-                sharp * STIPPLE_PER_STEP,
-                Leftovers::All,
-            );
+            crate::filters::convolve::gaussian_blur_accelerated(pixmap, down as f32 * 2.0 * WIDE_BLUR);
+            sharpen(pixmap, edge * 0.5);
         }
-        // The scrubbing brushes, which measure against the *broad* shading
-        // rather than against the daub. See BROAD_SCALE.
-        DaubBrush::LightRough => scrub(pixmap, &picture, width, sharp, Leftovers::Lightening, 1.0),
-        DaubBrush::DarkRough => scrub(pixmap, &picture, width, sharp, Leftovers::Darkening, 1.0),
-        DaubBrush::Sparkle => scrub(pixmap, &picture, width, sharp, Leftovers::All, 2.0),
+        DaubBrush::LightRough => rough_edge(pixmap, halo, Halo::Light),
+        DaubBrush::DarkRough => rough_edge(pixmap, halo, Halo::Dark),
+        DaubBrush::Sparkle => sparkle(pixmap, sharpness),
+    }
+    if rough {
+        lay_tooth(pixmap, DAUB_GRIT, DAUB_GRIT_SCALE, 3);
     }
 }
 
-/// Which half of the leftover detail a brush is allowed to put back.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Leftovers {
-    All,
-    /// Only where the picture was lighter than what it is measured against, so
-    /// the brush can scrub a surface white but never dirty it — and the other
-    /// way about.
-    Lightening,
-    Darkening,
+impl DaubBrush {
+    /// Whether the brush lays a tooth, which is laid by where on the canvas a
+    /// pixel is.
+    pub fn is_rough(self) -> bool {
+        matches!(self, DaubBrush::LightRough | DaubBrush::DarkRough | DaubBrush::Sparkle)
+    }
 }
 
-/// Scrub the picture back on over its daubs, measured against its *broad*
-/// shading rather than against the daubs themselves.
+/// How far the daub reaches across and down, in pixels either side.
+pub fn daub_reach(size: u32, brush: DaubBrush) -> (u32, u32) {
+    let reach = (size as f32 * DAUB_REACH).round().max(1.0);
+    match brush {
+        DaubBrush::WideSharp | DaubBrush::WideBlurry => (
+            (reach * WIDE_STRETCH) as u32,
+            (reach / WIDE_STRETCH).max(1.0) as u32,
+        ),
+        _ => (reach as u32, reach as u32),
+    }
+}
+
+/// Noise in each colour channel, blurred to specks `scale` pixels across and
+/// centred on 127.5. `salt` keeps two uses from being the same noise.
+fn blurred_specks(width: u32, height: u32, scale: f32, salt: usize) -> Pixmap {
+    let mut specks = Pixmap::new(width, height);
+    specks
+        .as_bytes_mut()
+        .par_chunks_exact_mut(width as usize * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                for c in 0..3 {
+                    px[c] = ((speck(x as i32, y as i32, c + salt) * 0.5 + 0.5) * 255.0) as u8;
+                }
+                px[3] = 255;
+            }
+        });
+    crate::filters::convolve::gaussian_blur_accelerated(&mut specks, scale);
+    specks
+}
+
+/// What [`blurred_specks`] at `scale` must be multiplied by to spread about
+/// one level. A blur of σ leaves white noise about 1/(2√π·σ) of its spread,
+/// and `speck` starts at about 52 levels.
+fn speck_gain(scale: f32) -> f32 {
+    2.0 * std::f32::consts::PI.sqrt() * scale / 52.0
+}
+
+/// Add colour noise of about `levels` spread, in specks `scale` pixels
+/// across, each channel on its own. `salt` keeps two coats from being the
+/// same noise.
+fn lay_tooth(pixmap: &mut Pixmap, levels: f32, scale: f32, salt: usize) {
+    let tooth = blurred_specks(pixmap.width(), pixmap.height(), scale, salt);
+    let gain = levels * speck_gain(scale);
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(tooth.as_bytes().par_chunks_exact(stride))
+        .for_each(|(out, tooth)| {
+            for (out, tooth) in out.chunks_exact_mut(4).zip(tooth.chunks_exact(4)) {
+                for c in 0..3 {
+                    let v = out[c] as f32 + (tooth[c] as f32 - 127.5) * gain;
+                    out[c] = v.clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+}
+
+/// Sparkle's contour lines: how many levels of brightness apart they are
+/// drawn, how far and how broadly the wobble pushes them about, how thin they
+/// are, and how bright they are per step of Sharpness. The dark lines are
+/// drawn at a fraction of the light ones'.
+const CONTOUR_STEP: f32 = 8.0;
+const CONTOUR_SOFTEN: f32 = 2.0;
+const CONTOUR_WOBBLE: f32 = 12.0;
+const CONTOUR_WOBBLE_SCALE: f32 = 12.0;
+const CONTOUR_THIN: f32 = 8.0;
+const CONTOUR_PER_STEP: f32 = 3.0;
+const CONTOUR_DARK: f32 = 0.5;
+
+/// Sparkle's sharpening: scale in pixels and strength per step.
+const SPARKLE_SCALE: f32 = 1.5;
+const SPARKLE_PER_STEP: f32 = 0.1;
+
+/// Sparkle's brilliance: an overall lift (gain after a gamma), then a push
+/// towards white that starts at [`BRILLIANCE_FROM`] and leaves the darks alone.
+const BRILLIANCE_GAMMA: f32 = 0.85;
+const BRILLIANCE_GAIN: f32 = 1.1;
+const BRILLIANCE_FROM: f32 = 0.3;
+const BRILLIANCE_PUSH: f32 = 0.5;
+
+/// Sparkle: the daubs with contour lines drawn through them, sharpened, and
+/// lit up.
 ///
-/// Which of the two it is measured against decides what the brush looks like,
-/// and it is not a detail. Measured against the daub, the leftover in a smooth
-/// part of the picture is the grain and nothing else — the daub of an
-/// out-of-focus background *is* that background — so the brush lays speckle
-/// there and the flowing ribbons that cover CS6's Rough and Sparkle never
-/// appear. Measured against a blur wide enough to lose the shading too, the
-/// leftover in that same smooth part is a level or two of gradient running
-/// across the frame, and multiplying that by twenty is exactly what turns it
-/// into ribbons. The grain is still in there; it is now the smaller half of
-/// what the brush is scrubbing rather than the whole of it.
-fn scrub(
-    pixmap: &mut Pixmap,
-    picture: &Pixmap,
-    width: f32,
-    sharpness: f32,
-    keep: Leftovers,
-    hardness: f32,
-) {
-    // Blurred from the picture rather than from the daubs under it: the daubs
-    // are flat patches with steps between them, and at these gains those steps
-    // come back as blocks. The picture's own shading has no steps in it.
-    let mut broad = picture.clone();
-    crate::filters::convolve::gaussian_blur_accelerated(&mut broad, width * BROAD_SCALE);
-    put_back(
-        pixmap,
-        picture,
-        &broad,
-        sharpness * ROUGH_PER_STEP * hardness,
-        keep,
-    );
+/// The swirling lines all over CS6's Sparkle, which are densest in the
+/// out-of-focus background, are iso-lines of brightness: where the picture
+/// shades slowly they are far apart and follow the shading, and a slow random
+/// wobble added to the brightness first keeps them from reading as a
+/// topographic map. Light lines are drawn stronger than dark ones, which is
+/// half of the brilliance; the other half is a tone curve that sends the light
+/// parts towards white channel by channel, so the petals go pale rather than
+/// merely brighter while the background stays dark.
+fn sparkle(pixmap: &mut Pixmap, sharpness: f32) {
+    use std::f32::consts::TAU;
+
+    let mut field = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut field, CONTOUR_SOFTEN);
+    let wobble = blurred_specks(pixmap.width(), pixmap.height(), CONTOUR_WOBBLE_SCALE, 7);
+    let wobble_gain = CONTOUR_WOBBLE * speck_gain(CONTOUR_WOBBLE_SCALE);
+    let amp = sharpness * CONTOUR_PER_STEP;
+
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(field.as_bytes().par_chunks_exact(stride))
+        .zip(wobble.as_bytes().par_chunks_exact(stride))
+        .for_each(|((out, field), wobble)| {
+            for ((out, f), wb) in out
+                .chunks_exact_mut(4)
+                .zip(field.chunks_exact(4))
+                .zip(wobble.chunks_exact(4))
+            {
+                let lum = 0.299 * f[0] as f32 + 0.587 * f[1] as f32 + 0.114 * f[2] as f32;
+                let level = lum + (wb[0] as f32 - 127.5) * wobble_gain;
+                let wave = (level / CONTOUR_STEP * TAU).cos();
+                let line = wave.max(0.0).powf(CONTOUR_THIN)
+                    - CONTOUR_DARK * (-wave).max(0.0).powf(CONTOUR_THIN);
+                for c in 0..3 {
+                    out[c] = (out[c] as f32 + line * amp).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+
+    let sharp = pixmap.clone();
+    let mut soft = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut soft, SPARKLE_SCALE);
+    put_back(pixmap, &sharp, &soft, sharpness * SPARKLE_PER_STEP);
+
+    let brilliant: [u8; 256] = std::array::from_fn(|v| {
+        let x = ((v as f32 / 255.0).powf(BRILLIANCE_GAMMA) * BRILLIANCE_GAIN).min(1.0);
+        let k = ((x - BRILLIANCE_FROM) / (1.0 - BRILLIANCE_FROM)).clamp(0.0, 1.0);
+        let k = k * k * (3.0 - 2.0 * k);
+        let x = x + BRILLIANCE_PUSH * k * (1.0 - x);
+        (x * 255.0).round() as u8
+    });
+    pixmap.as_bytes_mut().par_chunks_exact_mut(4).for_each(|px| {
+        for c in 0..3 {
+            px[c] = brilliant[px[c] as usize];
+        }
+    });
 }
 
-/// Add what `over` has and `under` does not to whatever is in `pixmap`.
-fn put_back(pixmap: &mut Pixmap, over: &Pixmap, under: &Pixmap, gain: f32, keep: Leftovers) {
+/// An unsharp mask at [`EDGE_SCALE`], channel by channel.
+fn sharpen(pixmap: &mut Pixmap, gain: f32) {
     if gain <= 0.0 {
         return;
     }
+    let sharp = pixmap.clone();
+    let mut soft = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut soft, EDGE_SCALE);
+    put_back(pixmap, &sharp, &soft, gain);
+}
+
+/// Which side of a boundary a Rough brush draws its halo on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Halo {
+    Light,
+    Dark,
+}
+
+/// The Rough brushes' halo, taken on brightness and laid on all three
+/// channels alike, so that a dark halo goes to black rather than to a deeper
+/// shade of whatever it was.
+fn rough_edge(pixmap: &mut Pixmap, gain: f32, keep: Halo) {
+    if gain <= 0.0 {
+        return;
+    }
+    let mut soft = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut soft, ROUGH_SCALE);
+    let lum = |p: &[u8]| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(soft.as_bytes().par_chunks_exact(stride))
+        .for_each(|(out, soft)| {
+            for (out, soft) in out.chunks_exact_mut(4).zip(soft.chunks_exact(4)) {
+                let halo = lum(out) - lum(soft);
+                let halo = match keep {
+                    Halo::Light => halo.max(0.0),
+                    Halo::Dark => halo.min(0.0),
+                } * gain;
+                for c in 0..3 {
+                    out[c] = (out[c] as f32 + halo).clamp(0.0, 255.0).round() as u8;
+                }
+            }
+        });
+}
+
+/// Add what `over` has and `under` does not to whatever is in `pixmap`.
+fn put_back(pixmap: &mut Pixmap, over: &Pixmap, under: &Pixmap, gain: f32) {
     let stride = pixmap.stride();
     pixmap
         .as_bytes_mut()
@@ -1069,15 +1228,1085 @@ fn put_back(pixmap: &mut Pixmap, over: &Pixmap, under: &Pixmap, gain: f32, keep:
                 .zip(under.chunks_exact(4))
             {
                 for c in 0..3 {
-                    let left_over = over[c] as f32 - under[c] as f32;
-                    let allowed = match keep {
-                        Leftovers::All => left_over,
-                        Leftovers::Lightening => left_over.max(0.0),
-                        Leftovers::Darkening => left_over.min(0.0),
-                    };
-                    out[c] = (out[c] as f32 + allowed * gain).clamp(0.0, 255.0).round() as u8;
+                    let lift = (over[c] as f32 - under[c] as f32) * gain;
+                    out[c] = (out[c] as f32 + lift).clamp(0.0, 255.0).round() as u8;
                 }
-                // Alpha stands: repainting the picture does not change the
+            }
+        });
+}
+
+/// How broad a swell counts as the picture's shading rather than its relief,
+/// in pixels. The relief is the picture less a blur this wide, so a bright
+/// shape stands up out of the wrap and the wrap dips into a trough around it
+/// before it settles — and the far wall of that trough is what catches the
+/// light in the ring CS6 draws a little way outside every petal.
+const WRAP_SHADING: f32 = 8.0;
+
+/// How far the relief is smoothed before it is lit, in pixels: a floor, and
+/// a step of Smoothness. Wrap laid over a surface does not follow its every
+/// grain; the smoother it is, the broader and fewer its folds.
+const WRAP_SMOOTH_FLOOR: f32 = 1.0;
+const WRAP_SMOOTH_PER_STEP: f32 = 0.7;
+
+/// How hard the relief is pushed up before it is lit: a floor, and a step of
+/// Detail. It goes through `tanh`, so strong relief is capped and faint relief
+/// is what the slider really raises — which is what brings up the crinkles
+/// in the background as Detail goes up.
+const WRAP_DETAIL_FLOOR: f32 = 0.5;
+const WRAP_DETAIL_PER_STEP: f32 = 0.08;
+
+/// How steep the relief stands, as a multiplier on its slope.
+const WRAP_DEPTH: f32 = 250.0;
+
+/// Where the light is — up and to the left, the convention relief is read
+/// by — and how tight the highlight is. High, because plastic is glossy: the
+/// highlights are thin bright streaks, not a sheen.
+const WRAP_LIGHT: [f32; 3] = [-1.0, -1.0, 1.2];
+const WRAP_SHINE: f32 = 50.0;
+
+/// How bright the highlights are at the top of Highlight Strength, and how
+/// sharply that grows along the slider. CS6's low settings are barely there,
+/// so the growth is steeper than a straight line.
+const WRAP_GLOSS: f32 = 5.0;
+const WRAP_GLOSS_CURVE: f32 = 1.6;
+
+/// How much the wrap dulls the picture under it at the top of Highlight
+/// Strength.
+const WRAP_DULL: f32 = 0.25;
+
+/// Filter ▸ Artistic ▸ Plastic Wrap: the picture shrink-wrapped in glossy
+/// plastic.
+///
+/// The picture's brightness is read as a surface — light things stand up,
+/// dark things sink — and the surface is lit by one light with a tight
+/// specular highlight. Only the highlight is laid back on, towards white, over
+/// a slightly dulled copy of the picture; the plastic itself is clear.
+///
+/// **Highlight Strength** is how bright the highlights are. **Detail** is how
+/// much of the picture's faint relief the wrap picks up. **Smoothness** is how
+/// broad its folds are.
+///
+/// Alpha is left alone: wrapping the picture does not change the layer's
+/// shape.
+///
+/// No GPU path. The work is three blurs of a floating-point height field —
+/// in bytes the relief is a level or two deep and its slopes would come back
+/// as steps — and the backend's blur is over bytes. The lighting is one pass
+/// per pixel, which would upload its input and read it straight back.
+pub fn plastic_wrap(pixmap: &mut Pixmap, highlight: u32, detail: u32, smoothness: u32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let highlight = highlight.clamp(*WRAP_HIGHLIGHT.start(), *WRAP_HIGHLIGHT.end()) as f32;
+    let detail = detail.clamp(*WRAP_DETAIL.start(), *WRAP_DETAIL.end()) as f32;
+    let smoothness = smoothness.clamp(*WRAP_SMOOTHNESS.start(), *WRAP_SMOOTHNESS.end()) as f32;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+
+    let brightness: Vec<f32> = pixmap
+        .as_bytes()
+        .par_chunks_exact(4)
+        .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0)
+        .collect();
+    let mut shading = brightness.clone();
+    blur_field(&mut shading, width, height, WRAP_SHADING);
+    let mut relief: Vec<f32> = brightness.iter().zip(&shading).map(|(b, s)| b - s).collect();
+    blur_field(
+        &mut relief,
+        width,
+        height,
+        WRAP_SMOOTH_FLOOR + smoothness * WRAP_SMOOTH_PER_STEP,
+    );
+    let push = WRAP_DETAIL_FLOOR + detail * WRAP_DETAIL_PER_STEP;
+    relief.par_iter_mut().for_each(|r| *r = (*r * push).tanh());
+
+    // The half-way vector between the light and a viewer straight above.
+    let light = normalise(WRAP_LIGHT);
+    let half = normalise([light[0], light[1], light[2] + 1.0]);
+    let gloss = (highlight / *WRAP_HIGHLIGHT.end() as f32).powf(WRAP_GLOSS_CURVE) * WRAP_GLOSS;
+    let dull = 1.0 - WRAP_DULL * highlight / *WRAP_HIGHLIGHT.end() as f32;
+
+    let relief = &relief;
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(y, out)| {
+            // Central differences, one-sided at the edges.
+            let (up, down) = (y.saturating_sub(1), (y + 1).min(height - 1));
+            for (x, px) in out.chunks_exact_mut(4).enumerate() {
+                let (left, right) = (x.saturating_sub(1), (x + 1).min(width - 1));
+                let dx = (relief[y * width + right] - relief[y * width + left])
+                    / (right - left).max(1) as f32;
+                let dy = (relief[down * width + x] - relief[up * width + x])
+                    / (down - up).max(1) as f32;
+                let normal = normalise([-dx * WRAP_DEPTH, -dy * WRAP_DEPTH, 1.0]);
+                let facing = (normal[0] * half[0] + normal[1] * half[1] + normal[2] * half[2])
+                    .max(0.0);
+                let shine = (facing.powf(WRAP_SHINE) * gloss).min(1.0);
+                for c in 0..3 {
+                    let under = px[c] as f32 * dull;
+                    px[c] = (under + (255.0 - under) * shine).round().clamp(0.0, 255.0) as u8;
+                }
+                // Alpha stands: wrapping the picture does not change the
+                // layer's shape.
+            }
+        });
+}
+
+fn normalise(v: [f32; 3]) -> [f32; 3] {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / length, v[1] / length, v[2] / length]
+}
+
+/// A Gaussian blur of a floating-point field, with the edge pixels standing
+/// in for what is past them.
+pub(crate) fn blur_field(field: &mut [f32], width: usize, height: usize, sigma: f32) {
+    if sigma <= 0.0 {
+        return;
+    }
+    let taps = (sigma * 3.0).ceil() as i32;
+    let kernel = crate::filters::convolve::gaussian_kernel_1d(sigma, taps);
+    let kernel = &kernel;
+    let mut scratch = field.to_vec();
+    field
+        .par_chunks_exact_mut(width)
+        .zip(scratch.par_chunks_exact(width))
+        .for_each(|(out, row)| {
+            for (x, slot) in out.iter_mut().enumerate() {
+                *slot = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| {
+                        let at = (x as i32 + k as i32 - taps).clamp(0, width as i32 - 1);
+                        w * row[at as usize]
+                    })
+                    .sum();
+            }
+        });
+    scratch.copy_from_slice(field);
+    let scratch = &scratch;
+    field
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, out)| {
+            for (x, slot) in out.iter_mut().enumerate() {
+                *slot = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| {
+                        let at = (y as i32 + k as i32 - taps).clamp(0, height as i32 - 1);
+                        w * scratch[at as usize * width + x]
+                    })
+                    .sum();
+            }
+        });
+}
+
+/// How far the wrap reaches, in pixels: the blur that takes the shading out
+/// and the one that smooths the relief, three sigma each, and the slope's
+/// one pixel either side.
+pub fn plastic_wrap_reach(smoothness: u32) -> u32 {
+    let smoothness = smoothness.clamp(*WRAP_SMOOTHNESS.start(), *WRAP_SMOOTHNESS.end()) as f32;
+    ((WRAP_SHADING + WRAP_SMOOTH_FLOOR + smoothness * WRAP_SMOOTH_PER_STEP) * 3.0).ceil() as u32 + 2
+}
+
+/// How far the picture is smoothed before it is posterized, in pixels. It is
+/// what gives the bands blotchy, rounded outlines rather than the ragged ones
+/// a photograph's grain would cut.
+const POSTER_SETTLE: f32 = 2.0;
+
+/// How many bands of brightness Posterization gives: a floor, plus a step,
+/// plus a step that grows with the slider. CS6 is harsh at the bottom of the
+/// slider — three bands, so the darkest parts of the background go black — and
+/// by the top the banding is barely there.
+const POSTER_BANDS: f32 = 3.0;
+const POSTER_BANDS_CURVE: f32 = 0.25;
+
+/// Where between two bands a brightness is rounded up rather than down. Over
+/// a half, so that a band only goes to black when it is well into the dark:
+/// CS6's lowest setting turns a mid-green background bright green with black
+/// only in its deepest shadow.
+const POSTER_ROUND: f32 = 0.64;
+
+/// The edges: how far round each pixel the ink looks, as a floor and a step
+/// of Edge Thickness; how much darker than that a pixel must be before it is
+/// inked, in levels; and how much ink a level of darkness is worth, as a floor
+/// and a step of Edge Intensity.
+///
+/// Ink goes where a pixel is darker than what is round it, which is the dark
+/// side of every boundary — the background just outside a petal — and along
+/// anything thin and dark, like a vein. That is where CS6 draws.
+const POSTER_EDGE_SOFTEN: f32 = 0.5;
+const POSTER_REACH: f32 = 1.5;
+const POSTER_REACH_PER_STEP: f32 = 0.5;
+const POSTER_INK_FROM: f32 = 2.0;
+const POSTER_INK: f32 = 12.0;
+const POSTER_INK_PER_STEP: f32 = 4.0;
+
+/// Filter ▸ Artistic ▸ Poster Edges: the picture posterized, with its edges
+/// inked in black.
+///
+/// **Posterization** bands the picture's brightness and keeps its colour: each
+/// pixel is scaled to its band's brightness, so a background comes back as a
+/// few flat greens rather than as the few flat primaries per-channel
+/// posterizing would give. **Edge Thickness** is how broad the ink is, and
+/// **Edge Intensity** how much of the picture it picks up — at the top, every
+/// vein is hatched in.
+///
+/// Alpha is left alone: posterizing the picture does not change the layer's
+/// shape.
+///
+/// No GPU path. What costs is the blurs — the settling one already goes
+/// through the backend, and the one the ink measures against is over floats —
+/// and the rest is one pass that would upload its input and read it straight
+/// back.
+pub fn poster_edges(pixmap: &mut Pixmap, thickness: u32, intensity: u32, posterization: u32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let thickness = thickness.clamp(*POSTER_THICKNESS.start(), *POSTER_THICKNESS.end()) as f32;
+    let intensity = intensity.clamp(*POSTER_INTENSITY.start(), *POSTER_INTENSITY.end()) as f32;
+    let posterization =
+        posterization.clamp(*POSTER_LEVELS.start(), *POSTER_LEVELS.end()) as f32;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+    let brightness_of = |p: &[u8]| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+
+    let mut settled = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut settled, POSTER_SETTLE);
+
+    let mut softened = pixmap.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut softened, POSTER_EDGE_SOFTEN);
+    let brightness: Vec<f32> = softened.as_bytes().par_chunks_exact(4).map(brightness_of).collect();
+    let mut around = brightness.clone();
+    blur_field(
+        &mut around,
+        width,
+        height,
+        POSTER_REACH + thickness * POSTER_REACH_PER_STEP,
+    );
+
+    let steps = POSTER_BANDS + posterization + posterization * posterization * POSTER_BANDS_CURVE - 1.0;
+    let ink_gain = (POSTER_INK + intensity * POSTER_INK_PER_STEP) / 255.0;
+    let (brightness, around) = (&brightness, &around);
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(settled.as_bytes().par_chunks_exact(stride))
+        .enumerate()
+        .for_each(|(y, (out, settled))| {
+            for (x, (px, from)) in out.chunks_exact_mut(4).zip(settled.chunks_exact(4)).enumerate() {
+                let level = brightness_of(from);
+                let band = (level / 255.0 * steps + POSTER_ROUND).floor().min(steps) * 255.0 / steps;
+                let scale = band / level.max(1.0);
+
+                let i = y * width + x;
+                let darker = around[i] - brightness[i] - POSTER_INK_FROM;
+                let bare = 1.0 - (darker * ink_gain).clamp(0.0, 1.0);
+
+                for c in 0..3 {
+                    px[c] = ((from[c] as f32 * scale).min(255.0) * bare).round() as u8;
+                }
+                // Alpha stands: posterizing the picture does not change the
+                // layer's shape.
+            }
+        });
+}
+
+/// How far Poster Edges reaches, in pixels: the wider of the settling blur
+/// and the one the ink measures against, three sigma each, with the ink's own
+/// softening on top.
+pub fn poster_edges_reach(thickness: u32) -> u32 {
+    let thickness = thickness.clamp(*POSTER_THICKNESS.start(), *POSTER_THICKNESS.end()) as f32;
+    let widest = POSTER_SETTLE.max(POSTER_REACH + thickness * POSTER_REACH_PER_STEP);
+    ((widest + POSTER_EDGE_SOFTEN) * 3.0).ceil() as u32 + 1
+}
+
+/// How long a pastel stroke is, in pixels: a floor, so that even Stroke
+/// Length 0 is drawn in strokes as CS6's is, and a step of the slider.
+///
+/// This is the length of the chalk's *grain*. The picture itself is smeared
+/// far less — [`PASTEL_SMEAR`] — because CS6's pastel keeps the picture sharp
+/// at any Stroke Length: the long streaks are chalk laid over it, not the
+/// picture dragged out. Smearing the picture by the stroke's full length
+/// turns it into a motion blur.
+const PASTEL_STROKE: f32 = 6.0;
+const PASTEL_STROKE_PER_STEP: f32 = 0.6;
+const PASTEL_SMEAR: f32 = 2.0;
+const PASTEL_SMEAR_PER_STEP: f32 = 0.1;
+
+/// Which way the strokes run: up and to the right, as CS6's do, in degrees
+/// anticlockwise from the horizontal.
+const PASTEL_ANGLE: f32 = 45.0;
+
+/// How far along itself a stroke drags its colour, in stroke lengths, at its
+/// furthest. Each stroke takes its colour from a little way up or down its own
+/// line, which is what breaks an outline into the ragged, overlapping marks of
+/// chalk rather than a clean smear.
+const PASTEL_DRAG: f32 = 0.12;
+
+/// How much of the picture's fine detail each stroke carries, as a floor and
+/// a step of Stroke Detail, and the scale in pixels below which it counts as
+/// detail. High detail is what lays CS6's bright scratches over the horse's
+/// highlights.
+const PASTEL_DETAIL_SCALE: f32 = 2.0;
+const PASTEL_DETAIL_FLOOR: f32 = 0.5;
+const PASTEL_DETAIL_PER_STEP: f32 = 0.15;
+
+/// The grain of the chalk, in levels of spread. It is strongest in the dark,
+/// where chalk goes on thin and catches only on the tooth of the paper, and
+/// faintest in the light, where it is laid thick.
+const PASTEL_GRAIN: f32 = 22.0;
+const PASTEL_GRAIN_DARK: f32 = 1.2;
+
+/// How much lighter than the picture the pastel is, as a gamma: chalk is
+/// opaque and pale, and CS6's pastel is a washed-out copy of the photograph.
+const PASTEL_PALE: f32 = 0.8;
+
+/// Filter ▸ Artistic ▸ Rough Pastels: the picture drawn in coloured chalk on
+/// a textured surface.
+///
+/// Two stages, the second shared with the other textured filters.
+///
+/// 1. **The strokes.** The picture is dragged into diagonal strokes, each
+///    carrying some of the fine detail under it, with the grain of the chalk
+///    over the top, and then paled. **Stroke Length** is how long the strokes
+///    are; **Stroke Detail** how much of the picture they carry.
+/// 2. **The surface.** The strokes are lit as if drawn on the chosen texture —
+///    see [`crate::filters::texture::apply_relief`] for Texture, Scaling,
+///    Relief, Light and Invert.
+///
+/// Alpha is left alone.
+///
+/// No GPU path. The strokes are sampled along a line, which is a fit, but
+/// every stage wants the previous one's result on the CPU and each would
+/// upload and read back — the per-call cost compositing already showed is not
+/// worth paying (docs/gpu-migration.md).
+#[allow(clippy::too_many_arguments)]
+pub fn rough_pastels(
+    pixmap: &mut Pixmap,
+    length: u32,
+    detail: u32,
+    texture: crate::filters::texture::Texture,
+    scaling: u32,
+    relief: u32,
+    light: crate::filters::texture::Light,
+    invert: bool,
+) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let length = length.clamp(*PASTEL_LENGTH.start(), *PASTEL_LENGTH.end()) as f32;
+    let detail = detail.clamp(*PASTEL_DETAIL.start(), *PASTEL_DETAIL.end()) as f32;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+    let stroke = PASTEL_STROKE + length * PASTEL_STROKE_PER_STEP;
+    let (along_x, along_y) = {
+        let radians = PASTEL_ANGLE.to_radians();
+        (radians.cos(), -radians.sin())
+    };
+
+    // Where each stroke takes its colour from.
+    let drag = streaked_noise(width, height, stroke * 2.0 + 3.0, 11, (along_x, along_y));
+    let picture = pixmap.clone();
+    let mut dragged = picture.clone();
+    dragged
+        .as_bytes_mut()
+        .par_chunks_exact_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, px) in row.chunks_exact_mut(4).enumerate() {
+                let offset = drag[y * width + x].clamp(-2.0, 2.0) * stroke * PASTEL_DRAG;
+                let sx = (x as f32 + along_x * offset).round().clamp(0.0, (width - 1) as f32);
+                let sy = (y as f32 + along_y * offset).round().clamp(0.0, (height - 1) as f32);
+                let from = (sy as usize * width + sx as usize) * 4;
+                px[..3].copy_from_slice(&picture.as_bytes()[from..from + 3]);
+            }
+        });
+    let mut strokes = dragged;
+    let smear = PASTEL_SMEAR + length * PASTEL_SMEAR_PER_STEP;
+    crate::filters::convolve::motion_blur(&mut strokes, PASTEL_ANGLE, smear);
+
+    // The picture's fine detail, drawn along the stroke: a streak of the
+    // picture less a streak of its blur, which is the streak of the detail.
+    let carried = smear;
+    let mut sharp = picture.clone();
+    crate::filters::convolve::motion_blur(&mut sharp, PASTEL_ANGLE, carried);
+    let mut soft = picture.clone();
+    crate::filters::convolve::gaussian_blur_accelerated(&mut soft, PASTEL_DETAIL_SCALE);
+    crate::filters::convolve::motion_blur(&mut soft, PASTEL_ANGLE, carried);
+    let carry = PASTEL_DETAIL_FLOOR + detail * PASTEL_DETAIL_PER_STEP;
+
+    let grain = streaked_noise(width, height, stroke * 1.5 + 3.0, 12, (along_x, along_y));
+    let pale: [f32; 256] = std::array::from_fn(|v| 255.0 * (v as f32 / 255.0).powf(PASTEL_PALE));
+
+    let stride = pixmap.stride();
+    let (sharp, soft, grain) = (&sharp, &soft, &grain);
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(strokes.as_bytes().par_chunks_exact(stride))
+        .enumerate()
+        .for_each(|(y, (out, strokes))| {
+            let (sharp, soft) = (sharp.row(y as u32), soft.row(y as u32));
+            for x in 0..width {
+                let i = x * 4;
+                let mut chalk = [0.0f32; 3];
+                for c in 0..3 {
+                    chalk[c] = strokes[i + c] as f32
+                        + (sharp[i + c] as f32 - soft[i + c] as f32) * carry;
+                }
+                let lightness = (0.299 * chalk[0] + 0.587 * chalk[1] + 0.114 * chalk[2]) / 255.0;
+                let tooth = grain[y * width + x] * PASTEL_GRAIN * (PASTEL_GRAIN_DARK - lightness);
+                for c in 0..3 {
+                    let v = (chalk[c] + tooth).clamp(0.0, 255.0);
+                    out[i + c] = pale[v.round() as usize].round() as u8;
+                }
+                // Alpha stands: drawing the picture does not change the
+                // layer's shape.
+            }
+        });
+
+    crate::filters::texture::apply_relief(pixmap, texture, scaling, relief, light, invert);
+}
+
+/// White noise averaged along `along` over `length` pixels, then scaled to a
+/// spread of one: streaks, each about as long as a stroke. Laid by where on
+/// the canvas a pixel is.
+pub(crate) fn streaked_noise(width: usize, height: usize, length: f32, salt: usize, along: (f32, f32)) -> Vec<f32> {
+    let noise: Vec<f32> = (0..width * height)
+        .into_par_iter()
+        .map(|i| speck((i % width) as i32, (i / width) as i32, salt))
+        .collect();
+    let steps = length.round().max(1.0) as i32;
+    let mut streaks = vec![0.0f32; width * height];
+    streaks
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, slot) in row.iter_mut().enumerate() {
+                let (mut total, mut count) = (0.0f32, 0.0f32);
+                for step in -steps / 2..=steps / 2 {
+                    let sx = (x as f32 + along.0 * step as f32).round() as i32;
+                    let sy = (y as f32 + along.1 * step as f32).round() as i32;
+                    if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
+                        continue;
+                    }
+                    total += noise[sy as usize * width + sx as usize];
+                    count += 1.0;
+                }
+                *slot = total / count.max(1.0);
+            }
+        });
+    let spread = (streaks.par_iter().map(|v| v * v).sum::<f32>() / streaks.len() as f32).sqrt();
+    if spread > 0.0 {
+        streaks.par_iter_mut().for_each(|v| *v /= spread);
+    }
+    streaks
+}
+
+/// How long a smudge is, in pixels: a floor and a step of Stroke Length.
+const SMUDGE_STROKE: f32 = 8.0;
+const SMUDGE_STROKE_PER_STEP: f32 = 2.0;
+
+/// How big a smudged patch is, in pixels either side: a floor and a step of
+/// Stroke Length. CS6's smudging is soft paint with crisp edges between
+/// patches, not a streak — a long streak reads as motion blur.
+const SMUDGE_PATCH: f32 = 1.0;
+const SMUDGE_PATCH_PER_STEP: f32 = 0.35;
+
+/// The fine streaks: how much of the picture's own detail, dragged along the
+/// stroke, goes back on, and how long the drag is as a fraction of the stroke;
+/// and a light grain along the strokes in the darks, in levels. This is what
+/// CS6's smudging is made of close up — dense, thin diagonal streaks over
+/// crisp patches. Without them the smear reads as a blur.
+const SMUDGE_STREAK: f32 = 0.8;
+const SMUDGE_STREAK_LENGTH: f32 = 0.5;
+const SMUDGE_GRAIN: f32 = 7.0;
+
+/// Which way the smudges run, in degrees anticlockwise from the horizontal.
+const SMUDGE_ANGLE: f32 = 45.0;
+
+/// How much the smudge favours the darker of the picture and its streak —
+/// the stick drags dark into light, not light into dark — and how far the
+/// smudging is confined to the dark: a power on darkness, so the lights are
+/// barely touched.
+const SMUDGE_DARK_DRAG: f32 = 0.8;
+const SMUDGE_DARK_ONLY: f32 = 0.4;
+
+/// How much of the smear goes over the patches at most. Short of all of it,
+/// so a bridle or an eye still reads through the strokes.
+const SMUDGE_MIX: f32 = 0.5;
+
+/// How much the tones below the highlights are deepened, most in the
+/// midtones and fading to nothing at black and at the highlights. The stick lays dark as well as
+/// lifting light: CS6's shadows and midtones come back heavier than the
+/// photograph's at any Intensity.
+const SMUDGE_DEEPEN: f32 = 0.4;
+
+/// Where the highlights start, as a fraction of white: at Highlight Area 0,
+/// and how far down each step takes it. And how soft the start is.
+const SMUDGE_HIGHLIGHT_FROM: f32 = 0.9;
+const SMUDGE_HIGHLIGHT_PER_STEP: f32 = 0.02;
+const SMUDGE_HIGHLIGHT_SOFT: f32 = 0.15;
+
+/// At Intensity 10: how far the highlights are carried towards white, and how
+/// much the contrast is raised.
+const SMUDGE_LIFT: f32 = 0.9;
+const SMUDGE_CONTRAST: f32 = 0.2;
+
+/// Filter ▸ Artistic ▸ Smudge Stick: the picture's darks smeared along short
+/// diagonal strokes, and its lights brightened towards white.
+///
+/// **Stroke Length** is how long the smudges are. **Highlight Area** is how
+/// far down the tones the brightening reaches — at 20 most of a sunlit
+/// picture burns out. **Intensity** is how hard the lights are brightened and
+/// the contrast raised.
+///
+/// Alpha is left alone.
+///
+/// The streaks are mostly the picture's own detail, dragged; the grain along
+/// them is kept light, because a heavy one reads as pencil hatching, which is
+/// Rough Pastels' look, not this one.
+///
+/// No GPU path. The smudge is a streak along a line and the rest one pass per
+/// pixel, and each would upload its input and read it straight back.
+pub fn smudge_stick(pixmap: &mut Pixmap, length: u32, highlight: u32, intensity: u32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let length = length.clamp(*SMUDGE_LENGTH.start(), *SMUDGE_LENGTH.end()) as f32;
+    let highlight = highlight.clamp(*SMUDGE_HIGHLIGHT.start(), *SMUDGE_HIGHLIGHT.end()) as f32;
+    let intensity = intensity.clamp(*SMUDGE_INTENSITY.start(), *SMUDGE_INTENSITY.end()) as f32
+        / *SMUDGE_INTENSITY.end() as f32;
+    let width = pixmap.width() as usize;
+    let stroke = SMUDGE_STROKE + length * SMUDGE_STROKE_PER_STEP;
+
+    // Patches first — a median keeps their edges and loses the fine detail
+    // inside them — then a short drag along the stroke.
+    let patch = (SMUDGE_PATCH + length * SMUDGE_PATCH_PER_STEP).round() as u32;
+    let patches = crate::filters::convolve::median_of(pixmap, patch, patch);
+    let mut streak = patches.clone();
+    crate::filters::convolve::motion_blur(&mut streak, SMUDGE_ANGLE, stroke);
+    // The picture's detail — what the patches lost — dragged along the
+    // stroke, held about mid-grey so it survives in bytes.
+    let mut detail = pixmap.clone();
+    for (d, p) in detail.as_bytes_mut().chunks_exact_mut(4).zip(patches.as_bytes().chunks_exact(4)) {
+        for c in 0..3 {
+            d[c] = (128 + (d[c] as i32 - p[c] as i32) / 2).clamp(0, 255) as u8;
+        }
+    }
+    crate::filters::convolve::motion_blur(&mut detail, SMUDGE_ANGLE, stroke * SMUDGE_STREAK_LENGTH);
+    let along = {
+        let radians = SMUDGE_ANGLE.to_radians();
+        (radians.cos(), -radians.sin())
+    };
+    let grain = streaked_noise(width, pixmap.height() as usize, stroke * SMUDGE_STREAK_LENGTH + 3.0, 13, along);
+    let mut darkest = darkest_along(&patches, SMUDGE_ANGLE, stroke);
+    crate::filters::convolve::motion_blur(&mut darkest, SMUDGE_ANGLE, stroke * 0.5);
+
+    let from = (SMUDGE_HIGHLIGHT_FROM - highlight * SMUDGE_HIGHLIGHT_PER_STEP) * 255.0;
+    let soft = SMUDGE_HIGHLIGHT_SOFT * 255.0;
+    let contrast = 1.0 + intensity * SMUDGE_CONTRAST;
+    let lift = intensity * SMUDGE_LIFT;
+    let luma = |p: [f32; 3]| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(streak.as_bytes().par_chunks_exact(stride))
+        .zip(darkest.as_bytes().par_chunks_exact(stride))
+        .zip(patches.as_bytes().par_chunks_exact(stride))
+        .zip(detail.as_bytes().par_chunks_exact(stride))
+        .enumerate()
+        .for_each(|(y, ((((out, streak), darkest), patches), detail))| {
+            for x in 0..width {
+                let i = x * 4;
+                let picture = [out[i] as f32, out[i + 1] as f32, out[i + 2] as f32];
+                let dragged = [darkest[i] as f32, darkest[i + 1] as f32, darkest[i + 2] as f32];
+                // The darker of the pixel and the darkest along its stroke, so
+                // dark dragged into a light is smudged there too — the dark
+                // streaks CS6 lays through spray next to a dark leg.
+                let darkness = 1.0 - luma(picture).min(luma(dragged)) / 255.0;
+                let own_darkness = 1.0 - luma(picture) / 255.0;
+                let smudged = darkness.powf(SMUDGE_DARK_ONLY) * SMUDGE_MIX;
+                let mut paint = [0.0f32; 3];
+                for c in 0..3 {
+                    let s = streak[i + c] as f32;
+                    // The darkest along the stroke, so dark is carried along
+                    // it as a mark rather than averaged away — and taken from
+                    // the patches, not the picture, whose own darks are sharp
+                    // and would come back as speckle.
+                    let d = darkest[i + c] as f32;
+                    let smear = s + (d.min(s) - s) * SMUDGE_DARK_DRAG;
+                    // Over the patches, which keep the shapes readable under
+                    // the smear, and not over the picture's own grain.
+                    let under = picture[c] + (patches[i + c] as f32 - picture[c]) * own_darkness.powf(SMUDGE_DARK_ONLY);
+                    let streaks = (detail[i + c] as f32 - 128.0) * 2.0 * SMUDGE_STREAK
+                        + grain[y * width + x] * SMUDGE_GRAIN * own_darkness;
+                    let v = under + (smear - under) * smudged + streaks;
+                    paint[c] = (v - 128.0) * contrast + 128.0;
+                }
+                let below = (1.0 - luma(paint) / from.max(1.0)).clamp(0.0, 1.0);
+                // Heaviest in the midtones: the blacks are black already, and
+                // taking them further only loses what is in them.
+                let deepen = 1.0 - SMUDGE_DEEPEN * 4.0 * below * (1.0 - below);
+                for v in paint.iter_mut() {
+                    *v *= deepen;
+                }
+                let over = ((luma(paint) - from) / soft).clamp(0.0, 1.0);
+                let lit = over * over * (3.0 - 2.0 * over) * lift;
+                for c in 0..3 {
+                    let v = paint[c] + (255.0 - paint[c]) * lit;
+                    out[i + c] = v.clamp(0.0, 255.0).round() as u8;
+                }
+                // Alpha stands: smudging the picture does not change the
+                // layer's shape.
+            }
+        });
+}
+
+/// The darkest value along a line through each pixel, channel by channel.
+fn darkest_along(source: &Pixmap, angle: f32, length: f32) -> Pixmap {
+    let steps = length.round().max(1.0) as i32;
+    let radians = angle.to_radians();
+    let (dx, dy) = (radians.cos(), -radians.sin());
+    let (width, height) = (source.width() as i32, source.height() as i32);
+    let mut out = source.clone();
+    let stride = out.stride();
+    out.as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let i = x as usize * 4;
+                for step in -steps / 2..=steps / 2 {
+                    let sx = (x as f32 + dx * step as f32).round() as i32;
+                    let sy = (y as f32 + dy * step as f32).round() as i32;
+                    if sx < 0 || sy < 0 || sx >= width || sy >= height {
+                        continue;
+                    }
+                    let line = source.row(sy as u32);
+                    let j = sx as usize * 4;
+                    for c in 0..3 {
+                        row[i + c] = row[i + c].min(line[j + c]);
+                    }
+                }
+            }
+        });
+    out
+}
+
+/// How far Smudge Stick reaches, in pixels: the patch, and half its stroke
+/// either way.
+pub fn smudge_stick_reach(length: u32) -> u32 {
+    let length = length.clamp(*SMUDGE_LENGTH.start(), *SMUDGE_LENGTH.end()) as f32;
+    let patch = (SMUDGE_PATCH + length * SMUDGE_PATCH_PER_STEP).round();
+    (patch + (SMUDGE_STROKE + length * SMUDGE_STROKE_PER_STEP) / 2.0).ceil() as u32 + 1
+}
+
+/// How big the sponge's blotches are, in pixels of blur on the noise they are
+/// cut from: a floor and a step of Brush Size.
+const SPONGE_BLOTCH: f32 = 2.0;
+const SPONGE_BLOTCH_PER_STEP: f32 = 0.6;
+
+/// How hard the blotches are cut, as a gain on the noise before `tanh`: high
+/// at Smoothness 1, where their edges are crisp, and lower as it rises.
+const SPONGE_CUT: f32 = 3.0;
+const SPONGE_CUT_PER_STEP: f32 = 0.12;
+
+/// How many levels lighter or darker a blotch is per step of Definition.
+const SPONGE_LEVELS: f32 = 1.4;
+
+/// How much the picture under the blotches is settled: a median, whose reach
+/// grows with Brush Size, then a blur that grows with Smoothness.
+const SPONGE_SETTLE: f32 = 1.0;
+const SPONGE_SETTLE_PER_STEP: f32 = 0.2;
+const SPONGE_SOFTEN_PER_STEP: f32 = 0.12;
+
+/// Filter ▸ Artistic ▸ Sponge: the picture dabbed on with a sponge.
+///
+/// The picture is settled into soft patches, and a pattern of blotches is
+/// laid over it, each a little lighter or a little darker than what is under
+/// it — the open and closed cells of the sponge. The blotches are smooth
+/// noise cut hard, so they come out as rounded, irregular spots rather than
+/// as grain.
+///
+/// **Brush Size** is how big the blotches are. **Definition** is how much
+/// lighter or darker they are. **Smoothness** is how soft their edges are,
+/// and how soft the picture under them.
+///
+/// Alpha is left alone.
+///
+/// No GPU path. The work is a median, which is sequential along each row, and
+/// the blurs, which already go through the backend.
+pub fn sponge(pixmap: &mut Pixmap, size: u32, definition: u32, smoothness: u32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let size = size.clamp(*SPONGE_SIZE.start(), *SPONGE_SIZE.end()) as f32;
+    let definition = definition.clamp(*SPONGE_DEFINITION.start(), *SPONGE_DEFINITION.end()) as f32;
+    let smoothness = smoothness.clamp(*SPONGE_SMOOTHNESS.start(), *SPONGE_SMOOTHNESS.end()) as f32;
+
+    let settle = (SPONGE_SETTLE + size * SPONGE_SETTLE_PER_STEP).round() as u32;
+    let mut settled = crate::filters::convolve::median_of(pixmap, settle, settle);
+    crate::filters::convolve::gaussian_blur_accelerated(&mut settled, smoothness * SPONGE_SOFTEN_PER_STEP);
+
+    let scale = SPONGE_BLOTCH + size * SPONGE_BLOTCH_PER_STEP;
+    let blotches = blurred_specks(pixmap.width(), pixmap.height(), scale, 31);
+    let spread = speck_gain(scale);
+    let cut = (SPONGE_CUT - (smoothness - 1.0) * SPONGE_CUT_PER_STEP).max(0.5);
+    let levels = definition * SPONGE_LEVELS;
+
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(settled.as_bytes().par_chunks_exact(stride))
+        .zip(blotches.as_bytes().par_chunks_exact(stride))
+        .for_each(|((out, settled), blotches)| {
+            for ((px, from), b) in out
+                .chunks_exact_mut(4)
+                .zip(settled.chunks_exact(4))
+                .zip(blotches.chunks_exact(4))
+            {
+                let cell = ((b[0] as f32 - 127.5) * spread * cut).tanh() * levels;
+                for c in 0..3 {
+                    px[c] = (from[c] as f32 + cell).clamp(0.0, 255.0).round() as u8;
+                }
+                // Alpha stands: dabbing the picture does not change the
+                // layer's shape.
+            }
+        });
+}
+
+/// How far the underpainting is settled, per step of Brush Size: a median
+/// reach, which gives the soft patches, and a blur, which washes them
+/// together.
+const UNDERPAINT_PATCH_PER_STEP: f32 = 0.6;
+const UNDERPAINT_WASH_PER_STEP: f32 = 0.8;
+
+/// How far the texture's slope bends where the paint is read from, per step
+/// of Texture Coverage, and how far the surface is softened first so a hard
+/// texture bends it over a pixel or two rather than in a single jump.
+const UNDERPAINT_PUSH_PER_STEP: f32 = 3.5;
+const UNDERPAINT_BEVEL: f32 = 0.7;
+
+/// How much Relief each step of Texture Coverage adds.
+const UNDERPAINT_RELIEF_PER_STEP: f32 = 1.0;
+
+/// How much less the surface shows in the light than in the dark. See
+/// [`crate::filters::texture::apply_relief_weighted`].
+const UNDERPAINT_DARK_BIAS: f32 = 0.4;
+
+/// How hard the surface glints: see
+/// [`crate::filters::texture::Finish::crisp`].
+const UNDERPAINT_CRISP: f32 = 0.75;
+
+/// The shadow in the surface's low parts, and how much of the surface fades
+/// out in broad soft patches. See [`crate::filters::texture::Finish`].
+const UNDERPAINT_OCCLUSION: f32 = 70.0;
+const UNDERPAINT_PATCHY: f32 = 0.7;
+
+/// Filter ▸ Artistic ▸ Underpainting: the picture laid in broadly on a
+/// textured surface, as the first coat of a painting is.
+///
+/// 1. **Brush Size** settles the picture into soft washes of colour.
+/// 2. **Texture Coverage** is how much the surface shows through: the paint is
+///    bent about by the texture's slope, so edges take on its pattern, and
+///    the surface stands deeper.
+/// 3. The surface is lit — see [`crate::filters::texture::apply_relief`] for
+///    Texture, Scaling, Relief, Light and Invert.
+///
+/// Alpha is left alone.
+///
+/// No GPU path. The settling is a median, which is sequential along each row,
+/// and every later stage wants the one before back on the CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn underpainting(
+    pixmap: &mut Pixmap,
+    size: u32,
+    coverage: u32,
+    texture: crate::filters::texture::Texture,
+    scaling: u32,
+    relief: u32,
+    light: crate::filters::texture::Light,
+    invert: bool,
+) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let size = size.clamp(*UNDERPAINT_SIZE.start(), *UNDERPAINT_SIZE.end()) as f32;
+    let coverage = coverage.clamp(*UNDERPAINT_COVERAGE.start(), *UNDERPAINT_COVERAGE.end()) as f32;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+
+    let patch = (size * UNDERPAINT_PATCH_PER_STEP).round() as u32;
+    let mut paint = if patch > 0 {
+        crate::filters::convolve::median_of(pixmap, patch, patch)
+    } else {
+        pixmap.clone()
+    };
+    for (p, o) in paint.as_bytes_mut().chunks_exact_mut(4).zip(pixmap.as_bytes().chunks_exact(4)) {
+        p[3] = o[3];
+    }
+    crate::filters::convolve::gaussian_blur_accelerated(&mut paint, size * UNDERPAINT_WASH_PER_STEP);
+
+    let mut surface = crate::filters::texture::height_map(texture, pixmap.width(), pixmap.height(), scaling);
+    if invert {
+        surface.par_iter_mut().for_each(|h| *h = 1.0 - *h);
+    }
+    blur_field(&mut surface, width, height, UNDERPAINT_BEVEL);
+    let push = coverage * UNDERPAINT_PUSH_PER_STEP;
+    let (lx, ly) = light.towards();
+    let (paint, surface) = (&paint, &surface);
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(y, out)| {
+            let (up, down) = (y.saturating_sub(1), (y + 1).min(height - 1));
+            for (x, px) in out.chunks_exact_mut(4).enumerate() {
+                // Read the paint from where the surface's slope bends it, as
+                // light through rippled glass: flat surface, no change; the
+                // side of a ridge, a jump. That is what cuts an edge into the
+                // texture's own jagged pattern.
+                let (left, right) = (x.saturating_sub(1), (x + 1).min(width - 1));
+                let dx = (surface[y * width + right] - surface[y * width + left]) / 2.0;
+                let dy = (surface[down * width + x] - surface[up * width + x]) / 2.0;
+                // Along the light only: the paint slides down the slopes the
+                // light shows, so with the light above, edges break into the
+                // horizontal dashes CS6 gives and not into a grid of cells.
+                let along = (dx * lx + dy * ly) * push
+                    * crate::filters::texture::patchiness(x, y, UNDERPAINT_PATCHY);
+                // Sampled between pixels, so the bend is smooth rather than a
+                // pixel's jump.
+                let fx = (x as f32 + lx * along).clamp(0.0, (width - 1) as f32);
+                let fy = (y as f32 + ly * along).clamp(0.0, (height - 1) as f32);
+                let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                let (r0, r1) = (paint.row(y0 as u32), paint.row(y1 as u32));
+                for c in 0..3 {
+                    let top = r0[x0 * 4 + c] as f32 * (1.0 - tx) + r0[x1 * 4 + c] as f32 * tx;
+                    let bottom = r1[x0 * 4 + c] as f32 * (1.0 - tx) + r1[x1 * 4 + c] as f32 * tx;
+                    px[c] = (top * (1.0 - ty) + bottom * ty).round() as u8;
+                }
+                // Alpha stands: laying the picture in does not change the
+                // layer's shape.
+            }
+        });
+
+    // Coverage is surface as well as push: CS6's texture stands out plainly
+    // at Relief 4 once the coverage is up.
+    let relief = relief + (coverage * UNDERPAINT_RELIEF_PER_STEP).round() as u32;
+    crate::filters::texture::apply_relief_weighted(
+        pixmap,
+        texture,
+        scaling,
+        relief,
+        light,
+        invert,
+        crate::filters::texture::Finish {
+            dark_bias: UNDERPAINT_DARK_BIAS,
+            bevel: UNDERPAINT_BEVEL,
+            crisp: UNDERPAINT_CRISP,
+            occlusion: UNDERPAINT_OCCLUSION,
+            patchy: UNDERPAINT_PATCHY,
+        },
+    );
+}
+
+/// How far the picture is washed into patches, in pixels of median reach:
+/// the reach at Brush Detail 1, and how much each step of detail takes off.
+const WATER_WASH: f32 = 3.6;
+const WATER_WASH_PER_STEP: f32 = 0.2;
+
+/// The smart blur that smooths the gradients inside a wash and keeps its
+/// boundary: reach in pixels, and how many levels apart two tones may be and
+/// still be the same wash.
+const WATER_FLATTEN_REACH: u32 = 2;
+const WATER_FLATTEN_LEVELS: u32 = 16;
+
+/// How many pools of tone the picture is quantised into: at Brush Detail 1,
+/// and how many more each step adds. Each pixel keeps its own colour and is
+/// taken to its pool's brightness, so a pool is one flat wash of paint.
+const WATER_POOLS: f32 = 8.0;
+const WATER_POOLS_PER_STEP: f32 = 1.0;
+
+/// How much of the pooled picture is laid over the smooth wash — the cutout
+/// layer's opacity in the stack. All of it reads as a poster.
+const WATER_POOL_MIX: f32 = 0.35;
+
+/// The drawing under the paint: an edge finder over the pooled picture, and
+/// how dark a line a unit of edge draws, multiplied in. The scale in pixels
+/// it is found at keeps the line a pixel or two wide rather than a crisp
+/// single-pixel trace.
+const WATER_LINE_SCALE: f32 = 0.8;
+const WATER_LINE: f32 = 0.0025;
+
+/// Local contrast in the light, before the shadows: the scale in pixels a
+/// pixel is compared against, and how far its difference is pushed. What
+/// gives CS6's white spray its dark flecks and blue-grey pools.
+const WATER_LOCAL_SCALE: f32 = 3.0;
+const WATER_LOCAL: f32 = 7.0;
+
+/// Where Shadow Intensity starts taking tones to black, as a fraction of
+/// white: at 0, and how far each step raises it; and how soft the fall is.
+/// At 5 it reaches the sea and the whole of it goes dark, as CS6's does.
+const WATER_SHADOW_FROM: f32 = 0.12;
+const WATER_SHADOW_PER_STEP: f32 = 0.085;
+const WATER_SHADOW_SOFT: f32 = 0.1;
+
+/// How much richer the colour is than the photograph's.
+const WATER_SATURATION: f32 = 1.25;
+
+/// How deep the colour is laid at any setting: watercolour is richer in the
+/// dark than the photograph, as a gamma.
+const WATER_DEPTH: f32 = 1.15;
+
+/// The granulation of the pigment: levels at Texture 1 and per step, and the
+/// size of a speck in pixels. Laid on before the wash, in brightness only, so
+/// the washing turns it into a faint mottle inside the pools — laid on after,
+/// it is noise and reads as film grain.
+const WATER_GRAIN: f32 = 2.0;
+const WATER_GRAIN_SCALE: f32 = 2.0;
+
+/// What each step of Texture above 1 adds: a fine grit laid on at the end,
+/// in levels, strongest in the dark and fading out in the light. Laid on
+/// before the washing it is enlarged into blotches that cover the sky.
+const WATER_GRIT_PER_STEP: f32 = 9.0;
+const WATER_GRIT_SCALE: f32 = 0.7;
+
+/// Filter ▸ Artistic ▸ Watercolor: the picture washed in with a wet brush.
+///
+/// The classic stack, in order:
+///
+/// 1. **Dry brush** — Dry Brush's own dabs, their size set by **Brush
+///    Detail**: blotches with ragged edges, where a median would leave smooth
+///    rounded shapes.
+/// 2. **Smart blur** — the gradients inside each shape smoothed away, its
+///    boundary kept.
+/// 3. **Cutout** — the brightness pulled part of the way to a handful of
+///    pools, each pixel keeping its colour.
+/// 4. **Find edges** — the pools' boundaries drawn in as thin dark lines and
+///    multiplied over the paint.
+/// 5. **Shadow Intensity** takes the darker tones to black: at 1 only the
+///    deepest shadows, by 5 everything below the midtones. **Texture** is how
+///    much the pigment granulates.
+///
+/// Alpha is left alone.
+///
+/// No GPU path. The dabs and the smart blur are sequential along each row.
+pub fn watercolor(pixmap: &mut Pixmap, detail: u32, shadow: u32, texture: u32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let detail = detail.clamp(*WATER_DETAIL.start(), *WATER_DETAIL.end()) as f32;
+    let shadow = shadow.clamp(*WATER_SHADOW.start(), *WATER_SHADOW.end()) as f32;
+    let texture = texture.clamp(*WATER_TEXTURE.start(), *WATER_TEXTURE.end()) as f32;
+    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
+    let luma = |p: &[u8]| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+
+    // Granulation, under everything else.
+    let grain = blurred_specks(pixmap.width(), pixmap.height(), WATER_GRAIN_SCALE, 61);
+    let grain_gain = WATER_GRAIN * speck_gain(WATER_GRAIN_SCALE);
+    let grit = blurred_specks(pixmap.width(), pixmap.height(), WATER_GRIT_SCALE, 62);
+    let grit_gain = (texture - 1.0) * WATER_GRIT_PER_STEP * speck_gain(WATER_GRIT_SCALE);
+    let mut grained = pixmap.clone();
+    grained
+        .as_bytes_mut()
+        .par_chunks_exact_mut(4)
+        .zip(grain.as_bytes().par_chunks_exact(4))
+        .for_each(|(px, g)| {
+            let speck = (g[0] as f32 - 127.5) * grain_gain;
+            for c in 0..3 {
+                px[c] = (px[c] as f32 + speck).round().clamp(0.0, 255.0) as u8;
+            }
+        });
+
+    // 1 and 2: dry brush, smart blur.
+    let reach = (WATER_WASH - (detail - 1.0) * WATER_WASH_PER_STEP).round().max(1.0) as u32;
+    // Dabs, not a median: a median leaves smooth, rounded shapes, where a
+    // brush leaves blotches with ragged edges — Dry Brush's own dabs.
+    let mut wash = grained;
+    paint_in_dabs(&mut wash, reach, true);
+    crate::filters::convolve::surface_blur(&mut wash, WATER_FLATTEN_REACH, WATER_FLATTEN_LEVELS);
+
+    // 3: cutout — pools of tone, then their edges rounded.
+    let steps = (WATER_POOLS + (detail - 1.0) * WATER_POOLS_PER_STEP - 1.0).max(1.0);
+    wash.as_bytes_mut().par_chunks_exact_mut(4).for_each(|px| {
+        let level = luma(px);
+        let pool = (level / 255.0 * steps).round() / steps * 255.0;
+        // Less in the light: a pale wash is thin and has no hard pools, and a
+        // clear sky banded into contours reads as a map.
+        let mix = WATER_POOL_MIX * (1.0 - level / 255.0);
+        let scale = 1.0 + (pool / level.max(1.0) - 1.0) * mix;
+        for c in 0..3 {
+            px[c] = (px[c] as f32 * scale).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+
+    // 4: find edges, on the pools' brightness.
+    let mut tone: Vec<f32> = wash.as_bytes().par_chunks_exact(4).map(luma).collect();
+    blur_field(&mut tone, width, height, WATER_LINE_SCALE);
+    let mut around = tone.clone();
+    blur_field(&mut around, width, height, WATER_LOCAL_SCALE);
+    let (tone, around) = (&tone, &around);
+
+    let from = WATER_SHADOW_FROM + shadow * WATER_SHADOW_PER_STEP;
+    let depth: [f32; 256] = std::array::from_fn(|v| 255.0 * (v as f32 / 255.0).powf(WATER_DEPTH));
+
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .zip(wash.as_bytes().par_chunks_exact(stride))
+        .zip(grit.as_bytes().par_chunks_exact(stride))
+        .enumerate()
+        .for_each(|(y, ((out, wash), grit))| {
+            let (up, down) = (y.saturating_sub(1), (y + 1).min(height - 1));
+            for (x, ((px, w), g)) in out
+                .chunks_exact_mut(4)
+                .zip(wash.chunks_exact(4))
+                .zip(grit.chunks_exact(4))
+                .enumerate()
+            {
+                let (left, right) = (x.saturating_sub(1), (x + 1).min(width - 1));
+                let at = |xx: usize, yy: usize| tone[yy * width + xx];
+                // Sobel.
+                let gx = at(right, up) + 2.0 * at(right, y) + at(right, down)
+                    - at(left, up) - 2.0 * at(left, y) - at(left, down);
+                let gy = at(left, down) + 2.0 * at(x, down) + at(right, down)
+                    - at(left, up) - 2.0 * at(x, up) - at(right, up);
+                let line = 1.0 - ((gx * gx + gy * gy).sqrt() * WATER_LINE).min(1.0);
+
+                let mut paint = [0.0f32; 3];
+                for c in 0..3 {
+                    paint[c] = depth[w[c] as usize] * line;
+                }
+                // Local contrast in the light: a speck of spray a little
+                // darker than the white round it is pulled down further, so
+                // it is caught by the shadows and dries as a dark fleck.
+                let i = y * width + x;
+                let pale = around[i] / 255.0;
+                let lift = (tone[i] - around[i]) * WATER_LOCAL * pale * pale;
+                let grey = 0.299 * paint[0] + 0.587 * paint[1] + 0.114 * paint[2];
+                let lifted = (grey + lift).max(0.0);
+                let ratio = lifted / grey.max(1.0);
+                for v in paint.iter_mut() {
+                    *v = (lifted + (*v * ratio - lifted) * WATER_SATURATION).clamp(0.0, 255.0);
+                }
+                let grey = lifted.min(255.0);
+                let t = ((grey / 255.0 - (from - WATER_SHADOW_SOFT)) / (2.0 * WATER_SHADOW_SOFT))
+                    .clamp(0.0, 1.0);
+                let kept = t * t * (3.0 - 2.0 * t);
+                let speck = (g[0] as f32 - 127.5) * grit_gain * (1.0 - grey / 255.0);
+                for c in 0..3 {
+                    px[c] = (paint[c] * kept + speck).round().clamp(0.0, 255.0) as u8;
+                }
+                // Alpha stands: washing the picture in does not change the
                 // layer's shape.
             }
         });
@@ -2797,7 +4026,7 @@ mod tests {
             "the daub left the surface as it found it"
         );
         let step = after.get(32, 32).r as i32 - after.get(31, 32).r as i32;
-        assert!(step > 120, "the daub washed across the edge: {step} levels");
+        assert!(step >= 100, "the daub washed across the edge: {step} levels");
     }
 
     /// A bigger brush lays a bigger daub, and anything smaller than the daub
@@ -2816,87 +4045,438 @@ mod tests {
         assert!(survives(20) < 8, "a large brush left the mark standing");
     }
 
-    /// The daub alone, which the brushes are measured against below.
-    fn daubed() -> Pixmap {
-        let mut pm = two_noisy_fields();
-        paint_daubs(&mut pm, 8, 0, DaubBrush::Simple);
-        pm
-    }
-
-    /// The Rough brushes scrub what the daubing threw away back on, and each
-    /// is allowed one direction only: Light Rough can scrub a surface brighter
-    /// and never dirty it, Dark Rough the other way about. Sparkle is Light
-    /// Rough taken further.
+    /// Dark Rough draws a dark outline along the dark side of a boundary —
+    /// darker than either field — and Light Rough a light one along the
+    /// bright side.
     #[test]
-    fn the_rough_brushes_scrub_in_one_direction_only() {
-        let scrubbed = |brush| {
-            let mut pm = two_noisy_fields();
+    fn the_rough_brushes_draw_their_halo_on_one_side() {
+        let halo = |brush| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(60, 60, 60, 255));
+            pm.fill_rect(crate::buffer::Rect::new(32, 0, 32, 64), Rgba8::new(200, 200, 200, 255));
             paint_daubs(&mut pm, 8, 20, brush);
-            pm
+            let mean = |x: i32| (0..64).map(|y| pm.get(x, y).r as u32).sum::<u32>() / 64;
+            (mean(30), mean(33))
         };
-        let (plain, light, dark) = (
-            daubed(),
-            scrubbed(DaubBrush::LightRough),
-            scrubbed(DaubBrush::DarkRough),
-        );
-        for y in 0..64 {
-            for x in 0..64 {
-                let (p, l, d) = (plain.get(x, y).r, light.get(x, y).r, dark.get(x, y).r);
-                assert!(l >= p, "Light Rough darkened {p} to {l} at {x},{y}");
-                assert!(d <= p, "Dark Rough lightened {p} to {d} at {x},{y}");
-            }
-        }
+        let (dark_side, _) = halo(DaubBrush::DarkRough);
+        assert!(dark_side < 30, "Dark Rough drew no outline: {dark_side}");
+        let (dark_side, light_side) = halo(DaubBrush::LightRough);
+        assert!(light_side > 230, "Light Rough drew no rim: {light_side}");
+        assert!(dark_side > 40, "Light Rough darkened the dark side: {dark_side}");
     }
 
-    /// ...and they scrub hard. This is what separates them from the painting
-    /// brushes, where the same slider is worth a fraction as much.
+    /// Sparkle draws contour lines across a slow gradient, which the plain
+    /// brush leaves smooth, and lifts the light parts of the picture.
     #[test]
-    fn the_rough_brushes_scrub_harder_than_the_painting_ones() {
-        let texture = |brush| {
-            let mut pm = two_noisy_fields();
-            paint_daubs(&mut pm, 8, 20, brush);
-            restlessness(&pm, 4..28)
-        };
-        assert!(
-            texture(DaubBrush::LightRough) > texture(DaubBrush::Simple) * 3,
-            "the rough brush laid no more texture than the plain one"
-        );
-    }
-
-    /// The two Wide brushes lay the same daub and differ in what goes on top:
-    /// Wide Sharp lays definition where two daubs meet, Wide Blurry lays the
-    /// grain of the paint. So on a surface that is nothing but grain — no
-    /// shapes for either to find — the blurry brush is the rougher of the two.
-    #[test]
-    fn wide_blurry_lays_the_grain_where_wide_sharp_lays_definition() {
-        let grainy = || {
+    fn sparkle_draws_contours_and_lights_the_picture_up() {
+        let ramp = || {
             let mut pm = Pixmap::new(64, 64);
             for y in 0..64 {
                 for x in 0..64 {
-                    let v = 120 + ((x * 7 + y * 13) % 5) as i32 * 4 - 8;
-                    pm.set(x, y, Rgba8::new(v as u8, v as u8, v as u8, 255));
+                    let v = (60 + x * 2) as u8;
+                    pm.set(x, y, Rgba8::new(v, v, v, 255));
                 }
             }
             pm
         };
-        let texture = |brush| {
-            let mut pm = grainy();
-            paint_daubs(&mut pm, 12, 20, brush);
-            restlessness(&pm, 4..28)
+        let across = |pm: &Pixmap| {
+            (1..64)
+                .map(|x| (pm.get(x, 32).r as i32 - pm.get(x - 1, 32).r as i32).unsigned_abs())
+                .sum::<u32>()
         };
+        let (mut plain, mut sparkle) = (ramp(), ramp());
+        paint_daubs(&mut plain, 4, 17, DaubBrush::Simple);
+        paint_daubs(&mut sparkle, 4, 17, DaubBrush::Sparkle);
         assert!(
-            texture(DaubBrush::WideBlurry) > texture(DaubBrush::WideSharp) * 2,
-            "the blurry brush laid no more grain than the sharp one: {} against {}",
-            texture(DaubBrush::WideBlurry),
-            texture(DaubBrush::WideSharp)
+            across(&sparkle) > across(&plain) * 3,
+            "no contours: {} against {}",
+            across(&sparkle),
+            across(&plain)
         );
+
+        let mut light = Pixmap::filled(32, 32, Rgba8::new(200, 200, 200, 255));
+        paint_daubs(&mut light, 4, 0, DaubBrush::Sparkle);
+        assert!(light.get(16, 16).r > 220, "not lit up: {}", light.get(16, 16).r);
+    }
+
+    /// The Rough brushes lay texture where the painting ones leave a surface
+    /// smooth.
+    #[test]
+    fn the_rough_brushes_lay_texture() {
+        let texture = |brush| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(120, 120, 120, 255));
+            paint_daubs(&mut pm, 8, 10, brush);
+            restlessness(&pm, 4..60)
+        };
+        assert_eq!(texture(DaubBrush::Simple), 0);
+        assert!(texture(DaubBrush::DarkRough) > 500, "no texture: {}", texture(DaubBrush::DarkRough));
+    }
+
+    /// The Wide brushes stretch the daub sideways, so a horizontal stripe a
+    /// round daub of the same size paints over survives them.
+    #[test]
+    fn the_wide_brushes_lay_a_wide_daub() {
+        let stripe = |brush| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(60, 60, 60, 255));
+            pm.fill_rect(crate::buffer::Rect::new(0, 30, 64, 4), Rgba8::new(200, 200, 200, 255));
+            paint_daubs(&mut pm, 12, 0, brush);
+            pm.get(32, 31).r
+        };
+        assert!(stripe(DaubBrush::Simple) < 70, "the round daub kept the stripe");
+        assert!(stripe(DaubBrush::WideSharp) > 190, "the wide daub lost the stripe");
     }
 
     #[test]
     fn paint_daubs_leaves_alpha_alone() {
         let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(0, 0, 3, 3), Rgba8::new(120, 140, 160, 200));
+        let before = pm.clone();
         paint_daubs(&mut pm, 8, 7, DaubBrush::DarkRough);
-        assert!(pm.as_bytes().chunks_exact(4).all(|p| p[3] == 77));
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    /// Relief catches the light: a bright disc on a dark ground comes back
+    /// with highlights round it, and a flat surface comes back with none.
+    #[test]
+    fn plastic_wrap_highlights_relief_and_not_a_flat_surface() {
+        let mut flat = Pixmap::filled(48, 48, Rgba8::new(90, 90, 90, 255));
+        plastic_wrap(&mut flat, 20, 9, 7);
+        let brightest = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[0]).max().unwrap();
+        assert!(brightest(&flat) <= 90, "the flat surface shone: {}", brightest(&flat));
+
+        let mut disc = Pixmap::filled(64, 64, Rgba8::new(40, 40, 40, 255));
+        for y in 0..64 {
+            for x in 0..64 {
+                if (x - 32) * (x - 32) + (y - 32) * (y - 32) < 12 * 12 {
+                    disc.set(x, y, Rgba8::new(200, 200, 200, 255));
+                }
+            }
+        }
+        plastic_wrap(&mut disc, 20, 9, 7);
+        assert!(brightest(&disc) > 240, "the relief did not shine: {}", brightest(&disc));
+    }
+
+    /// Highlight Strength is how bright the highlights are, and at 0 there
+    /// are none.
+    #[test]
+    fn plastic_wrap_highlight_strength_sets_the_gloss() {
+        let lit = |strength| {
+            let mut pm = Pixmap::new(64, 64);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let v = if (x / 8 + y / 8) % 2 == 0 { 60 } else { 180 };
+                    pm.set(x, y, Rgba8::new(v, v, v, 255));
+                }
+            }
+            let before = pm.clone();
+            plastic_wrap(&mut pm, strength, 9, 7);
+            pm.as_bytes()
+                .chunks_exact(4)
+                .zip(before.as_bytes().chunks_exact(4))
+                .map(|(a, b)| (a[0] as i32 - b[0] as i32).max(0) as u32)
+                .sum::<u32>()
+        };
+        assert_eq!(lit(0), 0);
+        assert!(lit(20) > lit(8) * 2, "{} against {}", lit(20), lit(8));
+    }
+
+    #[test]
+    fn plastic_wrap_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(250, 250, 250, 200));
+        let before = pm.clone();
+        plastic_wrap(&mut pm, 15, 9, 7);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn plastic_wrap_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        plastic_wrap(&mut pm, 15, 9, 7);
+    }
+
+    /// The dark side of a boundary is inked, and the light side and a flat
+    /// field are not.
+    #[test]
+    fn poster_edges_inks_the_dark_side_of_a_boundary() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::new(60, 60, 60, 255));
+        pm.fill_rect(crate::buffer::Rect::new(32, 0, 32, 64), Rgba8::new(200, 200, 200, 255));
+        poster_edges(&mut pm, 2, 1, 6);
+        assert!(pm.get(31, 32).r < 15, "no ink on the dark side: {}", pm.get(31, 32).r);
+        assert!(pm.get(33, 32).r > 150, "ink on the light side: {}", pm.get(33, 32).r);
+        assert!(pm.get(8, 32).r > 40, "ink on a flat field: {}", pm.get(8, 32).r);
+    }
+
+    /// Posterization bands the brightness and keeps the colour: a ramp comes
+    /// back in few values, and a green stays green.
+    #[test]
+    fn poster_edges_bands_brightness_and_keeps_colour() {
+        let mut ramp = Pixmap::new(256, 8);
+        for y in 0..8 {
+            for x in 0..256 {
+                ramp.set(x, y, Rgba8::new(x as u8, x as u8, x as u8, 255));
+            }
+        }
+        poster_edges(&mut ramp, 0, 0, 0);
+        let mut values: Vec<u8> = (0..256).map(|x| ramp.get(x, 4).r).collect();
+        // A level either way is rounding, not another band.
+        values.dedup_by(|a, b| a.abs_diff(*b) <= 2);
+        assert!(values.len() <= 8, "the ramp was not banded: {values:?}");
+
+        let mut green = Pixmap::filled(32, 32, Rgba8::new(50, 100, 20, 255));
+        poster_edges(&mut green, 2, 1, 0);
+        let g = green.get(16, 16);
+        assert!(g.g > g.r * 3 / 2 && g.g > g.b * 3, "the green lost its colour: {g:?}");
+    }
+
+    #[test]
+    fn poster_edges_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        poster_edges(&mut pm, 2, 1, 2);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn poster_edges_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        poster_edges(&mut pm, 2, 1, 2);
+    }
+
+    fn pastel(pm: &mut Pixmap, length: u32, detail: u32, relief: u32) {
+        use crate::filters::texture::{Light, Texture};
+        rough_pastels(pm, length, detail, Texture::Canvas, 100, relief, Light::Bottom, false);
+    }
+
+    /// A longer stroke carries a mark further along the diagonal — but only
+    /// a little: the picture stays sharp, and the long streaks are grain.
+    #[test]
+    fn rough_pastels_strokes_run_diagonally_and_lengthen() {
+        let reach = |length| {
+            let mut pm = Pixmap::filled(80, 80, Rgba8::new(40, 40, 40, 255));
+            pm.fill_rect(crate::buffer::Rect::new(38, 38, 4, 4), Rgba8::new(255, 255, 255, 255));
+            pastel(&mut pm, length, 1, 0);
+            // Up and to the right of the mark, and straight to its right.
+            let diagonal: u32 = (3..5).map(|d| pm.get(41 + d, 38 - d).r as u32).sum();
+            let across: u32 = (4..7).map(|d| pm.get(41 + d, 40).r as u32).sum::<u32>() * 2 / 3;
+            (diagonal, across)
+        };
+        let (short, _) = reach(0);
+        let (long, across) = reach(40);
+        assert!(long > short, "a longer stroke did not reach further: {long} against {short}");
+        assert!(long > across, "the stroke did not run diagonally: {long} against {across}");
+    }
+
+    /// The pastel is paler than the picture, and grained where it was flat.
+    #[test]
+    fn rough_pastels_pales_and_grains_the_picture() {
+        let mut pm = Pixmap::filled(64, 64, Rgba8::new(100, 100, 100, 255));
+        pastel(&mut pm, 6, 4, 0);
+        let mean = pm.as_bytes().chunks_exact(4).map(|p| p[0] as u32).sum::<u32>() / (64 * 64);
+        assert!(mean > 110, "not paler: {mean}");
+        assert!(restlessness(&pm, 4..60) > 300, "no grain: {}", restlessness(&pm, 4..60));
+    }
+
+    #[test]
+    fn rough_pastels_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        pastel(&mut pm, 6, 4, 20);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn rough_pastels_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        pastel(&mut pm, 6, 4, 20);
+    }
+
+    /// The lights are carried towards white, further as Highlight Area goes
+    /// up, and not at all at Intensity 0 beyond the smudge.
+    #[test]
+    fn smudge_stick_brightens_the_lights() {
+        let lit = |highlight, intensity| {
+            let mut pm = Pixmap::filled(32, 32, Rgba8::new(170, 170, 170, 255));
+            smudge_stick(&mut pm, 2, highlight, intensity);
+            pm.get(16, 16).r
+        };
+        assert!(lit(0, 10) < 200, "a mid-light burnt out at Highlight Area 0: {}", lit(0, 10));
+        assert!(lit(20, 10) > 240, "Highlight Area 20 did not burn it out: {}", lit(20, 10));
+        assert!(lit(20, 0) < 180, "Intensity 0 still brightened: {}", lit(20, 0));
+    }
+
+    /// Dark is smeared along the diagonal into light, and light is not
+    /// smeared into dark.
+    #[test]
+    fn smudge_stick_drags_dark_along_the_diagonal() {
+        // Straight edges, which the median keeps; a corner it rounds away.
+        // A diagonal stroke smears both a band and a stripe; a horizontal or
+        // vertical one only smears one of them.
+        let smeared = |rect| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(150, 150, 150, 255));
+            pm.fill_rect(rect, Rgba8::new(0, 0, 0, 255));
+            smudge_stick(&mut pm, 10, 0, 0);
+            pm
+        };
+        let band = smeared(crate::buffer::Rect::new(0, 20, 64, 20));
+        let stripe = smeared(crate::buffer::Rect::new(20, 0, 20, 64));
+        assert!(band.get(30, 17).r < 140, "nothing smeared over the band: {}", band.get(30, 17).r);
+        assert!(stripe.get(43, 30).r < 140, "nothing smeared past the stripe: {}", stripe.get(43, 30).r);
+        assert!(band.get(30, 30).r < 30, "the dark was washed out: {}", band.get(30, 30).r);
+    }
+
+    #[test]
+    fn smudge_stick_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        smudge_stick(&mut pm, 2, 10, 10);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn smudge_stick_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        smudge_stick(&mut pm, 2, 0, 10);
+    }
+
+    /// A flat field comes back blotched, lighter and darker, and more so as
+    /// Definition rises; at Definition 0 it stays flat.
+    #[test]
+    fn sponge_blotches_a_flat_field() {
+        let spread = |definition| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(128, 128, 128, 255));
+            sponge(&mut pm, 2, definition, 5);
+            let values: Vec<u8> = pm.as_bytes().chunks_exact(4).map(|p| p[0]).collect();
+            (values.iter().min().copied().unwrap(), values.iter().max().copied().unwrap())
+        };
+        assert_eq!(spread(0), (128, 128));
+        let (lo, hi) = spread(12);
+        assert!(lo < 118 && hi > 138, "not blotched: {lo}..{hi}");
+        let (lo2, hi2) = spread(25);
+        assert!(hi2 - lo2 > hi - lo, "more Definition did not blotch harder");
+    }
+
+    /// A bigger brush lays bigger blotches: fewer changes from one pixel to
+    /// the next.
+    #[test]
+    fn sponge_brush_size_sizes_the_blotches() {
+        let busy = |size| {
+            let mut pm = Pixmap::filled(96, 96, Rgba8::new(128, 128, 128, 255));
+            sponge(&mut pm, size, 20, 5);
+            restlessness(&pm, 4..92)
+        };
+        assert!(busy(0) > busy(10) * 2, "{} against {}", busy(0), busy(10));
+    }
+
+    #[test]
+    fn sponge_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        sponge(&mut pm, 2, 12, 5);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn sponge_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        sponge(&mut pm, 2, 12, 5);
+    }
+
+    fn underpaint(pm: &mut Pixmap, size: u32, coverage: u32, relief: u32) {
+        use crate::filters::texture::{Light, Texture};
+        underpainting(pm, size, coverage, Texture::Burlap, 100, relief, Light::Top, false);
+    }
+
+    /// A bigger brush washes a sharp edge out further.
+    #[test]
+    fn underpainting_brush_size_softens_the_picture() {
+        let edge = |size| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(40, 40, 40, 255));
+            pm.fill_rect(crate::buffer::Rect::new(32, 0, 32, 64), Rgba8::new(220, 220, 220, 255));
+            underpaint(&mut pm, size, 0, 0);
+            pm.get(29, 32).r
+        };
+        assert!(edge(20) > edge(0) + 30, "{} against {}", edge(20), edge(0));
+    }
+
+    /// Texture Coverage breaks a straight edge into the texture's pattern.
+    #[test]
+    fn underpainting_coverage_breaks_an_edge() {
+        let ragged = |coverage| {
+            let mut pm = Pixmap::filled(64, 64, Rgba8::new(40, 40, 40, 255));
+            pm.fill_rect(crate::buffer::Rect::new(32, 0, 32, 64), Rgba8::new(220, 220, 220, 255));
+            underpaint(&mut pm, 0, coverage, 0);
+            restlessness(&pm, 26..38)
+        };
+        assert!(ragged(40) > ragged(0) + 500, "{} against {}", ragged(40), ragged(0));
+    }
+
+    #[test]
+    fn underpainting_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        underpaint(&mut pm, 6, 16, 4);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn underpainting_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        underpaint(&mut pm, 6, 16, 4);
+    }
+
+    /// Shadow Intensity takes a mid-dark tone to black once it is up, and
+    /// leaves a light one alone.
+    #[test]
+    fn watercolor_shadow_intensity_blackens_the_darker_tones() {
+        let tone = |value, shadow| {
+            let mut pm = Pixmap::filled(32, 32, Rgba8::new(value, value, value, 255));
+            watercolor(&mut pm, 9, shadow, 1);
+            pm.get(16, 16).r
+        };
+        assert!(tone(100, 0) > 60, "a mid-dark went black at 0: {}", tone(100, 0));
+        assert!(tone(100, 6) < 15, "a mid-dark stayed at 6: {}", tone(100, 6));
+        assert!(tone(220, 6) > 180, "a light tone went dark: {}", tone(220, 6));
+    }
+
+    /// Less detail washes a small mark away; more keeps it.
+    #[test]
+    fn watercolor_brush_detail_sets_the_wash() {
+        let kept = |detail| {
+            let mut pm = Pixmap::filled(48, 48, Rgba8::new(200, 200, 200, 255));
+            pm.fill_rect(crate::buffer::Rect::new(22, 22, 5, 5), Rgba8::new(90, 90, 90, 255));
+            watercolor(&mut pm, detail, 0, 1);
+            pm.get(24, 24).r
+        };
+        assert!(kept(14) < 150, "full detail lost the mark: {}", kept(14));
+        assert!(kept(1) > 170, "the broadest wash kept the mark: {}", kept(1));
+    }
+
+    #[test]
+    fn watercolor_leaves_alpha_alone() {
+        let mut pm = Pixmap::filled(32, 32, Rgba8::new(120, 140, 160, 77));
+        pm.fill_rect(crate::buffer::Rect::new(4, 4, 8, 8), Rgba8::new(20, 20, 20, 200));
+        let before = pm.clone();
+        watercolor(&mut pm, 9, 1, 1);
+        let alpha = |pm: &Pixmap| pm.as_bytes().chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>();
+        assert_eq!(alpha(&pm), alpha(&before));
+    }
+
+    #[test]
+    fn watercolor_over_an_empty_pixmap_does_nothing() {
+        let mut pm = Pixmap::new(0, 0);
+        watercolor(&mut pm, 9, 1, 1);
     }
 
     #[test]

@@ -1100,7 +1100,7 @@ pub fn median_filter(pixmap: &mut Pixmap, radius: u32) {
     if radius == 0 || pixmap.is_empty() {
         return;
     }
-    let medians = median_of(pixmap, radius);
+    let medians = median_of(pixmap, radius, radius);
     pixmap.as_bytes_mut().copy_from_slice(medians.as_bytes());
 }
 
@@ -1115,7 +1115,7 @@ pub fn dust_and_scratches(pixmap: &mut Pixmap, radius: u32, threshold: u32) {
     if radius == 0 || pixmap.is_empty() {
         return;
     }
-    let medians = median_of(pixmap, radius);
+    let medians = median_of(pixmap, radius, radius);
     let limit = threshold.min(255) as i32;
     let median_bytes = medians.as_bytes();
 
@@ -1126,14 +1126,16 @@ pub fn dust_and_scratches(pixmap: &mut Pixmap, radius: u32, threshold: u32) {
     }
 }
 
-/// The median of each pixel's neighbourhood, as its own image.
+/// The median of each pixel's neighbourhood, as its own image. The window
+/// reaches `across` columns either side and `down` rows above and below.
 ///
-/// Shared by Median and Dust & Scratches, which differ only in what they do
-/// with the answer.
-fn median_of(source: &Pixmap, radius: u32) -> Pixmap {
+/// Shared by Median, Dust & Scratches and Paint Daubs, which differ only in
+/// what they do with the answer.
+pub(crate) fn median_of(source: &Pixmap, across: u32, down: u32) -> Pixmap {
     let width = source.width() as i32;
     let height = source.height() as i32;
-    let reach = radius as i32;
+    let reach = across as i32;
+    let reach_y = down as i32;
 
     let mut out_map = source.clone();
     let stride = out_map.stride();
@@ -1144,8 +1146,8 @@ fn median_of(source: &Pixmap, radius: u32) -> Pixmap {
         .enumerate()
         .for_each(|(row, out)| {
             let y = row as i32;
-            let top = (y - reach).max(0);
-            let bottom = (y + reach).min(height - 1);
+            let top = (y - reach_y).max(0);
+            let bottom = (y + reach_y).min(height - 1);
 
             let mut hist = [[0u32; 256]; 4];
             let mut column = |hist: &mut [[u32; 256]; 4], x: i32, add: bool| {
