@@ -438,7 +438,7 @@ fn stroke(across: f32, along: f32, spacing: f32, seed: u32) -> f32 {
 }
 
 /// Deterministic 0..1 noise from two whole numbers.
-fn noise(a: i32, b: i32) -> f32 {
+pub(crate) fn noise(a: i32, b: i32) -> f32 {
     let mut h = (a as u32)
         .wrapping_mul(0x27d4_eb2d)
         ^ (b as u32).wrapping_mul(0x1656_67b1)
@@ -1035,7 +1035,7 @@ pub fn daub_reach(size: u32, brush: DaubBrush) -> (u32, u32) {
 
 /// Noise in each colour channel, blurred to specks `scale` pixels across and
 /// centred on 127.5. `salt` keeps two uses from being the same noise.
-fn blurred_specks(width: u32, height: u32, scale: f32, salt: usize) -> Pixmap {
+pub(crate) fn blurred_specks(width: u32, height: u32, scale: f32, salt: usize) -> Pixmap {
     let mut specks = Pixmap::new(width, height);
     specks
         .as_bytes_mut()
@@ -1056,7 +1056,7 @@ fn blurred_specks(width: u32, height: u32, scale: f32, salt: usize) -> Pixmap {
 /// What [`blurred_specks`] at `scale` must be multiplied by to spread about
 /// one level. A blur of σ leaves white noise about 1/(2√π·σ) of its spread,
 /// and `speck` starts at about 52 levels.
-fn speck_gain(scale: f32) -> f32 {
+pub(crate) fn speck_gain(scale: f32) -> f32 {
     2.0 * std::f32::consts::PI.sqrt() * scale / 52.0
 }
 

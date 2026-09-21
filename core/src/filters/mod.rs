@@ -16,6 +16,7 @@ pub mod distort;
 pub mod pixelate;
 pub mod render;
 pub mod segment;
+pub mod sketch;
 pub mod stylize;
 pub mod texture;
 
@@ -311,6 +312,80 @@ pub enum Filter {
         brightness: u32,
         smoothness: u32,
     },
+    /// The picture as an airbrush would spatter it — CS6's Spatter.
+    Spatter {
+        radius: u32,
+        smoothness: u32,
+    },
+    /// The picture repainted in angled, scattered strokes — CS6's Sprayed
+    /// Strokes.
+    SprayedStrokes {
+        length: u32,
+        radius: u32,
+        direction: brush_strokes::StrokeDirection,
+    },
+    /// The picture carved in shallow relief and lit from one side, in the two
+    /// swatches — CS6's Bas Relief. The colours are the document's, so the
+    /// bridge fills them in; see `Engine::filter_for`.
+    BasRelief {
+        detail: u32,
+        smoothness: u32,
+        light: texture::Light,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture redrawn in charcoal and chalk over a mid-grey ground —
+    /// CS6's Chalk & Charcoal. The colours are the document's, so the bridge
+    /// fills them in; see `Engine::filter_for`.
+    ChalkAndCharcoal {
+        charcoal_area: u32,
+        chalk_area: u32,
+        pressure: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture redrawn as a charcoal sketch on bare paper — CS6's
+    /// Charcoal. The colours are the document's, so the bridge fills them in;
+    /// see `Engine::filter_for`.
+    Charcoal {
+        thickness: u32,
+        detail: u32,
+        balance: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture as a sheet of polished metal — CS6's Chrome. Grey
+    /// whatever the swatches are, unlike the rest of the Sketch family.
+    Chrome {
+        detail: u32,
+        smoothness: u32,
+    },
+    /// The picture drawn in a waxy stick on textured paper — CS6's Conté
+    /// Crayon. The colours are the document's, so the bridge fills them in;
+    /// see `Engine::filter_for`.
+    ConteCrayon {
+        foreground_level: u32,
+        background_level: u32,
+        texture: texture::Texture,
+        scaling: u32,
+        relief: u32,
+        light: texture::Light,
+        invert: bool,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture painted in Japanese ink wash — CS6's Sumi-e.
+    SumiE {
+        width: u32,
+        pressure: u32,
+        contrast: u32,
+    },
+    /// The picture drawn over in fine pen lines — CS6's Ink Outlines.
+    InkOutlines {
+        length: u32,
+        dark: u32,
+        light: u32,
+    },
     /// The picture stroked and driven to black and white — CS6's Dark
     /// Strokes.
     DarkStrokes {
@@ -453,6 +528,15 @@ impl Filter {
             Filter::AngledStrokes { .. } => "Angled Strokes",
             Filter::Crosshatch { .. } => "Crosshatch",
             Filter::DarkStrokes { .. } => "Dark Strokes",
+            Filter::InkOutlines { .. } => "Ink Outlines",
+            Filter::Spatter { .. } => "Spatter",
+            Filter::SprayedStrokes { .. } => "Sprayed Strokes",
+            Filter::SumiE { .. } => "Sumi-e",
+            Filter::BasRelief { .. } => "Bas Relief",
+            Filter::ChalkAndCharcoal { .. } => "Chalk & Charcoal",
+            Filter::Charcoal { .. } => "Charcoal",
+            Filter::Chrome { .. } => "Chrome",
+            Filter::ConteCrayon { .. } => "Conte Crayon",
             Filter::Underpainting { .. } => "Underpainting",
         }
     }
@@ -685,6 +769,61 @@ impl Filter {
                 relief: p5.max(0.0) as u32,
                 light: texture::Light::from_i32(at(5) as i32),
                 invert: at(6) != 0.0,
+            },
+            "Spatter" => Filter::Spatter {
+                radius: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+            },
+            "Sprayed Strokes" => Filter::SprayedStrokes {
+                length: p1.max(0.0) as u32,
+                radius: p2.max(0.0) as u32,
+                direction: brush_strokes::StrokeDirection::from_i32(p3 as i32),
+            },
+            "Conte Crayon" => Filter::ConteCrayon {
+                foreground_level: p1.max(0.0) as u32,
+                background_level: p2.max(0.0) as u32,
+                texture: texture::Texture::from_i32(p3 as i32),
+                scaling: at(3).max(0.0) as u32,
+                relief: at(4).max(0.0) as u32,
+                light: texture::Light::from_i32(at(5) as i32),
+                invert: at(6) != 0.0,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Chrome" => Filter::Chrome {
+                detail: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+            },
+            "Charcoal" => Filter::Charcoal {
+                thickness: p1.max(0.0) as u32,
+                detail: p2.max(0.0) as u32,
+                balance: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Chalk & Charcoal" => Filter::ChalkAndCharcoal {
+                charcoal_area: p1.max(0.0) as u32,
+                chalk_area: p2.max(0.0) as u32,
+                pressure: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Bas Relief" => Filter::BasRelief {
+                detail: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+                light: texture::Light::from_i32(p3 as i32),
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Sumi-e" => Filter::SumiE {
+                width: p1.max(0.0) as u32,
+                pressure: p2.max(0.0) as u32,
+                contrast: p3.max(0.0) as u32,
+            },
+            "Ink Outlines" => Filter::InkOutlines {
+                length: p1.max(0.0) as u32,
+                dark: p2.max(0.0) as u32,
+                light: p3.max(0.0) as u32,
             },
             "Dark Strokes" => Filter::DarkStrokes {
                 balance: p1.max(0.0) as u32,
@@ -997,6 +1136,32 @@ impl Filter {
             // The drag along each stroke is laid by where on the canvas a
             // pixel is.
             Filter::AngledStrokes { .. } | Filter::Crosshatch { .. } | Filter::DarkStrokes { .. } => None,
+            // The lines follow the picture's own contours, which a crop cuts.
+            Filter::InkOutlines { .. } => None,
+            // The spray is thrown by where on the canvas a pixel is.
+            Filter::Spatter { .. } => None,
+            // The comb that throws the spray is laid by where on the canvas a
+            // pixel is.
+            Filter::SprayedStrokes { .. } => None,
+            // The ink creeps by where on the canvas a pixel is.
+            Filter::SumiE { .. } => None,
+            // The strokes each stick is dragged along are laid by where on
+            // the canvas a pixel is.
+            Filter::ChalkAndCharcoal { .. } => None,
+            // The grain the stick is dragged across is laid by where on the
+            // canvas a pixel is.
+            Filter::Charcoal { .. } => None,
+            // The paper's grain is laid by where on the canvas a pixel is.
+            Filter::ConteCrayon { .. } => None,
+            // The melt reaches as far as Smoothness blurs, and the waveform
+            // magnifies whatever that changed.
+            Filter::Chrome { smoothness, .. } => {
+                Some(((1.6 + smoothness.clamp(0, 10) as f32 * 1.1) * 3.0).ceil() as u32 + 2)
+            }
+            // Two taps either side, plus whatever Smoothness blurred over.
+            Filter::BasRelief { smoothness, .. } => Some(
+                ((smoothness.clamp(1, 15) as f32 * 0.38) * 3.0).ceil() as u32 + 2,
+            ),
             Filter::AccentedEdges { width, smoothness, .. } => {
                 Some(brush_strokes::accented_edges_reach(width, smoothness))
             }
@@ -1213,6 +1378,75 @@ impl Filter {
                 black,
                 white,
             } => brush_strokes::dark_strokes(pixmap, balance, black, white),
+            Filter::InkOutlines {
+                length,
+                dark,
+                light,
+            } => brush_strokes::ink_outlines(pixmap, length, dark, light),
+            Filter::Spatter { radius, smoothness } => {
+                brush_strokes::spatter(pixmap, radius, smoothness)
+            }
+            Filter::SprayedStrokes {
+                length,
+                radius,
+                direction,
+            } => brush_strokes::sprayed_strokes(pixmap, length, radius, direction),
+            Filter::SumiE {
+                width,
+                pressure,
+                contrast,
+            } => brush_strokes::sumi_e(pixmap, width, pressure, contrast),
+            Filter::BasRelief {
+                detail,
+                smoothness,
+                light,
+                foreground,
+                background,
+            } => sketch::bas_relief(pixmap, detail, smoothness, light, foreground, background),
+            Filter::Chrome { detail, smoothness } => sketch::chrome(pixmap, detail, smoothness),
+            Filter::ConteCrayon {
+                foreground_level,
+                background_level,
+                texture,
+                scaling,
+                relief,
+                light,
+                invert,
+                foreground,
+                background,
+            } => sketch::conte_crayon(
+                pixmap,
+                foreground_level,
+                background_level,
+                texture,
+                scaling,
+                relief,
+                light,
+                invert,
+                foreground,
+                background,
+            ),
+            Filter::Charcoal {
+                thickness,
+                detail,
+                balance,
+                foreground,
+                background,
+            } => sketch::charcoal(pixmap, thickness, detail, balance, foreground, background),
+            Filter::ChalkAndCharcoal {
+                charcoal_area,
+                chalk_area,
+                pressure,
+                foreground,
+                background,
+            } => sketch::chalk_and_charcoal(
+                pixmap,
+                charcoal_area,
+                chalk_area,
+                pressure,
+                foreground,
+                background,
+            ),
             Filter::Underpainting {
                 size,
                 coverage,

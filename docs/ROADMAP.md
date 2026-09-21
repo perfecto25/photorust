@@ -584,17 +584,19 @@ paint, manage layers, select, filter and undo.
     - Angled Strokes - done
     - Crosshatch - done
     - Dark Strokes - done
-    - Ink Outlines
-    - Spatter
-    - Sprayed Strokes
-    - Sumi-e
+    - Ink Outlines - needs more work, not accurate
+    - Spatter - done
+    - Sprayed Strokes - done
+    - Sumi-e - done, but deliberately NOT CS6's: painted as a real ink
+      wash (bare warm paper, a few flat washes, bleeding edges, pooled
+      rims) rather than CS6's diagonal hatch over the photograph.
     
   - Sketch
-    - Bas Relief
-    - Chalk & Charcoal
-    - Charcoal
-    - Chrome
-    - Conte Crayon
+    - Bas Relief - done
+    - Chalk & Charcoal - done
+    - Charcoal - done
+    - Chrome - done
+    - Conte Crayon - done
     - Graphic Pen
     - Halftone Pattern
     - Note Paper 
@@ -697,6 +699,8 @@ paint, manage layers, select, filter and undo.
 - View dropdown
 - Window dropdown
 - Help dropdown
+
+
 Auto recovery - save working project to temp file for auto recover - not started
 
 BUGS:

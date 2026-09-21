@@ -2104,9 +2104,7 @@ void MainWindow::createMenus()
                                 [this] { applyFilter(QStringLiteral("Watercolor")); }));
 
     // CS6's Brush Strokes, which also lives in the Filter Gallery, in the
-    // Gallery's order. Accented Edges, Angled Strokes, Crosshatch and Dark
-    // Strokes are built; the rest are listed and disabled so what is missing
-    // is visible.
+    // Gallery's order. All eight are built.
     QMenu *brushStrokes = filter->addMenu(tr("Brush &Strokes"));
     brushStrokes->addAction(command(QStringLiteral("filter.accentedEdges"),
                                     tr("&Accented Edges..."),
@@ -2118,15 +2116,15 @@ void MainWindow::createMenus()
                                     [this] { applyFilter(QStringLiteral("Crosshatch")); }));
     brushStrokes->addAction(command(QStringLiteral("filter.darkStrokes"), tr("&Dark Strokes..."),
                                     [this] { applyFilter(QStringLiteral("Dark Strokes")); }));
-    for (const QString &entry : {tr("&Ink Outlines..."),
-                                  tr("S&patter..."), tr("Sp&rayed Strokes..."),
-                                  tr("S&umi-e...")}) {
-        QAction *action = brushStrokes->addAction(entry);
-        action->setEnabled(false);
-        action->setStatusTip(tr("%1 is not implemented")
-                                  .arg(QString(entry).remove(QLatin1Char('&'))
-                                           .remove(QStringLiteral("..."))));
-    }
+    brushStrokes->addAction(command(QStringLiteral("filter.inkOutlines"), tr("&Ink Outlines..."),
+                                    [this] { applyFilter(QStringLiteral("Ink Outlines")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.spatter"), tr("S&patter..."),
+                                    [this] { applyFilter(QStringLiteral("Spatter")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.sprayedStrokes"),
+                                    tr("Sp&rayed Strokes..."),
+                                    [this] { applyFilter(QStringLiteral("Sprayed Strokes")); }));
+    brushStrokes->addAction(command(QStringLiteral("filter.sumiE"), tr("S&umi-e..."),
+                                    [this] { applyFilter(QStringLiteral("Sumi-e")); }));
 
     // CS6's Blur submenu, in its order. The three that are not here — Lens,
     // Shape and Smart Blur — are listed and disabled rather than left out:
@@ -2255,6 +2253,37 @@ void MainWindow::createMenus()
     QAction *reduceNoise = noise->addAction(tr("&Reduce Noise..."));
     reduceNoise->setEnabled(false);
     reduceNoise->setStatusTip(tr("Reduce Noise is not implemented"));
+
+    // CS6's Sketch submenu, which also lives in the Filter Gallery, in the
+    // Gallery's order. Every one of these paints between the two swatches
+    // rather than in the picture's own colours — all but Chrome, which is
+    // grey metal whatever the swatches say. Bas Relief, Chalk & Charcoal,
+    // Charcoal, Chrome and Conté Crayon are built; the other nine are listed
+    // and disabled so what is missing is visible.
+    QMenu *sketch = filter->addMenu(tr("S&ketch"));
+    sketch->addAction(command(QStringLiteral("filter.basRelief"), tr("&Bas Relief..."),
+                              [this] { applyFilter(QStringLiteral("Bas Relief")); }));
+    sketch->addAction(command(QStringLiteral("filter.chalkCharcoal"),
+                              tr("Chal&k && Charcoal..."),
+                              [this] { applyFilter(QStringLiteral("Chalk & Charcoal")); }));
+    sketch->addAction(command(QStringLiteral("filter.charcoal"), tr("C&harcoal..."),
+                              [this] { applyFilter(QStringLiteral("Charcoal")); }));
+    sketch->addAction(command(QStringLiteral("filter.chrome"), tr("Chro&me..."),
+                              [this] { applyFilter(QStringLiteral("Chrome")); }));
+    sketch->addAction(command(QStringLiteral("filter.conteCrayon"), tr("Cont&é Crayon..."),
+                              [this] { applyFilter(QStringLiteral("Conte Crayon")); }));
+    for (const QString &entry : {
+                                 tr("&Graphic Pen..."), tr("Halftone &Pattern..."),
+                                 tr("&Note Paper..."), tr("Photocop&y..."),
+                                 tr("P&laster..."), tr("&Reticulation..."),
+                                 tr("&Stamp..."), tr("&Torn Edges..."),
+                                 tr("&Water Paper...")}) {
+        QAction *action = sketch->addAction(entry);
+        action->setEnabled(false);
+        action->setStatusTip(tr("%1 is not implemented")
+                                  .arg(QString(entry).remove(QLatin1Char('&'))
+                                           .remove(QStringLiteral("..."))));
+    }
 
     // CS6's Stylize submenu, in its order. Diffuse, Emboss, Extrude, Find
     // Edges, Solarize, Tiles, Trace Contour and Wind — the whole submenu is
@@ -7011,7 +7040,11 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         || name == QLatin1String("Sponge") || name == QLatin1String("Underpainting")
         || name == QLatin1String("Watercolor") || name == QLatin1String("Accented Edges")
         || name == QLatin1String("Angled Strokes") || name == QLatin1String("Crosshatch")
-        || name == QLatin1String("Dark Strokes");
+        || name == QLatin1String("Dark Strokes") || name == QLatin1String("Ink Outlines")
+        || name == QLatin1String("Spatter") || name == QLatin1String("Sprayed Strokes")
+        || name == QLatin1String("Sumi-e") || name == QLatin1String("Bas Relief")
+        || name == QLatin1String("Chalk & Charcoal") || name == QLatin1String("Charcoal")
+        || name == QLatin1String("Chrome") || name == QLatin1String("Conte Crayon");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -7281,6 +7314,78 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
             dialog.addParameter(tr("Stroke Size:"), 1, 50, preset(0, 25.0f), 0);
             dialog.addParameter(tr("Stroke Detail:"), 1, 3, preset(1, 3.0f), 0);
             dialog.addParameter(tr("Softness:"), 0, 10, preset(2, 0.0f), 0);
+        } else if (name == QLatin1String("Spatter")) {
+            // The Filter Gallery's two sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Spray Radius:"), 0, 25, preset(0, 10.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(1, 5.0f), 0);
+        } else if (name == QLatin1String("Conte Crayon")) {
+            // The Filter Gallery's two level sliders, then the texture block
+            // it shares with Underpainting and Texturizer.
+            dialog.addParameter(tr("Foreground Level:"), 1, 15, preset(0, 11.0f), 0);
+            dialog.addParameter(tr("Background Level:"), 1, 15, preset(1, 7.0f), 0);
+            dialog.addChoice(tr("Texture:"),
+                             {tr("Brick"), tr("Burlap"), tr("Canvas"), tr("Sandstone")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(2, 2.0f)));
+            dialog.addParameter(tr("Scaling:"), 50, 200, preset(3, 100.0f), 0, tr(" %"));
+            dialog.addParameter(tr("Relief:"), 0, 50, preset(4, 4.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(5, 4.0f)));
+            dialog.addCheckBox(tr("Invert"), preset(6, 0.0f) != 0.0);
+            dialog.addDisabledNote(tr("Load Texture... is not implemented"));
+        } else if (name == QLatin1String("Chrome")) {
+            // The Filter Gallery's two sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Detail:"), 0, 10, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 0, 10, preset(1, 7.0f), 0);
+        } else if (name == QLatin1String("Charcoal")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Charcoal Thickness:"), 1, 7, preset(0, 1.0f), 0);
+            dialog.addParameter(tr("Detail:"), 0, 5, preset(1, 5.0f), 0);
+            dialog.addParameter(tr("Light/Dark Balance:"), 0, 100, preset(2, 50.0f), 0);
+        } else if (name == QLatin1String("Chalk & Charcoal")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Charcoal Area:"), 0, 20, preset(0, 6.0f), 0);
+            dialog.addParameter(tr("Chalk Area:"), 0, 20, preset(1, 6.0f), 0);
+            dialog.addParameter(tr("Stroke Pressure:"), 0, 5, preset(2, 1.0f), 0);
+        } else if (name == QLatin1String("Bas Relief")) {
+            // The Filter Gallery's two sliders and its Light list, in its
+            // order and over its ranges. The eight directions are the same
+            // list, in the same order, that Texturizer and Lighting Effects
+            // use.
+            dialog.addParameter(tr("Detail:"), 1, 15, preset(0, 13.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(1, 3.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(2, 0.0f)));
+        } else if (name == QLatin1String("Sumi-e")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Stroke Width:"), 3, 15, preset(0, 7.0f), 0);
+            dialog.addParameter(tr("Stroke Pressure:"), 0, 15, preset(1, 3.0f), 0);
+            dialog.addParameter(tr("Contrast:"), 0, 40, preset(2, 12.0f), 0);
+        } else if (name == QLatin1String("Sprayed Strokes")) {
+            // The Filter Gallery's two sliders and its Stroke Direction
+            // dropdown, in its order and over its ranges. The four directions
+            // are listed in the Gallery's own order, which is not the order
+            // round the compass.
+            dialog.addParameter(tr("Stroke Length:"), 0, 20, preset(0, 12.0f), 0);
+            dialog.addParameter(tr("Spray Radius:"), 0, 25, preset(1, 7.0f), 0);
+            dialog.addChoice(tr("Stroke Direction:"),
+                             {tr("Right Diagonal"), tr("Horizontal"), tr("Left Diagonal"),
+                              tr("Vertical")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(2, 0.0f)));
+        } else if (name == QLatin1String("Ink Outlines")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Stroke Length:"), 0, 50, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Dark Intensity:"), 0, 50, preset(1, 20.0f), 0);
+            dialog.addParameter(tr("Light Intensity:"), 0, 50, preset(2, 10.0f), 0);
         } else if (name == QLatin1String("Dark Strokes")) {
             // The Filter Gallery's three sliders, in its order and over its
             // ranges.

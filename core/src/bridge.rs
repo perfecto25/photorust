@@ -7972,6 +7972,31 @@ impl ffi::Engine {
                 *foreground = self.foreground;
                 *background = self.background;
             }
+            // Every Sketch filter paints between the two swatches rather than
+            // in the picture's own colours.
+            Filter::BasRelief {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::ChalkAndCharcoal {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::Charcoal {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::ConteCrayon {
+                foreground,
+                background,
+                ..
+            } => {
+                *foreground = self.foreground;
+                *background = self.background;
+            }
             // Tiles fills the gaps its shifted tiles leave with one swatch or
             // the other, so it needs both whichever was chosen.
             Filter::Tiles { options } => {
