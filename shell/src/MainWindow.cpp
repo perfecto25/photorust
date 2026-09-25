@@ -1728,6 +1728,54 @@ void MainWindow::createMenus()
                                   &MainWindow::reverseSelectedLayers);
     arrange->addAction(reverseAction);
 
+    // Align and Distribute, as CS6 lists them after Arrange. The Move tool's
+    // options bar carries the same actions as its row of buttons, so the two
+    // can never disagree about what is enabled.
+    struct EdgeEntry {
+        const char *alignId;
+        const char *distributeId;
+        const char *text;
+    };
+    const EdgeEntry edges[] = {
+        {"layer.alignTop", "layer.distributeTop", QT_TR_NOOP("&Top Edges")},
+        {"layer.alignVerticalCenters", "layer.distributeVerticalCenters",
+         QT_TR_NOOP("&Vertical Centers")},
+        {"layer.alignBottom", "layer.distributeBottom", QT_TR_NOOP("&Bottom Edges")},
+        {"layer.alignLeft", "layer.distributeLeft", QT_TR_NOOP("&Left Edges")},
+        {"layer.alignHorizontalCenters", "layer.distributeHorizontalCenters",
+         QT_TR_NOOP("&Horizontal Centers")},
+        {"layer.alignRight", "layer.distributeRight", QT_TR_NOOP("&Right Edges")},
+    };
+    QMenu *alignMenu = layer->addMenu(tr("A&lign"));
+    QMenu *distributeMenu = layer->addMenu(tr("D&istribute"));
+    for (int edge = 0; edge < 6; ++edge) {
+        const QString text = tr(edges[edge].text);
+        QAction *align = command(QString::fromLatin1(edges[edge].alignId), text,
+                                 [this, edge] { alignSelectedLayers(edge); });
+        align->setIcon(ToolIcons::fromSvgBody(ToolIcons::layerAlignSvg(edge, false),
+                                              kOptionsIconColor));
+        align->setToolTip(tr("Align %1").arg(QString(text).remove(QLatin1Char('&'))));
+        alignMenu->addAction(align);
+        m_alignActions << align;
+
+        QAction *distribute = command(QString::fromLatin1(edges[edge].distributeId), text,
+                                      [this, edge] { distributeSelectedLayers(edge); });
+        distribute->setIcon(ToolIcons::fromSvgBody(ToolIcons::layerAlignSvg(edge, true),
+                                                   kOptionsIconColor));
+        distribute->setToolTip(
+            tr("Distribute %1").arg(QString(text).remove(QLatin1Char('&'))));
+        distributeMenu->addAction(distribute);
+        m_distributeActions << distribute;
+        // CS6's menu has a break between the vertical three and the
+        // horizontal three.
+        if (edge == 2) {
+            alignMenu->addSeparator();
+            distributeMenu->addSeparator();
+        }
+    }
+    connect(alignMenu, &QMenu::aboutToShow, this, &MainWindow::updateAlignActions);
+    connect(distributeMenu, &QMenu::aboutToShow, this, &MainWindow::updateAlignActions);
+
     connect(arrange, &QMenu::aboutToShow, this, [this, arrangeActions, reverseAction] {
         const int active = m_engine ? m_engine->getActiveLayerIndex() : -1;
         for (int op = 0; op < arrangeActions.size(); ++op) {
@@ -2255,11 +2303,10 @@ void MainWindow::createMenus()
     reduceNoise->setStatusTip(tr("Reduce Noise is not implemented"));
 
     // CS6's Sketch submenu, which also lives in the Filter Gallery, in the
-    // Gallery's order. Every one of these paints between the two swatches
-    // rather than in the picture's own colours — all but Chrome, which is
-    // grey metal whatever the swatches say. Bas Relief, Chalk & Charcoal,
-    // Charcoal, Chrome and Conté Crayon are built; the other nine are listed
-    // and disabled so what is missing is visible.
+    // Gallery's order, all fourteen built. Every one of these paints between
+    // the two swatches rather than in the picture's own colours — all but
+    // Chrome, which is grey metal whatever the swatches say, and Water Paper,
+    // which keeps the picture's colours.
     QMenu *sketch = filter->addMenu(tr("S&ketch"));
     sketch->addAction(command(QStringLiteral("filter.basRelief"), tr("&Bas Relief..."),
                               [this] { applyFilter(QStringLiteral("Bas Relief")); }));
@@ -2272,18 +2319,25 @@ void MainWindow::createMenus()
                               [this] { applyFilter(QStringLiteral("Chrome")); }));
     sketch->addAction(command(QStringLiteral("filter.conteCrayon"), tr("Cont&é Crayon..."),
                               [this] { applyFilter(QStringLiteral("Conte Crayon")); }));
-    for (const QString &entry : {
-                                 tr("&Graphic Pen..."), tr("Halftone &Pattern..."),
-                                 tr("&Note Paper..."), tr("Photocop&y..."),
-                                 tr("P&laster..."), tr("&Reticulation..."),
-                                 tr("&Stamp..."), tr("&Torn Edges..."),
-                                 tr("&Water Paper...")}) {
-        QAction *action = sketch->addAction(entry);
-        action->setEnabled(false);
-        action->setStatusTip(tr("%1 is not implemented")
-                                  .arg(QString(entry).remove(QLatin1Char('&'))
-                                           .remove(QStringLiteral("..."))));
-    }
+    sketch->addAction(command(QStringLiteral("filter.graphicPen"), tr("&Graphic Pen..."),
+                              [this] { applyFilter(QStringLiteral("Graphic Pen")); }));
+    sketch->addAction(command(QStringLiteral("filter.halftonePattern"),
+                              tr("Halftone &Pattern..."),
+                              [this] { applyFilter(QStringLiteral("Halftone Pattern")); }));
+    sketch->addAction(command(QStringLiteral("filter.notePaper"), tr("&Note Paper..."),
+                              [this] { applyFilter(QStringLiteral("Note Paper")); }));
+    sketch->addAction(command(QStringLiteral("filter.photocopy"), tr("Photocop&y..."),
+                              [this] { applyFilter(QStringLiteral("Photocopy")); }));
+    sketch->addAction(command(QStringLiteral("filter.plaster"), tr("P&laster..."),
+                              [this] { applyFilter(QStringLiteral("Plaster")); }));
+    sketch->addAction(command(QStringLiteral("filter.reticulation"), tr("&Reticulation..."),
+                              [this] { applyFilter(QStringLiteral("Reticulation")); }));
+    sketch->addAction(command(QStringLiteral("filter.stamp"), tr("&Stamp..."),
+                              [this] { applyFilter(QStringLiteral("Stamp")); }));
+    sketch->addAction(command(QStringLiteral("filter.tornEdges"), tr("&Torn Edges..."),
+                              [this] { applyFilter(QStringLiteral("Torn Edges")); }));
+    sketch->addAction(command(QStringLiteral("filter.waterPaper"), tr("&Water Paper..."),
+                              [this] { applyFilter(QStringLiteral("Water Paper")); }));
 
     // CS6's Stylize submenu, in its order. Diffuse, Emboss, Extrude, Find
     // Edges, Solarize, Tiles, Trace Contour and Wind — the whole submenu is
@@ -2313,6 +2367,27 @@ void MainWindow::createMenus()
     stylize->addAction(command(QStringLiteral("filter.glowingEdges"),
                                tr("&Glowing Edges..."),
                                [this] { applyFilter(QStringLiteral("Glowing Edges")); }));
+
+    // CS6's Texture submenu, which also lives in the Filter Gallery, in the
+    // Gallery's order. Craquelure, Grain, Mosaic Tiles and Patchwork are
+    // built; the rest are listed and disabled so what is missing is visible.
+    QMenu *textureMenu = filter->addMenu(tr("&Texture"));
+    textureMenu->addAction(command(QStringLiteral("filter.craquelure"), tr("&Craquelure..."),
+                                   [this] { applyFilter(QStringLiteral("Craquelure")); }));
+    textureMenu->addAction(command(QStringLiteral("filter.grain"), tr("&Grain..."),
+                                   [this] { applyFilter(QStringLiteral("Grain")); }));
+    textureMenu->addAction(command(QStringLiteral("filter.mosaicTiles"), tr("&Mosaic Tiles..."),
+                                   [this] { applyFilter(QStringLiteral("Mosaic Tiles")); }));
+    textureMenu->addAction(command(QStringLiteral("filter.patchwork"), tr("&Patchwork..."),
+                                   [this] { applyFilter(QStringLiteral("Patchwork")); }));
+    for (const QString &entry : {
+                                  tr("&Stained Glass..."), tr("&Texturizer...")}) {
+        QAction *action = textureMenu->addAction(entry);
+        action->setEnabled(false);
+        action->setStatusTip(tr("%1 is not implemented")
+                                  .arg(QString(entry).remove(QLatin1Char('&'))
+                                           .remove(QStringLiteral("..."))));
+    }
 
     // CS6's Other submenu, in its order. Custom is built; the rest are listed
     // and disabled so what is missing is visible.
@@ -2890,9 +2965,7 @@ void MainWindow::populateOptionsBar(ToolId tool, int variant)
                           "Ctrl+Alt+click to zoom out    Right-click for zoom levels"),
                        m_optionsBar));
     } else if (tool == ToolId::Move) {
-        m_optionsBar->addWidget(
-            new QLabel(tr("Drag to move the active layer    Arrow keys nudge"),
-                       m_optionsBar));
+        addMoveOptions();
     } else if (tool == ToolId::Hand
                && static_cast<HandTool>(variant) == HandTool::RotateView) {
         addRotateViewOptions();
@@ -3217,6 +3290,20 @@ void MainWindow::warnLayerLocked()
                     QMessageBox::Ok, this);
     unsqueezeButtons(&box);
     box.exec();
+}
+
+QPointF MainWindow::filterPreviewStart() const
+{
+    const QPointF middle =
+        m_canvas->widgetToDocument(QPointF(m_canvas->width() / 2.0, m_canvas->height() / 2.0));
+    if (!m_engine) {
+        return middle;
+    }
+    const QRect content = m_engine->layerContentBounds(m_engine->getActiveLayerIndex());
+    if (content.isEmpty() || content.contains(middle.toPoint())) {
+        return middle;
+    }
+    return QRectF(content).center();
 }
 
 void MainWindow::warnHealingSourceRequired()
@@ -5631,6 +5718,12 @@ void MainWindow::createDocks()
             });
     connect(m_layersPanel, &LayersPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
+    connect(m_layersPanel, &LayersPanel::layerSelectionChanged, this, [this] {
+        updateAlignActions();
+        // The transform controls follow the active layer.
+        m_canvas->update();
+    });
+    connect(m_engine, &Engine::selectionChanged, this, &MainWindow::updateAlignActions);
     connect(m_historyPanel, &HistoryPanel::documentChanged,
             this, &MainWindow::onDocumentChanged);
     connect(m_pathsPanel, &PathsPanel::documentChanged,
@@ -7044,7 +7137,14 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         || name == QLatin1String("Spatter") || name == QLatin1String("Sprayed Strokes")
         || name == QLatin1String("Sumi-e") || name == QLatin1String("Bas Relief")
         || name == QLatin1String("Chalk & Charcoal") || name == QLatin1String("Charcoal")
-        || name == QLatin1String("Chrome") || name == QLatin1String("Conte Crayon");
+        || name == QLatin1String("Chrome") || name == QLatin1String("Conte Crayon")
+        || name == QLatin1String("Graphic Pen") || name == QLatin1String("Halftone Pattern")
+        || name == QLatin1String("Note Paper") || name == QLatin1String("Photocopy")
+        || name == QLatin1String("Plaster") || name == QLatin1String("Reticulation")
+        || name == QLatin1String("Stamp") || name == QLatin1String("Torn Edges")
+        || name == QLatin1String("Water Paper") || name == QLatin1String("Craquelure")
+        || name == QLatin1String("Grain") || name == QLatin1String("Mosaic Tiles")
+        || name == QLatin1String("Patchwork");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -7335,11 +7435,103 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
                              {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(5, 4.0f)));
             dialog.addCheckBox(tr("Invert"), preset(6, 0.0f) != 0.0);
             dialog.addDisabledNote(tr("Load Texture... is not implemented"));
+        } else if (name == QLatin1String("Graphic Pen")) {
+            // The Filter Gallery's two sliders and its Stroke Direction
+            // dropdown, in its order and over its ranges. The four directions
+            // are the same list, in the same order, that Sprayed Strokes uses.
+            dialog.addParameter(tr("Stroke Length:"), 1, 15, preset(0, 1.0f), 0);
+            dialog.addParameter(tr("Light/Dark Balance:"), 0, 100, preset(1, 9.0f), 0);
+            dialog.addChoice(tr("Stroke Direction:"),
+                             {tr("Right Diagonal"), tr("Horizontal"), tr("Left Diagonal"),
+                              tr("Vertical")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(2, 0.0f)));
         } else if (name == QLatin1String("Chrome")) {
             // The Filter Gallery's two sliders, in its order and over its
             // ranges.
             dialog.addParameter(tr("Detail:"), 0, 10, preset(0, 4.0f), 0);
             dialog.addParameter(tr("Smoothness:"), 0, 10, preset(1, 7.0f), 0);
+        } else if (name == QLatin1String("Halftone Pattern")) {
+            // The Filter Gallery's two sliders and its Pattern Type dropdown,
+            // in its order and over its ranges. Dot, Circle and Line are the
+            // engine's HalftonePattern order.
+            dialog.addParameter(tr("Size:"), 1, 12, preset(0, 1.0f), 0);
+            dialog.addParameter(tr("Contrast:"), 0, 50, preset(1, 5.0f), 0);
+            dialog.addChoice(tr("Pattern Type:"),
+                             {tr("Dot"), tr("Circle"), tr("Line")},
+                             {0.0, 1.0, 2.0}, int(preset(2, 0.0f)));
+        } else if (name == QLatin1String("Note Paper")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Image Balance:"), 0, 50, preset(0, 25.0f), 0);
+            dialog.addParameter(tr("Graininess:"), 0, 20, preset(1, 10.0f), 0);
+            dialog.addParameter(tr("Relief:"), 0, 25, preset(2, 11.0f), 0);
+        } else if (name == QLatin1String("Photocopy")) {
+            // The Filter Gallery's two sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Detail:"), 1, 24, preset(0, 7.0f), 0);
+            dialog.addParameter(tr("Darkness:"), 1, 50, preset(1, 8.0f), 0);
+        } else if (name == QLatin1String("Torn Edges")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Image Balance:"), 0, 50, preset(0, 25.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(1, 11.0f), 0);
+            dialog.addParameter(tr("Contrast:"), 1, 25, preset(2, 17.0f), 0);
+        } else if (name == QLatin1String("Patchwork")) {
+            // The Filter Gallery's two sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Square Size:"), 0, 10, preset(0, 4.0f), 0);
+            dialog.addParameter(tr("Relief:"), 0, 25, preset(1, 8.0f), 0);
+        } else if (name == QLatin1String("Mosaic Tiles")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Tile Size:"), 2, 100, preset(0, 12.0f), 0);
+            dialog.addParameter(tr("Grout Width:"), 1, 15, preset(1, 3.0f), 0);
+            dialog.addParameter(tr("Lighten Grout:"), 0, 10, preset(2, 9.0f), 0);
+        } else if (name == QLatin1String("Grain")) {
+            // The Filter Gallery's two sliders and its Grain Type dropdown, in
+            // its order and over its ranges. The ten types are the engine's
+            // GrainType order.
+            dialog.addParameter(tr("Intensity:"), 0, 100, preset(0, 40.0f), 0);
+            dialog.addParameter(tr("Contrast:"), 0, 100, preset(1, 50.0f), 0);
+            dialog.addChoice(tr("Grain Type:"),
+                             {tr("Regular"), tr("Soft"), tr("Sprinkles"), tr("Clumped"),
+                              tr("Contrasty"), tr("Enlarged"), tr("Stippled"), tr("Horizontal"),
+                              tr("Vertical"), tr("Speckle")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0},
+                             int(preset(2, 0.0f)));
+        } else if (name == QLatin1String("Craquelure")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Crack Spacing:"), 2, 100, preset(0, 15.0f), 0);
+            dialog.addParameter(tr("Crack Depth:"), 0, 10, preset(1, 6.0f), 0);
+            dialog.addParameter(tr("Crack Brightness:"), 0, 10, preset(2, 9.0f), 0);
+        } else if (name == QLatin1String("Water Paper")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Fiber Length:"), 3, 50, preset(0, 15.0f), 0);
+            dialog.addParameter(tr("Brightness:"), 0, 100, preset(1, 60.0f), 0);
+            dialog.addParameter(tr("Contrast:"), 0, 100, preset(2, 80.0f), 0);
+        } else if (name == QLatin1String("Stamp")) {
+            // The Filter Gallery's two sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Light/Dark Balance:"), 0, 50, preset(0, 25.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 50, preset(1, 5.0f), 0);
+        } else if (name == QLatin1String("Reticulation")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges.
+            dialog.addParameter(tr("Density:"), 0, 50, preset(0, 12.0f), 0);
+            dialog.addParameter(tr("Foreground Level:"), 0, 50, preset(1, 40.0f), 0);
+            dialog.addParameter(tr("Background Level:"), 0, 50, preset(2, 5.0f), 0);
+        } else if (name == QLatin1String("Plaster")) {
+            // The Filter Gallery's two sliders and its Light list, in its
+            // order and over its ranges — the same eight directions, in the
+            // same order, as Bas Relief.
+            dialog.addParameter(tr("Image Balance:"), 0, 50, preset(0, 20.0f), 0);
+            dialog.addParameter(tr("Smoothness:"), 1, 15, preset(1, 2.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(2, 4.0f)));
         } else if (name == QLatin1String("Charcoal")) {
             // The Filter Gallery's three sliders, in its order and over its
             // ranges.
@@ -7564,8 +7756,7 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         // Open looking at the middle of what the canvas is showing, and mark
         // that region on the canvas while the dialog is up.
         if (m_canvas) {
-            dialog.setPreviewCenter(m_canvas->widgetToDocument(QPointF(m_canvas->width() / 2.0,
-                                                                      m_canvas->height() / 2.0)));
+            dialog.setPreviewCenter(filterPreviewStart());
             connect(&dialog, &FilterPreviewDialog::previewRegionChanged, m_canvas,
                     &CanvasView::setFilterPreviewRect);
         }
@@ -7703,8 +7894,7 @@ void MainWindow::showFlame()
     dialog.addParameter(tr("Arrangement:"), 1, 20, preset(20, 1.0f), 0);
 
     if (m_canvas) {
-        dialog.setPreviewCenter(m_canvas->widgetToDocument(
-            QPointF(m_canvas->width() / 2.0, m_canvas->height() / 2.0)));
+        dialog.setPreviewCenter(filterPreviewStart());
         connect(&dialog, &FilterPreviewDialog::previewRegionChanged, m_canvas,
                 &CanvasView::setFilterPreviewRect);
     }
@@ -8442,6 +8632,100 @@ void MainWindow::editColorSettings()
 }
 
 // ----------------------------------------------------- Auto-Align Layers --
+
+void MainWindow::addMoveOptions()
+{
+    // CS6's Show Transform Controls: the active layer's content wears Free
+    // Transform's box while the Move tool is up, and a handle drag goes
+    // straight into the transform.
+    auto *showControls = new QCheckBox(tr("Show Transform Controls"), m_optionsBar);
+    showControls->setChecked(m_showTransformControls);
+    showControls->setToolTip(tr("Show a bounding box with handles round the active layer"));
+    connect(showControls, &QCheckBox::toggled, this, [this](bool on) {
+        m_showTransformControls = on;
+        m_canvas->setShowTransformControls(on);
+    });
+    m_optionsBar->addWidget(showControls);
+    m_optionsBar->addSeparator();
+
+    // The Align and Distribute buttons are the Layer menu's own actions, so
+    // they grey out on exactly the same terms.
+    auto addButtons = [this](const QList<QAction *> &actions) {
+        for (int edge = 0; edge < actions.size(); ++edge) {
+            auto *button = new QToolButton(m_optionsBar);
+            button->setDefaultAction(actions.at(edge));
+            button->setAutoRaise(true);
+            button->setIconSize(QSize(20, 20));
+            button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+            m_optionsBar->addWidget(button);
+            if (edge == 2) {
+                // A gap between the vertical three and the horizontal three,
+                // as CS6's bar has.
+                auto *gap = new QWidget(m_optionsBar);
+                gap->setFixedWidth(6);
+                m_optionsBar->addWidget(gap);
+            }
+        }
+    };
+    addButtons(m_alignActions);
+    m_optionsBar->addSeparator();
+    addButtons(m_distributeActions);
+    m_optionsBar->addSeparator();
+    if (m_autoAlignAction) {
+        auto *autoAlign = new QToolButton(m_optionsBar);
+        autoAlign->setDefaultAction(m_autoAlignAction);
+        autoAlign->setAutoRaise(true);
+        autoAlign->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        autoAlign->setIconSize(QSize(20, 20));
+        if (m_autoAlignAction->icon().isNull()) {
+            m_autoAlignAction->setIcon(ToolIcons::fromSvgBody(
+                QStringLiteral(R"SVG(<rect x="3" y="4" width="9" height="9"/>)SVG"
+                               R"SVG(<rect x="8" y="7" width="9" height="9"/>)SVG"),
+                kOptionsIconColor));
+        }
+        m_optionsBar->addWidget(autoAlign);
+    }
+    updateAlignActions();
+}
+
+void MainWindow::updateAlignActions()
+{
+    const int selected = m_layersPanel ? int(selectedLayerIndices().size()) : 0;
+    const bool haveSelection = m_engine && m_engine->hasSelection();
+    // Two layers line up against each other; one lines up against a
+    // selection, which is how CS6 aligns a layer to the canvas or a marquee.
+    const bool canAlign = selected >= 2 || (selected == 1 && haveSelection);
+    for (QAction *action : std::as_const(m_alignActions)) {
+        action->setEnabled(canAlign);
+    }
+    // Two layers have nothing between them to space.
+    for (QAction *action : std::as_const(m_distributeActions)) {
+        action->setEnabled(selected >= 3);
+    }
+    if (m_autoAlignAction) {
+        m_autoAlignAction->setEnabled(selected >= 2);
+    }
+}
+
+void MainWindow::alignSelectedLayers(int edge)
+{
+    if (!m_engine) {
+        return;
+    }
+    if (m_engine->alignLayers(selectedLayerVector(), edge)) {
+        refreshAll();
+    }
+}
+
+void MainWindow::distributeSelectedLayers(int edge)
+{
+    if (!m_engine) {
+        return;
+    }
+    if (m_engine->distributeLayers(selectedLayerVector(), edge)) {
+        refreshAll();
+    }
+}
 
 void MainWindow::autoAlignLayers()
 {

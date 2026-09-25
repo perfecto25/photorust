@@ -23,6 +23,22 @@ below is honest about where the gaps are.
 Uses your **graphics card when you have one**, and works normally when you do
 not; a missing GPU costs speed, never features.
 
+## Project Roadmap
+
+See docs/ROADMAP.md for specific details but the general plan is this
+
+1. Recreate Photoshop CS6 look and functionality 1:1
+2. Add new features like filters, brushes, CLI and agentic MCP bindings.
+3. Steal underpants.
+4. Profit.
+
+Photorust is free to use, develop and sing about, zero licenses or fees or ads.
+
+Forever.
+
+I'm working on this software by myself so maybe I'll put up a link to gofundme if  anyone wants to chip in. Thats about it. - Mike.
+
+
 ---
 
 ## Trying it

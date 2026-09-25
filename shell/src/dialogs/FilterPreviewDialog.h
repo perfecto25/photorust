@@ -40,7 +40,12 @@ public:
     explicit FilterPreviewPane(FilterPreviewDialog *dialog);
 
     /// Show `image` — a crop of the document at 1:1 — magnified by `zoom`.
-    void setContent(const QImage &image, double zoom);
+    /// `document` is the part of the image that lies on the document, in the
+    /// image's own pixels: transparency there is drawn as CS6's checkerboard,
+    /// so a transparent stretch of the layer reads as transparent rather than
+    /// as a preview that has gone blank. Beyond it is the pane's grey, as it
+    /// is round the edge of the canvas.
+    void setContent(const QImage &image, double zoom, const QRect &document = QRect());
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -51,6 +56,7 @@ protected:
 private:
     FilterPreviewDialog *m_dialog = nullptr;
     QImage m_image;
+    QRect m_document;
     double m_zoom = 1.0;
     bool m_dragging = false;
     QPointF m_dragFrom;

@@ -1080,7 +1080,7 @@ impl StrokeDirection {
 
     /// The angle the strokes run along, in degrees anticlockwise from the
     /// horizontal — the convention [`lay_strokes`] and [`streak_field`] use.
-    fn angle(self) -> f32 {
+    pub(crate) fn angle(self) -> f32 {
         match self {
             StrokeDirection::RightDiagonal => 45.0,
             StrokeDirection::Horizontal => 0.0,

@@ -265,6 +265,13 @@ paint, manage layers, select, filter and undo.
 ## ToolTip floating bar
 
 - move tool - done
+  - Show Transform Controls - done (box and handles round the active layer;
+    a handle drag goes straight into Free Transform)
+  - Align / Distribute buttons and Layer ▸ Align, ▸ Distribute - done
+    (aligns to a selection when there is one)
+  - Auto-Select - todo
+  - transform controls round several selected layers at once - todo (the
+    box follows the active layer only)
 - marquee tools - done
 - lasso tools - done
 - quick selection tools - done
@@ -597,15 +604,15 @@ paint, manage layers, select, filter and undo.
     - Charcoal - done
     - Chrome - done
     - Conte Crayon - done
-    - Graphic Pen
-    - Halftone Pattern
-    - Note Paper 
-    - Photocopy
-    - Plaster
-    - Reticulation
-    - Stamp
-    - Torn Edges
-    - Water Paper
+    - Graphic Pen - done
+    - Halftone Pattern - done
+    - Note Paper - done
+    - Photocopy - done
+    - Plaster - done
+    - Reticulation - done
+    - Stamp - done
+    - Torn Edges - done
+    - Water Paper - done
 
   - Blur submenu - done, except Lens, Shape and Smart Blur, which are listed
     and disabled: they need a depth map, the preset shape library and an
@@ -649,7 +656,7 @@ paint, manage layers, select, filter and undo.
     - Crystalize - done
     - Facet - done
     - Fragment - done
-    - Mezzotint - done
+    - Mezzotint - needs work
     - Mosaic - done
     - Pointilize - done
 
@@ -676,10 +683,10 @@ paint, manage layers, select, filter and undo.
     - Glowing Edges - done 
     
   - Texture 
-    - Craquelure
-    - Grain
-    - Mosaic Tiles
-    - Patchwork
+    - Craquelure - done
+    - Grain - done
+    - Mosaic Tiles - done
+    - Patchwork - done
     - Stained Glass
     - Texturizer
 
@@ -703,9 +710,6 @@ paint, manage layers, select, filter and undo.
 
 Auto recovery - save working project to temp file for auto recover - not started
 
-BUGS:
- - Panels - PR crashing when moving panel to independent panel window, and dragging another panel into 1st panel
- - Panels missing Minimize and Close buttons on top right corner
 
 Swatches Panel - done: the reflowing grid, click for foreground, ctrl-click
 for background, alt-click to delete, the empty area and the footer button to
@@ -723,3 +727,15 @@ File format support:
 - RAW
 - PNG
 - TIFF
+
+
+Phase 2:
+ - photorust CLI - separate bin for cli work, ie 
+
+ ``` 
+ photorustcli filter.sketch.conte_crayon --input_img horse.jpg --output_img horse2.jpg 
+ photorustcli image.adjustments.levels --channel rgb --input_levels 123 25 55 --output_levels 81 255 -i input_img.jpg -o output_img.jpg 
+ ```
+ 
+ - new filters (Gimp filters, etc)
+ -

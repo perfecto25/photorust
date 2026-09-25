@@ -5,6 +5,7 @@
 #include "photorust_core/src/bridge.cxxqt.h"
 
 #include <QContextMenuEvent>
+#include <array>
 #include <QScrollBar>
 #include <QCursor>
 #include <QGuiApplication>
@@ -80,6 +81,10 @@ void CanvasView::refresh()
         // is cheap to take because QImage is implicitly shared.
         m_image = m_engine->compositeImage();
     }
+    // Anything may have changed the active layer's content — a move, a
+    // brush stroke, an undo — so the transform controls' box is measured
+    // again on the next paint.
+    m_controlsStale = true;
     update();
 }
 
@@ -2801,6 +2806,7 @@ void CanvasView::paintEvent(QPaintEvent *event)
     paintPathOverlay(painter);
     paintTypeOverlay(painter);
     paintFreeTransform(painter);
+    paintTransformControls(painter);
     paintSearchHighlight(painter);
     paintShapeOverlay(painter);
     paintZoomOverlay(painter);
@@ -3284,6 +3290,16 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
             emit lockedLayerRefused();
             return;
         }
+        // A press on one of the transform controls' handles is the start of
+        // a Free Transform: enter it, and hand it this same press, so the
+        // drag that follows scales rather than having to be made twice.
+        if (transformControlAt(event->position()) >= 0) {
+            beginFreeTransform();
+            if (m_freeTransform) {
+                mousePressEvent(event);
+            }
+            return;
+        }
         m_dragging = true;
         m_dragStartDoc = doc;
         return;
@@ -3706,6 +3722,27 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
         return;
     }
 
+    // The Move tool's transform controls: a resize cursor over a handle, so
+    // it is plain a drag there will scale, and the Move cursor again off it.
+    if (m_tool == ToolId::Move && m_showTransformControls && !m_freeTransform
+        && !m_dragging) {
+        static const Qt::CursorShape handleCursors[] = {
+            Qt::SizeFDiagCursor, Qt::SizeBDiagCursor, Qt::SizeFDiagCursor,
+            Qt::SizeBDiagCursor, Qt::SizeVerCursor, Qt::SizeHorCursor,
+            Qt::SizeVerCursor, Qt::SizeHorCursor,
+        };
+        const int handle = transformControlAt(pos);
+        if (handle != m_controlsHover) {
+            m_controlsHover = handle;
+            if (handle >= 0) {
+                setCursor(handleCursors[handle]);
+            } else {
+                m_lastMousePos = pos;
+                updateCursor();
+            }
+        }
+    }
+
     // Free Transform hover: update cursor based on proximity to handles.
     if (m_freeTransform && !m_dragging) {
         const bool isQuadMode = m_ftMode == TransformMode::Skew
@@ -4003,6 +4040,8 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
             if (dx != 0 || dy != 0) {
                 m_engine->offsetLayer(m_engine->getActiveLayerIndex(), dx, dy);
                 m_dragStartDoc += QPointF(dx, dy);
+                // The box travels with the layer; no need to measure it again.
+                m_controlsBounds.translate(dx, dy);
             }
         } else if (toolPaints(m_tool)) {
             m_engine->extendStroke(float(doc.x()), float(doc.y()), 1.0f);
@@ -6053,6 +6092,101 @@ void CanvasView::beginFreeTransform(TransformMode mode)
     update();
     emit transformStarted();
     emit transformChanged();
+}
+
+void CanvasView::setShowTransformControls(bool show)
+{
+    if (m_showTransformControls == show) {
+        return;
+    }
+    m_showTransformControls = show;
+    m_controlsStale = true;
+    if (!show && m_tool == ToolId::Move) {
+        updateCursor();
+    }
+    update();
+}
+
+QRect CanvasView::transformControlsBounds() const
+{
+    if (!m_engine) {
+        return {};
+    }
+    const int layer = m_engine->getActiveLayerIndex();
+    if (m_controlsStale || layer != m_controlsLayer) {
+        m_controlsBounds = layer >= 0 ? m_engine->layerContentBounds(layer) : QRect();
+        m_controlsLayer = layer;
+        m_controlsStale = false;
+    }
+    return m_controlsBounds;
+}
+
+/// The eight handle points of a box in widget space: the corners from the
+/// top left clockwise, then the edge midpoints from the top clockwise — the
+/// order `transformControlAt` numbers them in.
+static std::array<QPointF, 8> controlHandles(const QPointF &tl, const QPointF &br)
+{
+    const QPointF tr(br.x(), tl.y());
+    const QPointF bl(tl.x(), br.y());
+    return {tl, tr, br, bl, (tl + tr) / 2.0, (tr + br) / 2.0, (br + bl) / 2.0, (bl + tl) / 2.0};
+}
+
+int CanvasView::transformControlAt(const QPointF &widgetPos) const
+{
+    if (m_tool != ToolId::Move || !m_showTransformControls || m_freeTransform) {
+        return -1;
+    }
+    const QRect box = transformControlsBounds();
+    if (box.isEmpty()) {
+        return -1;
+    }
+    // The same reach Free Transform gives its own handles, so a handle is
+    // as easy to catch before the transform starts as after.
+    constexpr double hitDist = 8.0;
+    const auto handles = controlHandles(documentToWidget(QPointF(box.topLeft())),
+                                        documentToWidget(QPointF(box.x() + box.width(),
+                                                                 box.y() + box.height())));
+    for (int i = 0; i < int(handles.size()); ++i) {
+        if (QLineF(widgetPos, handles[i]).length() <= hitDist) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void CanvasView::paintTransformControls(QPainter &painter)
+{
+    if (m_tool != ToolId::Move || !m_showTransformControls || m_freeTransform) {
+        return;
+    }
+    const QRect box = transformControlsBounds();
+    if (box.isEmpty()) {
+        return;
+    }
+    const QPointF tl = documentToWidget(QPointF(box.topLeft()));
+    const QPointF br = documentToWidget(QPointF(box.x() + box.width(), box.y() + box.height()));
+
+    // Drawn as Free Transform draws its own box, since it is the same box —
+    // pressing a handle turns the one straight into the other.
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(Qt::black, 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRect(QRectF(tl, br));
+
+    const double hs = 4.0;
+    for (const QPointF &pt : controlHandles(tl, br)) {
+        const QRectF handle(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2);
+        painter.fillRect(handle, Qt::white);
+        painter.drawRect(handle);
+    }
+
+    // The centre marker, as Free Transform draws its pivot.
+    const QPointF cp = (tl + br) / 2.0;
+    painter.drawLine(cp - QPointF(6, 0), cp + QPointF(6, 0));
+    painter.drawLine(cp - QPointF(0, 6), cp + QPointF(0, 6));
+    painter.drawEllipse(cp, 4.0, 4.0);
+    painter.restore();
 }
 
 static QPointF evalBezier(const QPointF p[4], double t)

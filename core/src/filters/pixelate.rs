@@ -200,6 +200,14 @@ fn dither_threshold(column: i32, band: i32) -> f32 {
     jitter(column, band, 1)
 }
 
+/// How steeply the dot patterns' grain is spread over the threshold range;
+/// see `mezzotint`. Measured off CS6's Coarse Dots over
+/// `samples/horse-3.jpg`, registered against the source and binned by its
+/// tone: the share thrown black runs 83%, 76%, 61%, 43%, 19%, 10%, 5% and
+/// 3% from the darkest eighth of the range to the lightest. This gives 95%,
+/// 81%, 63%, 43%, 26%, 16%, 5% and 0%.
+const MEZZOTINT_GRAIN_CONTRAST: f32 = 1.35;
+
 /// Which of CS6's ten Mezzotint patterns.
 ///
 /// Three families — dots, lines and strokes — at increasing coarseness. They
@@ -236,6 +244,27 @@ impl MezzotintType {
         }
     }
 
+    /// How far the dot patterns' grain is blurred, in pixels, or `None` for
+    /// the cell-based patterns.
+    ///
+    /// CS6's Medium, Grainy and Coarse Dots are not squares of 2, 3 and 4
+    /// pixels, however the names read: its Coarse Dots over
+    /// `samples/horse-3.jpg` is a scatter of irregular specks and worm-like
+    /// blobs of every shape, with the horse's outline and muscles still
+    /// drawn through them. That is a threshold that is itself grain — white
+    /// noise blurred into clumps this big — so a dot is wherever the clump
+    /// dips under the picture's tone, and takes the clump's shape; and each
+    /// pixel is decided on its own tone, so detail survives. A square cell
+    /// thrown one way or the other as a whole is pixel art instead.
+    fn grain(self) -> Option<f32> {
+        match self {
+            MezzotintType::MediumDots => Some(0.55),
+            MezzotintType::GrainyDots => Some(0.8),
+            MezzotintType::CoarseDots => Some(1.05),
+            _ => None,
+        }
+    }
+
     /// The cell the pattern is laid on.
     ///
     /// Dots are square, so their grain has no direction. Lines are wide and
@@ -244,9 +273,9 @@ impl MezzotintType {
     fn cell(self) -> (i32, i32) {
         match self {
             MezzotintType::FineDots => (1, 1),
-            MezzotintType::MediumDots => (2, 2),
-            MezzotintType::GrainyDots => (3, 3),
-            MezzotintType::CoarseDots => (4, 4),
+            // The dots past Fine are drawn from grain rather than cells;
+            // see `grain`.
+            MezzotintType::MediumDots | MezzotintType::GrainyDots | MezzotintType::CoarseDots => (1, 1),
             MezzotintType::ShortLines => (4, 1),
             MezzotintType::MediumLines => (9, 1),
             MezzotintType::LongLines => (18, 1),
@@ -286,6 +315,25 @@ pub fn mezzotint(pixmap: &mut Pixmap, kind: MezzotintType) {
     let src = &source;
     let stride = pixmap.stride();
 
+    // The dot patterns' threshold: white noise blurred into clumps, then
+    // spread over the range by a logistic curve. Spread evenly — a slope of
+    // 1.7 is close to blurred noise's own cumulative distribution — the
+    // dither would keep every area's tone exactly; CS6's grain is harsher
+    // than that, so the curve is shallower and the thresholds bunch about
+    // the middle. See [`MEZZOTINT_GRAIN_CONTRAST`].
+    let grain: Option<Vec<f32>> = kind.grain().map(|sigma| {
+        let (w, h) = (width as usize, height as usize);
+        let mut field: Vec<f32> = (0..w * h)
+            .into_par_iter()
+            .map(|i| jitter((i % w) as i32, (i / w) as i32, 3) - 0.5)
+            .collect();
+        crate::filters::artistic::blur_field(&mut field, w, h, sigma);
+        crate::filters::brush_strokes::unit_spread(&mut field);
+        field.par_iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-MEZZOTINT_GRAIN_CONTRAST * *v).exp()));
+        field
+    });
+    let grain = grain.as_deref();
+
     pixmap
         .as_bytes_mut()
         .par_chunks_exact_mut(stride)
@@ -299,6 +347,18 @@ pub fn mezzotint(pixmap: &mut Pixmap, kind: MezzotintType) {
             // than as a speck of ink.
             let offset = (jitter(band, 0, 7) * cell_w as f32) as i32;
 
+            if let Some(grain) = grain {
+                for x in 0..width {
+                    let i = x as usize * 4;
+                    let own = src.get(x, y);
+                    let threshold = grain[row * width as usize + x as usize];
+                    for (c, level) in [own.r, own.g, own.b].into_iter().enumerate() {
+                        out[i + c] = if level as f32 / 255.0 > threshold { 255 } else { 0 };
+                    }
+                    out[i + 3] = own.a;
+                }
+                return;
+            }
             for x in 0..width {
                 let column = (x + offset).div_euclid(cell_w);
                 // The middle of the cell stands for all of it, so the whole
@@ -1635,6 +1695,58 @@ mod tests {
         color_halftone(&mut px, 5.0, DEFAULT_SCREEN_ANGLES);
         for y in 0..64 {
             assert_eq!(px.get(50, y).a, 0, "the empty half of the layer was printed on");
+        }
+    }
+    /// Coarse Dots is grain, not a grid of squares: neighbouring pixels
+    /// clump together more than Fine Dots', but the clumps do not line up on
+    /// four-pixel cells — a pixel is as likely to differ from the one below
+    /// it across a cell boundary as within a cell. (Down, because rows of
+    /// square cells are shifted sideways from one another, so squares only
+    /// line up vertically.)
+    #[test]
+    fn coarse_dots_are_clumps_not_squares() {
+        let run = |kind| {
+            let mut px = flat(160, Rgba8::new(128, 128, 128, 255));
+            mezzotint(&mut px, kind);
+            px
+        };
+        // How often a pixel differs from the one below it, split by whether
+        // that pair straddles a multiple of four.
+        let changes = |px: &Pixmap| {
+            let (mut on, mut n_on, mut off, mut n_off) = (0.0, 0.0, 0.0, 0.0);
+            for y in 0..159 {
+                for x in 0..160 {
+                    let d = (px.get(x, y).r != px.get(x, y + 1).r) as u32 as f32;
+                    if (y + 1) % 4 == 0 {
+                        on += d;
+                        n_on += 1.0;
+                    } else {
+                        off += d;
+                        n_off += 1.0;
+                    }
+                }
+            }
+            (on / n_on, off / n_off)
+        };
+        let (_, fine_off) = changes(&run(MezzotintType::FineDots));
+        let (coarse_on, coarse_off) = changes(&run(MezzotintType::CoarseDots));
+        assert!(coarse_off < fine_off * 0.7, "coarse {coarse_off} vs fine {fine_off}: no clumping");
+        assert!(
+            (coarse_on - coarse_off).abs() < 0.05,
+            "changes fall on a four-pixel grid: {coarse_on} across cells, {coarse_off} within"
+        );
+    }
+
+    /// Each pixel is decided on its own tone, so a hard edge in the picture
+    /// stays where it was rather than being smeared across a cell.
+    #[test]
+    fn coarse_dots_keep_a_hard_edge() {
+        let mut px = flat(64, Rgba8::new(0, 0, 0, 255));
+        px.fill_rect(crate::buffer::Rect::new(31, 0, 33, 64), Rgba8::new(255, 255, 255, 255));
+        mezzotint(&mut px, MezzotintType::CoarseDots);
+        for y in 0..64 {
+            assert_eq!(px.get(30, y).r, 0, "the black side lit up at row {y}");
+            assert_eq!(px.get(31, y).r, 255, "the white side went dark at row {y}");
         }
     }
 }

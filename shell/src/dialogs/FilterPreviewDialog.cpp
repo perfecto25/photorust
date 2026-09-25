@@ -104,10 +104,11 @@ FilterPreviewPane::FilterPreviewPane(FilterPreviewDialog *dialog)
         "FilterPreviewPane", "Drag to move the preview over the image"));
 }
 
-void FilterPreviewPane::setContent(const QImage &image, double zoom)
+void FilterPreviewPane::setContent(const QImage &image, double zoom, const QRect &document)
 {
     m_image = image;
     m_zoom = zoom;
+    m_document = document;
     update();
 }
 
@@ -124,6 +125,25 @@ void FilterPreviewPane::paintEvent(QPaintEvent *event)
         painter.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 2.0);
         const QSizeF scaled(m_image.width() * m_zoom, m_image.height() * m_zoom);
         const QPointF at((width() - scaled.width()) / 2.0, (height() - scaled.height()) / 2.0);
+        if (!m_document.isEmpty()) {
+            // The transparency checkerboard, over the document only. Its
+            // squares stay a fixed size on screen whatever the zoom, as the
+            // canvas's do.
+            const QRectF board(at.x() + m_document.x() * m_zoom,
+                               at.y() + m_document.y() * m_zoom,
+                               m_document.width() * m_zoom, m_document.height() * m_zoom);
+            painter.save();
+            painter.setClipRect(board);
+            constexpr int kSquare = 6;
+            painter.fillRect(board, Qt::white);
+            const QColor grey(0xcc, 0xcc, 0xcc);
+            for (int y = 0; y * kSquare < height(); ++y) {
+                for (int x = (y % 2); x * kSquare < width(); x += 2) {
+                    painter.fillRect(QRect(x * kSquare, y * kSquare, kSquare, kSquare), grey);
+                }
+            }
+            painter.restore();
+        }
         painter.drawImage(QRectF(at, scaled), m_image);
     }
 
@@ -1289,7 +1309,12 @@ void FilterPreviewDialog::refreshPreview()
         m_engine->filterPreview(m_filterName, slice, int(std::lround(region.x())),
                                 int(std::lround(region.y())), int(region.width()),
                                 int(region.height()));
-    m_pane->setContent(image, zoomLadder().at(m_zoomStep));
+    // The part of the region on the document, in the thumbnail's own pixels.
+    const QRect onDocument = QRectF(0, 0, m_engine->getCanvasWidth(), m_engine->getCanvasHeight())
+                                 .intersected(region)
+                                 .translated(-region.topLeft())
+                                 .toAlignedRect();
+    m_pane->setContent(image, zoomLadder().at(m_zoomStep), onDocument);
     emit previewRegionChanged(region);
 }
 

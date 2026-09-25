@@ -85,6 +85,10 @@ QString protractorSvg();
 /// buttons: three ruled lines, the trailing one shortest, flush to whichever
 /// edge (or centred) the button sets.
 QString textAlignSvg(Qt::Alignment align, bool vertical = false);
+/// The Move tool's Align and Distribute buttons. `edge` is the engine's
+/// numbering: 0 top, 1 vertical centre, 2 bottom, 3 left, 4 horizontal
+/// centre, 5 right.
+QString layerAlignSvg(int edge, bool distribute);
 
 /// SVG body for the Type options bar's commit button — a plain checkmark.
 QString commitSvg();

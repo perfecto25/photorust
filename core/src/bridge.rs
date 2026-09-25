@@ -1501,6 +1501,21 @@ pub mod ffi {
         #[cxx_name = "linkLayers"]
         fn link_layers(self: Pin<&mut Engine>, indices: &QVector_i32) -> bool;
 
+        /// The Move tool's Align buttons: line the layers' content up along
+        /// `edge` (0 top, 1 vertical centre, 2 bottom, 3 left, 4 horizontal
+        /// centre, 5 right) — against the selection if there is one, else
+        /// against the box round all of them. One history step. False when
+        /// nothing moved.
+        #[qinvokable]
+        #[cxx_name = "alignLayers"]
+        fn align_layers(self: Pin<&mut Engine>, indices: &QVector_i32, edge: i32) -> bool;
+
+        /// The Move tool's Distribute buttons: space three or more layers so
+        /// `edge` of each falls at even steps between the outermost two.
+        #[qinvokable]
+        #[cxx_name = "distributeLayers"]
+        fn distribute_layers(self: Pin<&mut Engine>, indices: &QVector_i32, edge: i32) -> bool;
+
         /// Take them out of their sets — the same menu entry, which reads
         /// Unlink Layers once the selection is linked.
         #[qinvokable]
@@ -6096,6 +6111,38 @@ impl ffi::Engine {
         linked
     }
 
+    fn align_layers(
+        mut self: core::pin::Pin<&mut Self>,
+        indices: &ffi::QVector_i32,
+        edge: i32,
+    ) -> bool {
+        let Some(edge) = crate::document::AlignEdge::from_i32(edge) else {
+            return false;
+        };
+        let ids = self.layer_ids_at(indices);
+        let moved = self.as_mut().rust_mut().doc.align_layers(&ids, edge);
+        if moved {
+            self.sync();
+        }
+        moved
+    }
+
+    fn distribute_layers(
+        mut self: core::pin::Pin<&mut Self>,
+        indices: &ffi::QVector_i32,
+        edge: i32,
+    ) -> bool {
+        let Some(edge) = crate::document::AlignEdge::from_i32(edge) else {
+            return false;
+        };
+        let ids = self.layer_ids_at(indices);
+        let moved = self.as_mut().rust_mut().doc.distribute_layers(&ids, edge);
+        if moved {
+            self.sync();
+        }
+        moved
+    }
+
     fn unlink_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
         let ids = self.layer_ids_at(indices);
         let unlinked = self.as_mut().rust_mut().doc.unlink_layers(&ids);
@@ -7990,6 +8037,53 @@ impl ffi::Engine {
                 ..
             }
             | Filter::ConteCrayon {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::GraphicPen {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::HalftonePattern {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::NotePaper {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::Photocopy {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::Plaster {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::Reticulation {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::Stamp {
+                foreground,
+                background,
+                ..
+            }
+            | Filter::TornEdges {
+                foreground,
+                background,
+                ..
+            }
+            // Grain's Sprinkles, Speckle and Stippled throw the swatches over
+            // the picture.
+            | Filter::Grain {
                 foreground,
                 background,
                 ..

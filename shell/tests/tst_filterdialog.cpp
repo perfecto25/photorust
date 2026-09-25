@@ -28,6 +28,7 @@
 #include <QDoubleSpinBox>
 #include <QImage>
 #include <QLabel>
+#include <QPainter>
 #include <QSignalSpy>
 #include <QTest>
 
@@ -60,6 +61,24 @@ private slots:
     void lightingGreysOutWhatDoesNotApplyToThisLamp();
     void diffuseOffersItsFourModesAndNothingElse();
     void embossCollectsAngleThenHeightThenAmount();
+    void graphicPenCollectsLengthThenBalanceThenDirection();
+    void graphicPenDrawsInTheDocumentsSwatches();
+    void halftonePatternCollectsSizeThenContrastThenPatternType();
+    void halftonePatternDrawsInTheDocumentsSwatches();
+    void notePaperCollectsBalanceThenGraininessThenRelief();
+    void notePaperDrawsInTheDocumentsSwatches();
+    void photocopyCollectsDetailThenDarkness();
+    void photocopyDrawsInTheDocumentsSwatches();
+    void plasterCollectsBalanceThenSmoothnessThenLight();
+    void plasterDrawsInTheDocumentsSwatches();
+    void reticulationCollectsDensityThenForegroundThenBackground();
+    void stampCollectsBalanceThenSmoothness();
+    void tornEdgesCollectsBalanceThenSmoothnessThenContrast();
+    void waterPaperCollectsFiberThenBrightnessThenContrast();
+    void craquelureCollectsSpacingThenDepthThenBrightness();
+    void grainCollectsIntensityThenContrastThenType();
+    void mosaicTilesCollectsSizeThenGroutThenLighten();
+    void patchworkCollectsSquareSizeThenRelief();
     void extrudeGreysOutWhatAPyramidCannotHave();
     void tilesCollectsItsTwoNumbersThenTheFillChoice();
     void traceContourCollectsTheLevelThenTheEdge();
@@ -686,6 +705,387 @@ void TestFilterDialog::embossCollectsAngleThenHeightThenAmount()
     QCOMPARE(height, 1);
     QCOMPARE(amount, 2);
     QCOMPARE(dialog.parameters(), QList<float>({135.0f, 3.0f, 100.0f}));
+}
+
+void TestFilterDialog::graphicPenCollectsLengthThenBalanceThenDirection()
+{
+    // Two sliders and a dropdown, read positionally by the engine. Stroke
+    // Length and Light/Dark Balance are both plain numbers, so a swap draws a
+    // perfectly convincing pen picture at the other one's setting — and the
+    // direction is a list index, so an off-by-one lays the lines the wrong way
+    // without anything complaining.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Graphic Pen"));
+    const int length = dialog.addParameter(QStringLiteral("Stroke Length:"), 1, 15, 7);
+    const int balance = dialog.addParameter(QStringLiteral("Light/Dark Balance:"), 0, 100, 40);
+    const int direction = dialog.addChoice(
+        QStringLiteral("Stroke Direction:"),
+        {QStringLiteral("Right Diagonal"), QStringLiteral("Horizontal"),
+         QStringLiteral("Left Diagonal"), QStringLiteral("Vertical")},
+        {0.0, 1.0, 2.0, 3.0}, 2);
+
+    QCOMPARE(length, 0);
+    QCOMPARE(balance, 1);
+    QCOMPARE(direction, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({7.0f, 40.0f, 2.0f}));
+}
+
+void TestFilterDialog::graphicPenDrawsInTheDocumentsSwatches()
+{
+    // The ink is the foreground and the paper the background, both of which
+    // belong to the document rather than to the dialog — so the dialog never
+    // asks for them and the engine fills them in. If that seam is broken the
+    // filter still draws, just in black and white whatever the swatches say.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(30, 30, 30));
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Dark")));
+    engine.setForegroundColor(QColor(0, 0, 255));
+    engine.setBackgroundColor(QColor(255, 255, 0));
+
+    const QList<float> params{10.0f, 50.0f, 1.0f}; // Horizontal.
+    engine.applyFilter(QStringLiteral("Graphic Pen"),
+                       rust::Slice<const float>(params.constData(), size_t(params.size())));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    bool ink = false;
+    bool paper = false;
+    for (int y = 0; y < after.height(); ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            const QColor colour = after.pixelColor(x, y);
+            if (colour == QColor(0, 0, 255)) {
+                ink = true;
+            }
+            if (colour == QColor(255, 255, 0)) {
+                paper = true;
+            }
+        }
+    }
+    QVERIFY2(ink, "the ink is not the document's foreground colour");
+    QVERIFY2(paper, "the paper is not the document's background colour");
+}
+
+void TestFilterDialog::halftonePatternCollectsSizeThenContrastThenPatternType()
+{
+    // Two sliders and a dropdown, read positionally by the engine. Size and
+    // Contrast are both plain numbers in overlapping ranges, so a swap rules a
+    // perfectly convincing screen at the other one's setting — and the pattern
+    // is a list index, so an off-by-one dots where it should line without
+    // anything complaining.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Halftone Pattern"));
+    const int size = dialog.addParameter(QStringLiteral("Size:"), 1, 12, 6);
+    const int contrast = dialog.addParameter(QStringLiteral("Contrast:"), 0, 50, 5);
+    const int pattern = dialog.addChoice(
+        QStringLiteral("Pattern Type:"),
+        {QStringLiteral("Dot"), QStringLiteral("Circle"), QStringLiteral("Line")},
+        {0.0, 1.0, 2.0}, 0);
+
+    QCOMPARE(size, 0);
+    QCOMPARE(contrast, 1);
+    QCOMPARE(pattern, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({6.0f, 5.0f, 0.0f}));
+}
+
+void TestFilterDialog::halftonePatternDrawsInTheDocumentsSwatches()
+{
+    // As Graphic Pen: the ink is the foreground and the paper the background,
+    // both belonging to the document rather than to the dialog, so the dialog
+    // never asks for them and the engine fills them in. The sheet is a mid
+    // grey, so a dot's middle takes ink and its cell's edge leaves paper.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(128, 128, 128));
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Grey")));
+    engine.setForegroundColor(QColor(0, 0, 255));
+    engine.setBackgroundColor(QColor(255, 255, 0));
+
+    const QList<float> params{6.0f, 50.0f, 0.0f}; // Dot.
+    engine.applyFilter(QStringLiteral("Halftone Pattern"),
+                       rust::Slice<const float>(params.constData(), size_t(params.size())));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    bool ink = false;
+    bool paper = false;
+    for (int y = 0; y < after.height(); ++y) {
+        for (int x = 0; x < after.width(); ++x) {
+            const QColor colour = after.pixelColor(x, y);
+            if (colour == QColor(0, 0, 255)) {
+                ink = true;
+            }
+            if (colour == QColor(255, 255, 0)) {
+                paper = true;
+            }
+        }
+    }
+    QVERIFY2(ink, "the ink is not the document's foreground colour");
+    QVERIFY2(paper, "the paper is not the document's background colour");
+}
+
+void TestFilterDialog::notePaperCollectsBalanceThenGraininessThenRelief()
+{
+    // Three sliders in overlapping ranges, read positionally by the engine —
+    // a swap cuts a perfectly convincing sheet at the wrong settings.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Note Paper"));
+    const int balance = dialog.addParameter(QStringLiteral("Image Balance:"), 0, 50, 25);
+    const int graininess = dialog.addParameter(QStringLiteral("Graininess:"), 0, 20, 10);
+    const int relief = dialog.addParameter(QStringLiteral("Relief:"), 0, 25, 11);
+
+    QCOMPARE(balance, 0);
+    QCOMPARE(graininess, 1);
+    QCOMPARE(relief, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({25.0f, 10.0f, 11.0f}));
+}
+
+void TestFilterDialog::notePaperDrawsInTheDocumentsSwatches()
+{
+    // The paper is the background and the holes lean towards the foreground,
+    // both belonging to the document rather than to the dialog. With no
+    // relief the sheet is flat, so the paper comes back as the background
+    // exactly and the hole as something between the two.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(230, 230, 230));
+    {
+        QPainter painter(&image);
+        painter.fillRect(QRect(0, 0, image.width() / 2, image.height()), QColor(20, 20, 20));
+    }
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Halves")));
+    engine.setForegroundColor(QColor(0, 0, 255));
+    engine.setBackgroundColor(QColor(255, 255, 0));
+
+    const QList<float> params{25.0f, 0.0f, 0.0f};
+    engine.applyFilter(QStringLiteral("Note Paper"),
+                       rust::Slice<const float>(params.constData(), size_t(params.size())));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    const int y = after.height() / 2;
+    QCOMPARE(after.pixelColor(after.width() - 2, y), QColor(255, 255, 0));
+    const QColor hole = after.pixelColor(1, y);
+    QVERIFY2(hole.red() < 255 && hole.green() < 255 && hole.blue() > 0,
+             "the hole is not towards the document's foreground colour");
+}
+
+void TestFilterDialog::photocopyCollectsDetailThenDarkness()
+{
+    // Two sliders in overlapping ranges, read positionally by the engine —
+    // a swap copies at a perfectly plausible wrong setting.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Photocopy"));
+    const int detail = dialog.addParameter(QStringLiteral("Detail:"), 1, 24, 7);
+    const int darkness = dialog.addParameter(QStringLiteral("Darkness:"), 1, 50, 8);
+
+    QCOMPARE(detail, 0);
+    QCOMPARE(darkness, 1);
+    QCOMPARE(dialog.parameters(), QList<float>({7.0f, 8.0f}));
+}
+
+void TestFilterDialog::photocopyDrawsInTheDocumentsSwatches()
+{
+    // Toner is the foreground and paper the background, both the document's.
+    // Hard up against an edge the dark side is solid toner; far from it both
+    // halves are flat, so both come back as bare paper.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(230, 230, 230));
+    const int half = image.width() / 2;
+    {
+        QPainter painter(&image);
+        painter.fillRect(QRect(half, 0, image.width() - half, image.height()),
+                         QColor(20, 20, 20));
+    }
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Halves")));
+    engine.setForegroundColor(QColor(0, 0, 255));
+    engine.setBackgroundColor(QColor(255, 255, 0));
+
+    const QList<float> params{4.0f, 50.0f};
+    engine.applyFilter(QStringLiteral("Photocopy"),
+                       rust::Slice<const float>(params.constData(), size_t(params.size())));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    const int y = after.height() / 2;
+    QCOMPARE(after.pixelColor(half + 1, y), QColor(0, 0, 255));
+    QCOMPARE(after.pixelColor(after.width() - 2, y), QColor(255, 255, 0));
+    QCOMPARE(after.pixelColor(1, y), QColor(255, 255, 0));
+}
+
+void TestFilterDialog::plasterCollectsBalanceThenSmoothnessThenLight()
+{
+    // Two sliders and Bas Relief's Light list, read positionally. The light
+    // is a list index, so an off-by-one lights the plaster from the wrong
+    // side and turns the ramp with it without anything complaining.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Plaster"));
+    const int balance = dialog.addParameter(QStringLiteral("Image Balance:"), 0, 50, 20);
+    const int smoothness = dialog.addParameter(QStringLiteral("Smoothness:"), 1, 15, 2);
+    const int light = dialog.addChoice(
+        QStringLiteral("Light:"),
+        {QStringLiteral("Bottom"), QStringLiteral("Bottom Left"), QStringLiteral("Left"),
+         QStringLiteral("Top Left"), QStringLiteral("Top"), QStringLiteral("Top Right"),
+         QStringLiteral("Right"), QStringLiteral("Bottom Right")},
+        {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, 4);
+
+    QCOMPARE(balance, 0);
+    QCOMPARE(smoothness, 1);
+    QCOMPARE(light, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({20.0f, 2.0f, 4.0f}));
+}
+
+void TestFilterDialog::plasterDrawsInTheDocumentsSwatches()
+{
+    // The ramp runs from the background at the edge nearest the light to
+    // the foreground at the far edge, both the document's. A pale sheet
+    // pours nothing, so with Light Top the top row is the background and
+    // the bottom row the foreground.
+    Engine engine;
+    QImage image(engine.getCanvasWidth(), engine.getCanvasHeight(),
+                 QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(240, 240, 240));
+    QVERIFY(engine.addImageLayer(image, 0, 0, QStringLiteral("Pale")));
+    engine.setForegroundColor(QColor(0, 0, 255));
+    engine.setBackgroundColor(QColor(255, 255, 0));
+
+    const QList<float> params{20.0f, 2.0f, 4.0f}; // Top.
+    engine.applyFilter(QStringLiteral("Plaster"),
+                       rust::Slice<const float>(params.constData(), size_t(params.size())));
+
+    const QImage after = engine.layerImage(engine.getActiveLayerIndex());
+    const int x = after.width() / 2;
+    QCOMPARE(after.pixelColor(x, 0), QColor(255, 255, 0));
+    QCOMPARE(after.pixelColor(x, after.height() - 1), QColor(0, 0, 255));
+}
+
+void TestFilterDialog::reticulationCollectsDensityThenForegroundThenBackground()
+{
+    // Three sliders over the same 0–50, read positionally by the engine —
+    // swap the two levels and the picture still comes out grained, only with
+    // its shadows and highlights the wrong way round.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Reticulation"));
+    const int density = dialog.addParameter(QStringLiteral("Density:"), 0, 50, 12);
+    const int foreground = dialog.addParameter(QStringLiteral("Foreground Level:"), 0, 50, 40);
+    const int background = dialog.addParameter(QStringLiteral("Background Level:"), 0, 50, 5);
+
+    QCOMPARE(density, 0);
+    QCOMPARE(foreground, 1);
+    QCOMPARE(background, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({12.0f, 40.0f, 5.0f}));
+}
+
+void TestFilterDialog::stampCollectsBalanceThenSmoothness()
+{
+    // Two sliders in overlapping ranges, read positionally by the engine — a
+    // swap still stamps the picture, only cut and melted at the wrong values.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Stamp"));
+    const int balance = dialog.addParameter(QStringLiteral("Light/Dark Balance:"), 0, 50, 25);
+    const int smoothness = dialog.addParameter(QStringLiteral("Smoothness:"), 1, 50, 5);
+
+    QCOMPARE(balance, 0);
+    QCOMPARE(smoothness, 1);
+    QCOMPARE(dialog.parameters(), QList<float>({25.0f, 5.0f}));
+}
+
+void TestFilterDialog::tornEdgesCollectsBalanceThenSmoothnessThenContrast()
+{
+    // Three sliders in overlapping ranges, read positionally by the engine.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Torn Edges"));
+    const int balance = dialog.addParameter(QStringLiteral("Image Balance:"), 0, 50, 25);
+    const int smoothness = dialog.addParameter(QStringLiteral("Smoothness:"), 1, 15, 11);
+    const int contrast = dialog.addParameter(QStringLiteral("Contrast:"), 1, 25, 17);
+
+    QCOMPARE(balance, 0);
+    QCOMPARE(smoothness, 1);
+    QCOMPARE(contrast, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({25.0f, 11.0f, 17.0f}));
+}
+
+void TestFilterDialog::waterPaperCollectsFiberThenBrightnessThenContrast()
+{
+    // Three sliders, two of them over the same range, read positionally by
+    // the engine.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Water Paper"));
+    const int fiber = dialog.addParameter(QStringLiteral("Fiber Length:"), 3, 50, 15);
+    const int brightness = dialog.addParameter(QStringLiteral("Brightness:"), 0, 100, 60);
+    const int contrast = dialog.addParameter(QStringLiteral("Contrast:"), 0, 100, 80);
+
+    QCOMPARE(fiber, 0);
+    QCOMPARE(brightness, 1);
+    QCOMPARE(contrast, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({15.0f, 60.0f, 80.0f}));
+}
+
+void TestFilterDialog::craquelureCollectsSpacingThenDepthThenBrightness()
+{
+    // Three sliders, the last two over the same range, read positionally by
+    // the engine.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Craquelure"));
+    const int spacing = dialog.addParameter(QStringLiteral("Crack Spacing:"), 2, 100, 15);
+    const int depth = dialog.addParameter(QStringLiteral("Crack Depth:"), 0, 10, 6);
+    const int brightness = dialog.addParameter(QStringLiteral("Crack Brightness:"), 0, 10, 9);
+
+    QCOMPARE(spacing, 0);
+    QCOMPARE(depth, 1);
+    QCOMPARE(brightness, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({15.0f, 6.0f, 9.0f}));
+}
+
+void TestFilterDialog::grainCollectsIntensityThenContrastThenType()
+{
+    // Two sliders over the same range, then a dropdown whose value is the
+    // engine's GrainType, all read positionally.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Grain"));
+    const int intensity = dialog.addParameter(QStringLiteral("Intensity:"), 0, 100, 40);
+    const int contrast = dialog.addParameter(QStringLiteral("Contrast:"), 0, 100, 50);
+    const int type = dialog.addChoice(
+        QStringLiteral("Grain Type:"),
+        {QStringLiteral("Regular"), QStringLiteral("Soft"), QStringLiteral("Sprinkles"),
+         QStringLiteral("Clumped"), QStringLiteral("Contrasty"), QStringLiteral("Enlarged"),
+         QStringLiteral("Stippled"), QStringLiteral("Horizontal"), QStringLiteral("Vertical"),
+         QStringLiteral("Speckle")},
+        {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0}, 6);
+
+    QCOMPARE(intensity, 0);
+    QCOMPARE(contrast, 1);
+    QCOMPARE(type, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({40.0f, 50.0f, 6.0f}));
+}
+
+void TestFilterDialog::mosaicTilesCollectsSizeThenGroutThenLighten()
+{
+    // Three sliders in overlapping ranges, read positionally by the engine.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Mosaic Tiles"));
+    const int size = dialog.addParameter(QStringLiteral("Tile Size:"), 2, 100, 12);
+    const int grout = dialog.addParameter(QStringLiteral("Grout Width:"), 1, 15, 3);
+    const int lighten = dialog.addParameter(QStringLiteral("Lighten Grout:"), 0, 10, 9);
+
+    QCOMPARE(size, 0);
+    QCOMPARE(grout, 1);
+    QCOMPARE(lighten, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({12.0f, 3.0f, 9.0f}));
+}
+
+void TestFilterDialog::patchworkCollectsSquareSizeThenRelief()
+{
+    // Two sliders in overlapping ranges, read positionally by the engine.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Patchwork"));
+    const int square = dialog.addParameter(QStringLiteral("Square Size:"), 0, 10, 4);
+    const int relief = dialog.addParameter(QStringLiteral("Relief:"), 0, 25, 8);
+
+    QCOMPARE(square, 0);
+    QCOMPARE(relief, 1);
+    QCOMPARE(dialog.parameters(), QList<float>({4.0f, 8.0f}));
 }
 
 void TestFilterDialog::extrudeGreysOutWhatAPyramidCannotHave()

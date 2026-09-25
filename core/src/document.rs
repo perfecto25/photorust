@@ -133,6 +133,84 @@ fn set_blending_value(layer: &mut Layer, field: &str, value: f32) -> bool {
     true
 }
 
+/// Which edge — or centre line — the Move tool's Align and Distribute
+/// buttons work on, in the order CS6's options bar lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignEdge {
+    Top,
+    VerticalCenter,
+    Bottom,
+    Left,
+    HorizontalCenter,
+    Right,
+}
+
+impl AlignEdge {
+    pub fn from_i32(value: i32) -> Option<AlignEdge> {
+        Some(match value {
+            0 => AlignEdge::Top,
+            1 => AlignEdge::VerticalCenter,
+            2 => AlignEdge::Bottom,
+            3 => AlignEdge::Left,
+            4 => AlignEdge::HorizontalCenter,
+            5 => AlignEdge::Right,
+            _ => return None,
+        })
+    }
+
+    /// True for the edges that run up and down, which move layers sideways.
+    fn is_horizontal(self) -> bool {
+        matches!(self, AlignEdge::Left | AlignEdge::HorizontalCenter | AlignEdge::Right)
+    }
+
+    /// Where this edge of `r` lies, doubled — so a centre on a half pixel is
+    /// still a whole number.
+    fn doubled(self, r: Rect) -> i32 {
+        match self {
+            AlignEdge::Top => 2 * r.y,
+            AlignEdge::VerticalCenter => 2 * r.y + r.height as i32,
+            AlignEdge::Bottom => 2 * r.bottom(),
+            AlignEdge::Left => 2 * r.x,
+            AlignEdge::HorizontalCenter => 2 * r.x + r.width as i32,
+            AlignEdge::Right => 2 * r.right(),
+        }
+    }
+
+    /// The History panel's names for the steps, as CS6 writes them.
+    fn align_name(self) -> &'static str {
+        match self {
+            AlignEdge::Top => "Align Top Edges",
+            AlignEdge::VerticalCenter => "Align Vertical Centers",
+            AlignEdge::Bottom => "Align Bottom Edges",
+            AlignEdge::Left => "Align Left Edges",
+            AlignEdge::HorizontalCenter => "Align Horizontal Centers",
+            AlignEdge::Right => "Align Right Edges",
+        }
+    }
+
+    fn distribute_name(self) -> &'static str {
+        match self {
+            AlignEdge::Top => "Distribute Top Edges",
+            AlignEdge::VerticalCenter => "Distribute Vertical Centers",
+            AlignEdge::Bottom => "Distribute Bottom Edges",
+            AlignEdge::Left => "Distribute Left Edges",
+            AlignEdge::HorizontalCenter => "Distribute Horizontal Centers",
+            AlignEdge::Right => "Distribute Right Edges",
+        }
+    }
+}
+
+/// How far `rect` has to move for `edge` of it to meet the same edge of
+/// `target`. A centre that falls on a half pixel rounds down.
+fn align_delta(rect: Rect, target: Rect, edge: AlignEdge) -> (i32, i32) {
+    let by = (edge.doubled(target) - edge.doubled(rect)).div_euclid(2);
+    if edge.is_horizontal() {
+        (by, 0)
+    } else {
+        (0, by)
+    }
+}
+
 /// The part of `pixels` that is not fully transparent, in the pixmap's own
 /// coordinates, or `None` when nothing in it would show.
 fn opaque_bounds(pixels: &Pixmap) -> Option<Rect> {
@@ -2715,28 +2793,103 @@ impl Document {
         let ids = self.linked_with(id);
         let mut moved = false;
         for id in ids {
-            let Some(l) = self.stack.by_id_mut(id) else {
-                continue;
-            };
-            if l.lock_position {
-                // One locked member holds still while the rest of the set
-                // moves, rather than pinning the whole chain.
-                continue;
-            }
-            l.offset.0 += dx;
-            l.offset.1 += dy;
-            // A type layer's anchor travels with its pixels, so reopening it
-            // after a move resumes where the text now is rather than snapping
-            // back to where it was first clicked.
-            if let Some(text) = l.text.as_mut() {
-                text.origin.0 += dx as f32;
-                text.origin.1 += dy as f32;
-            }
-            moved = true;
+            // One locked member holds still while the rest of the set moves,
+            // rather than pinning the whole chain.
+            moved |= self.shift_layer(id, dx, dy);
         }
         if moved {
             self.commit_coalescing("Move Layer");
         }
+    }
+
+    /// Move one layer by a pixel delta, without recording history. False when
+    /// it is missing or its position is locked.
+    fn shift_layer(&mut self, id: LayerId, dx: i32, dy: i32) -> bool {
+        let Some(l) = self.stack.by_id_mut(id) else {
+            return false;
+        };
+        if l.lock_position {
+            return false;
+        }
+        l.offset.0 += dx;
+        l.offset.1 += dy;
+        // A type layer's anchor travels with its pixels, so reopening it
+        // after a move resumes where the text now is rather than snapping
+        // back to where it was first clicked.
+        if let Some(text) = l.text.as_mut() {
+            text.origin.0 += dx as f32;
+            text.origin.1 += dy as f32;
+        }
+        true
+    }
+
+    /// What each layer's visible content covers, in document space, for the
+    /// layers that have any. Empty layers have no edges to line up.
+    fn content_rects(&self, ids: &[LayerId]) -> Vec<(LayerId, Rect)> {
+        ids.iter()
+            .filter_map(|&id| {
+                let l = self.stack.by_id(id)?;
+                let b = opaque_bounds(&l.pixels)?;
+                Some((id, Rect::new(b.x + l.offset.0, b.y + l.offset.1, b.width, b.height)))
+            })
+            .collect()
+    }
+
+    /// Move ▸ Align, as the Move tool's options bar does it: line the layers'
+    /// content up along `edge`. With a selection they line up against the
+    /// selection — CS6's way of aligning one layer to the canvas or to a
+    /// region — and otherwise against the box round all of them together.
+    /// One history step, named for the button. False when nothing moved.
+    pub fn align_layers(&mut self, ids: &[LayerId], edge: AlignEdge) -> bool {
+        let rects = self.content_rects(ids);
+        let target = match self.selection_bounds() {
+            Some(selection) => selection,
+            None if rects.len() >= 2 => rects[1..]
+                .iter()
+                .fold(rects[0].1, |all, (_, r)| all.union(r)),
+            None => return false,
+        };
+        let mut moved = false;
+        for (id, rect) in rects {
+            let (dx, dy) = align_delta(rect, target, edge);
+            if (dx, dy) != (0, 0) {
+                moved |= self.shift_layer(id, dx, dy);
+            }
+        }
+        if moved {
+            self.commit(edge.align_name());
+        }
+        moved
+    }
+
+    /// Move ▸ Distribute: space the layers so that `edge` of each falls at
+    /// even steps between the two outermost, which stay where they are.
+    /// Needs three layers with content — with two there is nothing between
+    /// them to space. One history step. False when nothing moved.
+    pub fn distribute_layers(&mut self, ids: &[LayerId], edge: AlignEdge) -> bool {
+        let mut rects = self.content_rects(ids);
+        if rects.len() < 3 {
+            return false;
+        }
+        rects.sort_by_key(|&(_, r)| edge.doubled(r));
+        let first = edge.doubled(rects[0].1) as i64;
+        let last = edge.doubled(rects[rects.len() - 1].1) as i64;
+        let steps = (rects.len() - 1) as i64;
+        let mut moved = false;
+        for (i, &(id, rect)) in rects.iter().enumerate() {
+            // In doubled units, so a centre needs no rounding until the end.
+            let want = first + (last - first) * i as i64 / steps;
+            let by = ((want - edge.doubled(rect) as i64) as f64 / 2.0).round() as i32;
+            if by == 0 {
+                continue;
+            }
+            let (dx, dy) = if edge.is_horizontal() { (by, 0) } else { (0, by) };
+            moved |= self.shift_layer(id, dx, dy);
+        }
+        if moved {
+            self.commit(edge.distribute_name());
+        }
+        moved
     }
 
     /// A layer and everything linked to it, or just the layer when it is not
@@ -5092,7 +5245,8 @@ impl Document {
         if !matches!(layer.kind, LayerKind::Raster) {
             return None;
         }
-        let (width, height) = (layer.pixels.width(), layer.pixels.height());
+        let pixels = self.unpreviewed_pixels(layer);
+        let (width, height) = (pixels.width(), pixels.height());
         if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
             return None;
         }
@@ -5106,9 +5260,9 @@ impl Document {
             ((height as f32 * scale).round() as u32).max(1),
         );
         let mut work = if fitted == (width, height) {
-            layer.pixels.clone()
+            pixels.clone()
         } else {
-            crate::resample::resample(&layer.pixels, fitted.0, fitted.1, Resample::Bilinear)
+            crate::resample::resample(pixels, fitted.0, fitted.1, Resample::Bilinear)
         };
         match self.selection_proxy(fitted, layer.offset) {
             // The selection is shrunk alongside the picture rather than
@@ -5167,6 +5321,7 @@ impl Document {
         if !matches!(layer.kind, LayerKind::Raster) {
             return None;
         }
+        let pixels = self.unpreviewed_pixels(layer);
         let (ox, oy) = layer.offset;
 
         // The padded region, in the layer's own coordinates.
@@ -5174,7 +5329,7 @@ impl Document {
         let want = Rect::new(rect.x - ox, rect.y - oy, rect.width, rect.height);
         let padded = match pad {
             Some(n) => want.inflate(n),
-            None => layer.pixels.rect(),
+            None => pixels.rect(),
         };
 
         // A selection confines the thumbnail exactly as it will confine the
@@ -5192,7 +5347,7 @@ impl Document {
             _ => padded,
         };
 
-        let mut work = layer.pixels.crop(padded);
+        let mut work = pixels.crop(padded);
         match confined {
             Some((selection, bounds)) => filter_through_selection(
                 &mut work,
@@ -5255,6 +5410,20 @@ impl Document {
             if let Some(layer) = self.stack.by_id_mut(id) {
                 layer.pixels = pixels;
             }
+        }
+    }
+
+    /// A layer's pixels as they really are — not as a canvas preview is
+    /// showing them. [`Document::set_filter_preview`] filters the layer in
+    /// place and keeps the original aside, so anything that asks what a
+    /// filter *would* do has to start from the original: reading the layer
+    /// itself would filter the previewed result a second time. A dialog's
+    /// thumbnail and its canvas preview are refreshed on separate timers, so
+    /// the thumbnail is regularly asked for with the preview already showing.
+    fn unpreviewed_pixels<'a>(&'a self, layer: &'a Layer) -> &'a Pixmap {
+        match &self.filter_preview {
+            Some((id, original)) if *id == layer.id => original,
+            _ => &layer.pixels,
         }
     }
 
@@ -7583,6 +7752,35 @@ mod tests {
         );
     }
 
+    /// A dialog's thumbnail and its canvas preview refresh on separate
+    /// timers, so the thumbnail is regularly asked for while the canvas is
+    /// already showing the filter. It has to start from the layer as it
+    /// really is: reading the previewed pixels filtered them twice, which a
+    /// Sketch filter with the swatches swapped turns into a thumbnail that is
+    /// the negative of the canvas.
+    #[test]
+    fn a_thumbnail_is_not_filtered_twice_while_the_canvas_previews() {
+        let filter = Filter::BoxBlur { radius: 4 };
+        let region = Rect::new(8, 8, 16, 16);
+
+        let d = checkered(40, 5);
+        let alone = d.filter_preview(filter, region).unwrap();
+        let proxy_alone = d.filter_proxy(filter, 20, 20).unwrap();
+
+        let mut d = checkered(40, 5);
+        d.set_filter_preview(Some(filter));
+        assert_eq!(
+            d.filter_preview(filter, region).unwrap().as_bytes(),
+            alone.as_bytes(),
+            "the thumbnail filtered the canvas preview again"
+        );
+        assert_eq!(
+            d.filter_proxy(filter, 20, 20).unwrap().as_bytes(),
+            proxy_alone.as_bytes(),
+            "the whole-picture thumbnail filtered the canvas preview again"
+        );
+    }
+
     #[test]
     fn the_preview_checkbox_puts_the_pixels_back_and_leaves_no_history() {
         let mut d = checkered(40, 5);
@@ -8351,6 +8549,120 @@ mod tests {
         d.offset_layer(id, 4, 4);
         assert_eq!(d.layers().by_id(id).unwrap().offset, (4, 4));
         assert_eq!(d.composite().get(0, 0).a, 0, "content did not move");
+    }
+
+    /// A document with transparent layers holding a square each, at the
+    /// given (x, y, size), returned bottom first.
+    fn squares(at: &[(i32, i32, u32)]) -> (Document, Vec<LayerId>) {
+        let mut d = Document::new(200, 200, Rgba8::WHITE);
+        let ids = at
+            .iter()
+            .map(|&(x, y, size)| {
+                let pixels = Pixmap::filled(size, size, Rgba8::BLACK);
+                d.add_image_layer(pixels, (x, y), "Square".into())
+            })
+            .collect();
+        (d, ids)
+    }
+
+    fn offset_of(d: &Document, id: LayerId) -> (i32, i32) {
+        d.layers().by_id(id).unwrap().offset
+    }
+
+    #[test]
+    fn align_lines_edges_up_on_the_outermost() {
+        let (mut d, ids) = squares(&[(10, 40, 20), (60, 10, 30), (120, 70, 10)]);
+        assert!(d.align_layers(&ids, AlignEdge::Top));
+        for &id in &ids {
+            assert_eq!(offset_of(&d, id).1, 10, "every top meets the highest");
+        }
+        assert!(d.align_layers(&ids, AlignEdge::Right));
+        for (&id, size) in ids.iter().zip([20, 30, 10]) {
+            assert_eq!(offset_of(&d, id).0 + size, 130, "every right edge meets the furthest");
+        }
+        assert_eq!(d.history().undo_name(), Some("Align Right Edges"));
+    }
+
+    #[test]
+    fn align_centres_on_the_middle_of_them_all() {
+        let (mut d, ids) = squares(&[(0, 0, 20), (80, 100, 40)]);
+        assert!(d.align_layers(&ids, AlignEdge::HorizontalCenter));
+        // The box round both runs 0..120, so its middle is 60.
+        assert_eq!(offset_of(&d, ids[0]).0, 50);
+        assert_eq!(offset_of(&d, ids[1]).0, 40);
+        // Sideways only.
+        assert_eq!(offset_of(&d, ids[1]).1, 100);
+    }
+
+    /// With a selection the layers line up on it, which is how CS6 aligns a
+    /// single layer — to the canvas after Select All, or to a marquee.
+    #[test]
+    fn align_against_a_selection_moves_even_one_layer() {
+        let (mut d, ids) = squares(&[(30, 30, 20)]);
+        d.select_rect(Rect::new(0, 100, 200, 100), SelectionOp::Replace, 0);
+        assert!(d.align_layers(&ids, AlignEdge::Bottom));
+        assert_eq!(offset_of(&d, ids[0]), (30, 180));
+    }
+
+    #[test]
+    fn align_needs_two_layers_without_a_selection() {
+        let (mut d, ids) = squares(&[(30, 30, 20)]);
+        assert!(!d.align_layers(&ids, AlignEdge::Left));
+        assert_eq!(offset_of(&d, ids[0]), (30, 30));
+    }
+
+    /// It lines up what shows, not the layer's canvas: a square painted in
+    /// the middle of a big transparent layer aligns by the square.
+    #[test]
+    fn align_goes_by_the_content_not_the_layer() {
+        let mut d = Document::new(200, 200, Rgba8::WHITE);
+        let mut big = Pixmap::new(100, 100);
+        big.fill_rect(Rect::new(40, 40, 10, 10), Rgba8::BLACK);
+        let a = d.add_image_layer(big, (0, 0), "Big".into());
+        let b = d.add_image_layer(Pixmap::filled(10, 10, Rgba8::BLACK), (5, 150), "Small".into());
+        assert!(d.align_layers(&[a, b], AlignEdge::Left));
+        assert_eq!(offset_of(&d, a).0, -35, "the square's edge, at 40 in, meets 5");
+        assert_eq!(offset_of(&d, b).0, 5);
+    }
+
+    #[test]
+    fn align_is_one_step_to_undo() {
+        let (mut d, ids) = squares(&[(10, 40, 20), (60, 10, 30), (120, 70, 10)]);
+        assert!(d.align_layers(&ids, AlignEdge::Top));
+        assert!(d.undo());
+        assert_eq!(offset_of(&d, ids[0]), (10, 40));
+        assert_eq!(offset_of(&d, ids[2]), (120, 70));
+    }
+
+    #[test]
+    fn align_leaves_a_position_locked_layer_where_it_is() {
+        let (mut d, ids) = squares(&[(10, 40, 20), (60, 10, 30)]);
+        d.layers_mut_raw().by_id_mut(ids[1]).unwrap().lock_position = true;
+        // The locked one is the top-most, so the other still comes up to it;
+        // aligning bottoms would have to move the locked one, which holds.
+        assert!(d.align_layers(&ids, AlignEdge::Top));
+        assert_eq!(offset_of(&d, ids[0]).1, 10);
+        assert_eq!(offset_of(&d, ids[1]), (60, 10));
+        d.align_layers(&ids, AlignEdge::Bottom);
+        assert_eq!(offset_of(&d, ids[1]), (60, 10));
+    }
+
+    #[test]
+    fn distribute_spaces_the_middle_evenly_and_keeps_the_ends() {
+        let (mut d, ids) = squares(&[(0, 0, 10), (15, 50, 10), (100, 90, 10), (60, 20, 10)]);
+        assert!(d.distribute_layers(&ids, AlignEdge::Left));
+        // Left edges from 0 to 100 in three even steps.
+        assert_eq!(offset_of(&d, ids[0]).0, 0);
+        assert_eq!(offset_of(&d, ids[1]).0, 33);
+        assert_eq!(offset_of(&d, ids[3]).0, 67);
+        assert_eq!(offset_of(&d, ids[2]).0, 100);
+        assert_eq!(d.history().undo_name(), Some("Distribute Left Edges"));
+    }
+
+    #[test]
+    fn distribute_needs_three_layers() {
+        let (mut d, ids) = squares(&[(0, 0, 10), (50, 50, 10)]);
+        assert!(!d.distribute_layers(&ids, AlignEdge::Top));
     }
 
     #[test]

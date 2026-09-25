@@ -60,6 +60,9 @@ public slots:
 signals:
     /// Something changed that requires the canvas to repaint.
     void documentChanged();
+    /// Which layers are selected changed — the active one, or how many. The
+    /// Move tool's Align buttons light up and grey out on it.
+    void layerSelectionChanged();
     /// A double-click on an effect row: open Layer Style on that effect, the
     /// way CS6 does. The panel cannot open dialogs itself, so the window does.
     void editLayerStyle(int layerIndex, const QString &effectKey);

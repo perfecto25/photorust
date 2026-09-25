@@ -432,10 +432,25 @@ private:
     void pushPatchOptions();
     /// Tell the user the Healing Brush needs a source point first.
     void warnHealingSourceRequired();
+    /// Where a filter dialog's thumbnail should open: the middle of what the
+    /// canvas is showing — unless the active layer has nothing there, when it
+    /// opens on the layer's content instead, so a layer that is a small shape
+    /// on transparency does not open on an empty thumbnail.
+    QPointF filterPreviewStart() const;
     /// Tell the user an edit was refused because the layer is locked.
     void warnLayerLocked();
     /// Show the Auto-Align Layers dialog.
     void autoAlignLayers();
+    /// Layer ▸ Align and ▸ Distribute, and the Move tool's buttons for them.
+    /// `edge` is the engine's numbering, 0 top through 5 right.
+    void alignSelectedLayers(int edge);
+    void distributeSelectedLayers(int edge);
+    /// Light up the Align buttons for two layers or more — or for one with a
+    /// selection to align it to — and Distribute for three or more.
+    void updateAlignActions();
+    /// The Move tool's options: Show Transform Controls, then Align,
+    /// Distribute and Auto-Align.
+    void addMoveOptions();
     void editKeyboardShortcuts();
     void editColorSettings();
     /// Add the options for the healing group's region-based variants.
@@ -479,6 +494,12 @@ private:
     QList<QAction *> m_editNonTypingActions;
     QAction *m_transformAgainAction = nullptr;
     QAction *m_autoAlignAction = nullptr;
+    /// Layer ▸ Align and ▸ Distribute, in the engine's edge order. The Move
+    /// tool's options bar shows these same actions as buttons.
+    QList<QAction *> m_alignActions;
+    QList<QAction *> m_distributeActions;
+    /// The Move tool's Show Transform Controls, kept across tool switches.
+    bool m_showTransformControls = false;
     bool m_hasTransformed = false;
 
     void showTransformOptionsBar();

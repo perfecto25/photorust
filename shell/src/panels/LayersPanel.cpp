@@ -1674,6 +1674,7 @@ void LayersPanel::onSelectionChanged()
     }
     m_engine->setActiveLayer(index);
     refresh();
+    emit layerSelectionChanged();
 }
 
 void LayersPanel::onBlendModeChanged(int index)

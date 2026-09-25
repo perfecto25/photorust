@@ -399,6 +399,13 @@ public:
 
     /// Enter Free Transform mode on the active layer.
     void beginFreeTransform(TransformMode mode = TransformMode::Free);
+
+    /// The Move tool's Show Transform Controls. While the Move tool is active
+    /// the active layer's content wears Free Transform's box and handles, and
+    /// dragging a handle goes straight into Free Transform — the drag scales
+    /// from the first movement, as in CS6. Dragging anywhere else still moves.
+    void setShowTransformControls(bool show);
+    bool showTransformControls() const { return m_showTransformControls; }
     void commitFreeTransform();
     void cancelFreeTransform();
     bool isFreeTransforming() const { return m_freeTransform; }
@@ -700,6 +707,15 @@ private:
     /// they are about to commit.
     void paintSearchHighlight(QPainter &painter);
     void paintFreeTransform(QPainter &painter);
+    void paintTransformControls(QPainter &painter);
+    /// The box Show Transform Controls draws, in document space, or an empty
+    /// rect when there is nothing to draw it round. Cached: finding it means
+    /// scanning the layer, and it is asked for on every paint.
+    QRect transformControlsBounds() const;
+    /// Which handle of the Move tool's transform controls is under a widget
+    /// point: 0–3 the corners from top-left clockwise, 4–7 the edge midpoints
+    /// from the top clockwise, or -1 for none.
+    int transformControlAt(const QPointF &widgetPos) const;
     void paintShapeOverlay(QPainter &painter);
     /// Draw the rectangle a Zoom drag is marking out.
     void paintZoomOverlay(QPainter &painter);
@@ -1093,6 +1109,15 @@ private:
 
     // -- Free Transform --
     bool m_freeTransform = false;
+    bool m_showTransformControls = false;
+    // The box round the active layer's content, and which layer it was
+    // measured for. Refreshed lazily; `refresh()` marks it stale.
+    mutable QRect m_controlsBounds;
+    mutable int m_controlsLayer = -1;
+    mutable bool m_controlsStale = true;
+    // The handle the pointer was last over, so the cursor is only changed
+    // when that changes.
+    int m_controlsHover = -1;
     TransformMode m_ftMode = TransformMode::Free;
     int m_ftLayerIndex = -1;
     QImage m_ftOrigImage;

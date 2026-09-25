@@ -7,7 +7,8 @@
 //! position" instead of "add this delta to that other delta".
 //!
 //! A **corner** point has no handles (or two independent ones) and the
-//! segments either side of it meet at an angle. A **smooth** point's handles
+//! segments either side of 
+//! it meet at an angle. A **smooth** point's handles
 //! stay collinear through the anchor, so the curve flows through it without a
 //! kink — that collinearity is the one invariant [`VectorPath::move_handle`]
 //! has to maintain and everything else leaves alone.

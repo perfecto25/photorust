@@ -938,6 +938,52 @@ QString ToolIcons::textAlignSvg(Qt::Alignment align, bool vertical)
     return QStringLiteral(R"SVG(<path d="M3 5H17M3 10H12M3 15H15" stroke-width="1.6"/>)SVG");
 }
 
+QString ToolIcons::layerAlignSvg(int edge, bool distribute)
+{
+    // Drawn for the top, left and centre cases and mirrored for the rest, so
+    // the six in a row read as one family the way CS6's do.
+    const bool sideways = edge >= 3;
+    const int along = edge % 3; // 0 leading edge, 1 centre, 2 trailing edge
+    QString svg;
+    auto bar = [&](double a, double b, double length, double breadth) {
+        // `a` runs across the line, `b` along it.
+        const double x = sideways ? a : b;
+        const double y = sideways ? b : a;
+        const double w = sideways ? length : breadth;
+        const double h = sideways ? breadth : length;
+        svg += QStringLiteral(R"SVG(<rect x="%1" y="%2" width="%3" height="%4" fill="COLOR" stroke="none"/>)SVG")
+                   .arg(x).arg(y).arg(w).arg(h);
+    };
+    auto line = [&](double at) {
+        svg += sideways ? QStringLiteral(R"SVG(<path d="M%1 2V18" stroke-width="1.2"/>)SVG").arg(at)
+                        : QStringLiteral(R"SVG(<path d="M2 %1H18" stroke-width="1.2"/>)SVG").arg(at);
+    };
+
+    if (!distribute) {
+        // One line, and two bars of different lengths meeting it at their
+        // leading edge, their middles or their trailing edge.
+        line(along == 0 ? 3.0 : along == 1 ? 10.0 : 17.0);
+        const double longBar = 12.0;
+        const double shortBar = 7.0;
+        auto start = [&](double length) {
+            return along == 0 ? 3.6 : along == 1 ? 10.0 - length / 2 : 16.4 - length;
+        };
+        bar(start(longBar), 4.5, longBar, 3.0);
+        bar(start(shortBar), 11.5, shortBar, 3.0);
+        return svg;
+    }
+
+    // Three small blocks stepped evenly across the icon, each with a line
+    // through the edge — or middle — that is being spaced.
+    for (int i = 0; i < 3; ++i) {
+        const double a = 2.5 + i * 5.5;
+        const double b = 2.0 + i * 6.0;
+        bar(a, b, 4.0, 4.0);
+        line(a + (along == 0 ? 0.0 : along == 1 ? 2.0 : 4.0));
+    }
+    return svg;
+}
+
 QString ToolIcons::penCursorSvg(int sign)
 {
     // The same nib the tool strip draws, turned 135° instead of -45° so it

@@ -16,6 +16,7 @@ set(SHELL_TESTS
     tst_sliderpopup
     tst_swatchespanel
     tst_toolcursors
+    tst_transformcontrols
     tst_typeantialias
     tst_typerestyle
     tst_typewarp

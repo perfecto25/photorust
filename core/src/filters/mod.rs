@@ -374,6 +374,117 @@ pub enum Filter {
         foreground: crate::buffer::Rgba8,
         background: crate::buffer::Rgba8,
     },
+    /// The picture drawn in fine parallel ink lines — CS6's Graphic Pen. The
+    /// colours are the document's, so the bridge fills them in; see
+    /// `Engine::filter_for`.
+    GraphicPen {
+        stroke_length: u32,
+        balance: u32,
+        direction: brush_strokes::StrokeDirection,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture ruled into a screen of dots, rings or lines — CS6's
+    /// Halftone Pattern. The colours are the document's, so the bridge fills
+    /// them in; see `Engine::filter_for`.
+    HalftonePattern {
+        size: u32,
+        contrast: u32,
+        pattern: sketch::HalftonePattern,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture cut out of a sheet of handmade paper — CS6's Note Paper.
+    /// The colours are the document's, so the bridge fills them in; see
+    /// `Engine::filter_for`.
+    NotePaper {
+        balance: u32,
+        graininess: u32,
+        relief: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture as a photocopier sees it — CS6's Photocopy. The colours
+    /// are the document's, so the bridge fills them in; see
+    /// `Engine::filter_for`.
+    Photocopy {
+        detail: u32,
+        darkness: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture poured in plaster and lit from one side — CS6's Plaster.
+    /// The colours are the document's, so the bridge fills them in; see
+    /// `Engine::filter_for`.
+    Plaster {
+        balance: u32,
+        smoothness: u32,
+        light: texture::Light,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture as film whose emulsion has clumped — CS6's Reticulation.
+    /// The colours are the document's, so the bridge fills them in; see
+    /// `Engine::filter_for`.
+    Reticulation {
+        density: u32,
+        foreground_level: u32,
+        background_level: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture cut as a rubber stamp — CS6's Stamp. The colours are the
+    /// document's, so the bridge fills them in; see `Engine::filter_for`.
+    Stamp {
+        balance: u32,
+        smoothness: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture torn out of paper — CS6's Torn Edges. The colours are the
+    /// document's, so the bridge fills them in; see `Engine::filter_for`.
+    TornEdges {
+        balance: u32,
+        smoothness: u32,
+        contrast: u32,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture printed through grain — CS6's Grain. Sprinkles, Speckle
+    /// and Stippled use the document's colours, so the bridge fills them in;
+    /// see `Engine::filter_for`.
+    Grain {
+        intensity: u32,
+        contrast: u32,
+        kind: texture::GrainType,
+        foreground: crate::buffer::Rgba8,
+        background: crate::buffer::Rgba8,
+    },
+    /// The picture as raised squares of its average colours — CS6's
+    /// Patchwork.
+    Patchwork {
+        square: u32,
+        relief: u32,
+    },
+    /// The picture laid in tiles with grout between — CS6's Mosaic Tiles.
+    MosaicTiles {
+        size: u32,
+        grout: u32,
+        lighten: u32,
+    },
+    /// The picture painted onto cracked plaster — CS6's Craquelure.
+    Craquelure {
+        spacing: u32,
+        depth: u32,
+        brightness: u32,
+    },
+    /// The picture daubed onto damp, fibrous paper — CS6's Water Paper. It
+    /// keeps the picture's colours, so, like Chrome, it takes no swatches.
+    WaterPaper {
+        fiber: u32,
+        brightness: u32,
+        contrast: u32,
+    },
     /// The picture painted in Japanese ink wash — CS6's Sumi-e.
     SumiE {
         width: u32,
@@ -537,6 +648,19 @@ impl Filter {
             Filter::Charcoal { .. } => "Charcoal",
             Filter::Chrome { .. } => "Chrome",
             Filter::ConteCrayon { .. } => "Conte Crayon",
+            Filter::GraphicPen { .. } => "Graphic Pen",
+            Filter::HalftonePattern { .. } => "Halftone Pattern",
+            Filter::NotePaper { .. } => "Note Paper",
+            Filter::Photocopy { .. } => "Photocopy",
+            Filter::Plaster { .. } => "Plaster",
+            Filter::Reticulation { .. } => "Reticulation",
+            Filter::Stamp { .. } => "Stamp",
+            Filter::TornEdges { .. } => "Torn Edges",
+            Filter::WaterPaper { .. } => "Water Paper",
+            Filter::Craquelure { .. } => "Craquelure",
+            Filter::Grain { .. } => "Grain",
+            Filter::MosaicTiles { .. } => "Mosaic Tiles",
+            Filter::Patchwork { .. } => "Patchwork",
             Filter::Underpainting { .. } => "Underpainting",
         }
     }
@@ -787,6 +911,86 @@ impl Filter {
                 relief: at(4).max(0.0) as u32,
                 light: texture::Light::from_i32(at(5) as i32),
                 invert: at(6) != 0.0,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Graphic Pen" => Filter::GraphicPen {
+                stroke_length: p1.max(0.0) as u32,
+                balance: p2.max(0.0) as u32,
+                direction: brush_strokes::StrokeDirection::from_i32(p3 as i32),
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Halftone Pattern" => Filter::HalftonePattern {
+                size: p1.max(0.0) as u32,
+                contrast: p2.max(0.0) as u32,
+                pattern: sketch::HalftonePattern::from_i32(p3 as i32),
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Note Paper" => Filter::NotePaper {
+                balance: p1.max(0.0) as u32,
+                graininess: p2.max(0.0) as u32,
+                relief: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Photocopy" => Filter::Photocopy {
+                detail: p1.max(0.0) as u32,
+                darkness: p2.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Torn Edges" => Filter::TornEdges {
+                balance: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+                contrast: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Patchwork" => Filter::Patchwork {
+                square: p1.max(0.0) as u32,
+                relief: p2.max(0.0) as u32,
+            },
+            "Mosaic Tiles" => Filter::MosaicTiles {
+                size: p1.max(0.0) as u32,
+                grout: p2.max(0.0) as u32,
+                lighten: p3.max(0.0) as u32,
+            },
+            "Grain" => Filter::Grain {
+                intensity: p1.max(0.0) as u32,
+                contrast: p2.max(0.0) as u32,
+                kind: texture::GrainType::from_i32(p3 as i32),
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Craquelure" => Filter::Craquelure {
+                spacing: p1.max(0.0) as u32,
+                depth: p2.max(0.0) as u32,
+                brightness: p3.max(0.0) as u32,
+            },
+            "Water Paper" => Filter::WaterPaper {
+                fiber: p1.max(0.0) as u32,
+                brightness: p2.max(0.0) as u32,
+                contrast: p3.max(0.0) as u32,
+            },
+            "Stamp" => Filter::Stamp {
+                balance: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Reticulation" => Filter::Reticulation {
+                density: p1.max(0.0) as u32,
+                foreground_level: p2.max(0.0) as u32,
+                background_level: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+                background: crate::buffer::Rgba8::WHITE,
+            },
+            "Plaster" => Filter::Plaster {
+                balance: p1.max(0.0) as u32,
+                smoothness: p2.max(0.0) as u32,
+                light: texture::Light::from_i32(p3 as i32),
                 foreground: crate::buffer::Rgba8::BLACK,
                 background: crate::buffer::Rgba8::WHITE,
             },
@@ -1153,6 +1357,38 @@ impl Filter {
             Filter::Charcoal { .. } => None,
             // The paper's grain is laid by where on the canvas a pixel is.
             Filter::ConteCrayon { .. } => None,
+            // The strokes are laid by where on the canvas a pixel is, so a
+            // crop would land on a different part of the noise and its marks
+            // would not line up with the ones either side.
+            Filter::GraphicPen { .. } => None,
+            // The screen is laid by where on the canvas a pixel is — and the
+            // rings about the middle of the frame — so a crop would land on a
+            // different part of it and its cells would not line up with the
+            // ones either side.
+            Filter::HalftonePattern { .. } => None,
+            // The paper's grain is laid by where on the canvas a pixel is.
+            Filter::NotePaper { .. } => None,
+            // As far as the neighbourhood each pixel is compared with.
+            Filter::Photocopy { detail, .. } => Some(sketch::photocopy_reach(detail)),
+            // The ramp runs across the whole frame, so a crop would shade its
+            // own little ramp from black to white.
+            Filter::Plaster { .. } => None,
+            // The grain is laid by where on the canvas a pixel is.
+            Filter::Reticulation { .. } => None,
+            // As far as the melt blurs.
+            Filter::Stamp { smoothness, .. } => Some(sketch::stamp_reach(smoothness)),
+            // The grain is laid by where on the canvas a pixel is.
+            Filter::TornEdges { .. } => None,
+            // The fibres are laid by where on the canvas a pixel is.
+            Filter::WaterPaper { .. } => None,
+            // The cracks are laid by where on the canvas a pixel is.
+            Filter::Craquelure { .. } => None,
+            // The grain is laid by where on the canvas a pixel is.
+            Filter::Grain { .. } => None,
+            // The tiles are laid by where on the canvas a pixel is.
+            Filter::MosaicTiles { .. } => None,
+            // The squares are laid by where on the canvas a pixel is.
+            Filter::Patchwork { .. } => None,
             // The melt reaches as far as Smoothness blurs, and the waveform
             // magnifies whatever that changed.
             Filter::Chrome { smoothness, .. } => {
@@ -1423,6 +1659,102 @@ impl Filter {
                 relief,
                 light,
                 invert,
+                foreground,
+                background,
+            ),
+            Filter::GraphicPen {
+                stroke_length,
+                balance,
+                direction,
+                foreground,
+                background,
+            } => sketch::graphic_pen(
+                pixmap,
+                stroke_length,
+                balance,
+                direction,
+                foreground,
+                background,
+            ),
+            Filter::HalftonePattern {
+                size,
+                contrast,
+                pattern,
+                foreground,
+                background,
+            } => sketch::halftone_pattern(
+                pixmap,
+                size,
+                contrast,
+                pattern,
+                foreground,
+                background,
+            ),
+            Filter::NotePaper {
+                balance,
+                graininess,
+                relief,
+                foreground,
+                background,
+            } => sketch::note_paper(pixmap, balance, graininess, relief, foreground, background),
+            Filter::Photocopy {
+                detail,
+                darkness,
+                foreground,
+                background,
+            } => sketch::photocopy(pixmap, detail, darkness, foreground, background),
+            Filter::Plaster {
+                balance,
+                smoothness,
+                light,
+                foreground,
+                background,
+            } => sketch::plaster(pixmap, balance, smoothness, light, foreground, background),
+            Filter::Stamp {
+                balance,
+                smoothness,
+                foreground,
+                background,
+            } => sketch::stamp(pixmap, balance, smoothness, foreground, background),
+            Filter::TornEdges {
+                balance,
+                smoothness,
+                contrast,
+                foreground,
+                background,
+            } => sketch::torn_edges(pixmap, balance, smoothness, contrast, foreground, background),
+            Filter::WaterPaper {
+                fiber,
+                brightness,
+                contrast,
+            } => sketch::water_paper(pixmap, fiber, brightness, contrast),
+            Filter::Craquelure {
+                spacing,
+                depth,
+                brightness,
+            } => texture::craquelure(pixmap, spacing, depth, brightness),
+            Filter::Grain {
+                intensity,
+                contrast,
+                kind,
+                foreground,
+                background,
+            } => texture::grain(pixmap, intensity, contrast, kind, foreground, background),
+            Filter::Patchwork { square, relief } => texture::patchwork(pixmap, square, relief),
+            Filter::MosaicTiles { size, grout, lighten } => {
+                texture::mosaic_tiles(pixmap, size, grout, lighten)
+            }
+            Filter::Reticulation {
+                density,
+                foreground_level,
+                background_level,
+                foreground,
+                background,
+            } => sketch::reticulation(
+                pixmap,
+                density,
+                foreground_level,
+                background_level,
                 foreground,
                 background,
             ),
