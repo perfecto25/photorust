@@ -243,6 +243,7 @@
     { "id": "filter.traceContour",  "key": "",                   "name": "Trace Contour..." },
     { "id": "filter.wind",          "key": "",                   "name": "Wind..." },
     { "id": "filter.custom",        "key": "",                   "name": "Custom..." },
+    { "id": "filter.highPass",      "key": "",                   "name": "High Pass..." },
     { "id": "filter.glowingEdges",  "key": "",                   "name": "Glowing Edges..." },
     { "id": "filter.coloredPencil", "key": "",                   "name": "Colored Pencil..." },
     { "id": "filter.cutout",        "key": "",                   "name": "Cutout..." },
@@ -285,6 +286,9 @@
     { "id": "filter.grain",         "key": "",                   "name": "Grain..." },
     { "id": "filter.mosaicTiles",   "key": "",                   "name": "Mosaic Tiles..." },
     { "id": "filter.patchwork",     "key": "",                   "name": "Patchwork..." },
+    { "id": "filter.pictureFrame",  "key": "",                   "name": "Picture Frame..." },
+    { "id": "filter.stainedGlass",  "key": "",                   "name": "Stained Glass..." },
+    { "id": "filter.texturizer",    "key": "",                   "name": "Texturizer..." },
 
     { "id": "view.proofColors",     "key": "Ctrl+Y",             "name": "Proof Colors" },
     { "id": "view.gamutWarning",    "key": "Shift+Ctrl+Y",       "name": "Gamut Warning" },

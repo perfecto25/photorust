@@ -290,10 +290,22 @@ private:
     /// Open a file by path, telling the user if it could not be read — what
     /// File ▸ Open Recent needs.
     void openPath(const QString &path);
+    /// The tab already holding the file at `path`, or -1 if it is not open.
+    int openDocumentIndex(const QString &path) const;
     /// The work behind it: open the file into its own tab and return whether
     /// that worked, saying nothing either way. Opening several files at once
     /// reports on them together rather than one dialog at a time.
     bool loadPath(const QString &path);
+
+    /// Mark the start of a long job: the status bar's spinner and `text`
+    /// appear after a moment if the job is still going, or at once with
+    /// `showNow` — for work about to block the event loop, where the moment
+    /// would never come. Pair each with `endBusy`.
+    void beginBusy(const QString &text, bool showNow);
+    /// Change what the spinner says, and show it now if `showNow`, painting
+    /// straight away so it is up before the GUI thread blocks.
+    void setBusyText(const QString &text, bool showNow = false);
+    void endBusy();
     /// The remembered list, most recent first.
     QStringList recentFiles() const;
     /// Put a path at the top of it.
@@ -719,6 +731,14 @@ private:
     BrushPresetPicker *m_brushPicker = nullptr;
 
     QLabel *m_statusPosition = nullptr;
+
+    // The status bar's "working" indicator — a spinner and a line saying
+    // what on — shown while a large file opens. Counted rather than a flag,
+    // so opening several files at once shows it from the first to the last.
+    class BusyIndicator *m_busySpinner = nullptr;
+    QLabel *m_busyLabel = nullptr;
+    class QTimer *m_busyReveal = nullptr;
+    int m_busyDepth = 0;
     QLineEdit *m_statusZoom = nullptr;
     QLabel *m_statusDocSize = nullptr;
 

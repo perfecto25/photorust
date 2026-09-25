@@ -208,11 +208,34 @@ fn dither_threshold(column: i32, band: i32) -> f32 {
 /// 81%, 63%, 43%, 26%, 16%, 5% and 0%.
 const MEZZOTINT_GRAIN_CONTRAST: f32 = 1.35;
 
+/// How the line and stroke patterns' thresholds are bent away from mid-grey;
+/// see `MezzotintType::streaks`. Above 1 the thresholds bunch about the middle and
+/// straggle out towards the ends, which is what CS6's tone curve does: its
+/// Short Lines throws the tenth of the range either side of mid-grey 42% and
+/// 64% high — steeper than a plain bell of noise — yet still flecks 6% of
+/// the darkest tenth. The strokes fit best at the same value.
+const MEZZOTINT_LINE_SHAPE: f32 = 1.3;
+
+/// The shape of a line or stroke pattern's grain; see
+/// [`MezzotintType::streaks`].
+#[derive(Clone, Copy, Debug)]
+struct Streaks {
+    /// How far the grain reaches along a row, in pixels.
+    reach: f32,
+    /// How much of the grain reaches four times as far again.
+    tail: f32,
+    /// How far the grain is blurred down the column, in pixels. Nothing for
+    /// the lines, which are a pixel tall.
+    height: f32,
+    /// How far the thresholds spread either side of mid-grey.
+    spread: f32,
+}
+
 /// Which of CS6's ten Mezzotint patterns.
 ///
 /// Three families — dots, lines and strokes — at increasing coarseness. They
-/// differ only in the shape of the cell the random pattern is built on, which
-/// is the whole of the filter's variety.
+/// differ only in the shape of the random pattern the picture is thresholded
+/// against, which is the whole of the filter's variety.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum MezzotintType {
     #[default]
@@ -245,7 +268,7 @@ impl MezzotintType {
     }
 
     /// How far the dot patterns' grain is blurred, in pixels, or `None` for
-    /// the cell-based patterns.
+    /// Fine Dots and the line and stroke patterns.
     ///
     /// CS6's Medium, Grainy and Coarse Dots are not squares of 2, 3 and 4
     /// pixels, however the names read: its Coarse Dots over
@@ -265,23 +288,46 @@ impl MezzotintType {
         }
     }
 
-    /// The cell the pattern is laid on.
+    /// The grain of the line and stroke patterns, or `None` for the dots.
     ///
-    /// Dots are square, so their grain has no direction. Lines are wide and
-    /// one pixel tall, which is what draws them out into streaks. Strokes are
-    /// wide *and* a few pixels tall.
-    fn cell(self) -> (i32, i32) {
+    /// CS6's lines are not dashes of a set length. Over `samples/horse-3.jpg`
+    /// they run from a pixel or two to a few hundred, one pixel tall, and the
+    /// horse's highlights stay drawn through them. That is a threshold made of
+    /// noise smoothed along the row only: a streak is wherever it stays under
+    /// the picture's tone, so its length is random and grows the further the
+    /// tone is from mid-grey. A cell of fixed width thrown as a whole instead
+    /// gives every dash the same length and turns the picture into blocks.
+    ///
+    /// The longer lines owe their long streaks more to the **spread** than to
+    /// the reach. CS6 grows harsher from Short to Long: the tenth of the range
+    /// just above black is thrown high 8% of the time by Short Lines, 2% by
+    /// Medium and never by Long, so a light sky goes nearly solid and its few
+    /// dark streaks run on.
+    ///
+    /// The strokes are the same thing, thicker and more ragged. Each row of
+    /// CS6's agrees with the next about as well as a stroke two or three
+    /// pixels tall would, and hardly at all with the one after — and not in
+    /// fixed pairs, so it is a blur down the column rather than a taller cell.
+    /// Along the row the pattern forgets itself at two rates, most of it
+    /// within a pixel or two and the rest far later, which is the **tail**:
+    /// it is what leaves the odd stroke running on past the others. Medium
+    /// Strokes is softer than its neighbours either side — CS6 flecks a
+    /// twentieth of the darkest tones with it — and that is in the
+    /// measurement, not a slip.
+    ///
+    /// Every number was fitted to CS6's output, registered against the
+    /// source, on its tone curve and on how quickly the pattern forgets
+    /// itself along a row and down a column.
+    fn streaks(self) -> Option<Streaks> {
+        let streaks = |reach, tail, height, spread| Some(Streaks { reach, tail, height, spread });
         match self {
-            MezzotintType::FineDots => (1, 1),
-            // The dots past Fine are drawn from grain rather than cells;
-            // see `grain`.
-            MezzotintType::MediumDots | MezzotintType::GrainyDots | MezzotintType::CoarseDots => (1, 1),
-            MezzotintType::ShortLines => (4, 1),
-            MezzotintType::MediumLines => (9, 1),
-            MezzotintType::LongLines => (18, 1),
-            MezzotintType::ShortStrokes => (6, 2),
-            MezzotintType::MediumStrokes => (13, 3),
-            MezzotintType::LongStrokes => (26, 4),
+            MezzotintType::ShortLines => streaks(3.0, 0.0, 0.0, 0.21),
+            MezzotintType::MediumLines => streaks(6.0, 0.0, 0.0, 0.13),
+            MezzotintType::LongLines => streaks(9.0, 0.0, 0.0, 0.09),
+            MezzotintType::ShortStrokes => streaks(1.5, 0.5, 0.7, 0.14),
+            MezzotintType::MediumStrokes => streaks(2.0, 0.7, 0.7, 0.22),
+            MezzotintType::LongStrokes => streaks(5.0, 0.7, 0.7, 0.14),
+            _ => None,
         }
     }
 }
@@ -308,7 +354,6 @@ pub fn mezzotint(pixmap: &mut Pixmap, kind: MezzotintType) {
     if pixmap.is_empty() {
         return;
     }
-    let (cell_w, cell_h) = kind.cell();
     let width = pixmap.width() as i32;
     let height = pixmap.height() as i32;
     let source = pixmap.clone();
@@ -332,7 +377,8 @@ pub fn mezzotint(pixmap: &mut Pixmap, kind: MezzotintType) {
         field.par_iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-MEZZOTINT_GRAIN_CONTRAST * *v).exp()));
         field
     });
-    let grain = grain.as_deref();
+    let field = grain.or_else(|| kind.streaks().map(|streaks| streak_field(width, height, streaks)));
+    let field = field.as_deref();
 
     pixmap
         .as_bytes_mut()
@@ -340,44 +386,95 @@ pub fn mezzotint(pixmap: &mut Pixmap, kind: MezzotintType) {
         .enumerate()
         .for_each(|(row, out)| {
             let y = row as i32;
-            let band = y.div_euclid(cell_h);
-            // Every row of cells starts at a different place, so the grain
-            // comes out ragged instead of ruled into a grid. Left aligned, a
-            // cell bigger than a pixel reads as a block of pixel art rather
-            // than as a speck of ink.
-            let offset = (jitter(band, 0, 7) * cell_w as f32) as i32;
-
-            if let Some(grain) = grain {
-                for x in 0..width {
-                    let i = x as usize * 4;
-                    let own = src.get(x, y);
-                    let threshold = grain[row * width as usize + x as usize];
-                    for (c, level) in [own.r, own.g, own.b].into_iter().enumerate() {
-                        out[i + c] = if level as f32 / 255.0 > threshold { 255 } else { 0 };
-                    }
-                    out[i + 3] = own.a;
-                }
-                return;
-            }
             for x in 0..width {
-                let column = (x + offset).div_euclid(cell_w);
-                // The middle of the cell stands for all of it, so the whole
-                // cell is thrown the same way and the grain stays the size it
-                // is meant to be.
-                let cx = (column * cell_w - offset + cell_w / 2).clamp(0, width - 1);
-                let cy = (band * cell_h + cell_h / 2).clamp(0, height - 1);
-                let centre = src.get(cx, cy);
-
                 let i = x as usize * 4;
-                let threshold = dither_threshold(column, band);
-                for (c, level) in [centre.r, centre.g, centre.b].into_iter().enumerate() {
+                let own = src.get(x, y);
+                // Each pixel is decided on its own tone, so the picture's
+                // detail is drawn through the pattern rather than lost under
+                // it.
+                let threshold = match field {
+                    Some(field) => field[row * width as usize + x as usize],
+                    None => dither_threshold(x, y),
+                };
+                for (c, level) in [own.r, own.g, own.b].into_iter().enumerate() {
                     out[i + c] = if level as f32 / 255.0 > threshold { 255 } else { 0 };
                 }
                 // Transparency is left where it was: this is a printing
                 // process, not an eraser.
-                out[i + 3] = src.get(x, y).a;
+                out[i + 3] = own.a;
             }
         });
+}
+
+/// The line and stroke patterns' threshold: white noise smoothed along each
+/// row, blurred a little down the column for the strokes, then spread about
+/// mid-grey. See [`MezzotintType::streaks`].
+///
+/// Not a GPU candidate: each row is a pair of sequential recurrences, and the
+/// whole filter is a cheap single pass over the image.
+fn streak_field(width: i32, height: i32, streaks: Streaks) -> Vec<f32> {
+    let mut field = row_smoothed(width, height, streaks.reach, 5);
+    if streaks.tail > 0.0 {
+        let tail = row_smoothed(width, height, streaks.reach * 4.0, 6);
+        let (near, far) = ((1.0 - streaks.tail).sqrt(), streaks.tail.sqrt());
+        field.par_iter_mut().zip(tail.par_iter()).for_each(|(v, t)| *v = near * *v + far * t);
+    }
+    if streaks.height > 0.0 {
+        blur_columns(&mut field, width as usize, height as usize, streaks.height);
+    }
+    crate::filters::brush_strokes::unit_spread(&mut field);
+    field
+        .par_iter_mut()
+        .for_each(|v| *v = 0.5 + streaks.spread * v.signum() * v.abs().powf(MEZZOTINT_LINE_SHAPE));
+    field
+}
+
+/// White noise smoothed along each row by an exponential run forwards and
+/// back, spread to unit size.
+///
+/// The exponential rather than a Gaussian because CS6's streaks have a long
+/// tail — the odd one runs on far past the rest — and a Gaussian cuts its
+/// grain off sharply.
+fn row_smoothed(width: i32, height: i32, reach: f32, salt: u32) -> Vec<f32> {
+    let w = width as usize;
+    // Noise is drawn past both ends, so a streak reaching the edge is the
+    // same as one anywhere else rather than dying away into it.
+    let pad = (reach * 6.0).ceil() as i32;
+    let keep = (-1.0 / reach).exp();
+    let mut field = vec![0.0f32; w * height as usize];
+    field.par_chunks_exact_mut(w).enumerate().for_each(|(y, out)| {
+        let mut run: Vec<f32> = Vec::with_capacity(w + 2 * pad as usize);
+        let mut state = 0.0;
+        for x in -pad..width + pad {
+            state = keep * state + (1.0 - keep) * (jitter(x, y as i32, salt) - 0.5);
+            run.push(state);
+        }
+        let mut state = 0.0;
+        for v in run.iter_mut().rev() {
+            state = keep * state + (1.0 - keep) * *v;
+            *v = state;
+        }
+        out.copy_from_slice(&run[pad as usize..pad as usize + w]);
+    });
+    crate::filters::brush_strokes::unit_spread(&mut field);
+    field
+}
+
+/// A Gaussian blur of a floating-point field down its columns only, with the
+/// edge rows standing in for what is past them.
+fn blur_columns(field: &mut [f32], width: usize, height: usize, sigma: f32) {
+    let taps = (sigma * 3.0).ceil() as i32;
+    let kernel = crate::filters::convolve::gaussian_kernel_1d(sigma, taps);
+    let source = field.to_vec();
+    field.par_chunks_exact_mut(width).enumerate().for_each(|(y, out)| {
+        out.fill(0.0);
+        for (i, weight) in kernel.iter().enumerate() {
+            let from = (y as i32 + i as i32 - taps).clamp(0, height as i32 - 1) as usize;
+            for (v, s) in out.iter_mut().zip(&source[from * width..(from + 1) * width]) {
+                *v += weight * s;
+            }
+        }
+    });
 }
 
 /// How far apart two colours are, summed across the three channels.
@@ -1161,6 +1258,76 @@ mod tests {
             "Long Lines changes {} times across and {} times down, which is not a line",
             across,
             down
+        );
+    }
+
+    #[test]
+    fn lines_come_in_every_length() {
+        // CS6's lines are streaks of random length, a pixel or two up to a few
+        // hundred. Laid on cells of a fixed width, every dash comes out the
+        // same length and the result reads as ruled hatching.
+        let mut px = flat(400, Rgba8::new(64, 64, 64, 255));
+        mezzotint(&mut px, MezzotintType::MediumLines);
+        let mut runs = Vec::new();
+        for y in 0..400 {
+            let mut start = 0;
+            for x in 1..=400 {
+                if x == 400 || px.get(x, y).r != px.get(x - 1, y).r {
+                    if start > 0 && x < 400 {
+                        runs.push(x - start);
+                    }
+                    start = x;
+                }
+            }
+        }
+        runs.sort_unstable();
+        let at = |q: f32| runs[((runs.len() - 1) as f32 * q) as usize];
+        assert!(at(0.25) <= 5, "a quarter of the runs should be short, but the quartile is {}", at(0.25));
+        assert!(at(0.9) >= 25, "a tenth of the runs should be long, but the 90th percentile is {}", at(0.9));
+    }
+
+    #[test]
+    fn strokes_are_taller_than_lines() {
+        // A stroke is a line with some height to it: CS6's rows agree with
+        // the one below in a stroke pattern, and are independent in a line
+        // pattern. Without that the two families are the same filter.
+        let changes_down = |kind| {
+            let mut px = flat(200, Rgba8::new(128, 128, 128, 255));
+            mezzotint(&mut px, kind);
+            (1..200)
+                .flat_map(|y| (0..200).map(move |x| (x, y)))
+                .filter(|&(x, y)| px.get(x, y).r != px.get(x, y - 1).r)
+                .count()
+        };
+        let lines = changes_down(MezzotintType::ShortLines);
+        let strokes = changes_down(MezzotintType::ShortStrokes);
+        assert!(
+            strokes * 4 < lines * 3,
+            "Short Strokes changes {} times down a column and Short Lines {}",
+            strokes,
+            lines
+        );
+    }
+
+    #[test]
+    fn longer_lines_are_harsher() {
+        // CS6's longer line types throw a dark grey high less often: their
+        // thresholds bunch closer to mid-grey, which is what lets a light sky
+        // go nearly solid and its few dark streaks run on.
+        let lit = |kind| {
+            let mut px = flat(200, Rgba8::new(60, 60, 60, 255));
+            mezzotint(&mut px, kind);
+            px.as_bytes().chunks_exact(4).filter(|p| p[0] > 0).count()
+        };
+        let short = lit(MezzotintType::ShortLines);
+        let medium = lit(MezzotintType::MediumLines);
+        let long = lit(MezzotintType::LongLines);
+        assert!(
+            short > medium && medium > long,
+            "a dark grey was lit {}, {} and {} times by Short, Medium and Long Lines",
+            short,
+            medium,
+            long
         );
     }
 

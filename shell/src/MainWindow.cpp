@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 
+#include "BusyIndicator.h"
 #include "SliderPopup.h"
 
 #include "canvas/CanvasView.h"
@@ -67,6 +68,8 @@
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
+#include <thread>
+#include <QEventLoop>
 #include <QAbstractButton>
 #include <QActionGroup>
 #include <QApplication>
@@ -2259,8 +2262,8 @@ void MainWindow::createMenus()
     pixelate->addAction(command(QStringLiteral("filter.pointillize"), tr("&Pointillize..."),
                                 [this] { applyFilter(QStringLiteral("Pointillize")); }));
 
-    // CS6's Render submenu. Only Flame is built; the rest are listed and
-    // disabled so what is missing is visible.
+    // CS6's Render submenu. Tree is listed and disabled so what is missing is
+    // visible.
     QMenu *render = filter->addMenu(tr("&Render"));
     render->addAction(command(QStringLiteral("filter.flame"), tr("&Flame..."),
                               &MainWindow::showFlame));
@@ -2276,7 +2279,9 @@ void MainWindow::createMenus()
     render->addAction(command(QStringLiteral("filter.lightingEffects"),
                               tr("Li&ghting Effects..."),
                               [this] { applyFilter(QStringLiteral("Lighting Effects")); }));
-    for (const QString &entry : {tr("Pictu&re Frame..."), tr("&Tree...")}) {
+    render->addAction(command(QStringLiteral("filter.pictureFrame"), tr("Pictu&re Frame..."),
+                              [this] { applyFilter(QStringLiteral("Picture Frame")); }));
+    for (const QString &entry : {tr("&Tree...")}) {
         QAction *action = render->addAction(entry);
         action->setEnabled(false);
         action->setStatusTip(tr("%1 is not implemented")
@@ -2369,8 +2374,7 @@ void MainWindow::createMenus()
                                [this] { applyFilter(QStringLiteral("Glowing Edges")); }));
 
     // CS6's Texture submenu, which also lives in the Filter Gallery, in the
-    // Gallery's order. Craquelure, Grain, Mosaic Tiles and Patchwork are
-    // built; the rest are listed and disabled so what is missing is visible.
+    // Gallery's order.
     QMenu *textureMenu = filter->addMenu(tr("&Texture"));
     textureMenu->addAction(command(QStringLiteral("filter.craquelure"), tr("&Craquelure..."),
                                    [this] { applyFilter(QStringLiteral("Craquelure")); }));
@@ -2380,21 +2384,20 @@ void MainWindow::createMenus()
                                    [this] { applyFilter(QStringLiteral("Mosaic Tiles")); }));
     textureMenu->addAction(command(QStringLiteral("filter.patchwork"), tr("&Patchwork..."),
                                    [this] { applyFilter(QStringLiteral("Patchwork")); }));
-    for (const QString &entry : {
-                                  tr("&Stained Glass..."), tr("&Texturizer...")}) {
-        QAction *action = textureMenu->addAction(entry);
-        action->setEnabled(false);
-        action->setStatusTip(tr("%1 is not implemented")
-                                  .arg(QString(entry).remove(QLatin1Char('&'))
-                                           .remove(QStringLiteral("..."))));
-    }
+    textureMenu->addAction(command(QStringLiteral("filter.stainedGlass"),
+                                   tr("&Stained Glass..."),
+                                   [this] { applyFilter(QStringLiteral("Stained Glass")); }));
+    textureMenu->addAction(command(QStringLiteral("filter.texturizer"), tr("&Texturizer..."),
+                                   [this] { applyFilter(QStringLiteral("Texturizer")); }));
 
-    // CS6's Other submenu, in its order. Custom is built; the rest are listed
-    // and disabled so what is missing is visible.
+    // CS6's Other submenu, in its order. Custom and High Pass are built; the
+    // rest are listed and disabled so what is missing is visible.
     QMenu *other = filter->addMenu(tr("Ot&her"));
     other->addAction(command(QStringLiteral("filter.custom"), tr("&Custom..."),
                              [this] { applyFilter(QStringLiteral("Custom")); }));
-    for (const QString &entry : {tr("&High Pass..."), tr("&HSB/HSL"), tr("Ma&ximum..."),
+    other->addAction(command(QStringLiteral("filter.highPass"), tr("&High Pass..."),
+                             [this] { applyFilter(QStringLiteral("High Pass")); }));
+    for (const QString &entry : {tr("&HSB/HSL"), tr("Ma&ximum..."),
                                   tr("Mi&nimum..."), tr("&Offset...")}) {
         QAction *action = other->addAction(entry);
         action->setEnabled(false);
@@ -5760,6 +5763,63 @@ void MainWindow::createStatusBar()
     m_statusPosition = new QLabel(this);
     m_statusPosition->setMinimumWidth(120);
     statusBar()->addPermanentWidget(m_statusPosition);
+
+    // Hidden until something takes long enough to need it.
+    m_busySpinner = new BusyIndicator(this);
+    m_busyLabel = new QLabel(this);
+    m_busyLabel->hide();
+    statusBar()->addWidget(m_busySpinner);
+    statusBar()->addWidget(m_busyLabel);
+    m_busyReveal = new QTimer(this);
+    m_busyReveal->setSingleShot(true);
+    // Long enough that an ordinary photograph opens without the spinner
+    // flickering up and away again.
+    m_busyReveal->setInterval(300);
+    connect(m_busyReveal, &QTimer::timeout, this, [this] {
+        if (m_busyDepth > 0) {
+            setBusyText(m_busyLabel->text(), true);
+        }
+    });
+}
+
+void MainWindow::beginBusy(const QString &text, bool showNow)
+{
+    if (m_busyDepth++ == 0) {
+        QApplication::setOverrideCursor(Qt::BusyCursor);
+    }
+    m_busyLabel->setText(text);
+    if (showNow) {
+        setBusyText(text, true);
+    } else if (!m_busySpinner->isSpinning()) {
+        m_busyReveal->start();
+    }
+}
+
+void MainWindow::setBusyText(const QString &text, bool showNow)
+{
+    m_busyLabel->setText(text);
+    if (showNow && !m_busySpinner->isSpinning()) {
+        m_busyReveal->stop();
+        m_busySpinner->start();
+        m_busyLabel->show();
+    }
+    if (m_busySpinner->isSpinning()) {
+        // Painted now, not on the next pass of the event loop: the caller
+        // may be about to block it, and a spinner that only appears once the
+        // work is over says nothing.
+        statusBar()->repaint();
+    }
+}
+
+void MainWindow::endBusy()
+{
+    if (m_busyDepth == 0 || --m_busyDepth > 0) {
+        return;
+    }
+    m_busyReveal->stop();
+    m_busySpinner->stop();
+    m_busyLabel->hide();
+    QApplication::restoreOverrideCursor();
 }
 
 void MainWindow::refreshDocumentTabs()
@@ -5941,6 +6001,24 @@ void MainWindow::openDocument()
     }
 }
 
+int MainWindow::openDocumentIndex(const QString &path) const
+{
+    if (!m_engine) {
+        return -1;
+    }
+    const QString wanted = QFileInfo(path).canonicalFilePath();
+    if (wanted.isEmpty()) {
+        return -1;
+    }
+    for (int i = 0; i < m_engine->documentCount(); ++i) {
+        const QString open = m_engine->documentPathAt(i);
+        if (!open.isEmpty() && QFileInfo(open).canonicalFilePath() == wanted) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 void MainWindow::openPath(const QString &path)
 {
     if (!loadPath(path)) {
@@ -5954,6 +6032,32 @@ void MainWindow::openPath(const QString &path)
 
 bool MainWindow::loadPath(const QString &path)
 {
+    // A file that is already open is brought forward rather than opened a
+    // second time, as Photoshop does: two tabs of one file would each save
+    // over the other's changes. Compared by canonical path, so the same file
+    // reached through a symlink or a relative path still counts.
+    const int already = openDocumentIndex(path);
+    if (already >= 0) {
+        if (m_canvas && m_canvas->isFreeTransforming()) {
+            m_canvas->cancelFreeTransform();
+        }
+        m_engine->setActiveDocument(already);
+        rememberRecentFile(path);
+        refreshAll();
+        return true;
+    }
+
+    // The spinner, for as long as this takes. A file this big is shown at
+    // once: parts of opening it block the GUI thread, and the delayed reveal
+    // cannot fire while they do.
+    constexpr qint64 kLargeFileBytes = 32 * 1024 * 1024;
+    const QString name = QFileInfo(path).fileName();
+    beginBusy(tr("Opening %1…").arg(name), QFileInfo(path).size() >= kLargeFileBytes);
+    struct EndBusy {
+        MainWindow *window;
+        ~EndBusy() { window->endBusy(); }
+    } endBusy{this};
+
     // An animated GIF is several images in one file, and opening only the
     // first would throw the rest away without saying so.
     if (openAnimatedFrames(path)) {
@@ -5963,15 +6067,52 @@ bool MainWindow::loadPath(const QString &path)
         return true;
     }
 
-    if (!m_engine->openFile(path)) {
-        // The engine reads PSD itself and delegates the rest to Qt's plugins;
-        // if it declined, try decoding here and handing the pixels over.
-        // Through a reader rather than QImage's constructor, so a photograph's
-        // EXIF orientation is applied on this path too.
-        QImageReader reader(path);
-        reader.setAutoTransform(true);
-        const QImage image = reader.read();
-        if (image.isNull() || !m_engine->loadImage(image, path)) {
+    // The engine reads PSD itself, layers and all. Everything else — and a
+    // PSD the engine could not read, if a Qt plugin can — is decoded here and
+    // handed over as one block of bytes.
+    const bool psd = path.endsWith(QStringLiteral(".psd"), Qt::CaseInsensitive);
+    if (!psd || !m_engine->openFile(path)) {
+        // Decoded on a worker thread — two seconds for a 16000-pixel PNG —
+        // while this one keeps the window painted and the spinner turning.
+        // User input is held back meanwhile: a click that closed a tab or
+        // opened another file halfway through would pull the engine out
+        // from under this.
+        QImage image;
+        {
+            QEventLoop wait;
+            std::thread worker([&image, &wait, path] {
+                // Through a reader rather than QImage's constructor, so a
+                // photograph's EXIF orientation is applied.
+                QImageReader reader(path);
+                reader.setAutoTransform(true);
+                QImage decoded = reader.read();
+                // Straight-alpha RGBA, four bytes a pixel with no row padding,
+                // is the engine's own layout. Converted as an rvalue so Qt
+                // can do it in place where the depth allows, rather than
+                // holding two copies of a gigabyte picture at once.
+                if (!decoded.isNull()) {
+                    decoded = std::move(decoded).convertToFormat(QImage::Format_RGBA8888);
+                }
+                image = std::move(decoded);
+                // Queued, so it lands once `exec` below is running even if
+                // the decode finishes first.
+                QMetaObject::invokeMethod(&wait, [&wait] { wait.quit(); }, Qt::QueuedConnection);
+            });
+            wait.exec(QEventLoop::ExcludeUserInputEvents);
+            worker.join();
+        }
+        if (image.isNull() || image.bytesPerLine() != image.width() * 4) {
+            return false;
+        }
+        // What follows — copying the pixels in, building the document and
+        // drawing it the first time — runs here and blocks, so for a big
+        // picture the spinner is put up now, while it can still paint.
+        constexpr qint64 kLargePixels = 40'000'000;
+        setBusyText(tr("Preparing %1…").arg(name),
+                    qint64(image.width()) * image.height() >= kLargePixels);
+        const rust::Slice<const std::uint8_t> bytes(image.constBits(),
+                                                   size_t(image.sizeInBytes()));
+        if (!m_engine->loadImageRgba(bytes, image.width(), image.height(), path)) {
             return false;
         }
     }
@@ -7144,7 +7285,9 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
         || name == QLatin1String("Stamp") || name == QLatin1String("Torn Edges")
         || name == QLatin1String("Water Paper") || name == QLatin1String("Craquelure")
         || name == QLatin1String("Grain") || name == QLatin1String("Mosaic Tiles")
-        || name == QLatin1String("Patchwork");
+        || name == QLatin1String("Patchwork") || name == QLatin1String("Stained Glass")
+        || name == QLatin1String("Texturizer") || name == QLatin1String("Picture Frame")
+        || name == QLatin1String("High Pass");
     if (takesParameters && !skipDialog) {
         // Whatever the dialog was last given, or its own default.
         auto preset = [&presets](int slot, float fallback) {
@@ -7199,6 +7342,9 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
             // the darkest and lightest tones. Named here rather than left out
             // so it is clear what is missing, not that it was forgotten.
             dialog.addDisabledNote(tr("Shadows / Highlights — not implemented"));
+        } else if (name == QLatin1String("High Pass")) {
+            // CS6's one field, to a tenth of a pixel, over its range.
+            dialog.addParameter(tr("Radius:"), 0.1, 1000.0, preset(0, 10.0f), 1, tr(" Pixels"));
         } else if (name == QLatin1String("Unsharp Mask")) {
             dialog.addParameter(tr("Amount:"), 0.0, 5.0, preset(0, 1.0f), 2);
             dialog.addParameter(tr("Radius:"), 0.1, 250.0, preset(1, 1.0f), 1, tr(" Pixels"));
@@ -7481,6 +7627,116 @@ void MainWindow::applyFilterWith(const QString &name, const QList<float> &preset
             // ranges.
             dialog.addParameter(tr("Square Size:"), 0, 10, preset(0, 4.0f), 0);
             dialog.addParameter(tr("Relief:"), 0, 25, preset(1, 8.0f), 0);
+        } else if (name == QLatin1String("Picture Frame")) {
+            // CS6's Basic and Advanced tabs, in its order.
+            static const char *const frames[] = {
+                "Happy Vine", "Pretty Vine", "Smoke Signals", "Party", "Big Curls", "Tilde",
+                "Romance", "Curly Dance", "Wisps", "Spring Weed", "Eyelash", "Magic Smoke",
+                "Curly Vine", "Chainmail", "Fun Event", "Bush", "Simple Lace", "Pulse", "Root", "Snakes", "Mustache", "Circle Sprinkle", "Aligned Flowers",
+                "Little Flowers", "Snowflakes", "Flurry", "Check Marks", "Focused Lines",
+                "Focused Parallel Lines", "Focused Vibration", "Zen Garden", "Spikes", "Anemone",
+                "Pinwheel", "Spacing", "Line Box", "Rounded Corners", "Inverse Rounded Corners 1",
+                "Inverse Rounded Corners 2", "Dual Rounded Corners 1", "Dual Rounded Corners 2",
+                "Art Frame", "Rounded Art Frame", "Inverse Rounded Art Frame 1",
+                "Inverse Rounded Art Frame 2", "Dual Rounded Art Frame 1",
+                "Dual Rounded Art Frame 2"};
+            static const char *const flowers[] = {
+                "Small Circle", "Circle", "Star Flower", "Small Flower", "Orbit", "Pinwheel",
+                "Petals", "Sunflower Gate", "Rose", "Grass Circle", "Sun", "Broken Line Circle",
+                "Magical Door", "Twinkle", "Shiny Star", "Star Cloud", "Round Plus", "Plus Mark",
+                "Heart", "Star", "Snow Flake", "Cat's Footprint"};
+            static const char *const leaves[] = {
+                "Circle", "Square", "Drop 1", "Leaf 1", "Drop 2", "Drop 3", "Leaf 2", "Puff",
+                "Leaf 3", "Ginkgo leaf", "Triangle", "Leaf 4", "Star 1", "Oval", "Trapezoid",
+                "Lollipop 1", "Leaf 5", "Star 2", "Lollipop 2", "Cross", "Heart", "T", "Star 3"};
+            // "N: Name", numbered as CS6 numbers them; `from` is the first
+            // number, and None comes first where the list offers it.
+            auto numbered = [this](const char *const *names, int count, int from, bool none,
+                                   QStringList &items, QList<double> &values) {
+                if (none) {
+                    items << tr("None");
+                    values << 0.0;
+                }
+                for (int i = 0; i < count; ++i) {
+                    items << QStringLiteral("%1: %2").arg(from + i).arg(tr(names[i]));
+                    values << double(from + i);
+                }
+            };
+            QStringList frameItems, flowerItems, leafItems;
+            QList<double> frameValues, flowerValues, leafValues;
+            numbered(frames, 47, 1, false, frameItems, frameValues);
+            numbered(flowers, 22, 1, true, flowerItems, flowerValues);
+            numbered(leaves, 23, 1, true, leafItems, leafValues);
+
+            dialog.beginTab(tr("Basic"));
+            const int frame = dialog.addChoice(tr("Frame:"), frameItems, frameValues,
+                                               int(preset(0, 34.0f)) - 1);
+            // Which of vine, flower and leaf the chosen frame draws with, so
+            // the controls for the others grey out as CS6's do. The same
+            // table as the engine's `frame::uses`.
+            auto chosen = [&dialog, frame] { return int(dialog.parameterValue(frame)); };
+            auto vine = [chosen] {
+                const int f = chosen();
+                return !(f == 22 || f == 23 || (f >= 24 && f <= 26) || f == 33 || f == 35);
+            };
+            auto flower = [chosen] { return chosen() <= 35; };
+            auto leaf = [chosen] {
+                const int f = chosen();
+                return f == 5 || (f >= 11 && f <= 13) || f == 16 || f == 18 || f == 19
+                    || (f >= 24 && f <= 26);
+            };
+            // And `frame::uses_lines`: the frames drawn in lines.
+            auto lines = [chosen] {
+                const int f = chosen();
+                return f == 14 || (f >= 28 && f <= 30);
+            };
+            auto colour = [&preset](int slot, QColor fallback) {
+                return QColor(int(preset(slot, float(fallback.red()))),
+                              int(preset(slot + 1, float(fallback.green()))),
+                              int(preset(slot + 2, float(fallback.blue()))));
+            };
+            dialog.addColorButton(tr("Vine Color:"), colour(1, QColor(60, 84, 34)), vine);
+            dialog.addParameter(tr("Margin:"), 0, 100, preset(4, 14.0f), 0);
+            dialog.addParameter(tr("Size:"), 1, 100, preset(5, 20.0f), 0);
+            dialog.addParameter(tr("Arrangement:"), 1, 20, preset(6, 1.0f), 0);
+            dialog.addChoice(tr("Flower:"), flowerItems, flowerValues, int(preset(7, 2.0f)), {},
+                             flower);
+            dialog.addColorButton(tr("Flower Color:"), colour(8, QColor(0, 88, 218)), flower);
+            dialog.addParameter(tr("Flower Size:"), 1, 100, preset(11, 20.0f), 0, QString(),
+                                true, flower);
+            dialog.addChoice(tr("Leaf:"), leafItems, leafValues, int(preset(12, 4.0f)), {}, leaf);
+            dialog.addColorButton(tr("Leaf Color:"), colour(13, QColor(104, 170, 60)), leaf);
+            dialog.addParameter(tr("Leaf Size:"), 1, 100, preset(16, 20.0f), 0, QString(), true,
+                                leaf);
+
+            dialog.beginTab(tr("Advanced"));
+            dialog.addParameter(tr("Number of Lines:"), 1, 30, preset(17, 15.0f), 0, QString(),
+                                true, lines);
+            dialog.addParameter(tr("Thickness:"), 1, 200, preset(18, 29.0f), 0);
+            dialog.addParameter(tr("Angle:"), 0, 360, preset(19, 10.0f), 0);
+            dialog.addParameter(tr("Fade:"), 0, 100, preset(20, 0.0f), 0);
+            dialog.addCheckBox(tr("Invert"), preset(21, 0.0f) != 0.0);
+        } else if (name == QLatin1String("Texturizer")) {
+            // Nothing but the texture block CS6 shares with Rough Pastels,
+            // Underpainting and Conte Crayon, with Texturizer's own defaults.
+            dialog.addChoice(tr("Texture:"),
+                             {tr("Brick"), tr("Burlap"), tr("Canvas"), tr("Sandstone")},
+                             {0.0, 1.0, 2.0, 3.0}, int(preset(0, 2.0f)));
+            dialog.addParameter(tr("Scaling:"), 50, 200, preset(1, 100.0f), 0, tr(" %"));
+            dialog.addParameter(tr("Relief:"), 0, 50, preset(2, 4.0f), 0);
+            dialog.addChoice(tr("Light:"),
+                             {tr("Bottom"), tr("Bottom Left"), tr("Left"), tr("Top Left"),
+                              tr("Top"), tr("Top Right"), tr("Right"), tr("Bottom Right")},
+                             {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, int(preset(3, 4.0f)));
+            dialog.addCheckBox(tr("Invert"), preset(4, 0.0f) != 0.0);
+            dialog.addDisabledNote(tr("Load Texture... is not implemented"));
+        } else if (name == QLatin1String("Stained Glass")) {
+            // The Filter Gallery's three sliders, in its order and over its
+            // ranges. The lead is the foreground colour, which the engine
+            // reads for itself.
+            dialog.addParameter(tr("Cell Size:"), 2, 50, preset(0, 10.0f), 0);
+            dialog.addParameter(tr("Border Thickness:"), 1, 20, preset(1, 4.0f), 0);
+            dialog.addParameter(tr("Light Intensity:"), 0, 10, preset(2, 3.0f), 0);
         } else if (name == QLatin1String("Mosaic Tiles")) {
             // The Filter Gallery's three sliders, in its order and over its
             // ranges.
@@ -8370,6 +8626,13 @@ void MainWindow::closeDocument()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Mid-open, the load is still on the stack waiting for its worker; the
+    // window cannot go out from under it. The close is simply refused, and
+    // can be asked for again in a moment.
+    if (m_busyDepth > 0) {
+        event->ignore();
+        return;
+    }
     if (confirmDiscardAll()) {
         event->accept();
     } else {

@@ -76,6 +76,9 @@ private slots:
     void tornEdgesCollectsBalanceThenSmoothnessThenContrast();
     void waterPaperCollectsFiberThenBrightnessThenContrast();
     void craquelureCollectsSpacingThenDepthThenBrightness();
+    void stainedGlassCollectsCellSizeThenBorderThenLight();
+    void texturizerCollectsTheTextureBlockAlone();
+    void aChoiceCanFollowAnotherControl();
     void grainCollectsIntensityThenContrastThenType();
     void mosaicTilesCollectsSizeThenGroutThenLighten();
     void patchworkCollectsSquareSizeThenRelief();
@@ -1036,6 +1039,74 @@ void TestFilterDialog::craquelureCollectsSpacingThenDepthThenBrightness()
     QCOMPARE(depth, 1);
     QCOMPARE(brightness, 2);
     QCOMPARE(dialog.parameters(), QList<float>({15.0f, 6.0f, 9.0f}));
+}
+
+void TestFilterDialog::stainedGlassCollectsCellSizeThenBorderThenLight()
+{
+    // Three sliders read positionally by the engine; the lead's colour is
+    // not among them, because it is the foreground swatch.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Stained Glass"));
+    const int cell = dialog.addParameter(QStringLiteral("Cell Size:"), 2, 50, 10);
+    const int border = dialog.addParameter(QStringLiteral("Border Thickness:"), 1, 20, 4);
+    const int light = dialog.addParameter(QStringLiteral("Light Intensity:"), 0, 10, 3);
+
+    QCOMPARE(cell, 0);
+    QCOMPARE(border, 1);
+    QCOMPARE(light, 2);
+    QCOMPARE(dialog.parameters(), QList<float>({10.0f, 4.0f, 3.0f}));
+}
+
+void TestFilterDialog::texturizerCollectsTheTextureBlockAlone()
+{
+    // The texture block with nothing before it, so the engine reads Texture
+    // first rather than third as it does for Underpainting.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Texturizer"));
+    const int texture = dialog.addChoice(
+        QStringLiteral("Texture:"),
+        {QStringLiteral("Brick"), QStringLiteral("Burlap"), QStringLiteral("Canvas"),
+         QStringLiteral("Sandstone")},
+        {0.0, 1.0, 2.0, 3.0}, 2);
+    const int scaling = dialog.addParameter(QStringLiteral("Scaling:"), 50, 200, 100);
+    const int relief = dialog.addParameter(QStringLiteral("Relief:"), 0, 50, 4);
+    const int light = dialog.addChoice(
+        QStringLiteral("Light:"),
+        {QStringLiteral("Bottom"), QStringLiteral("Bottom Left"), QStringLiteral("Left"),
+         QStringLiteral("Top Left"), QStringLiteral("Top"), QStringLiteral("Top Right"),
+         QStringLiteral("Right"), QStringLiteral("Bottom Right")},
+        {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}, 4);
+    const int invert = dialog.addCheckBox(QStringLiteral("Invert"), false);
+
+    QCOMPARE(texture, 0);
+    QCOMPARE(scaling, 1);
+    QCOMPARE(relief, 2);
+    QCOMPARE(light, 3);
+    QCOMPARE(invert, 4);
+    QCOMPARE(dialog.parameters(), QList<float>({2.0f, 100.0f, 4.0f, 4.0f, 0.0f}));
+}
+
+void TestFilterDialog::aChoiceCanFollowAnotherControl()
+{
+    // Picture Frame greys its Leaf list out for the frames that have no
+    // leaves; the list still fills its slot either way.
+    Engine engine;
+    FilterPreviewDialog dialog(&engine, QStringLiteral("Picture Frame"));
+    const int frame = dialog.addChoice(QStringLiteral("Frame:"),
+                                       {QStringLiteral("18: Pulse"), QStringLiteral("22: Circle Sprinkle")},
+                                       {18.0, 22.0}, 1);
+    const int leaf = dialog.addChoice(
+        QStringLiteral("Leaf:"), {QStringLiteral("None"), QStringLiteral("1: Circle")}, {0.0, 1.0}, 1,
+        {}, [&dialog, frame] { return dialog.parameterValue(frame) == 18.0f; });
+    dialog.show();
+
+    auto *combo = qobject_cast<QComboBox *>(
+        dialog.findChildren<QComboBox *>().value(1));
+    QVERIFY(combo);
+    QVERIFY(!combo->isEnabled());
+    dialog.findChildren<QComboBox *>().value(0)->setCurrentIndex(0);
+    QVERIFY(combo->isEnabled());
+    QCOMPARE(dialog.parameterValue(leaf), 1.0f);
 }
 
 void TestFilterDialog::grainCollectsIntensityThenContrastThenType()

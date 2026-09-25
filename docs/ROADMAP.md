@@ -656,13 +656,13 @@ paint, manage layers, select, filter and undo.
     - Crystalize - done
     - Facet - done
     - Fragment - done
-    - Mezzotint - needs work
+    - Mezzotint - done
     - Mosaic - done
     - Pointilize - done
 
   - Render
-    - Flame - in progress
-    - Picture Frame
+    - Flame - done
+    - Picture Frame - done
     - Clouds - done
     - Difference clouds - done
     - Fibers - done
@@ -687,13 +687,13 @@ paint, manage layers, select, filter and undo.
     - Grain - done
     - Mosaic Tiles - done
     - Patchwork - done
-    - Stained Glass
-    - Texturizer
+    - Stained Glass - done
+    - Texturizer - done
 
   - Other 
     - Custom - done (5×5 grid, Scale, Offset; the dialog's Load/Save of
       .acf kernel files is not built)
-    - High Pass - 
+    - High Pass - done
     - HSB/HSL - 
     - Maximum - 
     - Minimum - 
@@ -720,13 +720,17 @@ preset libraries in the panel menu, and the list view modes.
 
 File format support:
 
-- GIF - in progress 
-- JPG
-- BMP
-- PSD - not started
-- RAW
-- PNG
-- TIFF
+  - GIF - in progress 
+  - JPG
+  - BMP
+  - PSD - not started
+  - RAW
+  - PNG
+  - TIFF
+
+
+- add search bar next to Help - can search for any object/menu item and takes user directly there
+- add a theme button next to search field, light/dark/gray
 
 
 Phase 2:
@@ -736,6 +740,7 @@ Phase 2:
  photorustcli filter.sketch.conte_crayon --input_img horse.jpg --output_img horse2.jpg 
  photorustcli image.adjustments.levels --channel rgb --input_levels 123 25 55 --output_levels 81 255 -i input_img.jpg -o output_img.jpg 
  ```
+
  
  - new filters (Gimp filters, etc)
  -

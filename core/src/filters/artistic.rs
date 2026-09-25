@@ -2114,6 +2114,7 @@ pub fn underpainting(
             crisp: UNDERPAINT_CRISP,
             occlusion: UNDERPAINT_OCCLUSION,
             patchy: UNDERPAINT_PATCHY,
+            gain: 1.0,
         },
     );
 }

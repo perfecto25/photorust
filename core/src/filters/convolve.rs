@@ -657,6 +657,47 @@ pub fn sharpen_edges(pixmap: &mut Pixmap) {
         });
 }
 
+/// CS6's range for High Pass's Radius, in pixels.
+pub const HIGH_PASS_RADIUS: std::ops::RangeInclusive<f32> = 0.1..=1000.0;
+
+/// Filter ▸ Other ▸ High Pass: what a Gaussian blur of `radius` takes out of
+/// the picture, laid over mid-grey.
+///
+/// Each channel is the original less the blur, plus 128. Where the picture is
+/// smooth over the radius the two agree and the pixel goes flat grey; either
+/// side of an edge it swings lighter or darker by as much as the edge steps.
+/// So a small radius keeps only fine detail — hair, texture, outlines — and a
+/// large one keeps more and more of the picture itself, until at CS6's
+/// hundreds of pixels it is nearly the original with its overall brightness
+/// pulled to the middle.
+///
+/// It is the same difference Unsharp Mask adds back to sharpen, and meant to
+/// be used the same way: on a layer of its own in Overlay or Linear Light,
+/// where the grey drops out and only the detail sharpens what is under it.
+///
+/// The blur is the accelerated one, so it runs on the GPU when that is worth
+/// it and has the blur's own parity tests behind it; what is left is one
+/// subtraction a pixel, not worth a trip to the GPU and back on its own.
+///
+/// Alpha is left alone.
+pub fn high_pass(pixmap: &mut Pixmap, radius: f32) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let radius = radius.clamp(*HIGH_PASS_RADIUS.start(), *HIGH_PASS_RADIUS.end());
+    let mut blurred = pixmap.clone();
+    gaussian_blur_accelerated(&mut blurred, radius);
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(4)
+        .zip(blurred.as_bytes().par_chunks_exact(4))
+        .for_each(|(px, b)| {
+            for c in 0..3 {
+                px[c] = (px[c] as i32 - b[c] as i32 + 128).clamp(0, 255) as u8;
+            }
+        });
+}
+
 /// Unsharp mask: add back a scaled copy of the difference against a blurred
 /// version. `threshold` suppresses sharpening of low-contrast areas (noise).
 pub fn unsharp_mask(pixmap: &mut Pixmap, amount: f32, radius: f32, threshold: u8) {
@@ -698,6 +739,63 @@ pub fn unsharp_mask(pixmap: &mut Pixmap, amount: f32, radius: f32, threshold: u8
 mod tests {
     use super::*;
     use crate::buffer::Rgba8;
+
+    #[test]
+    fn high_pass_turns_a_flat_picture_grey() {
+        // Nothing changes across it, so there is no detail to keep: every
+        // colour, however bright, comes back as the same mid-grey.
+        for colour in [Rgba8::new(10, 200, 90, 255), Rgba8::new(250, 250, 250, 255)] {
+            let mut px = Pixmap::filled(40, 40, colour);
+            high_pass(&mut px, 5.0);
+            for p in px.as_bytes().chunks_exact(4) {
+                assert_eq!(&p[..3], &[128, 128, 128]);
+            }
+        }
+    }
+
+    #[test]
+    fn high_pass_lights_the_bright_side_of_an_edge_and_darkens_the_other() {
+        let mut px = Pixmap::filled(80, 20, Rgba8::new(60, 60, 60, 255));
+        for y in 0..20 {
+            for x in 40..80 {
+                px.set(x, y, Rgba8::new(200, 200, 200, 255));
+            }
+        }
+        high_pass(&mut px, 4.0);
+        assert!(px.get(41, 10).r > 150, "the bright side came back {}", px.get(41, 10).r);
+        assert!(px.get(38, 10).r < 100, "the dark side came back {}", px.get(38, 10).r);
+        // Far from the edge, grey again.
+        assert!((px.get(5, 10).r as i32 - 128).abs() <= 2);
+        assert!((px.get(75, 10).r as i32 - 128).abs() <= 2);
+    }
+
+    #[test]
+    fn a_bigger_high_pass_radius_keeps_more_of_the_picture() {
+        // A bright bar 30 pixels wide on a dark ground. A small radius sees
+        // only its edges, and its middle goes grey; a big one sees the whole
+        // bar as detail, and its middle stays bright. (A ramp would not do:
+        // a Gaussian blur gives a straight ramp back unchanged, so its high
+        // pass is grey at any radius.)
+        let middle = |radius| {
+            let mut px = Pixmap::filled(200, 10, Rgba8::new(40, 40, 40, 255));
+            for y in 0..10 {
+                for x in 85..115 {
+                    px.set(x, y, Rgba8::new(220, 220, 220, 255));
+                }
+            }
+            high_pass(&mut px, radius);
+            px.get(100, 5).r as i32
+        };
+        assert!((middle(1.0) - 128).abs() < 5, "radius 1 left {}", middle(1.0));
+        assert!(middle(60.0) > 200, "radius 60 left {}", middle(60.0));
+    }
+
+    #[test]
+    fn high_pass_leaves_alpha_alone() {
+        let mut px = Pixmap::filled(30, 30, Rgba8::new(100, 150, 200, 77));
+        high_pass(&mut px, 3.0);
+        assert!(px.as_bytes().chunks_exact(4).all(|p| p[3] == 77));
+    }
 
     #[test]
     fn kernel_normalises_by_weight_sum() {

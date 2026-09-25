@@ -5,6 +5,8 @@
 # bridge (CLAUDE.md §2).
 
 set(SHELL_SOURCES
+    src/BusyIndicator.cpp
+    src/BusyIndicator.h
     src/MainWindow.cpp
     src/MainWindow.h
     src/SliderPopup.h

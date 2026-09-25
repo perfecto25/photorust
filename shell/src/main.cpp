@@ -4,6 +4,7 @@
 
 #include "photorust_core/src/bridge.cxxqt.h"
 
+#include <QImageReader>
 #include <QApplication>
 #include <QDir>
 #include <QFile>
@@ -80,6 +81,12 @@ void applyIcon(QApplication &app)
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+    // Qt refuses to decode an image over 256 MB by default — a guard for web
+    // browsers against hostile files, and far too small for an image editor:
+    // an 8200-pixel square is already over it. Photoshop opens a 30000-pixel
+    // square PSD, 3.6 GB of RGBA; this allows that and a little more, while
+    // still stopping a corrupt header from asking for something absurd.
+    QImageReader::setAllocationLimit(4096);
     QCoreApplication::setApplicationName(QStringLiteral("PhotoRust"));
     QCoreApplication::setOrganizationName(QStringLiteral("PhotoRust"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0"));

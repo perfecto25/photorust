@@ -13,6 +13,7 @@ pub mod artistic;
 pub mod brush_strokes;
 pub mod convolve;
 pub mod distort;
+pub mod frame;
 pub mod pixelate;
 pub mod render;
 pub mod segment;
@@ -62,6 +63,9 @@ pub enum Filter {
         radius: f32,
         threshold: u8,
     },
+    /// The detail a blur of `radius` would take out, over mid-grey — CS6's
+    /// Filter ▸ Other ▸ High Pass.
+    HighPass { radius: f32 },
     /// Add monochrome or colour noise. `amount` is a percentage, as CS6's
     /// slider is; `gaussian` picks its Gaussian distribution over the uniform
     /// one, which clumps rather than spreading evenly.
@@ -186,6 +190,9 @@ pub enum Filter {
         foreground: crate::buffer::Rgba8,
         background: crate::buffer::Rgba8,
     },
+    /// A decorative border of vines, flowers and leaves, or a ruled or
+    /// moulded frame — CS6's Picture Frame.
+    PictureFrame { options: frame::FrameOptions },
     /// Light thrown into the picture by the lens it was taken with —
     /// Filter ▸ Render ▸ Lens Flare. `center` is where the sun is, in
     /// fractions of the width and height, which is what the dialog's
@@ -472,6 +479,24 @@ pub enum Filter {
         grout: u32,
         lighten: u32,
     },
+    /// The picture printed on a surface of brick, burlap, canvas or
+    /// sandstone — CS6's Texturizer.
+    Texturizer {
+        texture: texture::Texture,
+        scaling: u32,
+        relief: u32,
+        light: texture::Light,
+        invert: bool,
+    },
+    /// The picture remade as panes of flat colour held in lead — CS6's
+    /// Stained Glass. The lead is the foreground colour; see
+    /// `Engine::filter_for`.
+    StainedGlass {
+        cell_size: u32,
+        border: u32,
+        light: u32,
+        foreground: crate::buffer::Rgba8,
+    },
     /// The picture painted onto cracked plaster — CS6's Craquelure.
     Craquelure {
         spacing: u32,
@@ -582,6 +607,7 @@ impl Filter {
             Filter::SharpenEdges => "Sharpen Edges",
             Filter::SmartSharpen { .. } => "Smart Sharpen",
             Filter::UnsharpMask { .. } => "Unsharp Mask",
+            Filter::HighPass { .. } => "High Pass",
             Filter::Noise { .. } => "Add Noise",
             Filter::Median { .. } => "Median",
             Filter::DustAndScratches { .. } => "Dust & Scratches",
@@ -610,6 +636,7 @@ impl Filter {
             Filter::Clouds { difference: true } => "Difference Clouds",
             Filter::Fibers { .. } => "Fibers",
             Filter::LensFlare { .. } => "Lens Flare",
+            Filter::PictureFrame { .. } => "Picture Frame",
             Filter::Lighting { .. } => "Lighting Effects",
             Filter::Diffuse { .. } => "Diffuse",
             Filter::Emboss { .. } => "Emboss",
@@ -661,6 +688,8 @@ impl Filter {
             Filter::Grain { .. } => "Grain",
             Filter::MosaicTiles { .. } => "Mosaic Tiles",
             Filter::Patchwork { .. } => "Patchwork",
+            Filter::StainedGlass { .. } => "Stained Glass",
+            Filter::Texturizer { .. } => "Texturizer",
             Filter::Underpainting { .. } => "Underpainting",
         }
     }
@@ -713,6 +742,7 @@ impl Filter {
                 remove: SharpenRemove::from_i32(p4 as i32),
                 angle: p5,
             },
+            "High Pass" => Filter::HighPass { radius: p1 },
             "Unsharp Mask" => Filter::UnsharpMask {
                 amount: p1,
                 radius: p2,
@@ -964,6 +994,19 @@ impl Filter {
                 foreground: crate::buffer::Rgba8::BLACK,
                 background: crate::buffer::Rgba8::WHITE,
             },
+            "Texturizer" => Filter::Texturizer {
+                texture: texture::Texture::from_i32(p1 as i32),
+                scaling: p2.max(0.0) as u32,
+                relief: p3.max(0.0) as u32,
+                light: texture::Light::from_i32(p4 as i32),
+                invert: p5 != 0.0,
+            },
+            "Stained Glass" => Filter::StainedGlass {
+                cell_size: p1.max(0.0) as u32,
+                border: p2.max(0.0) as u32,
+                light: p3.max(0.0) as u32,
+                foreground: crate::buffer::Rgba8::BLACK,
+            },
             "Craquelure" => Filter::Craquelure {
                 spacing: p1.max(0.0) as u32,
                 depth: p2.max(0.0) as u32,
@@ -1166,6 +1209,33 @@ impl Filter {
             },
             // The centre comes from the dialog's crosshair rather than a
             // slider, which is why it trails the two controls CS6 lists.
+            "Picture Frame" => {
+                let colour = |i: usize| {
+                    let c = |v: f32| v.clamp(0.0, 255.0) as u8;
+                    crate::buffer::Rgba8::new(c(at(i)), c(at(i + 1)), c(at(i + 2)), 255)
+                };
+                let whole = |i: usize| at(i).max(0.0) as u32;
+                Filter::PictureFrame {
+                    options: frame::FrameOptions {
+                        frame: whole(0),
+                        vine: colour(1),
+                        margin: whole(4),
+                        size: whole(5),
+                        arrangement: whole(6),
+                        flower: whole(7),
+                        flower_colour: colour(8),
+                        flower_size: whole(11),
+                        leaf: whole(12),
+                        leaf_colour: colour(13),
+                        leaf_size: whole(16),
+                        lines: whole(17),
+                        thickness: whole(18),
+                        angle: whole(19),
+                        fade: whole(20),
+                        invert: at(21) != 0.0,
+                    },
+                }
+            }
             "Lens Flare" => Filter::LensFlare {
                 brightness: p1.clamp(10.0, 300.0),
                 lens: render::LensType::from_i32(p2 as i32),
@@ -1201,6 +1271,9 @@ impl Filter {
             // in the worst direction.
             Filter::MotionBlur { distance, .. } => Some((distance / 2.0).ceil().max(1.0) as u32),
             Filter::UnsharpMask { radius, .. } => Some((radius * 3.0).ceil().max(1.0) as u32),
+            // As far as the blur reaches, which is past the canvas at the top
+            // of the range; the crop is clamped to the canvas either way.
+            Filter::HighPass { radius } => Some((radius * 3.0).ceil().max(1.0) as u32),
             // All three are built on a radius-1 Gaussian, which reaches three
             // pixels; Sharpen Edges then looks one further for its gradient.
             Filter::Sharpen | Filter::SharpenMore => Some(3),
@@ -1249,6 +1322,8 @@ impl Filter {
             // The flare is placed as a fraction of the whole frame and sized
             // against its diagonal, so a crop has no answer of its own.
             Filter::LensFlare { .. } => None,
+            // The frame is laid round the edge of the whole canvas.
+            Filter::PictureFrame { .. } => None,
             // The lamp is placed the same way.
             Filter::Lighting { .. } => None,
             // A pixel reaches one step for the neighbour it swaps with.
@@ -1389,6 +1464,11 @@ impl Filter {
             Filter::MosaicTiles { .. } => None,
             // The squares are laid by where on the canvas a pixel is.
             Filter::Patchwork { .. } => None,
+            // The panes are laid by where on the canvas a pixel is, and the
+            // glow is centred on the whole image.
+            Filter::StainedGlass { .. } => None,
+            // The surface is laid by where on the canvas a pixel is.
+            Filter::Texturizer { .. } => None,
             // The melt reaches as far as Smoothness blurs, and the waveform
             // magnifies whatever that changed.
             Filter::Chrome { smoothness, .. } => {
@@ -1456,6 +1536,7 @@ impl Filter {
                 radius,
                 threshold,
             } => unsharp_mask(pixmap, amount, radius, threshold),
+            Filter::HighPass { radius } => convolve::high_pass(pixmap, radius),
             Filter::Noise {
                 amount,
                 monochromatic,
@@ -1512,6 +1593,7 @@ impl Filter {
                 brightness,
                 lens,
             } => render::lens_flare(pixmap, center, brightness, lens),
+            Filter::PictureFrame { options } => frame::picture_frame(pixmap, &options),
             Filter::Lighting { light } => render::lighting_effects(pixmap, light),
             Filter::Diffuse { mode } => stylize::diffuse(pixmap, mode),
             Filter::Emboss {
@@ -1741,6 +1823,19 @@ impl Filter {
                 background,
             } => texture::grain(pixmap, intensity, contrast, kind, foreground, background),
             Filter::Patchwork { square, relief } => texture::patchwork(pixmap, square, relief),
+            Filter::StainedGlass {
+                cell_size,
+                border,
+                light,
+                foreground,
+            } => texture::stained_glass(pixmap, cell_size, border, light, foreground),
+            Filter::Texturizer {
+                texture: surface,
+                scaling,
+                relief,
+                light,
+                invert,
+            } => texture::texturizer(pixmap, surface, scaling, relief, light, invert),
             Filter::MosaicTiles { size, grout, lighten } => {
                 texture::mosaic_tiles(pixmap, size, grout, lighten)
             }

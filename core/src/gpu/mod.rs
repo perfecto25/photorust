@@ -284,6 +284,15 @@ mod tests {
     }
 
     #[test]
+    fn blur_matches_the_cpu_when_it_is_sent_in_bands() {
+        // Big enough for the GPU, and — at the small band budget tests build
+        // with — a radius that splits each pass into four bands of rows, the
+        // last one short. A seam between bands would show as a line of
+        // pixels blurred from the wrong rows.
+        assert_matches_cpu(200, 150, 40.0);
+    }
+
+    #[test]
     fn blur_matches_the_cpu_on_awkward_sizes() {
         // Not multiples of the 8x8 workgroup, so the shader's bounds check is
         // doing real work.

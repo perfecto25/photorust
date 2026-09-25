@@ -15,6 +15,13 @@ struct Params {
     taps: i32,
     // 1 = horizontal, 0 = vertical.
     horizontal: u32,
+    // The first row this dispatch covers. A big blur is sent as several
+    // dispatches over bands of rows so that none runs long enough for the
+    // driver's watchdog to reset the device.
+    row_offset: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<storage, read> src: array<u32>;
@@ -45,12 +52,12 @@ fn pack(c: vec4<f32>) -> u32 {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
     let h = params.height;
-    if (gid.x >= w || gid.y >= h) {
+    if (gid.x >= w || gid.y + params.row_offset >= h) {
         return;
     }
 
     let x = i32(gid.x);
-    let y = i32(gid.y);
+    let y = i32(gid.y + params.row_offset);
     let taps = params.taps;
     let last_x = i32(w) - 1;
     let last_y = i32(h) - 1;

@@ -169,11 +169,13 @@ pub struct Finish {
     /// How much of the surface fades out in broad, random patches: 0 is
     /// even everywhere, 1 lets some patches go smooth. See [`patchiness`].
     pub patchy: f32,
+    /// How many times deeper the surface is than Relief alone makes it.
+    pub gain: f32,
 }
 
 impl Default for Finish {
     fn default() -> Finish {
-        Finish { dark_bias: 0.0, bevel: BEVEL, crisp: 1.0, occlusion: 0.0, patchy: 0.0 }
+        Finish { dark_bias: 0.0, bevel: BEVEL, crisp: 1.0, occlusion: 0.0, patchy: 0.0, gain: 1.0 }
     }
 }
 
@@ -239,7 +241,7 @@ pub fn apply_relief_weighted(
                 let slope = -(dx * lx + dy * ly);
                 let slope = slope.signum() * slope.abs().powf(finish.crisp);
                 let patch = patchiness(x, y, finish.patchy);
-                let shade = slope * relief * weight * patch;
+                let shade = slope * relief * weight * patch * finish.gain;
                 let groove = (0.5 - field[y * width + x]).max(0.0) * 2.0
                     * finish.occlusion * relief * weight * patch;
                 for c in 0..3 {
@@ -279,25 +281,78 @@ fn brick(u: f32, v: f32) -> f32 {
     joints * (1.0 - GRIT + GRIT * grit)
 }
 
-/// Burlap: a coarse plain weave, 6 pixels to a thread, the threads wandering
-/// and uneven. Each crossing has one thread over the other, alternating, and
-/// the thread on top arches over it. Both directions matter: lit from the
-/// side, it is the threads running down that show, and from below the ones
-/// running across — a weave of one direction only turns into chevrons.
+/// Burlap: coarse sacking, read as CS6 draws it — threads running across,
+/// about 7 pixels to a thread, with a groove between each and the next.
+///
+/// CS6's burlap is not a round-threaded basket weave. Lit from the top it is
+/// dark grooves on a ground that keeps the picture's own tone, and the
+/// grooves are not straight: each runs a few pixels, then steps up or down
+/// where a thread crossing underneath lifts it, and some runs are shallow
+/// enough to break the line into dashes. The threads running down show only
+/// as those kinks and a faint dip at each crossing. A soft sine weave both
+/// ways — the obvious model — reads as knitting.
+///
+/// Fitted to CS6's Texturizer over `samples/horse-3.jpg`, registered against
+/// the source, on how the pattern repeats down a column — every 7 pixels,
+/// and about as strongly every 14 — and how quickly it changes along a row.
+/// The step is what sets the first: kinks much smaller than this and the
+/// grooves line up into a ruled page, much bigger and the rows dissolve.
 fn burlap(u: f32, v: f32) -> f32 {
-    use std::f32::consts::PI;
-    const PITCH: f32 = 6.0;
-    const WANDER: f32 = 1.5;
-    // Each thread wanders along its length.
-    let u = u + (value_noise(u, v, 9.0, 21) - 0.5) * 2.0 * WANDER;
-    let v = v + (value_noise(u, v, 9.0, 22) - 0.5) * 2.0 * WANDER;
-    // Round threads both ways, and which one is on top rising and falling
-    // smoothly from one crossing to the next. A hard switch at each crossing
-    // cuts the cloth into puzzle pieces.
-    let (a, b) = (u / PITCH * PI, v / PITCH * PI);
-    let over = 0.5 * a.sin() * b.sin();
-    let h = 0.5 + 0.3 * (b.sin().abs() - 0.5) + 0.2 * (a.sin().abs() - 0.5) + 0.3 * over;
-    h * (0.7 + 0.3 * value_noise(u, v, 3.0, 7))
+    const PITCH: f32 = 7.2;
+    // How long a groove runs between kinks, how far a kink steps it, and how
+    // much of a run the step takes.
+    const RUN: f32 = 4.0;
+    const KINK: f32 = 1.4;
+    const WEAVE: f32 = 0.35;
+    const DRIFT: f32 = 12.0;
+    const STEP: f32 = 0.45;
+    // The groove's half-width, and how deep the crossings dip.
+    const GROOVE: f32 = 1.3;
+    const CROSSING: f32 = 0.15;
+    let smooth = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let below = (v / PITCH).floor() as i32;
+    let mut h = 1.0f32;
+    // The groove above the pixel and the one below; a kink never moves a
+    // groove far enough for the next one out to reach.
+    for row in [below, below + 1] {
+        // The threads running down are straight enough that the crossings
+        // line up in columns, half a run apart from one groove to the next
+        // as the weave goes over and under. The columns wander, slowly enough that neighbouring grooves keep
+        // in step but not so slowly that the cloth reads as ruled.
+        let wander = (value_noise(u, row as f32 * PITCH, DRIFT, 26) - 0.5) * 2.0;
+        let t = u / RUN + 0.5 * row.rem_euclid(2) as f32 + wander;
+        let k = t.floor() as i32;
+        let blend = smooth((t - k as f32 - (1.0 - STEP)) / STEP);
+        let at = |k: i32| {
+            // Up at one crossing and down at the next, the other way round
+            // in the next groove, and never quite the same twice. That
+            // alternation is why CS6's burlap repeats every two threads more
+            // strongly than every one.
+            let weave = if (k + row).rem_euclid(2) == 0 { 1.0 } else { -1.0 };
+            let shift = (WEAVE * weave + (lattice(k, row, 23) - 0.5) * 2.0) * KINK;
+            // Most runs are cut deep; one in four or so barely at all.
+            let depth = (lattice(k, row, 24) * 1.4 - 0.1).clamp(0.25, 1.0);
+            (shift, depth)
+        };
+        let ((s0, d0), (s1, d1)) = (at(k), at(k + 1));
+        let shift = s0 + (s1 - s0) * blend;
+        let depth = d0 + (d1 - d0) * blend;
+        let d = (v - (row as f32 * PITCH + shift)) / GROOVE;
+        h -= depth * (-d * d).exp();
+        // The dip where a thread running down passes under, on the thread
+        // just below this groove.
+        let across = (t - (k + 1) as f32) * RUN;
+        let under = (v - row as f32 * PITCH) / PITCH;
+        if (0.0..1.0).contains(&under) {
+            h -= CROSSING * (-(across * across) / 0.8).exp() * (std::f32::consts::PI * under).sin();
+        }
+    }
+    // Hairy fibre along the threads.
+    let fibre = value_noise(u * 0.7, v * 1.4, 1.2, 7);
+    (h * (0.75 + 0.25 * fibre)).max(0.0)
 }
 
 /// Canvas: a fine plain weave, 3 pixels to a thread, the threads running down
@@ -1459,10 +1514,432 @@ pub fn patchwork(pixmap: &mut Pixmap, square: u32, relief: u32) {
         });
 }
 
+/// How Texturizer lights its surface, beyond the controls.
+///
+/// **Texturizer's relief is far deeper than the other filters'.** Measured on
+/// CS6's output over `samples/horse-3.jpg`, registered against the source,
+/// its Brick at Relief 24 moves a pixel by 80 levels, one standard deviation,
+/// and its Burlap and Sandstone at 16 by 70 and 40 — six to fifteen times
+/// what the same Relief does in Rough Pastels. So each texture has its own
+/// gain, fitted on those numbers; Canvas, which there was no reference for,
+/// is a guess of the same order.
+///
+/// **And it lights every tone alike.** CS6 moves the horse's blacks as far
+/// as the sky's whites — its brick throws white edges across the black
+/// horse — so the share of the light that scales with the picture's own
+/// brightness is mostly taken back out by the dark bias.
+const TEXTURIZER_FINISH: Finish = Finish {
+    dark_bias: 0.6,
+    bevel: BEVEL,
+    crisp: 1.0,
+    occlusion: 0.0,
+    patchy: 0.0,
+    gain: 1.0,
+};
+const TEXTURIZER_BURLAP_GAIN: f32 = 13.0;
+const TEXTURIZER_CANVAS_GAIN: f32 = 20.0;
+const TEXTURIZER_SANDSTONE_GAIN: f32 = 15.0;
+
+/// Brick is lit harder still, and crisply: CS6's shows a white lip along the
+/// top of each course and a black joint under it, with the face between
+/// keeping the picture's tone. The grit on the face slopes almost as steeply
+/// as the joints do, so without the crispness — which lifts strong slopes
+/// over faint ones — the depth that draws the joints turns every face to
+/// speckle. The occlusion is what makes the joint black rather than merely
+/// shaded.
+const TEXTURIZER_BRICK_GAIN: f32 = 135.0;
+const TEXTURIZER_BRICK_CRISP: f32 = 2.2;
+const TEXTURIZER_BRICK_OCCLUSION: f32 = 60.0;
+
+/// Filter ▸ Texture ▸ Texturizer: the picture printed on one of the four
+/// surfaces, and nothing else done to it.
+///
+/// It is the texture block Rough Pastels, Underpainting and Conté Crayon
+/// carry, on its own: the same controls in the same order — **Texture**,
+/// **Scaling**, **Relief**, **Light** and **Invert** — over the same ranges,
+/// and the same four surfaces, so a brick here is the brick there. It is lit
+/// much more deeply than they are; see [`TEXTURIZER_FINISH`].
+///
+/// Alpha is left alone.
+///
+/// No GPU path, for [`apply_relief`]'s reasons.
+pub fn texturizer(
+    pixmap: &mut Pixmap,
+    texture: Texture,
+    scaling: u32,
+    relief: u32,
+    light: Light,
+    invert: bool,
+) {
+    let finish = match texture {
+        Texture::Brick => Finish {
+            gain: TEXTURIZER_BRICK_GAIN,
+            crisp: TEXTURIZER_BRICK_CRISP,
+            occlusion: TEXTURIZER_BRICK_OCCLUSION,
+            ..TEXTURIZER_FINISH
+        },
+        Texture::Burlap => Finish { gain: TEXTURIZER_BURLAP_GAIN, ..TEXTURIZER_FINISH },
+        Texture::Canvas => Finish { gain: TEXTURIZER_CANVAS_GAIN, ..TEXTURIZER_FINISH },
+        Texture::Sandstone => Finish { gain: TEXTURIZER_SANDSTONE_GAIN, ..TEXTURIZER_FINISH },
+    };
+    apply_relief_weighted(pixmap, texture, scaling, relief, light, invert, finish);
+}
+
+/// CS6's ranges for Stained Glass, which its three sliders run over.
+pub const GLASS_CELL: std::ops::RangeInclusive<u32> = 2..=50;
+pub const GLASS_BORDER: std::ops::RangeInclusive<u32> = 1..=20;
+pub const GLASS_LIGHT: std::ops::RangeInclusive<u32> = 0..=10;
+
+/// How far apart the panes' seeds are, in pixels per step of Cell Size.
+/// CS6's panes are bigger than the slider reads: across a row its sky
+/// crosses a lead every 20 pixels or so at Cell Size 10, and every 49 at 26.
+const GLASS_SPACING: f32 = 2.2;
+
+/// How far each seed is nudged off its lattice point, as a share of the
+/// lattice step. CS6's panes are irregular but even — five and six sided,
+/// none much bigger than the rest — which is a hexagonal lattice shaken a
+/// little rather than points thrown down anyhow; a free scatter leaves slivers
+/// beside panes three times their size.
+const GLASS_JITTER: f32 = 0.6;
+
+/// How wide the lead is, in pixels per step of Border Thickness. CS6's lead
+/// is about two and a half pixels at 4 and seven at 10.
+const GLASS_LEAD: f32 = 0.62;
+
+/// Light Intensity's glow: how far it reaches from the middle of the image,
+/// as a share of the image's size, and how much of the way to white it takes
+/// the glass there at full intensity.
+///
+/// It grows with the **square** of the slider. Measured on CS6's output over
+/// `samples/horse-3.jpg`, the glass in the middle goes 85% of the way to
+/// white at 7 and hardly a tenth at 2 — a straight line through the first
+/// would light the second three times too brightly. At 7 it is still half as
+/// strong a fifth of the image out, and has faded to a sixth a third out.
+const GLASS_GLOW_REACH: f32 = 0.26;
+const GLASS_GLOW: f32 = 1.75;
+
+/// Filter ▸ Texture ▸ Stained Glass: the picture remade as panes of flat
+/// colour held in lead.
+///
+/// The panes are the cells of a Voronoi diagram — every pixel belongs to its
+/// nearest seed — laid on a jittered hexagonal lattice whose spacing
+/// follows **Cell Size**; see [`GLASS_JITTER`]. Each pane is filled with the
+/// average of the picture under it. The lead between them is **Border
+/// Thickness** wide and in the **foreground colour**, as CS6's is, and it
+/// runs round the edge of the image as well, half as wide there, since the
+/// pane on the far side is missing. **Light Intensity** is a glow centred on
+/// the image, as if the window were lit from behind at its middle: it takes
+/// the glass towards white and leaves the lead alone.
+///
+/// Alpha is left alone.
+///
+/// No GPU path, for Crystallize's reasons: each pane's average needs every
+/// pixel in it gathered first, and the whole filter is a few tens of
+/// milliseconds on the CPU.
+pub fn stained_glass(
+    pixmap: &mut Pixmap,
+    cell_size: u32,
+    border: u32,
+    light: u32,
+    lead: crate::buffer::Rgba8,
+) {
+    if pixmap.is_empty() {
+        return;
+    }
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let step = GLASS_SPACING * cell_size.clamp(*GLASS_CELL.start(), *GLASS_CELL.end()) as f32;
+    let row_step = step * 3f32.sqrt() / 2.0;
+    let half_lead = 0.5 * GLASS_LEAD * border.clamp(*GLASS_BORDER.start(), *GLASS_BORDER.end()) as f32;
+
+    // Seeds from two steps before the canvas to two after, so a pixel at the
+    // edge has neighbours on every side to be nearer to.
+    let cols = (width as f32 / step).ceil() as i32 + 5;
+    let rows = (height as f32 / row_step).ceil() as i32 + 5;
+    let seed_at = |i: i32, j: i32| -> (f32, f32) {
+        // Every other row is shifted half a step, which is what makes the
+        // lattice hexagonal.
+        let shift = 0.5 * (j & 1) as f32;
+        (
+            (i as f32 + shift + GLASS_JITTER * (lattice(i, j, 41) - 0.5)) * step,
+            (j as f32 + GLASS_JITTER * (lattice(i, j, 42) - 0.5)) * row_step,
+        )
+    };
+    let index_of = |i: i32, j: i32| -> usize { ((j + 2) * cols + (i + 2)) as usize };
+
+    // Which pane each pixel is in, and how far it is from the pane's edge —
+    // the nearer of the image's edge and the line halfway to a neighbouring
+    // seed. Worked out once and kept: both the averages and the painting
+    // need it.
+    let (w, h) = (width as usize, height as usize);
+    let mut owner = vec![0u32; w * h];
+    let mut inset = vec![0f32; w * h];
+    owner
+        .par_chunks_exact_mut(w)
+        .zip(inset.par_chunks_exact_mut(w))
+        .enumerate()
+        .for_each(|(row, (owners, insets))| {
+            let py = row as f32 + 0.5;
+            let j0 = (py / row_step).floor() as i32;
+            for x in 0..w {
+                let px = x as f32 + 0.5;
+                let i0 = (px / step).floor() as i32;
+                let mut near = [(0f32, 0f32); 25];
+                let mut n = 0;
+                let (mut best, mut best_at, mut best_index) = (f32::MAX, 0, 0usize);
+                for j in (j0 - 2).max(-2)..=(j0 + 2).min(rows - 3) {
+                    for i in (i0 - 2).max(-2)..=(i0 + 2).min(cols - 3) {
+                        let (sx, sy) = seed_at(i, j);
+                        let d = (sx - px) * (sx - px) + (sy - py) * (sy - py);
+                        if d < best {
+                            best = d;
+                            best_at = n;
+                            best_index = index_of(i, j);
+                        }
+                        near[n] = (sx, sy);
+                        n += 1;
+                    }
+                }
+                let (bx, by) = near[best_at];
+                // The distance to the bisector between the nearest seed and
+                // each other one, which is the distance to that side of the
+                // pane.
+                let mut edge = px.min(width as f32 - px).min(py).min(height as f32 - py);
+                for (k, &(sx, sy)) in near[..n].iter().enumerate() {
+                    if k == best_at {
+                        continue;
+                    }
+                    let d = (sx - px) * (sx - px) + (sy - py) * (sy - py);
+                    let apart = ((sx - bx) * (sx - bx) + (sy - by) * (sy - by)).sqrt();
+                    if apart > 0.0 {
+                        edge = edge.min((d - best) / (2.0 * apart));
+                    }
+                }
+                owners[x] = best_index as u32;
+                insets[x] = edge;
+            }
+        });
+
+    // What each pane averages to, in one sweep: a per-thread tally of every
+    // pane would cost more than the image at the smallest cell size.
+    let count = (cols * rows) as usize;
+    let mut totals = vec![[0u64; 3]; count];
+    let mut counts = vec![0u32; count];
+    for (i, px) in pixmap.as_bytes().chunks_exact(4).enumerate() {
+        let pane = owner[i] as usize;
+        for c in 0..3 {
+            totals[pane][c] += px[c] as u64;
+        }
+        counts[pane] += 1;
+    }
+    let panes: Vec<[f32; 3]> = totals
+        .iter()
+        .zip(&counts)
+        .map(|(t, &n)| {
+            let n = n.max(1) as f32;
+            [t[0] as f32 / n, t[1] as f32 / n, t[2] as f32 / n]
+        })
+        .collect();
+
+    let reach = GLASS_GLOW_REACH * (width as f32 * height as f32).sqrt();
+    let intensity = light.min(*GLASS_LIGHT.end()) as f32 / *GLASS_LIGHT.end() as f32;
+    let peak = (GLASS_GLOW * intensity * intensity).min(1.0);
+    let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+    let lead = [lead.r as f32, lead.g as f32, lead.b as f32];
+    let (owner, inset, panes) = (&owner, &inset, &panes);
+    let stride = pixmap.stride();
+    pixmap
+        .as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let dy = row as f32 + 0.5 - cy;
+            for (x, px) in out.chunks_exact_mut(4).take(w).enumerate() {
+                let i = row * w + x;
+                // A pixel's worth of soft edge, so the lead is not stepped.
+                let glass = (inset[i] - half_lead + 0.5).clamp(0.0, 1.0);
+                let dx = x as f32 + 0.5 - cx;
+                let glow = peak * (-(dx * dx + dy * dy) / (reach * reach)).exp();
+                let pane = panes[owner[i] as usize];
+                for c in 0..3 {
+                    let lit = pane[c] + (255.0 - pane[c]) * glow;
+                    px[c] = (lead[c] + (lit - lead[c]) * glass).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::Rgba8;
+
+    fn glass_at(pixmap: &Pixmap, x: i32, y: i32) -> [u8; 3] {
+        let p = pixmap.get(x, y);
+        [p.r, p.g, p.b]
+    }
+
+    #[test]
+    fn stained_glass_leads_in_the_foreground_colour_and_frames_the_image() {
+        // The lead is the foreground colour, as CS6's is, and it runs round
+        // the edge of the image as well as between the panes.
+        let lead = Rgba8::new(200, 20, 30, 255);
+        let mut px = Pixmap::filled(120, 90, Rgba8::new(40, 120, 220, 255));
+        stained_glass(&mut px, 10, 6, 0, lead);
+        for (x, y) in [(0, 0), (119, 0), (0, 89), (119, 89), (60, 0), (0, 45)] {
+            assert_eq!(glass_at(&px, x, y), [200, 20, 30], "no lead at {x},{y}");
+        }
+        // Everything that is not lead is the one colour the picture had:
+        // a flat picture makes flat panes.
+        let mut glass = 0;
+        for y in 0..90 {
+            for x in 0..120 {
+                let c = glass_at(&px, x, y);
+                if c == [40, 120, 220] {
+                    glass += 1;
+                }
+            }
+        }
+        assert!(glass > 120 * 90 / 2, "only {glass} pixels came back as glass");
+    }
+
+    #[test]
+    fn stained_glass_panes_are_flat_averages() {
+        // A ramp comes back as a handful of flat panes rather than a ramp:
+        // many fewer distinct colours than it went in with.
+        let mut px = Pixmap::new(200, 60);
+        for y in 0..60 {
+            for x in 0..200 {
+                px.set(x, y, Rgba8::new(x as u8, 255 - x as u8, 128, 255));
+            }
+        }
+        stained_glass(&mut px, 12, 1, 0, Rgba8::BLACK);
+        let mut colours = std::collections::HashMap::new();
+        for y in 0..60 {
+            for x in 0..200 {
+                *colours.entry(glass_at(&px, x, y)).or_insert(0) += 1;
+            }
+        }
+        // A colour to a pane, and those cover the picture; what is left is
+        // the soft edge of the lead, a pixel here and there.
+        let panes: Vec<i32> = colours.values().copied().filter(|&n| n >= 10).collect();
+        let covered: i32 = panes.iter().sum();
+        assert!(panes.len() < 60, "{} colours each cover ten pixels or more", panes.len());
+        assert!(covered > 200 * 60 * 7 / 10, "the panes cover only {covered} pixels");
+    }
+
+    #[test]
+    fn a_thicker_border_is_more_lead() {
+        let lead = |border| {
+            let mut px = Pixmap::filled(160, 160, Rgba8::new(255, 255, 255, 255));
+            stained_glass(&mut px, 10, border, 0, Rgba8::BLACK);
+            px.as_bytes().chunks_exact(4).filter(|p| p[0] < 128).count()
+        };
+        let thin = lead(2);
+        let thick = lead(10);
+        assert!(thick > thin * 2, "Border Thickness 10 leads {thick} pixels and 2 leads {thin}");
+    }
+
+    #[test]
+    fn bigger_cells_are_fewer_panes() {
+        // Leads crossed along the middle row.
+        let crossings = |cell| {
+            let mut px = Pixmap::filled(400, 100, Rgba8::new(255, 255, 255, 255));
+            stained_glass(&mut px, cell, 3, 0, Rgba8::BLACK);
+            (1..400)
+                .filter(|&x| px.get(x, 50).r < 128 && px.get(x - 1, 50).r >= 128)
+                .count()
+        };
+        let small = crossings(5);
+        let big = crossings(20);
+        assert!(small > big * 2, "Cell Size 5 crossed {small} leads and 20 crossed {big}");
+    }
+
+    #[test]
+    fn light_intensity_lights_the_middle_and_not_the_lead() {
+        // The glow is centred on the image: the glass in the middle goes
+        // towards white, the glass in a corner barely moves, and the lead
+        // stays the colour it was given.
+        let mut px = Pixmap::filled(300, 200, Rgba8::new(60, 60, 60, 255));
+        stained_glass(&mut px, 8, 6, 10, Rgba8::BLACK);
+        let brightest = |x0: i32, y0: i32| {
+            (y0..y0 + 20)
+                .flat_map(|y| (x0..x0 + 20).map(move |x| (x, y)))
+                .map(|(x, y)| px.get(x, y).r)
+                .max()
+                .unwrap()
+        };
+        let middle = brightest(140, 90);
+        let corner = brightest(4, 4);
+        assert!(middle > 200, "the middle only reached {middle}");
+        assert!(corner < 90, "the corner was lit to {corner}");
+        assert_eq!(glass_at(&px, 0, 100), [0, 0, 0], "the glow reached the lead");
+    }
+
+    #[test]
+    fn texturizer_leaves_a_picture_alone_at_no_relief() {
+        let mut px = Pixmap::filled(40, 40, Rgba8::new(90, 140, 200, 255));
+        let before = px.clone();
+        texturizer(&mut px, Texture::Burlap, 100, 0, Light::Top, false);
+        assert_eq!(px.as_bytes(), before.as_bytes());
+    }
+
+    #[test]
+    fn texturizer_shows_as_plainly_in_black_as_in_white() {
+        // CS6 lights every tone alike: its brick throws white edges across a
+        // black horse as plainly as dark ones across the sky. A surface that
+        // only scaled the picture's own brightness would vanish in the black.
+        let spread = |level: u8| {
+            let mut px = Pixmap::filled(120, 120, Rgba8::new(level, level, level, 255));
+            texturizer(&mut px, Texture::Sandstone, 100, 16, Light::Top, false);
+            let values: Vec<f32> = px.as_bytes().chunks_exact(4).map(|p| p[0] as f32).collect();
+            let mean = values.iter().sum::<f32>() / values.len() as f32;
+            (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / values.len() as f32).sqrt()
+        };
+        let dark = spread(30);
+        let light = spread(200);
+        assert!(dark > 20.0, "the surface barely shows in black: {dark:.1}");
+        assert!(dark > light * 0.6, "black shows {dark:.1} of texture and white {light:.1}");
+    }
+
+    #[test]
+    fn texturizer_brick_draws_its_courses() {
+        // Lit from the top, each course has a lit lip and a dark joint: down
+        // a column the picture swings far both ways once every course.
+        let mut px = Pixmap::filled(80, 90, Rgba8::new(128, 128, 128, 255));
+        texturizer(&mut px, Texture::Brick, 100, 24, Light::Top, false);
+        let column: Vec<u8> = (0..90).map(|y| px.get(40, y).r).collect();
+        let bright = column.iter().filter(|&&v| v > 220).count();
+        let dark = column.iter().filter(|&&v| v < 40).count();
+        assert!(bright >= 8, "only {bright} lit pixels down a column of ten courses");
+        assert!(dark >= 8, "only {dark} dark pixels down a column of ten courses");
+    }
+
+    #[test]
+    fn texturizer_invert_turns_the_surface_inside_out() {
+        let run = |invert| {
+            let mut px = Pixmap::filled(60, 60, Rgba8::new(128, 128, 128, 255));
+            texturizer(&mut px, Texture::Canvas, 100, 12, Light::Top, invert);
+            px
+        };
+        let (plain, inverted) = (run(false), run(true));
+        assert_ne!(plain.as_bytes(), inverted.as_bytes());
+    }
+
+    #[test]
+    fn stained_glass_is_deterministic() {
+        let run = || {
+            let mut px = Pixmap::new(90, 70);
+            for y in 0..70 {
+                for x in 0..90 {
+                    px.set(x, y, Rgba8::new((x * 3) as u8, (y * 3) as u8, 90, 255));
+                }
+            }
+            stained_glass(&mut px, 6, 3, 4, Rgba8::BLACK);
+            px
+        };
+        assert_eq!(run().as_bytes(), run().as_bytes());
+    }
 
     #[test]
     fn every_texture_stays_in_range_and_is_not_flat() {

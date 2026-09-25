@@ -31,6 +31,24 @@ use crate::layer::{LayerKind, LayerStack};
 /// handles perfectly well. See `docs/gpu-migration.md` for the numbers.
 const MIN_GPU_PIXELS: u64 = 128 * 128;
 
+/// How many kernel taps one blur submission may read in all, pixels times
+/// taps per pixel.
+///
+/// A driver resets the GPU when a single submission runs too long — about
+/// two seconds on amdgpu — and a reset loses the device for the rest of the
+/// process. A blur's work grows with its radius: High Pass at 800 pixels
+/// reads 4,801 taps per pixel per pass, and over a large document one
+/// dispatch of that is enough to trip the watchdog. So each pass goes out as
+/// bands of rows, each within this budget. Measured at about 2×10¹⁰ taps a
+/// second on the development machine, this is ~12 ms a band: far inside any
+/// watchdog, and a small blur still goes out as one band.
+#[cfg(not(test))]
+const TAPS_PER_SUBMISSION: u64 = 250_000_000;
+/// Far smaller under test, so the GPU parity tests' ordinary blurs go out in
+/// several bands and the seams between bands are checked against the CPU.
+#[cfg(test)]
+const TAPS_PER_SUBMISSION: u64 = 2_000_000;
+
 /// Uniform block for `blur.wgsl`. Four 4-byte fields, so no padding is needed
 /// to satisfy the 16-byte uniform alignment.
 #[repr(C)]
@@ -40,6 +58,8 @@ struct BlurParams {
     height: u32,
     taps: i32,
     horizontal: u32,
+    row_offset: u32,
+    _pad: [u32; 3],
 }
 
 /// Uniform block for `composite.wgsl`.
@@ -193,6 +213,11 @@ pub struct GpuBackend {
     /// Largest storage buffer the device will bind, in bytes. An image needing
     /// more than this goes to the CPU.
     max_binding: u64,
+    /// Set once the device is gone — reset by the driver, unplugged, or
+    /// failed. Everything after goes to the CPU: a lost device cannot be used
+    /// again, and wgpu panics rather than erroring on some calls against one,
+    /// which across the bridge would take the whole application down.
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GpuBackend {
@@ -204,6 +229,24 @@ impl GpuBackend {
             info,
             max_storage_binding,
         } = GpuProbe::new()?;
+
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let lost = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                eprintln!("photorust: GPU device lost ({reason:?}: {message}); using the CPU from now on");
+                lost.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        {
+            // wgpu's default is to panic on an error nobody asked about. A
+            // failed GPU call must cost a fallback, never the application.
+            let lost = lost.clone();
+            device.on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
+                eprintln!("photorust: GPU error ({error}); using the CPU from now on");
+                lost.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gaussian blur"),
@@ -302,6 +345,7 @@ impl GpuBackend {
             composite_pipeline,
             composite_layout,
             max_binding: max_storage_binding,
+            lost,
         })
     }
 
@@ -383,6 +427,39 @@ impl GpuBackend {
         bytes > 0 && bytes <= self.max_binding
     }
 
+    fn is_lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run `work` on the device, or say why not. A lost device is refused up
+    /// front, and a panic out of wgpu — which it raises for some calls on a
+    /// device that died mid-operation — is caught, marks the device lost, and
+    /// comes back as an error for the caller to fall back on.
+    fn guarded<T>(&self, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        if self.is_lost() {
+            return Err("the device was lost earlier".into());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(reason)) => {
+                // A failed readback or poll is how a reset usually shows.
+                if matches!(self.device.poll(wgpu::PollType::Poll), Err(_)) {
+                    self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(reason)
+            }
+            Err(panic) => {
+                self.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+                let what = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "a panic".into());
+                Err(format!("wgpu panicked: {what}"))
+            }
+        }
+    }
+
     /// Is the GPU path worth taking for this image?
     fn blur_is_worthwhile(&self, pixmap: &Pixmap) -> bool {
         let pixels = pixmap.width() as u64 * pixmap.height() as u64;
@@ -450,46 +527,53 @@ impl GpuBackend {
     ) {
         use wgpu::util::DeviceExt;
 
-        let params = BlurParams {
-            width,
-            height,
-            taps,
-            horizontal: u32::from(horizontal),
-        };
-        let params_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blur params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
+        for (row_offset, rows) in blur_bands(width, height, taps) {
+            let params = BlurParams {
+                width,
+                height,
+                taps,
+                horizontal: u32::from(horizontal),
+                row_offset,
+                _pad: [0; 3],
+            };
+            let params_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("blur params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blur bind group"),
+                layout: &self.blur_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: weights.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+                ],
             });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blur bind group"),
-            layout: &self.blur_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: weights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("blur pass") });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("blur"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.blur_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            // Workgroup is 8x8; round up so edge pixels are covered. The
-            // shader bounds-checks, so overshoot is harmless.
-            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("blur pass") });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("blur"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.blur_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                // Workgroup is 8x8; round up so edge pixels are covered. The
+                // shader bounds-checks, so overshoot is harmless.
+                pass.dispatch_workgroups(width.div_ceil(8), rows.div_ceil(8), 1);
+            }
+            // One submission per band: the watchdog times submissions, so it
+            // is the separate submits, not separate passes, that keep each
+            // one short.
+            self.queue.submit(Some(encoder.finish()));
         }
-        self.queue.submit(Some(encoder.finish()));
     }
 }
 
@@ -531,7 +615,7 @@ impl RenderBackend for GpuBackend {
         }
         // An adjustment layer means the shader cannot express the stack.
         let packed = pack_stack(stack)?;
-        match self.composite_on_gpu(&packed, width, height) {
+        match self.guarded(|| self.composite_on_gpu(&packed, width, height)) {
             Ok(out) => Some(out),
             Err(reason) => {
                 log_gpu_fallback("composite", &reason);
@@ -548,15 +632,60 @@ impl RenderBackend for GpuBackend {
             crate::filters::convolve::gaussian_blur(pixmap, radius);
             return;
         }
-        if let Err(reason) = self.blur_on_gpu(pixmap, radius) {
+        let original = pixmap.clone();
+        if let Err(reason) = self.guarded(|| self.blur_on_gpu(pixmap, radius)) {
             // A device that failed mid-operation must not cost the user their
-            // edit. The CPU path is always available and always correct.
+            // edit. The CPU path is always available and always correct —
+            // from the untouched original, since a failure can come after
+            // the premultiply has already been applied.
             log_gpu_fallback("blur", &reason);
+            *pixmap = original;
             crate::filters::convolve::gaussian_blur(pixmap, radius);
         }
     }
 }
 
+/// The bands of rows one blur pass is sent in, as (first row, row count),
+/// each reading at most [`TAPS_PER_SUBMISSION`] taps — rounded down to a
+/// multiple of the 8-row workgroup, so no band's last workgroup does the next
+/// band's rows over again, and never fewer than one workgroup's 8 rows.
+fn blur_bands(width: u32, height: u32, taps: i32) -> Vec<(u32, u32)> {
+    let per_row = width as u64 * (2 * taps.max(0) as u64 + 1);
+    let rows = (TAPS_PER_SUBMISSION / per_row.max(1)) / 8 * 8;
+    let rows = rows.max(8).min(height as u64).max(1) as u32;
+    (0..height).step_by(rows as usize).map(|start| (start, rows.min(height - start))).collect()
+}
+
 fn log_gpu_fallback(op: &str, reason: &str) {
     eprintln!("photorust: GPU {op} failed, using CPU instead ({reason})");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bands_cover_every_row_once_and_keep_to_the_budget() {
+        for (width, height, taps) in [(200u32, 150u32, 120i32), (1, 1, 0), (5000, 37, 2400), (64, 64, 3)] {
+            let bands = blur_bands(width, height, taps);
+            let mut next = 0;
+            for &(start, rows) in &bands {
+                assert_eq!(start, next, "a gap or overlap at row {start}");
+                assert!(rows > 0);
+                next = start + rows;
+            }
+            assert_eq!(next, height, "the bands stop at row {next} of {height}");
+            // Within the budget, unless the band is already down to the one
+            // workgroup's worth of rows it cannot go below.
+            let per_row = width as u64 * (2 * taps as u64 + 1);
+            for &(_, rows) in &bands {
+                assert!(rows as u64 * per_row <= TAPS_PER_SUBMISSION || rows <= 8, "{rows} rows of {per_row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_blur_goes_out_in_one_band() {
+        assert_eq!(blur_bands(64, 64, 3), vec![(0, 64)]);
+    }
 }

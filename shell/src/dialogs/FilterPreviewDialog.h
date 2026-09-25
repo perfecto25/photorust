@@ -234,8 +234,12 @@ public:
     /// groups — Mezzotint's dots, lines and strokes. The value is read from
     /// the chosen item rather than from its position, so a separator cannot
     /// shift what the list means.
+    ///
+    /// `enabledWhen` greys it out behind another control, as Picture Frame
+    /// greys out its Leaf list for the frames that have no leaves.
     int addChoice(const QString &label, const QStringList &items, const QList<double> &values,
-                  int index, const QList<int> &separatorsAfter = {});
+                  int index, const QList<int> &separatorsAfter = {},
+                  std::function<bool()> enabledWhen = {});
 
     /// A choice with an angle beside it, greyed out unless the chosen item is
     /// the one that uses it — Smart Sharpen's "Remove:", where only Motion

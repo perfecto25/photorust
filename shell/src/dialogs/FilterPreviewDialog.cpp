@@ -838,7 +838,8 @@ int FilterPreviewDialog::addShearCurve(int points)
 
 int FilterPreviewDialog::addChoice(const QString &label, const QStringList &items,
                                    const QList<double> &values, int index,
-                                   const QList<int> &separatorsAfter)
+                                   const QList<int> &separatorsAfter,
+                                   std::function<bool()> enabledWhen)
 {
     const int row = m_params->rowCount();
     auto *combo = new QComboBox(this);
@@ -851,11 +852,16 @@ int FilterPreviewDialog::addChoice(const QString &label, const QStringList &item
         }
     }
     combo->setCurrentIndex(combo->findData(values.value(qBound(0, index, items.size() - 1), 0.0)));
-    m_params->addWidget(new QLabel(label, this), row, 0);
+    auto *caption = new QLabel(label, this);
+    m_params->addWidget(caption, row, 0);
     m_params->addWidget(combo, row, 1);
 
     connect(combo, &QComboBox::currentIndexChanged, this,
             [this] { parametersChanged(); });
+    if (enabledWhen) {
+        m_conditional.append({caption, enabledWhen});
+        m_conditional.append({combo, enabledWhen});
+    }
 
     m_slots.append([combo] { return combo->currentData().toDouble(); });
     return m_slots.size() - 1;
@@ -974,7 +980,8 @@ int FilterPreviewDialog::addColorButton(const QString &label, const QColor &init
     };
     paint();
 
-    m_params->addWidget(new QLabel(label, this), row, 0);
+    auto *caption = new QLabel(label, this);
+    m_params->addWidget(caption, row, 0);
     m_params->addWidget(button, row, 1, Qt::AlignLeft);
 
     connect(button, &QPushButton::clicked, this, [this, button, paint] {
@@ -989,6 +996,7 @@ int FilterPreviewDialog::addColorButton(const QString &label, const QColor &init
     });
 
     if (enabledWhen) {
+        m_conditional.append({caption, enabledWhen});
         m_conditional.append({button, enabledWhen});
     }
     delete chosen;

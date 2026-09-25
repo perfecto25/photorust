@@ -123,6 +123,13 @@ pub mod ffi {
         #[cxx_name = "documentTitleAt"]
         fn document_title_at(self: &Engine, index: i32) -> QString;
 
+        /// Where the document at a tab index was opened from or last saved
+        /// to, or an empty string for one never saved — so the shell can
+        /// bring an already open file forward instead of opening it twice.
+        #[qinvokable]
+        #[cxx_name = "documentPathAt"]
+        fn document_path_at(self: &Engine, index: i32) -> QString;
+
         /// Whether the document at a tab index has unsaved changes.
         #[qinvokable]
         #[cxx_name = "documentModifiedAt"]
@@ -180,6 +187,23 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "loadImage"]
         fn load_image(self: Pin<&mut Engine>, image: &QImage, path: &QString) -> bool;
+
+        /// Open a picture the shell has already decoded, as straight-alpha
+        /// RGBA8888 rows with no padding — `width * height * 4` bytes.
+        ///
+        /// The way every non-PSD file comes in. `load_image` reads its QImage
+        /// a pixel at a time across the bridge, because cxx-qt-lib gives no
+        /// access to a QImage's bits; that is a quarter of a billion calls
+        /// for a 16000-pixel-square map. This is one copy.
+        #[qinvokable]
+        #[cxx_name = "loadImageRgba"]
+        fn load_image_rgba(
+            self: Pin<&mut Engine>,
+            data: &[u8],
+            width: i32,
+            height: i32,
+            path: &QString,
+        ) -> bool;
 
         /// Save to `path`. Returns false for anything but `.psd` — the shell
         /// writes other formats through `QImage::save`.
@@ -3272,20 +3296,21 @@ fn pixmap_to_qimage(pm: Pixmap) -> QImage {
     pm.premultiply();
 
     // SAFETY: the buffer is exactly `w * h * 4` bytes with no row padding,
-    // which is what `Format_RGBA8888_Premultiplied` describes. `borrowed` owns
-    // the allocation and stays alive until the end of this function.
-    let borrowed = unsafe {
+    // which is what `Format_RGBA8888_Premultiplied` describes, and every row
+    // is a whole number of 32-bit words, as Qt requires of scanlines.
+    //
+    // No copy after: `from_raw_bytes` hands the Vec itself to the QImage,
+    // which frees it when the last copy of the image goes. Copying it into
+    // Qt's own storage as well cost a second full-size allocation on every
+    // canvas refresh — a gigabyte a time on a 16000-pixel-square map.
+    unsafe {
         QImage::from_raw_bytes(
             pm.into_bytes(),
             w,
             h,
             QImageFormat::Format_RGBA8888_Premultiplied,
         )
-    };
-
-    // Deep copy into Qt-owned storage before `borrowed` (and the Rust
-    // allocation behind it) is dropped.
-    borrowed.copy(&borrowed.rect())
+    }
 }
 
 /// Copy a `QImage` into a [`Pixmap`].
@@ -3508,6 +3533,33 @@ impl ffi::Engine {
 
         let mut doc = Document::from_pixmap(pixmap);
         doc.path = Some(path);
+        doc.mark_saved();
+        self.as_mut().add_document(doc);
+        self.sync();
+        true
+    }
+
+    fn load_image_rgba(
+        mut self: core::pin::Pin<&mut Self>,
+        data: &[u8],
+        width: i32,
+        height: i32,
+        path: &QString,
+    ) -> bool {
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return false;
+        };
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(pm) = Pixmap::from_raw(width, height, data.to_vec()) else {
+            return false;
+        };
+        let mut doc = Document::from_pixmap(pm);
+        let path = path.to_string();
+        if !path.is_empty() {
+            doc.path = Some(path);
+        }
         doc.mark_saved();
         self.as_mut().add_document(doc);
         self.sync();
@@ -4532,6 +4584,13 @@ impl ffi::Engine {
     fn document_title_at(&self, index: i32) -> QString {
         match self.document_at(index) {
             Some(doc) => QString::from(doc.display_name().as_str()),
+            None => QString::default(),
+        }
+    }
+
+    fn document_path_at(&self, index: i32) -> QString {
+        match self.document_at(index) {
+            Some(doc) => QString::from(doc.path.clone().unwrap_or_default().as_str()),
             None => QString::default(),
         }
     }
@@ -8091,6 +8150,8 @@ impl ffi::Engine {
                 *foreground = self.foreground;
                 *background = self.background;
             }
+            // Stained Glass leads its panes in the foreground colour.
+            Filter::StainedGlass { foreground, .. } => *foreground = self.foreground,
             // Tiles fills the gaps its shifted tiles leave with one swatch or
             // the other, so it needs both whichever was chosen.
             Filter::Tiles { options } => {
