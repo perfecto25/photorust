@@ -37,6 +37,11 @@ public:
 
     /// Current zoom factor; 1.0 is 100%.
     double zoom() const { return m_zoom; }
+    /// How many times the canvas has had to redraw the whole document rather
+    /// than the part that changed. On a large picture each is a second with
+    /// every core busy, so after the first one it should only move for
+    /// changes that really are everywhere — see tst_canvasdamage.
+    int wholeRedraws() const { return m_wholeRedraws; }
 
     /// Set zoom, keeping the view centre fixed. Clamped to the range CS6
     /// allows (0.1% to 3200%).
@@ -911,8 +916,45 @@ private:
 
     Engine *m_engine = nullptr;
 
-    /// Cached composite. Refreshed from the engine, never edited here.
-    QImage m_image;
+    /// The document's size as last brought up to date — the geometry the
+    /// view is laid out by, whatever part of the picture is held here.
+    QSize m_canvasSize;
+
+    /// The part of the picture on screen: `m_viewRect` of level
+    /// `m_viewLevel` of the engine's view pyramid (core/src/view.rs), in
+    /// that level's pixels, premultiplied. Fetched when the view moves off
+    /// it or the zoom calls for another level, and patched in place where
+    /// the document changed. The whole document is never held here: at
+    /// fit-to-screen on a 16000-pixel map that would be a gigabyte to show a
+    /// window's worth.
+    QImage m_view;
+    QRect m_viewRect;
+    int m_viewLevel = -1;
+    int m_wholeRedraws = 0;
+
+    /// A whole-document stroke preview — Quick Mask's, which is a veil over
+    /// everything rather than a patch — drawn instead of the view while set.
+    /// The next catch-up drops it.
+    QImage m_override;
+
+    /// Bring the picture up to date with the document: the engine updates
+    /// its pyramid from what changed, and the part of `m_view` over the
+    /// change is fetched again.
+    void catchUp();
+
+    /// The pyramid level the current zoom draws from: the smallest one that
+    /// still has at least one pixel per device pixel.
+    int viewLevel() const;
+    /// Make `m_view` cover what is on screen, from the right level.
+    void ensureView();
+    /// Fetch again the part of `m_view` over `docRect`, in document pixels.
+    void refreshViewPart(const QRect &docRect);
+    /// Draw `image` into `target`, through the channel mask.
+    void drawPicture(QPainter &painter, const QImage &image, const QRectF &target);
+
+    /// Set the canvas up for a stroke just begun: patch by patch where the
+    /// engine can, a whole-document preview where it cannot (Quick Mask).
+    void startStrokePreview();
 
     /// Channel visibility bitmask. 0xFF = all visible.
     uint8_t m_channelMask = 0xFF;

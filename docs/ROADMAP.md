@@ -744,3 +744,9 @@ Phase 2:
  
  - new filters (Gimp filters, etc)
  -
+
+ 
+ BUGS:
+ - font color picker tool, doesnt update font color live on text if changing color, picker doesnt hold color if moving mouse out of window - FIXED
+ - on very large images, typing text is extremely slow - FIXED
+ - moving text layer on large image is very slow, any kind of layer action spikes cpus to 100 

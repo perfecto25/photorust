@@ -417,7 +417,11 @@ void ChannelsPanel::refresh()
     const auto entries = channelsForMode(mode);
     m_builtinCount = entries.size();
 
-    QImage composite = m_engine->compositeImage();
+    // Only as much of the composite as the thumbnails can show. The whole
+    // document, scaled down here, cost a full composite on every change —
+    // over a second a stroke on a 16000-pixel map. Twice the thumbnail size,
+    // so the smooth scale below still has something to smooth.
+    QImage composite = m_engine->compositeThumbnail(kThumbSize * 2);
 
     for (int i = 0; i < entries.size(); ++i) {
         const auto &entry = entries[i];

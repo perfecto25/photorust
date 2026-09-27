@@ -397,6 +397,72 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Everything about the layer except its pixels and mask, which come back
+    /// empty — what history keeps of a layer's settings, where cloning the
+    /// layer whole would copy its pixels to throw them away.
+    ///
+    /// Written out field by field, through a destructure that names them all,
+    /// so that adding a field to `Layer` is a compile error here rather than a
+    /// setting undo silently forgets.
+    pub fn clone_settings(&self) -> Layer {
+        let Layer {
+            id,
+            name,
+            kind,
+            pixels: _,
+            offset,
+            mask: _,
+            mask_enabled,
+            mask_linked,
+            blend_mode,
+            opacity,
+            fill_opacity,
+            visible,
+            clipping,
+            lock_transparency,
+            lock_pixels,
+            lock_position,
+            text,
+            effects,
+            label,
+            channels,
+            blend_if,
+            transparency_shapes,
+            mask_hides_effects,
+            parent,
+            expanded,
+            link,
+        } = self;
+        Layer {
+            id: *id,
+            name: name.clone(),
+            kind: kind.clone(),
+            pixels: Pixmap::new(0, 0),
+            offset: *offset,
+            mask: None,
+            mask_enabled: *mask_enabled,
+            mask_linked: *mask_linked,
+            blend_mode: *blend_mode,
+            opacity: *opacity,
+            fill_opacity: *fill_opacity,
+            visible: *visible,
+            clipping: *clipping,
+            lock_transparency: *lock_transparency,
+            lock_pixels: *lock_pixels,
+            lock_position: *lock_position,
+            text: text.clone(),
+            effects: effects.clone(),
+            label: *label,
+            channels: *channels,
+            blend_if: blend_if.clone(),
+            transparency_shapes: *transparency_shapes,
+            mask_hides_effects: *mask_hides_effects,
+            parent: *parent,
+            expanded: *expanded,
+            link: *link,
+        }
+    }
+
     /// A transparent raster layer of the given size.
     pub fn new_raster(id: LayerId, name: impl Into<String>, width: u32, height: u32) -> Self {
         Self {
@@ -585,6 +651,21 @@ impl LayerStack {
             // 0 is reserved for LayerId::NONE.
             next_id: 1,
         }
+    }
+
+    /// The stack's layers taken out, leaving it empty, and the id counter —
+    /// for history, which rebuilds a stack from its parts without copying
+    /// pixels. See [`LayerStack::from_parts`].
+    pub(crate) fn take_parts(&mut self) -> (Vec<Layer>, u64) {
+        (std::mem::take(&mut self.layers), self.next_id)
+    }
+
+    pub(crate) fn from_parts(layers: Vec<Layer>, next_id: u64) -> LayerStack {
+        LayerStack { layers, next_id }
+    }
+
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
     }
 
     /// Mint a fresh, never-reused id.

@@ -699,11 +699,11 @@ void ColorPickerDialog::updateHoverSampling()
     const bool overImage = ownWindow && !overSelf(pos) && g_sampler(pos).isValid();
 
     if (overImage == m_sampling) {
-        // Already in the right state; keep reading while over the image —
-        // unless a click has latched a colour, in which case the pointer is
-        // only moving over the image, not choosing from it.
+        // Already in the right state. Hovering only points: the colour is
+        // taken by a click, as in CS6, so the pointer can cross the image on
+        // its way anywhere without the colour following it.
         if (m_sampling) {
-            showCursorFor(m_latched ? g_sampler(pos).isValid() : sampleAt(pos));
+            showCursorFor(g_sampler(pos).isValid());
         }
         return;
     }
@@ -723,7 +723,7 @@ void ColorPickerDialog::updateHoverSampling()
         grabMouse();
         QGuiApplication::setOverrideCursor(Qt::ArrowCursor);
         m_cursorOverridden = true;
-        showCursorFor(sampleAt(pos));
+        showCursorFor(g_sampler(pos).isValid());
     } else {
         m_sampling = false;
         releaseMouse();
@@ -800,6 +800,12 @@ void ColorPickerDialog::mouseMoveEvent(QMouseEvent *event)
     // sampling — following them is smoother than waiting for the next poll.
     updateHoverSampling();
     if (m_sampling) {
+        // Dragging with the button down keeps choosing, as CS6's does — the
+        // colour follows the pointer until it is let go. Without the button
+        // it is only pointing.
+        if (event->buttons() & Qt::LeftButton) {
+            showCursorFor(sampleAt(event->globalPosition().toPoint()));
+        }
         event->accept();
         return;
     }
@@ -815,7 +821,6 @@ void ColorPickerDialog::mousePressEvent(QMouseEvent *event)
     // the press reaches whatever it was aimed at, the title bar included.
     if (m_sampling && overSelf(pos)) {
         m_sampling = false;
-        m_latched = false;
         releaseMouse();
         clearCursorOverride();
         event->ignore();
@@ -823,15 +828,9 @@ void ColorPickerDialog::mousePressEvent(QMouseEvent *event)
     }
 
     if (m_sampling) {
-        // A click on the image holds that colour: the pointer can then travel
-        // back to the dialog — over anything at all on the way — without the
-        // colour following it. Clicking again lets go and the eyedropper reads
-        // live once more.
-        m_latched = !m_latched;
-        if (m_latched) {
-            sampleAt(pos);
-        }
-        showCursorFor(true);
+        // The click is what chooses: the colour under the tip, and then
+        // nothing more until the next click.
+        showCursorFor(sampleAt(pos));
         event->accept();
         return;
     }
@@ -841,10 +840,9 @@ void ColorPickerDialog::mousePressEvent(QMouseEvent *event)
 void ColorPickerDialog::mouseReleaseEvent(QMouseEvent *event)
 {
     if (m_sampling) {
-        // The press has already decided what the colour is — and whether it is
-        // being held — so the release only refreshes the cursor.
-        const QPoint pos = event->globalPosition().toPoint();
-        showCursorFor(m_latched ? g_sampler(pos).isValid() : sampleAt(pos));
+        // The end of the click, or of a drag: the colour is wherever it was
+        // let go, and stays there.
+        showCursorFor(sampleAt(event->globalPosition().toPoint()));
         event->accept();
         return;
     }
@@ -854,8 +852,6 @@ void ColorPickerDialog::mouseReleaseEvent(QMouseEvent *event)
 void ColorPickerDialog::showEvent(QShowEvent *event)
 {
     QDialog::showEvent(event);
-    // A fresh picker reads live until something is clicked.
-    m_latched = false;
     if (!g_sampler) {
         return;
     }

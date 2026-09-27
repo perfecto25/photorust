@@ -611,6 +611,8 @@ pub struct Document {
     /// Snapshot taken when the stroke began, so the whole stroke is one undo
     /// step rather than one per mouse-move.
     stroke_undo_base: Option<LayerStack>,
+    /// See [`Document::restored_damage`].
+    restored: Option<Rect>,
 
     /// State for a Color Replacement stroke. That tool edits the layer directly
     /// as it goes rather than accumulating into a mask, because what it replaces
@@ -868,7 +870,7 @@ impl Document {
         let id = stack.allocate_id();
         stack.push(Layer::new_filled(id, "Background", width, height, background));
 
-        let history = History::new(stack.clone(), (width, height));
+        let history = History::new(&stack, (width, height));
         Self {
             width,
             height,
@@ -884,6 +886,7 @@ impl Document {
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
+            restored: None,
             replacer: None,
             replace_last: None,
             bg_eraser: None,
@@ -911,7 +914,7 @@ impl Document {
         if let Some(l) = doc.stack.get_mut(0) {
             l.name = "Layer 1".to_string();
         }
-        doc.history = History::new(doc.stack.clone(), (doc.width, doc.height));
+        doc.history = History::new(&doc.stack, (doc.width, doc.height));
         doc
     }
 
@@ -935,7 +938,7 @@ impl Document {
             .last()
             .map_or(LayerId::NONE, |layer| layer.id);
 
-        let history = History::new(stack.clone(), (width, height));
+        let history = History::new(&stack, (width, height));
         Self {
             width,
             height,
@@ -951,6 +954,7 @@ impl Document {
             active_layer,
             stroke: None,
             stroke_undo_base: None,
+            restored: None,
             replacer: None,
             replace_last: None,
             bg_eraser: None,
@@ -980,7 +984,7 @@ impl Document {
         layer.pixels = pixels;
         stack.push(layer);
 
-        let history = History::new(stack.clone(), (width, height));
+        let history = History::new(&stack, (width, height));
         Self {
             width,
             height,
@@ -996,6 +1000,7 @@ impl Document {
             active_layer: id,
             stroke: None,
             stroke_undo_base: None,
+            restored: None,
             replacer: None,
             replace_last: None,
             bg_eraser: None,
@@ -3064,8 +3069,15 @@ impl Document {
             return false;
         }
 
-        // Snapshot before the first dab so undo restores the pre-stroke state.
-        self.stroke_undo_base = Some(self.stack.clone());
+        // No snapshot of the stack, unlike the tools that change the layer as
+        // they go (Color Replacement, the Background Eraser, the toning and
+        // focus tools): this stroke touches the layer only when it ends, so a
+        // cancel has nothing to put back, and undo already has the state
+        // before it — the previous history entry. The snapshot cost a copy of
+        // every layer at the start of every stroke: over half a second on a
+        // 16000-pixel map, long enough for the pointer's first moves to be
+        // merged into one and the stroke to start with a straight line.
+        self.stroke_undo_base = None;
 
         let mut mask = StrokeMask::new(self.width, self.height);
         mask.begin(brush, x, y, pressure);
@@ -7529,6 +7541,49 @@ impl Document {
         compositor::composite_region(&self.stack, self.width, self.height, region).pixels
     }
 
+    /// Composite only `region`, as a `region`-sized image — what the canvas
+    /// redraws when only part of the document changed. The same per-row code
+    /// as [`Self::composite`], so the patch matches the whole picture exactly.
+    pub fn composite_patch(&self, region: Rect) -> Pixmap {
+        compositor::composite_patch(&self.stack, self.width, self.height, region).pixels
+    }
+
+    /// The composite shrunk to fit inside `size` x `size`, keeping its shape,
+    /// by point sampling. See [`compositor::composite_sampled`].
+    pub fn composite_thumbnail(&self, size: u32) -> Pixmap {
+        let size = size.max(1) as f32;
+        let scale = (size / self.width.max(1) as f32).min(size / self.height.max(1) as f32).min(1.0);
+        let tw = ((self.width as f32 * scale).round() as u32).max(1);
+        let th = ((self.height as f32 * scale).round() as u32).max(1);
+        compositor::composite_sampled(&self.stack, self.width, self.height, tw, th)
+    }
+
+    /// How much of the composite can change when the layer pixels in `rect`
+    /// do: `rect` itself, grown by the reach of any layer style in the
+    /// document, and clipped to the canvas.
+    ///
+    /// Everything else in compositing is per pixel — blend modes, masks,
+    /// clipping, adjustment layers, Dissolve — so a pixel changing can only
+    /// change the composite at that pixel. A style is the exception: a drop
+    /// shadow or an outer glow draws past the pixels that cast it, so a dab
+    /// on a styled layer changes the composite some way beyond the dab. The
+    /// widest style in the stack is used rather than just the edited
+    /// layer's, which also covers the style on a group the layer sits in.
+    pub fn composite_damage(&self, rect: Rect) -> Rect {
+        if rect.is_empty() {
+            return rect;
+        }
+        let reach = self
+            .stack
+            .as_slice()
+            .iter()
+            .filter(|layer| !layer.is_invisible() && layer.effects.any_enabled())
+            .map(|layer| layer.effects.extent().max(0) as u32)
+            .max()
+            .unwrap_or(0);
+        rect.inflate(reach).intersect(&Rect::from_size(self.width, self.height))
+    }
+
     /// Flatten to an opaque image over `background`.
     pub fn flattened(&self, background: Rgba8) -> Pixmap {
         compositor::flatten(&self.stack, self.width, self.height, background)
@@ -7556,12 +7611,13 @@ impl Document {
         // open type edit was holding on to no longer means anything.
         self.text_edit = None;
 
-        if let Some(state) = self.history.undo() {
-            let (stack, size) = (state.stack.clone(), state.size);
-            self.stack = stack;
+        // History brings the stack back itself, tile by tile, rather than
+        // handing over a copy of the whole thing.
+        if let Some(state) = self.history.undo(&mut self.stack) {
+            self.restored = state.changed.filter(|_| state.size == (self.width, self.height));
             self.color_mode = state.color_mode;
             self.bit_depth = state.bit_depth;
-            self.restore_size(size);
+            self.restore_size(state.size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -7575,12 +7631,13 @@ impl Document {
         self.stroke_undo_base = None;
         self.text_edit = None;
 
-        if let Some(state) = self.history.redo() {
-            let (stack, size) = (state.stack.clone(), state.size);
-            self.stack = stack;
+        // History brings the stack back itself, tile by tile, rather than
+        // handing over a copy of the whole thing.
+        if let Some(state) = self.history.redo(&mut self.stack) {
+            self.restored = state.changed.filter(|_| state.size == (self.width, self.height));
             self.color_mode = state.color_mode;
             self.bit_depth = state.bit_depth;
-            self.restore_size(size);
+            self.restore_size(state.size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -7594,12 +7651,11 @@ impl Document {
         self.stroke = None;
         self.stroke_undo_base = None;
 
-        if let Some(state) = self.history.jump_to(index) {
-            let (stack, size) = (state.stack.clone(), state.size);
-            self.stack = stack;
+        if let Some(state) = self.history.jump_to(index, &mut self.stack) {
+            self.restored = state.changed.filter(|_| state.size == (self.width, self.height));
             self.color_mode = state.color_mode;
             self.bit_depth = state.bit_depth;
-            self.restore_size(size);
+            self.restore_size(state.size);
             self.reconcile_active_layer();
             self.dirty = true;
             true
@@ -7608,11 +7664,21 @@ impl Document {
         }
     }
 
+    /// Where the last undo, redo or history jump changed the picture, in
+    /// document pixels — before any layer style's reach — or `None` when it
+    /// could have changed anywhere: layers came, went or changed a setting, or
+    /// the canvas changed size.
+    pub fn restored_damage(&self) -> Option<Rect> {
+        self.restored
+    }
+
     /// Record the current stack as a new history state.
     pub fn commit(&mut self, name: impl Into<String>) {
+        // By reference: history compares it with what it has and keeps only
+        // what changed, rather than taking a copy of every layer.
         self.history.push(
             name,
-            self.stack.clone(),
+            &self.stack,
             (self.width, self.height),
             self.color_mode,
             self.bit_depth,
@@ -7621,9 +7687,11 @@ impl Document {
     }
 
     pub fn commit_coalescing(&mut self, name: impl Into<String>) {
+        // By reference: history compares it with what it has and keeps only
+        // what changed, rather than taking a copy of every layer.
         self.history.push_coalescing(
             name,
-            self.stack.clone(),
+            &self.stack,
             (self.width, self.height),
             self.color_mode,
             self.bit_depth,
@@ -7671,6 +7739,49 @@ mod tests {
 
     fn doc() -> Document {
         Document::new(16, 16, Rgba8::WHITE)
+    }
+
+    #[test]
+    fn a_stroke_changes_the_composite_only_within_its_damage() {
+        // The canvas redraws `composite_damage(stroke bounds)` after a stroke
+        // and nothing else, so every pixel of the composite the stroke
+        // changes must fall inside it — including the drop shadow the stroke
+        // casts on a styled layer, well outside the paint itself.
+        let mut d = Document::new(200, 200, Rgba8::WHITE);
+        d.add_layer(None);
+        {
+            let fx = &mut d.active_layer_mut().unwrap().effects;
+            fx.drop_shadow.enabled = true;
+            fx.drop_shadow.distance = 20.0;
+            fx.drop_shadow.size = 4.0;
+        }
+        let brush = crate::brush::Brush { size: 8.0, ..crate::brush::Brush::default() };
+        assert!(d.begin_stroke(&brush, 60.0, 60.0, 1.0));
+        d.extend_stroke(&brush, 90.0, 70.0, 1.0);
+        let bounds = d.stroke_dirty();
+        let damage = d.composite_damage(bounds);
+
+        let before = d.composite();
+        d.end_stroke(Rgba8::BLACK, 1.0);
+        let after = d.composite();
+
+        let (mut outside_paint, mut changed) = (0, 0);
+        for y in 0..200 {
+            for x in 0..200 {
+                if before.get(x, y) == after.get(x, y) {
+                    continue;
+                }
+                changed += 1;
+                let inside = |r: &Rect| x >= r.x && y >= r.y && x < r.right() && y < r.bottom();
+                assert!(inside(&damage), "{x},{y} changed outside the damage {damage:?}");
+                if !inside(&bounds) {
+                    outside_paint += 1;
+                }
+            }
+        }
+        assert!(changed > 0, "the stroke changed nothing");
+        // Otherwise this would pass without the style's reach being needed.
+        assert!(outside_paint > 0, "the shadow never left the stroke's own bounds");
     }
 
     /// A checkerboard, so that a blur has something to move everywhere.

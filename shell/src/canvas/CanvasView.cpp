@@ -74,12 +74,138 @@ CanvasView::CanvasView(Engine *engine, QWidget *parent)
     refresh();
 }
 
+void CanvasView::catchUp()
+{
+    // The engine brings its pyramid up to date from what changed and says
+    // what that was: the whole canvas for anything it was not told the
+    // extent of, so a partial update is never a guess.
+    const QRect damage = m_engine->updateDisplay();
+    m_canvasSize = QSize(m_engine->getCanvasWidth(), m_engine->getCanvasHeight());
+    // Whatever preview stood in for the picture is superseded by it.
+    m_override = QImage();
+
+    if (damage.isEmpty()) {
+        return;
+    }
+    if (damage == QRect(QPoint(0, 0), m_canvasSize)) {
+        // Rebuilt from scratch — the levels may even have changed size — so
+        // the next paint fetches what it needs afresh.
+        ++m_wholeRedraws;
+        m_view = QImage();
+        m_viewLevel = -1;
+        return;
+    }
+    refreshViewPart(damage);
+}
+
+void CanvasView::refreshViewPart(const QRect &docRect)
+{
+    if (m_view.isNull() || m_viewLevel < 0) {
+        return;
+    }
+    // Every level pixel whose block the change touches.
+    const int step = 1 << m_viewLevel;
+    const QRect level = QRect(QPoint(docRect.left() / step, docRect.top() / step),
+                              QPoint(docRect.right() / step, docRect.bottom() / step))
+                            .intersected(m_viewRect);
+    if (level.isEmpty()) {
+        return;
+    }
+    const QImage part = m_engine->displayImage(m_viewLevel, level);
+    if (part.size() != level.size()) {
+        m_view = QImage();
+        return;
+    }
+    QPainter painter(&m_view);
+    // The part is the finished picture for that rectangle, so it replaces
+    // what is there rather than being laid over it.
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.drawImage(level.topLeft() - m_viewRect.topLeft(), part);
+}
+
+int CanvasView::viewLevel() const
+{
+    const int levels = m_engine ? m_engine->displayLevelCount() : 0;
+    // Device pixels per document pixel, so a high-density screen draws from
+    // a level with the detail it can actually show.
+    const double scale = m_zoom * devicePixelRatioF();
+    int level = 0;
+    while (level + 1 < levels && scale * double(1 << (level + 1)) <= 1.0) {
+        ++level;
+    }
+    return level;
+}
+
+void CanvasView::ensureView()
+{
+    if (!m_engine || m_canvasSize.isEmpty()) {
+        return;
+    }
+    const int level = viewLevel();
+    const QSize levelSize = m_engine->displayLevelSize(level);
+    if (levelSize.isEmpty()) {
+        return;
+    }
+
+    // What is on screen, in document pixels: the widget's corners taken back
+    // through the pan, zoom and rotation.
+    const QPointF corners[] = {widgetToDocument(QPointF(0, 0)),
+                               widgetToDocument(QPointF(width(), 0)),
+                               widgetToDocument(QPointF(0, height())),
+                               widgetToDocument(QPointF(width(), height()))};
+    double x0 = corners[0].x(), x1 = x0, y0 = corners[0].y(), y1 = y0;
+    for (const QPointF &c : corners) {
+        x0 = std::min(x0, c.x());
+        x1 = std::max(x1, c.x());
+        y0 = std::min(y0, c.y());
+        y1 = std::max(y1, c.y());
+    }
+    const double step = double(1 << level);
+    const QRect bounds(QPoint(0, 0), levelSize);
+    const QRect needed = QRect(QPoint(int(std::floor(x0 / step)), int(std::floor(y0 / step))),
+                               QPoint(int(std::ceil(x1 / step)), int(std::ceil(y1 / step))))
+                             .intersected(bounds);
+    if (needed.isEmpty()) {
+        return;
+    }
+    if (level == m_viewLevel && !m_view.isNull() && m_viewRect.contains(needed)) {
+        return;
+    }
+    // Half as much again on every side, so a short pan is drawn from what is
+    // here rather than asking the engine again.
+    const QRect fetch = needed
+                            .adjusted(-needed.width() / 2, -needed.height() / 2,
+                                      needed.width() / 2, needed.height() / 2)
+                            .intersected(bounds);
+    m_view = m_engine->displayImage(level, fetch);
+    m_viewRect = fetch;
+    m_viewLevel = level;
+}
+
+void CanvasView::startStrokePreview()
+{
+    m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
+    if (m_strokeNeedsFullPreview) {
+        m_override = m_engine->previewImage();
+        update();
+        return;
+    }
+    // The picture here is the base the per-move patches are drawn over.
+    // Brought up to date — usually nothing to do — and the first dab patched
+    // on, rather than recompositing the whole document at the start of every
+    // stroke: over a second each time on a 16000-pixel map. The stroke's end
+    // redraws its bounds from the document, which also takes the patches'
+    // paint back off if the stroke is cancelled.
+    catchUp();
+    if (!applyStrokePatch()) {
+        update();
+    }
+}
+
 void CanvasView::refresh()
 {
     if (m_engine) {
-        // The engine hands back a QImage that borrows a Rust-owned buffer; it
-        // is cheap to take because QImage is implicitly shared.
-        m_image = m_engine->compositeImage();
+        catchUp();
     }
     // Anything may have changed the active layer's content — a move, a
     // brush stroke, an undo — so the transform controls' box is measured
@@ -124,8 +250,8 @@ void CanvasView::refreshSelection()
 
 QPointF CanvasView::documentOrigin() const
 {
-    const double w = m_image.width() * m_zoom;
-    const double h = m_image.height() * m_zoom;
+    const double w = m_canvasSize.width() * m_zoom;
+    const double h = m_canvasSize.height() * m_zoom;
     // Centre the document, then apply the pan offset.
     return QPointF((width() - w) / 2.0 + m_pan.x(), (height() - h) / 2.0 + m_pan.y());
 }
@@ -133,12 +259,12 @@ QPointF CanvasView::documentOrigin() const
 QRectF CanvasView::documentRect() const
 {
     const QPointF origin = documentOrigin();
-    return QRectF(origin, QSizeF(m_image.width() * m_zoom, m_image.height() * m_zoom));
+    return QRectF(origin, QSizeF(m_canvasSize.width() * m_zoom, m_canvasSize.height() * m_zoom));
 }
 
 QColor CanvasView::colorAtGlobal(const QPoint &globalPos) const
 {
-    if (!m_engine || m_image.isNull()) {
+    if (!m_engine || m_canvasSize.isEmpty()) {
         return {};
     }
     const QPoint local = mapFromGlobal(globalPos);
@@ -147,8 +273,8 @@ QColor CanvasView::colorAtGlobal(const QPoint &globalPos) const
     }
 
     const QPointF doc = widgetToDocument(QPointF(local));
-    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_image.width()
-        || doc.y() >= m_image.height()) {
+    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_canvasSize.width()
+        || doc.y() >= m_canvasSize.height()) {
         return {};
     }
     return m_engine->pickColor(int(doc.x()), int(doc.y()));
@@ -156,7 +282,7 @@ QColor CanvasView::colorAtGlobal(const QPoint &globalPos) const
 
 bool CanvasView::sampleAtGlobal(const QPoint &globalPos, QColor *color, QPoint *docPos) const
 {
-    if (!m_engine || m_image.isNull()) {
+    if (!m_engine || m_canvasSize.isEmpty()) {
         return false;
     }
     const QPoint local = mapFromGlobal(globalPos);
@@ -165,8 +291,8 @@ bool CanvasView::sampleAtGlobal(const QPoint &globalPos, QColor *color, QPoint *
     }
 
     const QPointF doc = widgetToDocument(QPointF(local));
-    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_image.width()
-        || doc.y() >= m_image.height()) {
+    if (doc.x() < 0.0 || doc.y() < 0.0 || doc.x() >= m_canvasSize.width()
+        || doc.y() >= m_canvasSize.height()) {
         return false;
     }
 
@@ -294,8 +420,8 @@ void CanvasView::zoomToRect(const QRectF &docRect)
     // `documentToWidget(centre) == viewport centre` for the pan gives this;
     // the view rotation turns about that same centre, so it drops out.
     const QPointF centre = docRect.center();
-    m_pan = QPointF((m_image.width() * m_zoom) / 2.0 - centre.x() * m_zoom,
-                    (m_image.height() * m_zoom) / 2.0 - centre.y() * m_zoom);
+    m_pan = QPointF((m_canvasSize.width() * m_zoom) / 2.0 - centre.x() * m_zoom,
+                    (m_canvasSize.height() * m_zoom) / 2.0 - centre.y() * m_zoom);
 
     clampPan();
     emit zoomChanged(m_zoom);
@@ -322,8 +448,8 @@ void CanvasView::clampPan()
 {
     // Allow panning until only a sliver of the document remains visible, so it
     // can never be lost entirely off-screen.
-    const double marginX = width() / 2.0 + m_image.width() * m_zoom / 2.0 - 32.0;
-    const double marginY = height() / 2.0 + m_image.height() * m_zoom / 2.0 - 32.0;
+    const double marginX = width() / 2.0 + m_canvasSize.width() * m_zoom / 2.0 - 32.0;
+    const double marginY = height() / 2.0 + m_canvasSize.height() * m_zoom / 2.0 - 32.0;
 
     m_pan.setX(qBound(-qMax(marginX, 0.0), m_pan.x(), qMax(marginX, 0.0)));
     m_pan.setY(qBound(-qMax(marginY, 0.0), m_pan.y(), qMax(marginY, 0.0)));
@@ -342,8 +468,8 @@ void CanvasView::syncScrollBars()
 {
     m_scrollBarUpdating = true;
 
-    const double docW = m_image.width() * m_zoom;
-    const double docH = m_image.height() * m_zoom;
+    const double docW = m_canvasSize.width() * m_zoom;
+    const double docH = m_canvasSize.height() * m_zoom;
     const double marginX = width() / 2.0 + docW / 2.0 - 32.0;
     const double marginY = height() / 2.0 + docH / 2.0 - 32.0;
     const double maxX = qMax(marginX, 0.0);
@@ -423,13 +549,13 @@ void CanvasView::zoomOut()
 
 void CanvasView::fitToWindow()
 {
-    if (m_image.isNull() || m_image.width() == 0 || m_image.height() == 0) {
+    if (m_canvasSize.isEmpty() || m_canvasSize.width() == 0 || m_canvasSize.height() == 0) {
         return;
     }
     // Leave a small margin so the document does not touch the window edge.
     const double margin = 24.0;
-    const double sx = (width() - margin) / double(m_image.width());
-    const double sy = (height() - margin) / double(m_image.height());
+    const double sx = (width() - margin) / double(m_canvasSize.width());
+    const double sy = (height() - margin) / double(m_canvasSize.height());
 
     m_pan = QPointF(0.0, 0.0);
     setZoom(qMin(sx, sy));
@@ -1225,9 +1351,7 @@ bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
     if (m_cloneTool == CloneType::PatternStamp) {
         if (m_engine->beginPatternStroke(float(doc.x()), float(doc.y()), 1.0f)) {
             m_dragging = true;
-            m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
-            m_image = m_engine->previewImage();
-            update();
+            startStrokePreview();
         } else {
             reportIfLocked();
         }
@@ -1270,9 +1394,7 @@ bool CanvasView::clonePress(const QPointF &doc, Qt::KeyboardModifiers modifiers)
 
     if (m_engine->beginCloneStroke(float(doc.x()), float(doc.y()), 1.0f)) {
         m_dragging = true;
-        m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
-        m_image = m_engine->previewImage();
-        update();
+        startStrokePreview();
     } else {
         reportIfLocked();
     }
@@ -2684,62 +2806,16 @@ bool CanvasView::event(QEvent *event)
 
 // ----------------------------------------------------------------- painting --
 
-void CanvasView::paintEvent(QPaintEvent *event)
+void CanvasView::drawPicture(QPainter &painter, const QImage &image, const QRectF &target)
 {
-    Q_UNUSED(event)
-    QPainter painter(this);
-
-    // The near-black surround.
-    painter.fillRect(rect(), QColor(0x1e, 0x1e, 0x1e));
-
-    if (m_image.isNull()) {
-        return;
-    }
-
-    const QRectF target = documentRect();
-
-    // Everything from here to the document's border is laid out upright and
-    // then turned as a whole. The overlays below are not: they place themselves
-    // through `documentToWidget`, which already carries the rotation.
-    painter.save();
-    painter.setTransform(viewTransform(), true);
-
-    // Transparency checkerboard, clipped to the document.
-    painter.save();
-    painter.setClipRect(target);
-    const QColor light(0xcc, 0xcc, 0xcc);
-    const QColor dark(0x99, 0x99, 0x99);
-    painter.fillRect(target, light);
-
-    const int x0 = int(std::floor(target.left() / kCheckerSize));
-    const int x1 = int(std::ceil(target.right() / kCheckerSize));
-    const int y0 = int(std::floor(target.top() / kCheckerSize));
-    const int y1 = int(std::ceil(target.bottom() / kCheckerSize));
-    for (int cy = y0; cy <= y1; ++cy) {
-        for (int cx = x0; cx <= x1; ++cx) {
-            if ((cx + cy) % 2 == 0) {
-                continue;
-            }
-            painter.fillRect(QRectF(cx * kCheckerSize, cy * kCheckerSize,
-                                    kCheckerSize, kCheckerSize),
-                             dark);
-        }
-    }
-    painter.restore();
-
-    // At 200% and above Photoshop switches to nearest-neighbour so individual
-    // pixels stay crisp; below that it smooths.
-    // A turned canvas is resampled whatever the zoom, so nearest-neighbour
-    // would leave every edge in the image jagged.
-    painter.setRenderHint(QPainter::SmoothPixmapTransform,
-                          m_zoom < 2.0 || !qFuzzyIsNull(m_viewRotation));
-
-    if (m_channelMask == 0xFF || m_image.isNull()) {
-        painter.drawImage(target, m_image);
+    if (m_channelMask == 0xFF) {
+        painter.drawImage(target, image);
     } else {
         // Convert to ARGB32 so QRgb*/qRed/qGreen/qBlue work correctly
-        // (the engine's RGBA8888 format has different byte order).
-        QImage masked = m_image.convertToFormat(QImage::Format_ARGB32);
+        // (the engine's RGBA8888 format has different byte order). Only the
+        // part on screen is held, so this is a viewport's worth of pixels a
+        // paint, not the document's.
+        QImage masked = image.convertToFormat(QImage::Format_ARGB32);
         const int mode = m_engine ? m_engine->colorMode() : 4;
         if (mode == 5 || mode == 7) {
             const bool showC = m_channelMask & 0x01;
@@ -2788,6 +2864,75 @@ void CanvasView::paintEvent(QPaintEvent *event)
         }
         painter.drawImage(target, masked);
     }
+}
+
+void CanvasView::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event)
+    QPainter painter(this);
+
+    // The near-black surround.
+    painter.fillRect(rect(), QColor(0x1e, 0x1e, 0x1e));
+
+    if (m_canvasSize.isEmpty()) {
+        return;
+    }
+
+    const QRectF target = documentRect();
+
+    // Everything from here to the document's border is laid out upright and
+    // then turned as a whole. The overlays below are not: they place themselves
+    // through `documentToWidget`, which already carries the rotation.
+    painter.save();
+    painter.setTransform(viewTransform(), true);
+
+    // Transparency checkerboard, clipped to the document.
+    painter.save();
+    painter.setClipRect(target);
+    // One fill with a tiled brush, not a fillRect per square: the squares were
+    // counted over the whole document, on screen or not, so at 100% on a
+    // 16000-pixel map every repaint — every mouse move of a stroke — laid
+    // two million of them.
+    static const QBrush checker = [] {
+        QPixmap tile(2 * kCheckerSize, 2 * kCheckerSize);
+        tile.fill(QColor(0xcc, 0xcc, 0xcc));
+        QPainter tiler(&tile);
+        const QColor dark(0x99, 0x99, 0x99);
+        tiler.fillRect(kCheckerSize, 0, kCheckerSize, kCheckerSize, dark);
+        tiler.fillRect(0, kCheckerSize, kCheckerSize, kCheckerSize, dark);
+        return QBrush(tile);
+    }();
+    painter.fillRect(target, checker);
+    painter.restore();
+
+    // At 200% and above Photoshop switches to nearest-neighbour so individual
+    // pixels stay crisp; below that it smooths.
+    // A turned canvas is resampled whatever the zoom, so nearest-neighbour
+    // would leave every edge in the image jagged.
+    painter.setRenderHint(QPainter::SmoothPixmapTransform,
+                          m_zoom < 2.0 || !qFuzzyIsNull(m_viewRotation));
+
+    painter.save();
+    painter.setClipRect(target);
+    if (!m_override.isNull()) {
+        drawPicture(painter, m_override, target);
+    } else {
+        ensureView();
+        if (!m_view.isNull()) {
+            // Where the held part of the level lands: its rectangle scaled up
+            // to document pixels, then through the zoom. The last row and
+            // column of a level can overhang the document by part of a
+            // level pixel; the clip trims it.
+            const double step = double(1 << m_viewLevel);
+            const QPointF origin = documentOrigin();
+            const QRectF where(origin.x() + m_viewRect.x() * step * m_zoom,
+                               origin.y() + m_viewRect.y() * step * m_zoom,
+                               m_viewRect.width() * step * m_zoom,
+                               m_viewRect.height() * step * m_zoom);
+            drawPicture(painter, m_view, where);
+        }
+    }
+    painter.restore();
 
     // A thin border so the document edge reads against the surround.
     painter.setPen(QPen(QColor(0x00, 0x00, 0x00, 160), 1));
@@ -3426,11 +3571,7 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
         // A tablet would supply real pressure here; a mouse reports full.
         if (m_engine->beginStroke(float(doc.x()), float(doc.y()), 1.0f)) {
             m_dragging = true;
-            m_strokeNeedsFullPreview = m_engine->strokeNeedsFullPreview();
-            // The full composite once, as the base the per-move patches are
-            // drawn over.
-            m_image = m_engine->previewImage();
-            update();
+            startStrokePreview();
         } else {
             reportIfLocked();
         }
@@ -3439,7 +3580,7 @@ void CanvasView::mousePressEvent(QMouseEvent *event)
 
 bool CanvasView::applyStrokePatch()
 {
-    if (!m_engine || m_image.isNull()) {
+    if (!m_engine) {
         return false;
     }
     const QImage patch = m_engine->strokePatch();
@@ -3449,20 +3590,27 @@ bool CanvasView::applyStrokePatch()
     // `strokePatchRect` describes the patch just returned, so it is read after
     // it and not before.
     const QRect docRect = m_engine->strokePatchRect();
-    if (docRect.isEmpty() || !m_image.rect().contains(docRect)
-        || patch.size() != docRect.size()) {
+    if (docRect.isEmpty() || patch.size() != docRect.size()) {
         return false;
     }
 
-    QPainter painter(&m_image);
-    // The patch is the finished composite for that rectangle, not paint to lay
-    // over what is there — the layers above the stroke are already in it.
-    painter.setCompositionMode(QPainter::CompositionMode_Source);
-    painter.drawImage(docRect.topLeft(), patch);
-    painter.end();
+    if (!m_view.isNull() && m_viewLevel >= 0) {
+        // The patch is full size; the view may be a level down, so it goes in
+        // shrunk to match. The stroke's end fetches that rectangle again from
+        // the document, exact, which also takes these off if it is cancelled.
+        const double step = double(1 << m_viewLevel);
+        const QRectF where(docRect.x() / step - m_viewRect.x(), docRect.y() / step - m_viewRect.y(),
+                           docRect.width() / step, docRect.height() / step);
+        QPainter painter(&m_view);
+        // The finished composite for that rectangle, not paint to lay over
+        // what is there — the layers above the stroke are already in it.
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, m_viewLevel > 0);
+        painter.drawImage(where, patch);
+    }
 
-    // A margin, because the canvas image is drawn scaled and a document pixel
-    // at the edge of the patch can bleed into the neighbouring screen one.
+    // A margin, because the picture is drawn scaled and a document pixel at
+    // the edge of the patch can bleed into the neighbouring screen one.
     update(documentToWidget(docRect).adjusted(-2, -2, 2, 2));
     return true;
 }
@@ -4050,7 +4198,7 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event)
             // every move costs tens of milliseconds on a large image, and the
             // pointer's events get compressed away while it happens.
             if (m_strokeNeedsFullPreview) {
-                m_image = m_engine->previewImage();
+                m_override = m_engine->previewImage();
                 update();
             } else {
                 applyStrokePatch();

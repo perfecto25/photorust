@@ -129,6 +129,49 @@ pub fn composite_patch(
     }
 }
 
+/// The composite point-sampled down to `out_width` x `out_height`: each output
+/// pixel is the composite at the centre of the patch of canvas it stands for.
+///
+/// For thumbnails — the Channels panel's, which used to composite the whole
+/// document and then scale it down to 32 pixels on every change. Each output
+/// row composites one canvas row, so a thumbnail of a 16000-pixel-square map
+/// costs a few dozen rows rather than sixteen thousand. Point sampling rather
+/// than averaging, which is all a thumbnail that size can show anyway.
+pub fn composite_sampled(
+    stack: &LayerStack,
+    width: u32,
+    height: u32,
+    out_width: u32,
+    out_height: u32,
+) -> Pixmap {
+    let mut out = Pixmap::new(out_width.max(1), out_height.max(1));
+    if stack.is_empty() || width == 0 || height == 0 {
+        return out;
+    }
+    let layers = stack.as_slice();
+    let tiles = fill_tiles(layers);
+    let canvas = Rect::from_size(width, height);
+    let (ow, oh) = (out.width(), out.height());
+    let stride = out.stride();
+    out.as_bytes_mut()
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .for_each_init(
+            || vec![0u8; width as usize * 4],
+            |row, (ty, out_row)| {
+                let y = (((ty as f32 + 0.5) * height as f32 / oh as f32) as i32).min(height as i32 - 1);
+                let region = Rect::new(0, y, width, 1);
+                let effects = render_effects(layers, width, height, region);
+                composite_row(layers, &effects, &tiles, canvas, y, region, row);
+                for tx in 0..ow as usize {
+                    let x = (((tx as f32 + 0.5) * width as f32 / ow as f32) as usize).min(width as usize - 1);
+                    out_row[tx * 4..tx * 4 + 4].copy_from_slice(&row[x * 4..x * 4 + 4]);
+                }
+            },
+        );
+    out
+}
+
 /// Composite a single pixel.
 ///
 /// For the colour pickers and the Info panel, which ask one pixel at a time
@@ -604,6 +647,28 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sampled_composite_is_the_composite_at_the_sample_points() {
+        // Point sampling, so each thumbnail pixel must be exactly the full
+        // composite at the centre of the patch it stands for.
+        let mut stack = LayerStack::new();
+        let mut layer = crate::layer::Layer::new_raster(crate::layer::LayerId(1), "a", 90, 60);
+        for y in 0..60 {
+            for x in 0..90 {
+                layer.pixels.set(x, y, Rgba8::new((x * 2) as u8, (y * 4) as u8, 50, 255));
+            }
+        }
+        stack.push(layer);
+        let full = composite(&stack, 90, 60);
+        let small = composite_sampled(&stack, 90, 60, 9, 6);
+        for ty in 0..6 {
+            for tx in 0..9 {
+                let (x, y) = (tx * 10 + 5, ty * 10 + 5);
+                assert_eq!(small.get(tx, ty), full.get(x, y), "at {tx},{ty}");
+            }
+        }
+    }
     use crate::layer::LayerId;
 
     fn solid_layer(stack: &mut LayerStack, color: Rgba8, w: u32, h: u32) -> LayerId {

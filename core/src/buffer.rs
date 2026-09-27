@@ -8,6 +8,8 @@
 //! Premultiplication happens once, at the very end, when handing the result to
 //! Qt (`QImage::Format_RGBA8888_Premultiplied`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// A single straight-alpha RGBA pixel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(C)]
@@ -115,13 +117,32 @@ impl Rect {
 /// A dense, row-major RGBA image that can store 8, 16, or 32-bit per
 /// component. The raw byte layout changes with the depth, but the public
 /// `get`/`set` API always speaks `Rgba8` so existing code is unaffected.
-#[derive(Clone)]
 pub struct Pixmap {
     width: u32,
     height: u32,
     /// Bytes per component: 1 = u8, 2 = u16, 4 = f32.
     bpc: u8,
     data: Vec<u8>,
+    /// Which content this is, so history can tell an untouched layer from a
+    /// changed one without comparing a gigabyte of it. See [`Pixmap::stamp`].
+    stamp: AtomicU64,
+}
+
+/// The next stamp [`Pixmap::share_stamp`] hands out. Starts at 1: 0 means
+/// "not known to match anything".
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+impl Clone for Pixmap {
+    fn clone(&self) -> Self {
+        // A copy holds the same bytes, so it keeps the stamp.
+        Self {
+            width: self.width,
+            height: self.height,
+            bpc: self.bpc,
+            data: self.data.clone(),
+            stamp: AtomicU64::new(self.stamp.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl PartialEq for Pixmap {
@@ -148,6 +169,7 @@ impl Pixmap {
             height,
             bpc,
             data: vec![0u8; (width as usize) * (height as usize) * 4 * bpc as usize],
+            stamp: AtomicU64::new(0),
         }
     }
 
@@ -163,7 +185,7 @@ impl Pixmap {
         if data.len() != (width as usize) * (height as usize) * 4 {
             return None;
         }
-        Some(Self { width, height, bpc: 1, data })
+        Some(Self { width, height, bpc: 1, data, stamp: AtomicU64::new(0) })
     }
 
     /// Bytes per component (1 = 8-bit, 2 = 16-bit, 4 = 32-bit float).
@@ -197,11 +219,46 @@ impl Pixmap {
         self.width as usize * 4 * self.bpc as usize
     }
 
+    /// Which content this pixmap holds: two pixmaps with the same nonzero
+    /// stamp hold the same bytes. 0 promises nothing.
+    ///
+    /// Committing a history step compares the whole layer stack with the
+    /// copy history keeps, and on a 16000-pixel map that was a gigabyte per
+    /// commit — every step of a Move-tool drag kept every core busy for it.
+    /// Stamps let it skip every layer the step did not touch.
+    ///
+    /// The rule that keeps it true: every `&mut self` method clears the stamp
+    /// before it can change a byte, a copy keeps it, and only
+    /// [`Pixmap::share_stamp`] sets one — on two pixmaps already known to be
+    /// equal. A new `&mut self` method must call `touch` first.
+    pub fn stamp(&self) -> u64 {
+        self.stamp.load(Ordering::Relaxed)
+    }
+
+    /// Mark `self` and `other` as holding the same content, which the caller
+    /// has just made so. Through `&` for `other`, since what history makes
+    /// its copy agree with is the live stack, which it only borrows.
+    pub fn share_stamp(&mut self, other: &Pixmap) {
+        let stamp = match other.stamp() {
+            0 => NEXT_STAMP.fetch_add(1, Ordering::Relaxed),
+            s => s,
+        };
+        other.stamp.store(stamp, Ordering::Relaxed);
+        *self.stamp.get_mut() = stamp;
+    }
+
+    /// About to change: no longer the content any stamp promised.
+    #[inline]
+    fn touch(&mut self) {
+        *self.stamp.get_mut() = 0;
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.touch();
         &mut self.data
     }
 
@@ -218,6 +275,7 @@ impl Pixmap {
 
     /// Mutable row `y`. Panics if `y` is out of range.
     pub fn row_mut(&mut self, y: u32) -> &mut [u8] {
+        self.touch();
         let stride = self.stride();
         let start = y as usize * stride;
         &mut self.data[start..start + stride]
@@ -229,6 +287,7 @@ impl Pixmap {
     }
 
     pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        self.touch();
         let stride = self.stride();
         self.data.chunks_exact_mut(stride)
     }
@@ -275,6 +334,7 @@ impl Pixmap {
 
     /// Write a pixel from `Rgba8`, converting to the internal depth.
     pub fn set(&mut self, x: i32, y: i32, px: Rgba8) {
+        self.touch();
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
@@ -308,6 +368,7 @@ impl Pixmap {
     }
 
     pub fn fill(&mut self, color: Rgba8) {
+        self.touch();
         match self.bpc {
             2 => {
                 let vals: [u16; 4] = [
@@ -350,6 +411,7 @@ impl Pixmap {
 
     /// Fill only within `rect`, clipped to the pixmap.
     pub fn fill_rect(&mut self, rect: Rect, color: Rgba8) {
+        self.touch();
         let r = rect.intersect(&self.rect());
         if r.is_empty() {
             return;
@@ -362,6 +424,7 @@ impl Pixmap {
     }
 
     pub fn clear(&mut self) {
+        self.touch();
         self.data.fill(0);
     }
 
@@ -400,6 +463,7 @@ impl Pixmap {
     /// 32-bit layer on every mouse-move. Pixels landing outside this pixmap
     /// are dropped.
     pub fn blit(&mut self, src: &Pixmap, x: i32, y: i32) {
+        self.touch();
         // Clip to the overlap, in this pixmap's coordinates.
         let dst = Rect::new(x, y, src.width(), src.height()).intersect(&self.rect());
         if dst.is_empty() {
@@ -541,32 +605,76 @@ impl Pixmap {
         self.convert_depth(1)
     }
 
+    /// The tight box around every pixel that is not fully transparent, in the
+    /// pixmap's own coordinates; empty if there are none.
+    ///
+    /// Asked for after every stroke — the Properties panel shows it, and the
+    /// transform controls are drawn round it — so it must not cost a look at
+    /// every pixel. It works inward from the edges: the first and last rows
+    /// with anything in them, then, row by row between those in parallel, the
+    /// first and last pixel. An opaque layer answers every question at its
+    /// first pixel, so a gigabyte photograph costs one pixel a row; only a
+    /// mostly empty layer is scanned through, and then on every core.
+    pub fn content_bounds(&self) -> Rect {
+        use rayon::prelude::*;
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return Rect::default();
+        }
+        let visible = |x: usize, y: usize| -> bool {
+            if self.bpc == 1 {
+                self.data[(y * w + x) * 4 + 3] > 0
+            } else {
+                self.get(x as i32, y as i32).a > 0
+            }
+        };
+        let row_has = |y: usize| (0..w).any(|x| visible(x, y));
+        let Some(top) = (0..h).find(|&y| row_has(y)) else {
+            return Rect::default();
+        };
+        let bottom = (top..h).rev().find(|&y| row_has(y)).unwrap_or(top);
+        let (left, right) = (top..=bottom)
+            .into_par_iter()
+            .filter_map(|y| {
+                let first = (0..w).find(|&x| visible(x, y))?;
+                let last = (first..w).rev().find(|&x| visible(x, y)).unwrap_or(first);
+                Some((first, last))
+            })
+            .reduce(|| (usize::MAX, 0), |a, b| (a.0.min(b.0), a.1.max(b.1)));
+        Rect::new(left as i32, top as i32, (right - left + 1) as u32, (bottom - top + 1) as u32)
+    }
+
     /// Convert to premultiplied alpha in place.
     ///
     /// Qt's `Format_RGBA8888_Premultiplied` is the fast path for painting, so
     /// the composited result is converted once before crossing the bridge.
     pub fn premultiply(&mut self) {
-        for px in self.data.chunks_exact_mut(4) {
+        self.touch();
+        // In parallel: every pixel stands alone, and on a gigabyte composite
+        // one thread is most of a second.
+        use rayon::prelude::*;
+        self.data.par_chunks_exact_mut(4).for_each(|px| {
             let a = px[3] as u32;
             if a == 255 {
-                continue;
+                return;
             }
             if a == 0 {
                 px[0] = 0;
                 px[1] = 0;
                 px[2] = 0;
-                continue;
+                return;
             }
             // +127 rounds to nearest rather than truncating, which otherwise
             // darkens semi-transparent edges over repeated conversions.
             px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
             px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
             px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-        }
+        });
     }
 
     /// Inverse of [`Pixmap::premultiply`].
     pub fn unpremultiply(&mut self) {
+        self.touch();
         for px in self.data.chunks_exact_mut(4) {
             let a = px[3] as u32;
             if a == 255 || a == 0 {
@@ -627,6 +735,49 @@ impl std::fmt::Debug for Pixmap {
             .field("width", &self.width)
             .field("height", &self.height)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod content_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn an_opaque_pixmap_is_its_own_bounds() {
+        let p = Pixmap::filled(300, 200, Rgba8::new(1, 2, 3, 255));
+        assert_eq!(p.content_bounds(), Rect::new(0, 0, 300, 200));
+    }
+
+    #[test]
+    fn an_empty_pixmap_has_no_bounds() {
+        assert!(Pixmap::new(300, 200).content_bounds().is_empty());
+        assert!(Pixmap::new(0, 0).content_bounds().is_empty());
+    }
+
+    #[test]
+    fn scattered_pixels_are_boxed_tightly() {
+        // The two points that set left and right are on rows away from the
+        // top and bottom, so each edge has to be found separately.
+        let mut p = Pixmap::new(400, 300);
+        for (x, y) in [(120, 40), (30, 150), (370, 90), (200, 260)] {
+            p.set(x, y, Rgba8::new(0, 0, 0, 1));
+        }
+        assert_eq!(p.content_bounds(), Rect::new(30, 40, 341, 221));
+    }
+
+    #[test]
+    fn one_pixel_is_a_one_pixel_box() {
+        let mut p = Pixmap::new(50, 50);
+        p.set(49, 0, Rgba8::new(9, 9, 9, 200));
+        assert_eq!(p.content_bounds(), Rect::new(49, 0, 1, 1));
+    }
+
+    #[test]
+    fn deep_pixmaps_are_bounded_too() {
+        let mut p = Pixmap::new_with_depth(64, 64, 2);
+        p.set(10, 20, Rgba8::new(0, 0, 0, 255));
+        p.set(40, 30, Rgba8::new(0, 0, 0, 255));
+        assert_eq!(p.content_bounds(), Rect::new(10, 20, 31, 11));
     }
 }
 
@@ -742,6 +893,47 @@ mod tests {
         let original = positional();
         let same = original.transformed(Orientation::Upright);
         assert_eq!(same.as_bytes(), original.as_bytes());
+    }
+
+    #[test]
+    fn a_stamp_is_shared_by_copies_and_lost_by_any_change() {
+        // History skips comparing two pixmaps with the same stamp, so a
+        // change that kept its stamp would never be undoable. Every way in.
+        type Change = fn(&mut Pixmap);
+        let changes: [(&str, Change); 10] = [
+            ("as_bytes_mut", |p| p.as_bytes_mut()[0] = 9),
+            ("row_mut", |p| p.row_mut(0)[0] = 9),
+            ("rows_mut", |p| p.rows_mut().next().unwrap()[0] = 9),
+            ("set", |p| p.set(0, 0, Rgba8::WHITE)),
+            ("fill", |p| p.fill(Rgba8::WHITE)),
+            ("fill_rect", |p| p.fill_rect(Rect::new(0, 0, 1, 1), Rgba8::WHITE)),
+            ("clear", |p| p.clear()),
+            ("blit", |p| p.blit(&Pixmap::filled(1, 1, Rgba8::WHITE), 0, 0)),
+            ("premultiply", |p| p.premultiply()),
+            ("unpremultiply", |p| p.unpremultiply()),
+        ];
+        for (name, change) in changes {
+            let original = Pixmap::filled(4, 4, Rgba8::new(10, 20, 30, 128));
+            let mut copy = original.clone();
+            copy.share_stamp(&original);
+            assert_ne!(original.stamp(), 0);
+            assert_eq!(copy.stamp(), original.stamp());
+            assert_eq!(copy.clone().stamp(), original.stamp(), "a clone keeps the stamp");
+            change(&mut copy);
+            assert_eq!(copy.stamp(), 0, "{name} kept the stamp");
+        }
+    }
+
+    #[test]
+    fn new_pixmaps_promise_nothing() {
+        assert_eq!(Pixmap::new(2, 2).stamp(), 0);
+        assert_eq!(Pixmap::from_raw(1, 1, vec![0; 4]).unwrap().stamp(), 0);
+        // Two separately shared pairs never collide.
+        let (a, b) = (Pixmap::new(1, 1), Pixmap::new(1, 1));
+        let (mut ca, mut cb) = (a.clone(), b.clone());
+        ca.share_stamp(&a);
+        cb.share_stamp(&b);
+        assert_ne!(a.stamp(), b.stamp());
     }
 
     #[test]

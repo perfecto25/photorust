@@ -42,6 +42,7 @@ pub mod brush;
 pub mod bucket;
 pub mod buffer;
 pub mod compositor;
+pub mod damage;
 pub mod document;
 pub mod effects;
 pub mod erase;
@@ -70,6 +71,7 @@ pub mod slice;
 pub mod smudge;
 pub mod stamp;
 pub mod tone;
+pub mod view;
 pub mod wand;
 
 pub use blend::BlendMode;

@@ -39,7 +39,7 @@ use crate::selection::{Selection, SelectionOp};
 use crate::wand::{self, QuickSelector};
 // `rust_mut()` on a generated QObject comes from this trait.
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QColor, QImage, QImageFormat, QPointF, QPolygonF, QRect, QString};
+use cxx_qt_lib::{QColor, QImage, QImageFormat, QPointF, QPolygonF, QRect, QSize, QString};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -63,6 +63,8 @@ pub mod ffi {
 
         include!("cxx-qt-lib/qrect.h");
         type QRect = cxx_qt_lib::QRect;
+        include!("cxx-qt-lib/qsize.h");
+        type QSize = cxx_qt_lib::QSize;
 
         include!("cxx-qt-lib/qvector.h");
         /// Carries lasso vertices in. Qt's own container, so the shell builds
@@ -243,6 +245,56 @@ pub mod ffi {
         #[qinvokable]
         #[cxx_name = "compositeImage"]
         fn composite_image(self: &Engine) -> QImage;
+
+        /// What the canvas must redraw to catch up with the document since it
+        /// last asked, in document pixels: the whole canvas when a change was
+        /// not described, just its rectangle when it was, and an empty
+        /// rectangle when nothing changed. Clears the account; the canvas is
+        /// the only thing that should call it. See `crate::damage`.
+        #[qinvokable]
+        #[cxx_name = "takeCanvasDamage"]
+        fn take_canvas_damage(self: Pin<&mut Engine>) -> QRect;
+
+        /// The composite of just `rect`, as a `rect`-sized image in the same
+        /// format as `compositeImage` — what the canvas pastes over the part
+        /// of its picture that changed.
+        #[qinvokable]
+        #[cxx_name = "compositeRegionImage"]
+        fn composite_region_image(self: &Engine, rect: &QRect) -> QImage;
+
+        /// Bring the canvas's picture of the document up to date — the
+        /// composite and its halved copies, see `crate::view` — and say what
+        /// changed, in document pixels: the whole canvas after a rebuild, the
+        /// damaged rectangle after a partial update, empty if nothing changed.
+        /// Consumes the damage, as `takeCanvasDamage` does; the canvas is the
+        /// one caller.
+        #[qinvokable]
+        #[cxx_name = "updateDisplay"]
+        fn update_display(self: Pin<&mut Engine>) -> QRect;
+
+        /// How many levels the canvas's picture has: 1 for the composite
+        /// alone, more for a picture large enough to be worth halving.
+        #[qinvokable]
+        #[cxx_name = "displayLevelCount"]
+        fn display_level_count(self: &Engine) -> i32;
+
+        /// The size of one level: level 0 is the document's size, each after
+        /// it half the one before, rounded up.
+        #[qinvokable]
+        #[cxx_name = "displayLevelSize"]
+        fn display_level_size(self: &Engine, level: i32) -> QSize;
+
+        /// `rect` of a level, in that level's pixels, premultiplied — what
+        /// the canvas draws. Only the part on screen is ever asked for.
+        #[qinvokable]
+        #[cxx_name = "displayImage"]
+        fn display_image(self: &Engine, level: i32, rect: &QRect) -> QImage;
+
+        /// The composite shrunk to fit a `size`-pixel square, for thumbnails.
+        /// Costs a few rows of compositing, not the whole document.
+        #[qinvokable]
+        #[cxx_name = "compositeThumbnail"]
+        fn composite_thumbnail(self: &Engine, size: i32) -> QImage;
 
         /// The rendering backend in use, as one line for the UI — for
         /// example "GPU — AMD Radeon 780M Graphics (Vulkan)".
@@ -2984,6 +3036,13 @@ pub struct EngineRust {
     /// Next "Untitled-N" number to hand out, so new documents get distinct
     /// names the way Photoshop's do.
     next_untitled: u32,
+    /// What the canvas has yet to redraw. See `crate::damage`, and
+    /// `doc_mut` / `doc_mut_within` below, which are the only ways to the
+    /// document's pixels.
+    damage: crate::damage::CanvasDamage,
+    /// The composite as the canvas shows it, at every level of zoom. See
+    /// `crate::view`; brought up to date by `update_display`.
+    view: crate::view::ViewPyramid,
     brush: Brush,
     /// The style Copy Layer Style put aside, waiting for a Paste.
     copied_style: Option<crate::effects::LayerEffects>,
@@ -3106,6 +3165,8 @@ impl Default for EngineRust {
             shelf: Vec::new(),
             active: 0,
             next_untitled: 2,
+            damage: crate::damage::CanvasDamage::default(),
+            view: crate::view::ViewPyramid::default(),
             brush: Brush::default(),
             copied_style: None,
             style_edit: None,
@@ -3186,6 +3247,12 @@ fn rgba_to_qcolor(c: Rgba8) -> QColor {
 /// image. Saving, flattening and every filter go on seeing the picture without
 /// it.
 fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
+    apply_quick_mask_veil_at(composite, selection, (0, 0));
+}
+
+/// [`apply_quick_mask_veil`] over a patch whose top left is `origin` in the
+/// document, so a partial redraw veils exactly as a whole one does.
+fn apply_quick_mask_veil_at(composite: &mut Pixmap, selection: &Selection, origin: (i32, i32)) {
     // Nothing selected means nothing masked — entering Quick Mask selects all
     // (see `Document::set_quick_mask`), so an empty mask here can only mean a
     // document that has none, and covering it in red would be a lie.
@@ -3198,7 +3265,7 @@ fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
 
     for y in 0..composite.height() as i32 {
         for x in 0..composite.width() as i32 {
-            let masked = 1.0 - selection.coverage_at(x, y);
+            let masked = 1.0 - selection.coverage_at(x + origin.0, y + origin.1);
             if masked <= 0.0 {
                 continue;
             }
@@ -3208,28 +3275,6 @@ fn apply_quick_mask_veil(composite: &mut Pixmap, selection: &Selection) {
     }
 }
 
-/// Convert a [`Pixmap`] into a `QImage` that owns its pixels.
-///
-/// The obvious implementation wraps the Rust allocation with
-/// `QImage::from_raw_bytes` and lets Qt free it through a Rust deleter — no
-/// copy at all. That is **not safe here**: the wrapper `QImage` is a temporary
-/// that dies when this function returns across the bridge, and its destructor
-/// runs the deleter and frees the Rust buffer. The `QImage` the C++ side ends
-/// up holding then points at freed memory.
-///
-/// The failure is easy to miss because it scales with allocation size: a
-/// multi-megabyte composite usually still reads back as the right pixels
-/// because nothing has reused the pages yet, while a two-kilobyte layer
-/// thumbnail fills with whatever was allocated next and visibly corrupts.
-///
-/// So the borrowed image is deep-copied while it is unquestionably still
-/// alive, and the copy — backed by Qt-owned memory — is what crosses the
-/// boundary.
-///
-/// This costs one memcpy per composite, against CLAUDE.md §8's "avoid copying
-/// buffers across the FFI bridge". Removing it means giving Qt a buffer whose
-/// lifetime is genuinely independent of this call; the natural fix is to keep
-/// Parse "pos,r,g,b;pos,r,g,b;..." into a Gradient.
 /// Parse Replace Color's sample list: semicolon-separated "x,y,r,g,b".
 /// Malformed entries are skipped rather than failing the whole list, so a
 /// stray separator cannot discard colours the user picked.
@@ -3258,6 +3303,7 @@ fn parse_color_samples(text: &str) -> Vec<ColorSample> {
     out
 }
 
+/// Parse "pos,r,g,b;pos,r,g,b;..." into a Gradient.
 fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
     use crate::gradient::{Gradient, GradientStop};
     let text = s.to_string();
@@ -3283,6 +3329,27 @@ fn parse_gradient_stops(s: &QString) -> Option<crate::gradient::Gradient> {
     Some(Gradient::new(stops))
 }
 
+/// Convert a [`Pixmap`] into a `QImage` that owns its pixels.
+///
+/// The obvious implementation wraps the Rust allocation with
+/// `QImage::from_raw_bytes` and lets Qt free it through a Rust deleter — no
+/// copy at all. That is **not safe here**: the wrapper `QImage` is a temporary
+/// that dies when this function returns across the bridge, and its destructor
+/// runs the deleter and frees the Rust buffer. The `QImage` the C++ side ends
+/// up holding then points at freed memory.
+///
+/// The failure is easy to miss because it scales with allocation size: a
+/// multi-megabyte composite usually still reads back as the right pixels
+/// because nothing has reused the pages yet, while a two-kilobyte layer
+/// thumbnail fills with whatever was allocated next and visibly corrupts.
+///
+/// So the borrowed image is deep-copied while it is unquestionably still
+/// alive, and the copy — backed by Qt-owned memory — is what crosses the
+/// boundary.
+///
+/// This costs one memcpy per composite, against CLAUDE.md §8's "avoid copying
+/// buffers across the FFI bridge". Removing it means giving Qt a buffer whose
+/// lifetime is genuinely independent of this call; the natural fix is to keep
 /// a persistent back-buffer in [`EngineRust`] and hand out a `QImage` that
 /// borrows it, which is worth doing once the canvas renderer lands.
 fn pixmap_to_qimage(pm: Pixmap) -> QImage {
@@ -3290,27 +3357,35 @@ fn pixmap_to_qimage(pm: Pixmap) -> QImage {
         return QImage::default();
     }
     let mut pm = if pm.bpc() != 1 { pm.to_8bit() } else { pm };
-    let (w, h) = (pm.width() as i32, pm.height() as i32);
     // Qt paints premultiplied ARGB fastest; convert once here rather than
     // making Qt do it on every repaint.
     pm.premultiply();
+    premultiplied_to_qimage(pm)
+}
 
+/// [`pixmap_to_qimage`] for 8-bit pixels already premultiplied — the view
+/// pyramid's, which are kept that way. The same deep copy, for the same
+/// reason.
+fn premultiplied_to_qimage(pm: Pixmap) -> QImage {
+    if pm.is_empty() {
+        return QImage::default();
+    }
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
     // SAFETY: the buffer is exactly `w * h * 4` bytes with no row padding,
-    // which is what `Format_RGBA8888_Premultiplied` describes, and every row
-    // is a whole number of 32-bit words, as Qt requires of scanlines.
-    //
-    // No copy after: `from_raw_bytes` hands the Vec itself to the QImage,
-    // which frees it when the last copy of the image goes. Copying it into
-    // Qt's own storage as well cost a second full-size allocation on every
-    // canvas refresh — a gigabyte a time on a 16000-pixel-square map.
-    unsafe {
+    // which is what `Format_RGBA8888_Premultiplied` describes. `borrowed` owns
+    // the allocation and stays alive until the end of this function.
+    let borrowed = unsafe {
         QImage::from_raw_bytes(
             pm.into_bytes(),
             w,
             h,
             QImageFormat::Format_RGBA8888_Premultiplied,
         )
-    }
+    };
+
+    // Deep copy into Qt-owned storage before `borrowed` (and the Rust
+    // allocation behind it) is dropped.
+    borrowed.copy(&borrowed.rect())
 }
 
 /// Copy a `QImage` into a [`Pixmap`].
@@ -3332,6 +3407,19 @@ fn qimage_to_pixmap(img: &QImage) -> Option<Pixmap> {
 }
 
 impl EngineRust {
+    /// Where the layer `id` has pixels, or nothing if it has gone.
+    fn layer_bounds(&self, id: LayerId) -> Rect {
+        self.doc.layers().by_id(id).map_or(Rect::default(), |l| l.bounds())
+    }
+
+    /// Where the type layer held back by an open edit has pixels, or nothing
+    /// if no edit is open.
+    fn text_edit_bounds(&self) -> Rect {
+        self.doc
+            .text_edit_layer()
+            .map_or(Rect::default(), |(id, _)| self.layer_bounds(id))
+    }
+
     /// Translate a panel index (0 = topmost) to a [`LayerId`].
     fn layer_id_at(&self, panel_index: i32) -> Option<LayerId> {
         let count = self.doc.layer_count();
@@ -3432,6 +3520,64 @@ impl EngineRust {
         } else {
             self.foreground
         }
+    }
+}
+
+/// The ways to the document, and the canvas damage account that goes with
+/// them. See `crate::damage` for why they are split this way.
+impl ffi::Engine {
+    /// The document, for a change nobody is going to describe: the canvas
+    /// redraws all of it. The default, and always correct.
+    fn doc_mut(self: core::pin::Pin<&mut Self>) -> &mut Document {
+        trace_edit("doc_mut");
+        let rust = core::pin::Pin::into_inner(self.rust_mut());
+        rust.damage.edited();
+        &mut rust.doc
+    }
+
+    /// The document, for a change the caller will describe with
+    /// [`Self::mark_damage`] before handing control back to the shell. Faster
+    /// for the canvas; wrong if the mark does not cover what was changed.
+    fn doc_mut_within(self: core::pin::Pin<&mut Self>) -> &mut Document {
+        &mut core::pin::Pin::into_inner(self.rust_mut()).doc
+    }
+
+    /// The whole engine, for code that reaches the document through it: as
+    /// [`Self::doc_mut`], treated as a change to the whole canvas.
+    fn edit(self: core::pin::Pin<&mut Self>) -> core::pin::Pin<&mut EngineRust> {
+        trace_edit("edit");
+        let mut rust = self.rust_mut();
+        rust.damage.edited();
+        rust
+    }
+
+    /// Record that the layer pixels in `rect` changed, and so whatever of the
+    /// composite depends on them. An empty rectangle records a change that
+    /// shows nowhere.
+    fn mark_damage(mut self: core::pin::Pin<&mut Self>, rect: Rect) {
+        let damage = self.doc.composite_damage(rect);
+        self.as_mut().rust_mut().damage.mark(damage);
+    }
+
+    /// [`Self::sync`] after an undo, redo or history jump: the change is what
+    /// history put back (`Document::restored_damage`), plus whatever stroke
+    /// was in progress — its dabs are on the canvas but not in the document,
+    /// and restoring throws them away. When history cannot say, everything.
+    fn sync_restored(mut self: core::pin::Pin<&mut Self>, stroke: Rect) {
+        match self.doc.restored_damage() {
+            Some(changed) => self.sync_within(changed.union(&stroke)),
+            None => {
+                self.as_mut().rust_mut().damage.edited();
+                self.sync();
+            }
+        }
+    }
+
+    /// [`Self::sync`], with the change described as `rect` rather than left
+    /// to mean the whole canvas.
+    fn sync_within(mut self: core::pin::Pin<&mut Self>, rect: Rect) {
+        self.as_mut().mark_damage(rect);
+        self.sync();
     }
 }
 
@@ -3598,16 +3744,16 @@ impl ffi::Engine {
             return false;
         }
 
-        self.as_mut().rust_mut().doc.path = Some(path);
-        self.as_mut().rust_mut().doc.mark_saved();
+        self.as_mut().doc_mut().path = Some(path);
+        self.as_mut().doc_mut().mark_saved();
         self.sync();
         true
     }
 
     fn mark_saved_as(mut self: core::pin::Pin<&mut Self>, path: &QString) {
         let path = path.to_string();
-        self.as_mut().rust_mut().doc.path = Some(path);
-        self.as_mut().rust_mut().doc.mark_saved();
+        self.as_mut().doc_mut().path = Some(path);
+        self.as_mut().doc_mut().mark_saved();
         self.sync();
     }
 
@@ -3633,6 +3779,78 @@ impl ffi::Engine {
             return QString::default();
         };
         QString::from(metadata::read(&bytes).xmp.unwrap_or_default().as_str())
+    }
+
+    fn take_canvas_damage(mut self: core::pin::Pin<&mut Self>) -> QRect {
+        let (w, h) = self.doc.size();
+        let r = self.as_mut().rust_mut().damage.take(Rect::from_size(w, h));
+        QRect::new(r.x, r.y, r.width as i32, r.height as i32)
+    }
+
+    fn composite_region_image(&self, rect: &QRect) -> QImage {
+        let region = Rect::new(rect.x(), rect.y(), rect.width().max(0) as u32, rect.height().max(0) as u32)
+            .intersect(&Rect::from_size(self.doc.width(), self.doc.height()));
+        if region.is_empty() {
+            return QImage::default();
+        }
+        let mut patch = self.doc.composite_patch(region);
+        if self.doc.quick_mask() {
+            apply_quick_mask_veil_at(&mut patch, self.doc.selection(), (region.x, region.y));
+        }
+        pixmap_to_qimage(patch)
+    }
+
+    fn update_display(mut self: core::pin::Pin<&mut Self>) -> QRect {
+        let (w, h) = self.doc.size();
+        let canvas = Rect::from_size(w, h);
+        let damage = self.as_mut().rust_mut().damage.take(canvas);
+        let qrect = |r: Rect| QRect::new(r.x, r.y, r.width as i32, r.height as i32);
+
+        // The composite in the form the pyramid keeps: 8-bit, with Quick
+        // Mask's veil on, premultiplied.
+        let prepare = |mut pixels: Pixmap, origin: (i32, i32), doc: &Document| {
+            if pixels.bpc() != 1 {
+                pixels = pixels.to_8bit();
+            }
+            if doc.quick_mask() {
+                apply_quick_mask_veil_at(&mut pixels, doc.selection(), origin);
+            }
+            pixels.premultiply();
+            pixels
+        };
+
+        if !self.view.fits(w, h) || damage == canvas {
+            let whole = prepare(self.doc.composite(), (0, 0), &self.doc);
+            self.as_mut().rust_mut().view.rebuild(whole);
+            return qrect(canvas);
+        }
+        if damage.is_empty() {
+            return qrect(damage);
+        }
+        let patch = prepare(self.doc.composite_patch(damage), (damage.x, damage.y), &self.doc);
+        self.as_mut().rust_mut().view.update(damage, &patch);
+        qrect(damage)
+    }
+
+    fn display_level_count(&self) -> i32 {
+        self.view.level_count() as i32
+    }
+
+    fn display_level_size(&self, level: i32) -> QSize {
+        let (w, h) = self.view.level_size(level.max(0) as usize);
+        QSize::new(w as i32, h as i32)
+    }
+
+    fn display_image(&self, level: i32, rect: &QRect) -> QImage {
+        let rect = Rect::new(rect.x(), rect.y(), rect.width().max(0) as u32, rect.height().max(0) as u32);
+        match self.view.crop(level.max(0) as usize, rect) {
+            Some(pixels) if !pixels.is_empty() => premultiplied_to_qimage(pixels),
+            _ => QImage::default(),
+        }
+    }
+
+    fn composite_thumbnail(&self, size: i32) -> QImage {
+        pixmap_to_qimage(self.doc.composite_thumbnail(size.clamp(1, 1024) as u32))
     }
 
     fn composite_image(&self) -> QImage {
@@ -3691,10 +3909,12 @@ impl ffi::Engine {
             (self.paint_color(), self.brush.opacity)
         };
 
+        // Composites the stroke onto the layer and puts the layer back, so
+        // the document is as it was: the patch is the only change, and the
+        // canvas lays it down itself.
         let patch = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .preview_stroke_patch(color, opacity);
 
         match patch {
@@ -3741,7 +3961,7 @@ impl ffi::Engine {
         let Some(kind) = MarkerKind::from_i32(kind) else {
             return -1;
         };
-        let index = self.as_mut().rust_mut().doc.annotations_mut().add(kind, x, y);
+        let index = self.as_mut().doc_mut().annotations_mut().add(kind, x, y);
         match index {
             Some(i) => {
                 self.as_mut().annotations_changed();
@@ -3763,8 +3983,7 @@ impl ffi::Engine {
         };
         if !self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .annotations_mut()
             .move_marker(kind, index, x, y)
         {
@@ -3778,7 +3997,7 @@ impl ffi::Engine {
         let (Some(kind), Ok(index)) = (MarkerKind::from_i32(kind), usize::try_from(index)) else {
             return false;
         };
-        if !self.as_mut().rust_mut().doc.annotations_mut().remove(kind, index) {
+        if !self.as_mut().doc_mut().annotations_mut().remove(kind, index) {
             return false;
         }
         self.as_mut().annotations_changed();
@@ -3789,7 +4008,7 @@ impl ffi::Engine {
         let Some(kind) = MarkerKind::from_i32(kind) else {
             return;
         };
-        self.as_mut().rust_mut().doc.annotations_mut().clear(kind);
+        self.as_mut().doc_mut().annotations_mut().clear(kind);
         self.as_mut().annotations_changed();
     }
 
@@ -3817,8 +4036,7 @@ impl ffi::Engine {
         let text = text.to_string();
         if !self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .annotations_mut()
             .set_text(kind, index, text)
         {
@@ -3834,15 +4052,14 @@ impl ffi::Engine {
 
     fn set_ruler(mut self: core::pin::Pin<&mut Self>, ax: f32, ay: f32, bx: f32, by: f32) {
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .annotations_mut()
             .set_ruler(Ruler::new(ax, ay, bx, by));
         self.as_mut().annotations_changed();
     }
 
     fn clear_ruler(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.annotations_mut().clear_ruler();
+        self.as_mut().doc_mut().annotations_mut().clear_ruler();
         self.as_mut().annotations_changed();
     }
 
@@ -3893,7 +4110,7 @@ impl ffi::Engine {
     ) -> i32 {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
         let index = {
-            let mut rust = self.as_mut().rust_mut();
+            let mut rust = self.as_mut().edit();
             let slices = rust.doc.slices_mut();
             if !slices.add(rect) {
                 return -1;
@@ -3916,7 +4133,7 @@ impl ffi::Engine {
             return false;
         };
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
-        if !self.as_mut().rust_mut().doc.slices_mut().set(index, rect) {
+        if !self.as_mut().doc_mut().slices_mut().set(index, rect) {
             return false;
         }
         self.as_mut().slices_changed();
@@ -3927,7 +4144,7 @@ impl ffi::Engine {
         let Ok(index) = usize::try_from(index) else {
             return false;
         };
-        if !self.as_mut().rust_mut().doc.slices_mut().remove(index) {
+        if !self.as_mut().doc_mut().slices_mut().remove(index) {
             return false;
         }
         self.as_mut().slices_changed();
@@ -3935,7 +4152,7 @@ impl ffi::Engine {
     }
 
     fn clear_slices(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.slices_mut().clear();
+        self.as_mut().doc_mut().slices_mut().clear();
         self.as_mut().slices_changed();
     }
 
@@ -3968,7 +4185,7 @@ impl ffi::Engine {
         let Ok(index) = usize::try_from(index) else {
             return false;
         };
-        if !self.as_mut().rust_mut().doc.paths_mut().set_active(index) {
+        if !self.as_mut().doc_mut().paths_mut().set_active(index) {
             return false;
         }
         self.as_mut().paths_changed();
@@ -4027,8 +4244,7 @@ impl ffi::Engine {
         let path = crate::path::VectorPath::from_subpaths(subpaths);
         let index = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .paths_mut()
             .set_named(&name.to_string(), path) as i32;
         self.as_mut().paths_changed();
@@ -4048,7 +4264,7 @@ impl ffi::Engine {
             return false;
         };
         let changed = {
-            let mut engine = self.as_mut().rust_mut();
+            let mut engine = self.as_mut().edit();
             let layers = engine.doc.layers_mut_raw();
             match layers.by_id_mut(id).and_then(|l| l.text.as_mut()) {
                 Some(text) => {
@@ -4070,7 +4286,7 @@ impl ffi::Engine {
             }
         };
         if changed {
-            self.as_mut().rust_mut().doc.commit("Paragraph");
+            self.as_mut().doc_mut().commit("Paragraph");
             self.as_mut().sync();
         }
         changed
@@ -4110,7 +4326,7 @@ impl ffi::Engine {
             v_distort: v_distort.clamp(-1.0, 1.0),
         };
         let changed = {
-            let mut engine = self.as_mut().rust_mut();
+            let mut engine = self.as_mut().edit();
             let layers = engine.doc.layers_mut_raw();
             match layers.by_id_mut(id).and_then(|l| l.text.as_mut()) {
                 Some(text) if text.warp != warp => {
@@ -4123,7 +4339,7 @@ impl ffi::Engine {
         if changed {
             // The pixels are re-rendered by the shell, which redraws the layer
             // straight after; this only records what was asked for.
-            self.as_mut().rust_mut().doc.commit("Warp Text");
+            self.as_mut().doc_mut().commit("Warp Text");
             self.as_mut().sync();
         }
         changed
@@ -4144,7 +4360,7 @@ impl ffi::Engine {
     }
 
     fn rasterize_type_layer(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let done = self.as_mut().rust_mut().doc.rasterize_type_layer();
+        let done = self.as_mut().doc_mut().rasterize_type_layer();
         if done {
             // The pixels are unchanged, but the Layers panel draws a type
             // layer differently and every menu that asks "is this type?" has
@@ -4168,8 +4384,7 @@ impl ffi::Engine {
         }
         let made = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .convert_type_layer_to_shape(&contours)
             .is_some();
         if made {
@@ -4179,7 +4394,7 @@ impl ffi::Engine {
     }
 
     fn add_path(mut self: core::pin::Pin<&mut Self>) -> i32 {
-        let index = self.as_mut().rust_mut().doc.paths_mut().add_named() as i32;
+        let index = self.as_mut().doc_mut().paths_mut().add_named() as i32;
         self.as_mut().paths_changed();
         index
     }
@@ -4190,8 +4405,7 @@ impl ffi::Engine {
         };
         let result = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .paths_mut()
             .duplicate(index)
             .map_or(-1, |i| i as i32);
@@ -4205,7 +4419,7 @@ impl ffi::Engine {
         let Ok(index) = usize::try_from(index) else {
             return false;
         };
-        if !self.as_mut().rust_mut().doc.paths_mut().remove(index) {
+        if !self.as_mut().doc_mut().paths_mut().remove(index) {
             return false;
         }
         self.as_mut().paths_changed();
@@ -4220,7 +4434,7 @@ impl ffi::Engine {
         if name.is_empty() {
             return false;
         }
-        if !self.as_mut().rust_mut().doc.paths_mut().rename(index, name) {
+        if !self.as_mut().doc_mut().paths_mut().rename(index, name) {
             return false;
         }
         self.as_mut().paths_changed();
@@ -4233,8 +4447,7 @@ impl ffi::Engine {
 
     fn path_append_corner(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32) {
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .paths_mut()
             .ensure_active()
             .append_corner(x, y);
@@ -4247,7 +4460,7 @@ impl ffi::Engine {
         y: f32,
         independent: bool,
     ) -> bool {
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4259,7 +4472,7 @@ impl ffi::Engine {
     }
 
     fn path_close_active_subpath(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4271,7 +4484,7 @@ impl ffi::Engine {
     }
 
     fn path_finish_editing(mut self: core::pin::Pin<&mut Self>) {
-        if let Some(path) = self.as_mut().rust_mut().doc.paths_mut().active_mut() {
+        if let Some(path) = self.as_mut().doc_mut().paths_mut().active_mut() {
             path.finish_editing();
         }
         self.as_mut().paths_changed();
@@ -4316,7 +4529,7 @@ impl ffi::Engine {
         let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4341,7 +4554,7 @@ impl ffi::Engine {
             return false;
         };
         let side = if side == 0 { crate::path::HandleSide::In } else { crate::path::HandleSide::Out };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4356,7 +4569,7 @@ impl ffi::Engine {
         let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4371,7 +4584,7 @@ impl ffi::Engine {
         let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4386,7 +4599,7 @@ impl ffi::Engine {
         let (Ok(sp), Ok(seg)) = (usize::try_from(sp), usize::try_from(seg)) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4401,7 +4614,7 @@ impl ffi::Engine {
         let (Ok(sp), Ok(pt)) = (usize::try_from(sp), usize::try_from(pt)) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4416,7 +4629,7 @@ impl ffi::Engine {
         let Ok(sp) = usize::try_from(sp) else {
             return false;
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(path) = rust.doc.paths_mut().active_mut() else {
             return false;
         };
@@ -4489,8 +4702,7 @@ impl ffi::Engine {
             .collect();
         let added = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .add_freeform_subpath(&pairs, tolerance.max(0.1), close);
         if added {
             self.as_mut().paths_changed();
@@ -4503,8 +4715,7 @@ impl ffi::Engine {
         let feather = feather.clamp(0, 1000) as u32;
         let made = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .select_from_active_path(op, feather);
         if made {
             self.as_mut().selection_changed();
@@ -4515,7 +4726,7 @@ impl ffi::Engine {
 
     fn path_fill(mut self: core::pin::Pin<&mut Self>) -> bool {
         let color = self.foreground;
-        let dirty = self.as_mut().rust_mut().doc.fill_active_path(color, 1.0);
+        let dirty = self.as_mut().doc_mut().fill_active_path(color, 1.0);
         if dirty.is_empty() {
             return false;
         }
@@ -4528,8 +4739,7 @@ impl ffi::Engine {
         let color = self.paint_color();
         let dirty = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .stroke_active_path(&brush, color, brush.opacity);
         if dirty.is_empty() {
             return false;
@@ -4541,7 +4751,7 @@ impl ffi::Engine {
     /// Open `doc` in a new tab, at the end, and make it active.
     fn add_document(mut self: core::pin::Pin<&mut Self>, doc: Document) {
         {
-            let mut rust = self.as_mut().rust_mut();
+            let mut rust = self.as_mut().edit();
             let previous = rust.active;
             let current = std::mem::replace(&mut rust.doc, doc);
             rust.shelf.insert(previous, current);
@@ -4608,7 +4818,7 @@ impl ffi::Engine {
         }
 
         {
-            let mut rust = self.as_mut().rust_mut();
+            let mut rust = self.as_mut().edit();
             let previous = rust.active;
             // Put the active document back in its slot, then lift out the one
             // being switched to. Doing it in this order keeps the tab order
@@ -4639,11 +4849,11 @@ impl ffi::Engine {
             // Closing the active tab moves to its neighbour, preferring the one
             // to the left as Photoshop does.
             let next = if index > 0 { index - 1 } else { 0 };
-            let mut rust = self.as_mut().rust_mut();
+            let mut rust = self.as_mut().edit();
             rust.doc = rust.shelf.remove(next);
             rust.active = next;
         } else {
-            let mut rust = self.as_mut().rust_mut();
+            let mut rust = self.as_mut().edit();
             let shelf_index = if index < rust.active { index } else { index - 1 };
             rust.shelf.remove(shelf_index);
             if index < rust.active {
@@ -4670,7 +4880,7 @@ impl ffi::Engine {
 
     fn set_color_mode(mut self: core::pin::Pin<&mut Self>, mode: i32) {
         if let Some(m) = ImageMode::from_index(mode) {
-            self.as_mut().rust_mut().doc.set_color_mode(m);
+            self.as_mut().doc_mut().set_color_mode(m);
             self.sync();
         }
     }
@@ -4678,7 +4888,7 @@ impl ffi::Engine {
     fn convert_to_indexed(mut self: core::pin::Pin<&mut Self>, max_colors: i32, dither_amount: i32) {
         let colors = max_colors.clamp(2, 256) as u32;
         let dither = dither_amount.clamp(0, 100) as u32;
-        self.as_mut().rust_mut().doc.convert_to_indexed(colors, dither);
+        self.as_mut().doc_mut().convert_to_indexed(colors, dither);
         self.sync();
     }
 
@@ -4691,7 +4901,7 @@ impl ffi::Engine {
             8 | 16 | 32 => depth as u8,
             _ => return,
         };
-        self.as_mut().rust_mut().doc.set_bit_depth(d);
+        self.as_mut().doc_mut().set_bit_depth(d);
         self.sync();
     }
 
@@ -4704,8 +4914,7 @@ impl ffi::Engine {
         let w = width.max(1) as u32;
         let h = height.max(1) as u32;
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .resample_image(w, h, crate::resample::Resample::from_i32(mode));
         self.sync();
     }
@@ -4719,7 +4928,7 @@ impl ffi::Engine {
     }
 
     fn set_image_resolution(mut self: core::pin::Pin<&mut Self>, dpi: f32) {
-        self.as_mut().rust_mut().doc.set_resolution(dpi);
+        self.as_mut().doc_mut().set_resolution(dpi);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4740,7 +4949,7 @@ impl ffi::Engine {
         } else {
             Some(Rgba8::new(clamp(fill_r), clamp(fill_g), clamp(fill_b), clamp(fill_a)))
         };
-        self.as_mut().rust_mut().doc.resize_canvas_anchored(
+        self.as_mut().doc_mut().resize_canvas_anchored(
             width.max(1) as u32,
             height.max(1) as u32,
             anchor_x.clamp(0, 2) as u8,
@@ -4753,7 +4962,7 @@ impl ffi::Engine {
     fn resize_canvas(mut self: core::pin::Pin<&mut Self>, width: i32, height: i32) {
         let w = width.clamp(1, 30_000) as u32;
         let h = height.clamp(1, 30_000) as u32;
-        self.as_mut().rust_mut().doc.resize_canvas(w, h);
+        self.as_mut().doc_mut().resize_canvas(w, h);
         self.sync();
     }
 
@@ -4769,7 +4978,7 @@ impl ffi::Engine {
             (at(6), at(7)),
         ];
 
-        if !self.as_mut().rust_mut().doc.perspective_crop(&quad) {
+        if !self.as_mut().doc_mut().perspective_crop(&quad) {
             return false;
         }
         self.sync();
@@ -4785,7 +4994,7 @@ impl ffi::Engine {
         delete_cropped: bool,
     ) {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
-        self.as_mut().rust_mut().doc.crop(rect, delete_cropped);
+        self.as_mut().doc_mut().crop(rect, delete_cropped);
         // `sync` covers the rest: the size properties, the repaint, and the
         // selection re-trace the crop needs because the ants moved with the
         // canvas.
@@ -4803,8 +5012,7 @@ impl ffi::Engine {
         let edges = crate::document::TrimEdges { top, bottom, left, right };
         let trimmed = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .trim(crate::document::TrimBasis::from_i32(basis), edges);
         if trimmed {
             self.sync();
@@ -4817,7 +5025,7 @@ impl ffi::Engine {
     }
 
     fn reveal_all(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let revealed = self.as_mut().rust_mut().doc.reveal_all();
+        let revealed = self.as_mut().doc_mut().reveal_all();
         if revealed {
             self.sync();
         }
@@ -5075,34 +5283,11 @@ impl ffi::Engine {
         else {
             return QRect::new(0, 0, 0, 0);
         };
-        let w = layer.pixels.width() as i32;
-        let h = layer.pixels.height() as i32;
-        if w == 0 || h == 0 {
+        let b = layer.pixels.content_bounds();
+        if b.is_empty() {
             return QRect::new(0, 0, 0, 0);
         }
-        let mut min_x = w;
-        let mut min_y = h;
-        let mut max_x = 0i32;
-        let mut max_y = 0i32;
-        for y in 0..h {
-            for x in 0..w {
-                if layer.pixels.get(x, y).a > 0 {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                }
-            }
-        }
-        if max_x < min_x {
-            return QRect::new(0, 0, 0, 0);
-        }
-        QRect::new(
-            layer.offset.0 + min_x,
-            layer.offset.1 + min_y,
-            max_x - min_x + 1,
-            max_y - min_y + 1,
-        )
+        QRect::new(layer.offset.0 + b.x, layer.offset.1 + b.y, b.width as i32, b.height as i32)
     }
 
     fn layer_offset_x(&self, index: i32) -> i32 {
@@ -5130,11 +5315,11 @@ impl ffi::Engine {
         let Some(pixels) = qimage_to_pixmap(image) else {
             return;
         };
-        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+        if let Some(layer) = self.as_mut().doc_mut().layers_mut_raw().by_id_mut(id) {
             layer.pixels = pixels;
             layer.offset = (x, y);
         }
-        self.as_mut().rust_mut().doc.commit("Free Transform");
+        self.as_mut().doc_mut().commit("Free Transform");
         self.sync();
     }
 
@@ -5144,8 +5329,7 @@ impl ffi::Engine {
         // there are no new corners and the fill is never reached.
         let fill = self.background;
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .rotate_canvas_arbitrary(degrees, Some(fill));
         self.sync();
     }
@@ -5157,7 +5341,7 @@ impl ffi::Engine {
         } else {
             Orientation::FlipVertical
         };
-        self.as_mut().rust_mut().doc.rotate_canvas(how);
+        self.as_mut().doc_mut().rotate_canvas(how);
         self.sync();
     }
 
@@ -5173,7 +5357,7 @@ impl ffi::Engine {
         let (cw, ch) = self.doc.size();
         let cw = cw as i32;
         let ch = ch as i32;
-        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+        if let Some(layer) = self.as_mut().doc_mut().layers_mut_raw().by_id_mut(id) {
             let (ox, oy) = layer.offset;
             let lw = layer.pixels.width() as i32;
             let lh = layer.pixels.height() as i32;
@@ -5191,7 +5375,7 @@ impl ffi::Engine {
             270 => "Rotate 90\u{b0} CCW",
             _ => "Rotate",
         };
-        self.as_mut().rust_mut().doc.commit(label);
+        self.as_mut().doc_mut().commit(label);
         self.sync();
     }
 
@@ -5201,7 +5385,7 @@ impl ffi::Engine {
         let (cw, ch) = self.doc.size();
         let cw = cw as i32;
         let ch = ch as i32;
-        if let Some(layer) = self.as_mut().rust_mut().doc.layers_mut_raw().by_id_mut(id) {
+        if let Some(layer) = self.as_mut().doc_mut().layers_mut_raw().by_id_mut(id) {
             let (ox, oy) = layer.offset;
             let lw = layer.pixels.width() as i32;
             let lh = layer.pixels.height() as i32;
@@ -5214,20 +5398,20 @@ impl ffi::Engine {
             }
         }
         let label = if horizontal { "Flip Horizontal" } else { "Flip Vertical" };
-        self.as_mut().rust_mut().doc.commit(label);
+        self.as_mut().doc_mut().commit(label);
         self.sync();
     }
 
     fn set_active_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.set_active_layer(id);
+            self.as_mut().doc_mut().set_active_layer(id);
             self.sync();
         }
     }
 
     fn set_layer_visible(mut self: core::pin::Pin<&mut Self>, index: i32, visible: bool) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.set_layer_visible(id, visible);
+            self.as_mut().doc_mut().set_layer_visible(id, visible);
             self.sync();
         }
     }
@@ -5235,7 +5419,7 @@ impl ffi::Engine {
     fn set_layer_opacity(mut self: core::pin::Pin<&mut Self>, index: i32, percent: i32) {
         if let Some(id) = self.layer_id_at(index) {
             let v = percent.clamp(0, 100) as f32 / 100.0;
-            self.as_mut().rust_mut().doc.set_layer_opacity(id, v);
+            self.as_mut().doc_mut().set_layer_opacity(id, v);
             self.sync();
         }
     }
@@ -5243,7 +5427,7 @@ impl ffi::Engine {
     fn set_layer_fill_opacity(mut self: core::pin::Pin<&mut Self>, index: i32, percent: i32) {
         if let Some(id) = self.layer_id_at(index) {
             let v = percent.clamp(0, 100) as f32 / 100.0;
-            self.as_mut().rust_mut().doc.set_layer_fill_opacity(id, v);
+            self.as_mut().doc_mut().set_layer_fill_opacity(id, v);
             self.sync();
         }
     }
@@ -5251,7 +5435,7 @@ impl ffi::Engine {
     fn set_layer_blend_mode(mut self: core::pin::Pin<&mut Self>, index: i32, mode: i32) {
         if let Some(id) = self.layer_id_at(index) {
             let mode = BlendMode::from_i32(mode);
-            self.as_mut().rust_mut().doc.set_layer_blend_mode(id, mode);
+            self.as_mut().doc_mut().set_layer_blend_mode(id, mode);
             self.sync();
         }
     }
@@ -5259,7 +5443,7 @@ impl ffi::Engine {
     fn set_layer_name(mut self: core::pin::Pin<&mut Self>, index: i32, name: &QString) {
         if let Some(id) = self.layer_id_at(index) {
             let name = name.to_string();
-            self.as_mut().rust_mut().doc.set_layer_name(id, name);
+            self.as_mut().doc_mut().set_layer_name(id, name);
             self.sync();
         }
     }
@@ -5273,8 +5457,7 @@ impl ffi::Engine {
     ) {
         if let Some(id) = self.layer_id_at(index) {
             self.as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .set_layer_locks(id, transparency, pixels, position);
             self.sync();
         }
@@ -5282,13 +5465,13 @@ impl ffi::Engine {
 
     fn set_layer_clipping(mut self: core::pin::Pin<&mut Self>, index: i32, clipping: bool) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.set_layer_clipping(id, clipping);
+            self.as_mut().doc_mut().set_layer_clipping(id, clipping);
             self.sync();
         }
     }
 
     fn add_layer(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.add_layer(None);
+        self.as_mut().doc_mut().add_layer(None);
         self.sync();
     }
 
@@ -5311,8 +5494,7 @@ impl ffi::Engine {
         let key = key.to_string();
         let set = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_effect_value(id, &key, value);
         if set {
             // The canvas repaints, but nothing lands in the History panel —
@@ -5325,7 +5507,7 @@ impl ffi::Engine {
 
     fn commit_layer_effects(mut self: core::pin::Pin<&mut Self>) {
         self.as_mut().rust_mut().style_edit = None;
-        self.as_mut().rust_mut().doc.commit_layer_effects();
+        self.as_mut().doc_mut().commit_layer_effects();
         self.sync();
     }
 
@@ -5346,8 +5528,7 @@ impl ffi::Engine {
         self.as_mut().rust_mut().style_edit = None;
         let restored = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_style_state(id, state);
         if restored {
             // No commit: a cancelled edit leaves nothing in the History panel,
@@ -5397,7 +5578,7 @@ impl ffi::Engine {
         let Some(id) = self.layer_id_at(index) else {
             return false;
         };
-        let cleared = self.as_mut().rust_mut().doc.clear_layer_effects(id);
+        let cleared = self.as_mut().doc_mut().clear_layer_effects(id);
         if cleared {
             self.sync();
         }
@@ -5425,7 +5606,7 @@ impl ffi::Engine {
         let Some(style) = self.copied_style else {
             return false;
         };
-        let pasted = self.as_mut().rust_mut().doc.set_layer_effects(id, style);
+        let pasted = self.as_mut().doc_mut().set_layer_effects(id, style);
         if pasted {
             self.sync();
         }
@@ -5437,7 +5618,7 @@ impl ffi::Engine {
     }
 
     fn hide_all_effects(mut self: core::pin::Pin<&mut Self>, hidden: bool) {
-        self.as_mut().rust_mut().doc.hide_all_effects(hidden);
+        self.as_mut().doc_mut().hide_all_effects(hidden);
         self.sync();
     }
 
@@ -5463,7 +5644,7 @@ impl ffi::Engine {
     ) {
         let name = name.to_string();
         let name = if name.trim().is_empty() { None } else { Some(name) };
-        self.as_mut().rust_mut().doc.add_layer_configured(
+        self.as_mut().doc_mut().add_layer_configured(
             name,
             BlendMode::from_i32(mode),
             opacity.clamp(0, 100) as f32 / 100.0,
@@ -5487,7 +5668,7 @@ impl ffi::Engine {
         let name = name.to_string();
         let name = if name.trim().is_empty() { None } else { Some(name) };
         let clamp = |v: i32| v.clamp(0, 255) as u8;
-        self.as_mut().rust_mut().doc.add_fill_layer(
+        self.as_mut().doc_mut().add_fill_layer(
             name,
             Rgba8::opaque(clamp(r), clamp(g), clamp(b)),
             BlendMode::from_i32(mode),
@@ -5507,7 +5688,7 @@ impl ffi::Engine {
         let Some(id) = self.layer_id_at(index) else {
             return;
         };
-        if self.as_mut().rust_mut().doc.set_layer_mask_linked(id, linked) {
+        if self.as_mut().doc_mut().set_layer_mask_linked(id, linked) {
             self.sync();
         }
     }
@@ -5556,8 +5737,7 @@ impl ffi::Engine {
         };
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_label(id, label.clamp(0, 7) as u8)
         {
             self.sync();
@@ -5593,7 +5773,7 @@ impl ffi::Engine {
             dither,
             align_with_layer: align,
         };
-        self.as_mut().rust_mut().doc.add_gradient_fill_layer(
+        self.as_mut().doc_mut().add_gradient_fill_layer(
             name,
             fill,
             BlendMode::from_i32(mode),
@@ -5622,7 +5802,7 @@ impl ffi::Engine {
             scale: scale.clamp(10, 1000) as f32 / 100.0,
             link_with_layer: link,
         };
-        self.as_mut().rust_mut().doc.add_pattern_fill_layer(
+        self.as_mut().doc_mut().add_pattern_fill_layer(
             name,
             fill,
             BlendMode::from_i32(mode),
@@ -5648,7 +5828,7 @@ impl ffi::Engine {
             2 => LayerKind::Pattern(crate::fill::PatternFill::default()),
             _ => LayerKind::Gradient(crate::fill::GradientFill::default()),
         };
-        let id = self.as_mut().rust_mut().doc.begin_fill_layer(
+        let id = self.as_mut().doc_mut().begin_fill_layer(
             name,
             kind,
             BlendMode::from_i32(mode),
@@ -5690,8 +5870,7 @@ impl ffi::Engine {
             align_with_layer: align,
         };
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_fill(id, LayerKind::Gradient(fill));
         self.as_mut().layers_changed();
         self.as_mut().canvas_changed();
@@ -5712,8 +5891,7 @@ impl ffi::Engine {
             link_with_layer: link,
         };
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_fill(id, LayerKind::Pattern(fill));
         self.as_mut().layers_changed();
         self.as_mut().canvas_changed();
@@ -5725,9 +5903,9 @@ impl ffi::Engine {
         };
         self.as_mut().rust_mut().fill_preview = None;
         if keep {
-            self.as_mut().rust_mut().doc.commit_fill_layer(id);
+            self.as_mut().doc_mut().commit_fill_layer(id);
         } else {
-            self.as_mut().rust_mut().doc.discard_layer(id);
+            self.as_mut().doc_mut().discard_layer(id);
         }
         self.sync();
     }
@@ -5748,7 +5926,7 @@ impl ffi::Engine {
         } else {
             name
         };
-        let converted = self.as_mut().rust_mut().doc.layer_from_background(
+        let converted = self.as_mut().doc_mut().layer_from_background(
             &name,
             BlendMode::from_i32(mode),
             opacity.clamp(0, 100) as f32 / 100.0,
@@ -5764,7 +5942,7 @@ impl ffi::Engine {
     }
 
     fn layer_via_copy(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let made = self.as_mut().rust_mut().doc.layer_via_copy().is_some();
+        let made = self.as_mut().doc_mut().layer_via_copy().is_some();
         if made {
             self.sync();
         }
@@ -5772,7 +5950,7 @@ impl ffi::Engine {
     }
 
     fn layer_via_cut(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let made = self.as_mut().rust_mut().doc.layer_via_cut().is_some();
+        let made = self.as_mut().doc_mut().layer_via_cut().is_some();
         if made {
             self.sync();
         }
@@ -5793,7 +5971,7 @@ impl ffi::Engine {
         };
         let name = name.to_string();
         let name = if name.trim().is_empty() { None } else { Some(name) };
-        self.as_mut().rust_mut().doc.add_adjustment_layer_configured(
+        self.as_mut().doc_mut().add_adjustment_layer_configured(
             name,
             adjustment,
             BlendMode::from_i32(mode),
@@ -5831,8 +6009,7 @@ impl ffi::Engine {
         };
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_adjustment(id, adjustment)
         {
             self.as_mut().layers_changed();
@@ -5871,8 +6048,7 @@ impl ffi::Engine {
         }
         if !self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_adjustment(id, adjustment)
         {
             return false;
@@ -5900,8 +6076,7 @@ impl ffi::Engine {
         };
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_adjustment(id, defaults)
         {
             self.as_mut().layers_changed();
@@ -5936,8 +6111,7 @@ impl ffi::Engine {
 
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_adjustment(id, Adjustment::GradientMap { ramp })
         {
             self.as_mut().layers_changed();
@@ -5993,8 +6167,7 @@ impl ffi::Engine {
         };
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_layer_adjustment(id, Adjustment::ColorLookup { tables })
         {
             self.as_mut().layers_changed();
@@ -6029,9 +6202,9 @@ impl ffi::Engine {
                 .doc
                 .layer_adjustment(id)
                 .map_or("Adjustment", |a| a.name());
-            self.as_mut().rust_mut().doc.commit(label);
+            self.as_mut().doc_mut().commit(label);
         } else {
-            self.as_mut().rust_mut().doc.set_layer_adjustment(id, before);
+            self.as_mut().doc_mut().set_layer_adjustment(id, before);
         }
         self.sync();
     }
@@ -6044,8 +6217,7 @@ impl ffi::Engine {
         let name = kind.to_string();
         let adjustment = Adjustment::default_for(&name).unwrap_or_default();
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .add_adjustment_layer(adjustment);
         self.sync();
     }
@@ -6065,7 +6237,7 @@ impl ffi::Engine {
         if ids.is_empty() {
             return false;
         }
-        let made = self.as_mut().rust_mut().doc.group_layers(&ids).is_some();
+        let made = self.as_mut().doc_mut().group_layers(&ids).is_some();
         if made {
             self.sync();
         }
@@ -6075,7 +6247,7 @@ impl ffi::Engine {
     fn add_layer_group(mut self: core::pin::Pin<&mut Self>, name: &QString) {
         let name = name.to_string();
         let name = (!name.trim().is_empty()).then_some(name);
-        self.as_mut().rust_mut().doc.add_group(name);
+        self.as_mut().doc_mut().add_group(name);
         self.sync();
     }
 
@@ -6107,7 +6279,7 @@ impl ffi::Engine {
             },
             None => return false,
         };
-        let done = self.as_mut().rust_mut().doc.ungroup_layers(group);
+        let done = self.as_mut().doc_mut().ungroup_layers(group);
         if done {
             self.sync();
         }
@@ -6118,7 +6290,7 @@ impl ffi::Engine {
         let (Some(id), Some(op)) = (self.layer_id_at(index), ArrangeOp::from_i32(op)) else {
             return false;
         };
-        let moved = self.as_mut().rust_mut().doc.arrange_layer(id, op);
+        let moved = self.as_mut().doc_mut().arrange_layer(id, op);
         if moved {
             self.sync();
         }
@@ -6134,7 +6306,7 @@ impl ffi::Engine {
 
     fn reverse_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
         let ids = self.layer_ids_at(indices);
-        let reversed = self.as_mut().rust_mut().doc.reverse_layers(&ids);
+        let reversed = self.as_mut().doc_mut().reverse_layers(&ids);
         if reversed {
             self.sync();
         }
@@ -6152,8 +6324,7 @@ impl ffi::Engine {
         };
         let moved = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .move_layer_into_group(id, group_id);
         if moved {
             self.sync();
@@ -6163,7 +6334,7 @@ impl ffi::Engine {
 
     fn link_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
         let ids = self.layer_ids_at(indices);
-        let linked = self.as_mut().rust_mut().doc.link_layers(&ids);
+        let linked = self.as_mut().doc_mut().link_layers(&ids);
         if linked {
             self.sync();
         }
@@ -6179,7 +6350,7 @@ impl ffi::Engine {
             return false;
         };
         let ids = self.layer_ids_at(indices);
-        let moved = self.as_mut().rust_mut().doc.align_layers(&ids, edge);
+        let moved = self.as_mut().doc_mut().align_layers(&ids, edge);
         if moved {
             self.sync();
         }
@@ -6195,7 +6366,7 @@ impl ffi::Engine {
             return false;
         };
         let ids = self.layer_ids_at(indices);
-        let moved = self.as_mut().rust_mut().doc.distribute_layers(&ids, edge);
+        let moved = self.as_mut().doc_mut().distribute_layers(&ids, edge);
         if moved {
             self.sync();
         }
@@ -6204,7 +6375,7 @@ impl ffi::Engine {
 
     fn unlink_layers(mut self: core::pin::Pin<&mut Self>, indices: &ffi::QVector_i32) -> bool {
         let ids = self.layer_ids_at(indices);
-        let unlinked = self.as_mut().rust_mut().doc.unlink_layers(&ids);
+        let unlinked = self.as_mut().doc_mut().unlink_layers(&ids);
         if unlinked {
             self.sync();
         }
@@ -6258,8 +6429,7 @@ impl ffi::Engine {
         };
         if self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_group_expanded(id, expanded)
         {
             self.as_mut().layers_changed();
@@ -6268,7 +6438,7 @@ impl ffi::Engine {
 
     fn duplicate_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.duplicate_layer(id);
+            self.as_mut().doc_mut().duplicate_layer(id);
             self.sync();
         }
     }
@@ -6295,7 +6465,7 @@ impl ffi::Engine {
 
         // Same document: straight in above the active layer.
         if destination >= 0 && destination as usize == self.active {
-            self.as_mut().rust_mut().doc.insert_layer(layer);
+            self.as_mut().doc_mut().insert_layer(layer);
             self.sync();
             return true;
         }
@@ -6332,7 +6502,7 @@ impl ffi::Engine {
         } else {
             destination - 1
         };
-        let mut rust = self.as_mut().rust_mut();
+        let mut rust = self.as_mut().edit();
         let Some(target) = rust.shelf.get_mut(shelf_index) else {
             return false;
         };
@@ -6341,7 +6511,7 @@ impl ffi::Engine {
     }
 
     fn delete_hidden_layers(mut self: core::pin::Pin<&mut Self>) -> i32 {
-        let removed = self.as_mut().rust_mut().doc.delete_hidden_layers();
+        let removed = self.as_mut().doc_mut().delete_hidden_layers();
         if removed > 0 {
             self.sync();
         }
@@ -6359,7 +6529,7 @@ impl ffi::Engine {
 
     fn delete_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.delete_layer(id);
+            self.as_mut().doc_mut().delete_layer(id);
             self.sync();
         }
     }
@@ -6374,47 +6544,72 @@ impl ffi::Engine {
         }
         // Flip the destination from panel order to stack order.
         let stack_to = count - 1 - to as usize;
-        self.as_mut().rust_mut().doc.reorder_layer(id, stack_to);
+        self.as_mut().doc_mut().reorder_layer(id, stack_to);
         self.sync();
     }
 
     fn merge_layer_down(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.merge_down(id);
+            self.as_mut().doc_mut().merge_down(id);
             self.sync();
         }
     }
 
     fn flatten_image(mut self: core::pin::Pin<&mut Self>) {
         let bg = self.background;
-        self.as_mut().rust_mut().doc.flatten(bg);
+        self.as_mut().doc_mut().flatten(bg);
         self.sync();
     }
 
     fn add_layer_mask(mut self: core::pin::Pin<&mut Self>, index: i32, reveal_all: bool) {
         if let Some(id) = self.layer_id_at(index) {
             self.as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .add_layer_mask(id, reveal_all);
             self.sync();
         }
     }
 
     fn offset_layer(mut self: core::pin::Pin<&mut Self>, index: i32, dx: i32, dy: i32) {
-        if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.offset_layer(id, dx, dy);
+        let Some(id) = self.layer_id_at(index) else {
+            return;
+        };
+        // A Move-tool drag calls this on every mouse move, so recompositing
+        // the whole document each time kept every core busy for a second a
+        // step on a 16000-pixel map. Moving pixels changes the picture only
+        // where they were and where they now are — layers clipped to one and
+        // its mask move within the same bounds, and its style's reach is
+        // `mark_damage`'s. Everything linked moves too. Only plain pixel
+        // layers are that simple: a fill or adjustment covers the canvas
+        // and a group is its members, so those still redraw everything.
+        let ids = self.doc.linked_with(id);
+        let layers = self.doc.layers();
+        let local = ids.iter().all(|&id| {
+            layers.by_id(id).is_some_and(|l| matches!(l.kind, LayerKind::Raster))
+        });
+        if !local {
+            self.as_mut().doc_mut().offset_layer(id, dx, dy);
             self.sync();
+            return;
         }
+        let before = ids
+            .iter()
+            .fold(Rect::default(), |r, &id| r.union(&self.layer_bounds(id)));
+        self.as_mut().doc_mut_within().offset_layer(id, dx, dy);
+        let after = ids
+            .iter()
+            .fold(before, |r, &id| r.union(&self.layer_bounds(id)));
+        self.sync_within(after);
     }
 
     fn seal_history(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.seal_history();
+        // Closes a run of history steps; nothing on the canvas changes.
+        self.as_mut().doc_mut_within().seal_history();
     }
 
     fn rasterize_layer(mut self: core::pin::Pin<&mut Self>, index: i32) {
         if let Some(id) = self.layer_id_at(index) {
-            self.as_mut().rust_mut().doc.rasterize_type(id);
+            self.as_mut().doc_mut().rasterize_type(id);
             self.sync();
         }
     }
@@ -6430,8 +6625,7 @@ impl ffi::Engine {
             return false;
         };
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .add_image_layer(pixels, (x, y), name.to_string());
         self.sync();
         true
@@ -6485,11 +6679,28 @@ impl ffi::Engine {
         let Some(pixels) = qimage_to_pixmap(image) else {
             return false;
         };
-        self.as_mut()
-            .rust_mut()
-            .doc
+        // A new layer shows only where it has pixels, so that is all the
+        // canvas redraws — the Type tool adds one at every click, and on a
+        // 16000-pixel map recompositing the whole picture for it took over a
+        // second. The exception is a layer slipped into a clipping group: the
+        // clipped layers above now clip to it instead of their old base,
+        // which changes them wherever they are.
+        let id = self
+            .as_mut()
+            .doc_mut_within()
             .add_text_layer(pixels, (x, y), name.to_string(), content);
-        self.sync();
+        let layers = self.doc.layers();
+        let splits_clipping = layers
+            .index_of(id)
+            .and_then(|i| layers.get(i + 1))
+            .is_some_and(|above| above.clipping);
+        if splits_clipping {
+            self.as_mut().rust_mut().damage.edited();
+            self.sync();
+        } else {
+            let bounds = self.layer_bounds(id);
+            self.sync_within(bounds);
+        }
         true
     }
 
@@ -6531,15 +6742,21 @@ impl ffi::Engine {
         let Some(pixels) = qimage_to_pixmap(image) else {
             return false;
         };
+        // Only the old and new renderings change, and the held-back layer
+        // coming back. Marked before as well as after, since a hidden layer's
+        // style does not count towards `mark_damage`'s reach and this changes
+        // which layers are hidden.
+        let before = self.layer_bounds(id).union(&self.text_edit_bounds());
+        self.as_mut().mark_damage(before);
         // The edit is over either way, so the layer gets its pixels back before
         // they are replaced — otherwise a failed update would leave it hidden.
-        self.as_mut().rust_mut().doc.end_text_edit();
+        self.as_mut().doc_mut_within().end_text_edit();
         let updated = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .update_text_layer(id, pixels, (x, y), name.to_string(), content);
-        self.sync();
+        let after = before.union(&self.layer_bounds(id));
+        self.sync_within(after);
         updated
     }
 
@@ -6575,7 +6792,7 @@ impl ffi::Engine {
         }
 
         let op = SelectionOp::from_i32(op);
-        self.as_mut().rust_mut().doc.select_mask(&coverage, op, 0);
+        self.as_mut().doc_mut().select_mask(&coverage, op, 0);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
         true
@@ -6652,14 +6869,24 @@ impl ffi::Engine {
         let Some(id) = self.layer_id_at(index) else {
             return false;
         };
-        let started = self.as_mut().rust_mut().doc.begin_text_edit(id);
-        self.sync();
+        // Hiding a layer changes the picture only where it has pixels, and
+        // where layers clipped to it do — which is inside the same pixels.
+        // Beginning also ends any edit already open, bringing that layer
+        // back. Both are marked before and after the change, since a hidden
+        // layer's style does not count towards `mark_damage`'s reach.
+        let bounds = self.layer_bounds(id).union(&self.text_edit_bounds());
+        self.as_mut().mark_damage(bounds);
+        let started = self.as_mut().doc_mut_within().begin_text_edit(id);
+        self.sync_within(bounds);
         started
     }
 
     fn end_text_edit(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.end_text_edit();
-        self.sync();
+        // As `begin_text_edit`: only the held-back layer's pixels come back.
+        let bounds = self.text_edit_bounds();
+        self.as_mut().mark_damage(bounds);
+        self.as_mut().doc_mut_within().end_text_edit();
+        self.sync_within(bounds);
     }
 
     // -- painting -----------------------------------------------------------
@@ -6768,28 +6995,38 @@ impl ffi::Engine {
         // instead. Photoshop's Pencil works exactly this way, which is what makes
         // it usable for touching up 1px lines.
         let erase = self.auto_erase && {
-            let under = self.doc.composite().get(x as i32, y as i32);
+            // One pixel of the composite, not all of it: this runs at the
+            // start of every Pencil stroke.
+            let under = self.doc.composite_pixel(x as i32, y as i32);
             let fg = self.foreground;
             under.r == fg.r && under.g == fg.g && under.b == fg.b && under.a == fg.a
         };
         self.as_mut().rust_mut().auto_erase_active = erase;
 
         let brush = self.brush;
+        // Nothing reaches the layer until the stroke ends: the dabs gather in
+        // the stroke mask, and the canvas shows them by patch. So beginning
+        // and extending a stroke change nothing the canvas has to redraw.
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .begin_stroke(&brush, x, y, pressure)
     }
 
     fn extend_stroke(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) {
         let brush = self.brush;
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .extend_stroke(&brush, x, y, pressure);
     }
 
     fn end_stroke(mut self: core::pin::Pin<&mut Self>) {
+        // Every ending — paint, clone, heal, or Quick Mask's paint into the
+        // selection — writes only inside the stroke's own coverage, so what
+        // the canvas redraws is the stroke's bounds (grown by any layer
+        // style; see `mark_damage`). Taken before the stroke is, since ending
+        // it consumes the mask.
+        let bounds = self.doc.stroke_dirty();
+
         // The Spot Healing Brush uses the same stroke machinery but a different
         // ending: the covered region is reconstructed rather than filled.
         if let Some(mode) = self.heal_mode {
@@ -6798,13 +7035,13 @@ impl ffi::Engine {
             // what belongs from the surroundings alone.
             match self.heal_source {
                 Some((dx, dy)) => {
-                    self.as_mut().rust_mut().doc.end_heal_clone_stroke(dx, dy);
+                    self.as_mut().doc_mut_within().end_heal_clone_stroke(dx, dy);
                 }
                 None => {
-                    self.as_mut().rust_mut().doc.end_heal_stroke(mode);
+                    self.as_mut().doc_mut_within().end_heal_stroke(mode);
                 }
             }
-            self.sync();
+            self.sync_within(bounds);
             return;
         }
         let opacity = self.brush.opacity;
@@ -6812,17 +7049,17 @@ impl ffi::Engine {
         // filling with a colour. Everything up to here — dabs, spacing, flow —
         // was the same stroke machinery.
         if self.doc.is_cloning() {
-            self.as_mut().rust_mut().doc.end_clone_stroke(opacity);
-            self.sync();
+            self.as_mut().doc_mut_within().end_clone_stroke(opacity);
+            self.sync_within(bounds);
             return;
         }
         let color = self.paint_color();
-        self.as_mut().rust_mut().doc.end_stroke(color, opacity);
-        self.sync();
+        self.as_mut().doc_mut_within().end_stroke(color, opacity);
+        self.sync_within(bounds);
     }
 
     fn cancel_stroke(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.cancel_stroke();
+        self.as_mut().doc_mut().cancel_stroke();
         self.sync();
     }
 
@@ -6891,7 +7128,7 @@ impl ffi::Engine {
             Sampling::Continuous => None,
         };
         let foreground = self.foreground;
-        let started = self.as_mut().rust_mut().doc.begin_background_erase(
+        let started = self.as_mut().doc_mut().begin_background_erase(
             &brush, options, reference, foreground, x, y, pressure,
         );
         if started {
@@ -6905,8 +7142,7 @@ impl ffi::Engine {
         let foreground = self.foreground;
         let dirty = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .extend_background_erase(&brush, x, y, pressure, foreground);
         if !dirty.is_empty() {
             self.as_mut().canvas_changed();
@@ -6914,13 +7150,13 @@ impl ffi::Engine {
     }
 
     fn end_background_erase(mut self: core::pin::Pin<&mut Self>) {
-        if self.as_mut().rust_mut().doc.end_background_erase() {
+        if self.as_mut().doc_mut().end_background_erase() {
             self.sync();
         }
     }
 
     fn cancel_background_erase(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.cancel_background_erase();
+        self.as_mut().doc_mut().cancel_background_erase();
         self.as_mut().canvas_changed();
     }
 
@@ -6935,7 +7171,7 @@ impl ffi::Engine {
         sample_all: bool,
         opacity: i32,
     ) -> bool {
-        let dirty = self.as_mut().rust_mut().doc.magic_erase(
+        let dirty = self.as_mut().doc_mut().magic_erase(
             x,
             y,
             tolerance.clamp(0, 255) as u32,
@@ -6962,7 +7198,7 @@ impl ffi::Engine {
             ReplaceSampling::Continuous => None,
         };
         let replacement = self.foreground;
-        let started = self.as_mut().rust_mut().doc.begin_replace(
+        let started = self.as_mut().doc_mut().begin_replace(
             &brush, options, reference, replacement, x, y, pressure,
         );
         if started {
@@ -6976,8 +7212,7 @@ impl ffi::Engine {
         let replacement = self.foreground;
         let dirty = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .extend_replace(&brush, x, y, pressure, replacement);
         if !dirty.is_empty() {
             self.as_mut().canvas_changed();
@@ -6985,13 +7220,13 @@ impl ffi::Engine {
     }
 
     fn end_replace(mut self: core::pin::Pin<&mut Self>) {
-        if self.as_mut().rust_mut().doc.end_replace() {
+        if self.as_mut().doc_mut().end_replace() {
             self.sync();
         }
     }
 
     fn cancel_replace(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.cancel_replace();
+        self.as_mut().doc_mut().cancel_replace();
         self.sync();
     }
 
@@ -7047,8 +7282,7 @@ impl ffi::Engine {
         let reservoir = self.mixer_reservoir;
         let started = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .begin_mixer(&brush, options, reservoir, x, y, pressure);
         if started {
             self.as_mut().canvas_changed();
@@ -7058,14 +7292,14 @@ impl ffi::Engine {
 
     fn extend_mixer(mut self: core::pin::Pin<&mut Self>, x: f32, y: f32, pressure: f32) {
         let brush = self.brush;
-        let dirty = self.as_mut().rust_mut().doc.extend_mixer(&brush, x, y, pressure);
+        let dirty = self.as_mut().doc_mut().extend_mixer(&brush, x, y, pressure);
         if !dirty.is_empty() {
             self.as_mut().canvas_changed();
         }
     }
 
     fn end_mixer(mut self: core::pin::Pin<&mut Self>) {
-        let Some(carried) = self.as_mut().rust_mut().doc.end_mixer() else {
+        let Some(carried) = self.as_mut().doc_mut().end_mixer() else {
             return;
         };
         // What the brush ends the stroke holding, unless a toggle says
@@ -7084,7 +7318,7 @@ impl ffi::Engine {
     }
 
     fn cancel_mixer(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.cancel_mixer();
+        self.as_mut().doc_mut().cancel_mixer();
         self.sync();
     }
 
@@ -7152,8 +7386,7 @@ impl ffi::Engine {
 
         let started = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .begin_clone_stroke(&brush, x, y, pressure, offset, sampling);
         if started {
             self.as_mut().rust_mut().clone_offset = Some(offset);
@@ -7212,15 +7445,13 @@ impl ffi::Engine {
         let drawn = match mode {
             ShapeMode::Shape => self
                 .as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .add_shape_layer(&points, color, options.kind.layer_name())
                 .is_some(),
-            ShapeMode::Path => self.as_mut().rust_mut().doc.append_shape_path(&points),
+            ShapeMode::Path => self.as_mut().doc_mut().append_shape_path(&points),
             ShapeMode::Pixels => !self
                 .as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .fill_shape(&points, color, 1.0)
                 .is_empty(),
         };
@@ -7304,8 +7535,7 @@ impl ffi::Engine {
         let aligned = self.pattern_aligned;
         let started = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut_within()
             .begin_pattern_stroke(&brush, x, y, pressure, index, aligned);
         if started {
             self.as_mut().canvas_changed();
@@ -7370,8 +7600,7 @@ impl ffi::Engine {
         let options = self.gradient_options;
         let dirty = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .draw_gradient(&ramp, &options, (x0, y0), (x1, y1));
         if dirty.is_empty() {
             return false;
@@ -7456,21 +7685,18 @@ impl ffi::Engine {
         let started = if self.tone_active {
             let options = self.tone_options;
             self.as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .begin_tone(&brush, options, x, y, pressure)
         } else if self.focus_tool == 2 {
             let options = self.smudge_options;
             let paint = self.foreground;
             self.as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .begin_smudge(&brush, options, paint, x, y, pressure)
         } else {
             let options = self.focus_options;
             self.as_mut()
-                .rust_mut()
-                .doc
+                .doc_mut()
                 .begin_focus(&brush, options, x, y, pressure)
         };
         if started {
@@ -7486,20 +7712,20 @@ impl ffi::Engine {
         pressure: f32,
     ) {
         let brush = self.brush;
-        let dirty = self.as_mut().rust_mut().doc.extend_retouch(&brush, x, y, pressure);
+        let dirty = self.as_mut().doc_mut().extend_retouch(&brush, x, y, pressure);
         if !dirty.is_empty() {
             self.as_mut().canvas_changed();
         }
     }
 
     fn end_retouch_stroke(mut self: core::pin::Pin<&mut Self>) {
-        if self.as_mut().rust_mut().doc.end_retouch() {
+        if self.as_mut().doc_mut().end_retouch() {
             self.sync();
         }
     }
 
     fn cancel_retouch_stroke(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.cancel_retouch();
+        self.as_mut().doc_mut().cancel_retouch();
         self.sync();
     }
 
@@ -7531,8 +7757,7 @@ impl ffi::Engine {
         let colour = self.paint_color();
         let dirty = self
             .as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .fill_bucket((x, y), &options, colour);
         if dirty.is_empty() {
             return false;
@@ -7568,7 +7793,7 @@ impl ffi::Engine {
             destination,
             transparent,
         };
-        self.as_mut().rust_mut().doc.patch_selection(options);
+        self.as_mut().doc_mut().patch_selection(options);
         self.sync();
     }
 
@@ -7589,8 +7814,7 @@ impl ffi::Engine {
             color: color.clamp(0, 10) as u32,
         };
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .content_aware_move(&options, sample_all_layers);
         self.sync();
     }
@@ -7605,7 +7829,7 @@ impl ffi::Engine {
         darken: i32,
     ) {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
-        self.as_mut().rust_mut().doc.remove_red_eye(
+        self.as_mut().doc_mut().remove_red_eye(
             rect,
             pupil.clamp(0, 100) as u32,
             darken.clamp(0, 100) as u32,
@@ -7615,13 +7839,13 @@ impl ffi::Engine {
 
     fn fill_foreground(mut self: core::pin::Pin<&mut Self>) {
         let c = self.foreground;
-        self.as_mut().rust_mut().doc.fill(c);
+        self.as_mut().doc_mut().fill(c);
         self.sync();
     }
 
     fn fill_background(mut self: core::pin::Pin<&mut Self>) {
         let c = self.background;
-        self.as_mut().rust_mut().doc.fill(c);
+        self.as_mut().doc_mut().fill(c);
         self.sync();
     }
 
@@ -7633,7 +7857,7 @@ impl ffi::Engine {
         let c = Rgba8::new(r.clamp(0, 255) as u8, g.clamp(0, 255) as u8,
                            b.clamp(0, 255) as u8, a.clamp(0, 255) as u8);
         let mode = BlendMode::from_i32(blend_mode);
-        self.as_mut().rust_mut().doc.fill_with_opacity(c, opacity, mode);
+        self.as_mut().doc_mut().fill_with_opacity(c, opacity, mode);
         self.sync();
     }
 
@@ -7644,7 +7868,7 @@ impl ffi::Engine {
     ) {
         if pattern_index < 0 { return; }
         let mode = BlendMode::from_i32(blend_mode);
-        self.as_mut().rust_mut().doc.fill_with_pattern(pattern_index as usize, opacity, mode);
+        self.as_mut().doc_mut().fill_with_pattern(pattern_index as usize, opacity, mode);
         self.sync();
     }
 
@@ -7655,12 +7879,12 @@ impl ffi::Engine {
     ) {
         let c = Rgba8::opaque(r.clamp(0, 255) as u8, g.clamp(0, 255) as u8,
                               b.clamp(0, 255) as u8);
-        self.as_mut().rust_mut().doc.stroke_selection(c, width, opacity, location);
+        self.as_mut().doc_mut().stroke_selection(c, width, opacity, location);
         self.sync();
     }
 
     fn clear_selection(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.clear_selection_pixels();
+        self.as_mut().doc_mut().clear_selection_pixels();
         self.sync();
     }
 
@@ -7669,7 +7893,7 @@ impl ffi::Engine {
     }
 
     fn set_quick_mask(mut self: core::pin::Pin<&mut Self>, on: bool) {
-        self.as_mut().rust_mut().doc.set_quick_mask(on);
+        self.as_mut().doc_mut().set_quick_mask(on);
         // Both the canvas and the selection outline change: the veil goes on or
         // off, and the marching ants give way to it.
         self.as_mut().selection_changed();
@@ -7677,7 +7901,7 @@ impl ffi::Engine {
     }
 
     fn copy_selection(mut self: core::pin::Pin<&mut Self>, merged: bool) -> QImage {
-        let Some((pixels, origin)) = self.as_mut().rust_mut().doc.copy_selection(merged) else {
+        let Some((pixels, origin)) = self.as_mut().doc_mut().copy_selection(merged) else {
             return QImage::default();
         };
         self.as_mut().rust_mut().copy_origin = origin;
@@ -7707,7 +7931,7 @@ impl ffi::Engine {
             2 => PasteMode::Outside,
             _ => PasteMode::Plain,
         };
-        self.as_mut().rust_mut().doc.paste_into(pixels, (x, y), mode);
+        self.as_mut().doc_mut().paste_into(pixels, (x, y), mode);
         self.sync();
         true
     }
@@ -7732,7 +7956,7 @@ impl ffi::Engine {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
         let op = SelectionOp::from_i32(op);
         let feather = feather.clamp(0, 1000) as u32;
-        self.as_mut().rust_mut().doc.select_rect(rect, op, feather);
+        self.as_mut().doc_mut().select_rect(rect, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7749,7 +7973,7 @@ impl ffi::Engine {
         let rect = Rect::new(x, y, width.max(0) as u32, height.max(0) as u32);
         let op = SelectionOp::from_i32(op);
         let feather = feather.clamp(0, 1000) as u32;
-        self.as_mut().rust_mut().doc.select_ellipse(rect, op, feather);
+        self.as_mut().doc_mut().select_ellipse(rect, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7772,7 +7996,7 @@ impl ffi::Engine {
 
         let op = SelectionOp::from_i32(op);
         let feather = feather.clamp(0, 1000) as u32;
-        self.as_mut().rust_mut().doc.select_polygon(&pairs, op, feather);
+        self.as_mut().doc_mut().select_polygon(&pairs, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7846,7 +8070,7 @@ impl ffi::Engine {
     ) {
         let mask = self.color_range_coverage(range, target, fuzziness, invert);
         let op = SelectionOp::from_i32(op);
-        self.as_mut().rust_mut().doc.select_mask(&mask, op, 0);
+        self.as_mut().doc_mut().select_mask(&mask, op, 0);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7872,7 +8096,7 @@ impl ffi::Engine {
 
         let op = SelectionOp::from_i32(op);
         let feather = feather.clamp(0, 1000) as u32;
-        self.as_mut().rust_mut().doc.select_mask(&mask, op, feather);
+        self.as_mut().doc_mut().select_mask(&mask, op, feather);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7920,7 +8144,7 @@ impl ffi::Engine {
         let mut updated = base;
         updated.apply_mask_feathered(&mask, op, feather);
 
-        self.as_mut().rust_mut().doc.set_selection(updated);
+        self.as_mut().doc_mut().set_selection(updated);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7932,26 +8156,26 @@ impl ffi::Engine {
     }
 
     fn select_all(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.select_all();
+        self.as_mut().doc_mut().select_all();
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
 
     fn deselect(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.deselect();
+        self.as_mut().doc_mut().deselect();
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
 
     fn invert_selection(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.invert_selection();
+        self.as_mut().doc_mut().invert_selection();
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
 
     fn feather_selection(mut self: core::pin::Pin<&mut Self>, radius: i32) {
         let r = radius.clamp(0, 1000) as u32;
-        self.as_mut().rust_mut().doc.selection_mut().feather(r);
+        self.as_mut().doc_mut().selection_mut().feather(r);
         self.as_mut().selection_changed();
         self.as_mut().canvas_changed();
     }
@@ -7961,7 +8185,9 @@ impl ffi::Engine {
     }
 
     fn selection_bounds(mut self: core::pin::Pin<&mut Self>) -> Vec<i32> {
-        let b = self.as_mut().rust_mut().doc.selection_mut().bounds();
+        // Only fills the selection's cache of its own bounds: the picture is
+        // untouched, so nothing for the canvas to redraw.
+        let b = self.as_mut().doc_mut_within().selection_mut().bounds();
         vec![b.x, b.y, b.width as i32, b.height as i32]
     }
 
@@ -7992,15 +8218,15 @@ impl ffi::Engine {
         // A preview may still be showing when OK is pressed. Take it away
         // first, so that the filter is applied to the layer as it really is
         // and the history step holds one application rather than two.
-        self.as_mut().rust_mut().doc.clear_filter_preview();
-        self.as_mut().rust_mut().doc.apply_filter(filter);
+        self.as_mut().doc_mut().clear_filter_preview();
+        self.as_mut().doc_mut().apply_filter(filter);
         self.sync();
     }
 
     fn apply_flame(mut self: core::pin::Pin<&mut Self>, params: &[f32]) -> bool {
         let options = crate::filters::FlameOptions::from_params(params);
-        self.as_mut().rust_mut().doc.clear_filter_preview();
-        if !self.as_mut().rust_mut().doc.apply_flame(&options) {
+        self.as_mut().doc_mut().clear_filter_preview();
+        if !self.as_mut().doc_mut().apply_flame(&options) {
             return false;
         }
         self.sync();
@@ -8014,8 +8240,7 @@ impl ffi::Engine {
             Some(crate::filters::FlameOptions::from_params(params))
         };
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .set_flame_preview(options.as_ref());
         // Only the canvas: a preview is not a document change, so neither the
         // History panel nor the Layers panel should hear about it.
@@ -8041,10 +8266,9 @@ impl ffi::Engine {
         let Some(map) = qimage_to_pixmap(map) else {
             return;
         };
-        self.as_mut().rust_mut().doc.clear_filter_preview();
+        self.as_mut().doc_mut().clear_filter_preview();
         self.as_mut()
-            .rust_mut()
-            .doc
+            .doc_mut()
             .apply_displace(&map, h_scale, v_scale, stretch, wrap);
         self.sync();
     }
@@ -8220,7 +8444,7 @@ impl ffi::Engine {
         } else {
             self.as_ref().filter_for(&QString::from(&name), params)
         };
-        self.as_mut().rust_mut().doc.set_filter_preview(filter);
+        self.as_mut().doc_mut().set_filter_preview(filter);
         // Only the canvas: a preview is not a document change, so neither the
         // History panel nor the Layers panel should hear about it.
         self.as_mut().canvas_changed();
@@ -8278,7 +8502,7 @@ impl ffi::Engine {
                 None => return,
             },
         };
-        self.as_mut().rust_mut().doc.apply_adjustment(adjustment);
+        self.as_mut().doc_mut().apply_adjustment(adjustment);
         self.sync();
     }
 
@@ -8292,7 +8516,7 @@ impl ffi::Engine {
         channel: i32,
     ) {
         if channel >= 1 && channel <= 3 {
-            self.as_mut().rust_mut().doc.apply_levels_channel(
+            self.as_mut().doc_mut().apply_levels_channel(
                 (channel - 1) as usize,
                 in_black,
                 in_white,
@@ -8308,7 +8532,7 @@ impl ffi::Engine {
                 out_black,
                 out_white,
             };
-            self.as_mut().rust_mut().doc.apply_adjustment(adjustment);
+            self.as_mut().doc_mut().apply_adjustment(adjustment);
         }
         self.sync();
     }
@@ -8321,7 +8545,7 @@ impl ffi::Engine {
         if lut.len() != 256 {
             return;
         }
-        self.as_mut().rust_mut().doc.apply_curves_lut(lut, channel);
+        self.as_mut().doc_mut().apply_curves_lut(lut, channel);
         self.sync();
     }
 
@@ -8332,7 +8556,7 @@ impl ffi::Engine {
         lightness: f32,
         channel: i32,
     ) {
-        self.as_mut().rust_mut().doc.apply_hue_saturation_range(hue, saturation, lightness, channel);
+        self.as_mut().doc_mut().apply_hue_saturation_range(hue, saturation, lightness, channel);
         self.sync();
     }
 
@@ -8344,7 +8568,7 @@ impl ffi::Engine {
         tone: i32,
         preserve_luminosity: bool,
     ) {
-        self.as_mut().rust_mut().doc.apply_color_balance(cyan_red, magenta_green, yellow_blue, tone, preserve_luminosity);
+        self.as_mut().doc_mut().apply_color_balance(cyan_red, magenta_green, yellow_blue, tone, preserve_luminosity);
         self.sync();
     }
 
@@ -8360,7 +8584,7 @@ impl ffi::Engine {
         tint_hue: f32,
         tint_sat: f32,
     ) {
-        self.as_mut().rust_mut().doc.apply_black_and_white(reds, yellows, greens, cyans, blues, magentas, tint, tint_hue, tint_sat);
+        self.as_mut().doc_mut().apply_black_and_white(reds, yellows, greens, cyans, blues, magentas, tint, tint_hue, tint_sat);
         self.sync();
     }
 
@@ -8372,7 +8596,7 @@ impl ffi::Engine {
         density: f32,
         preserve_luminosity: bool,
     ) {
-        self.as_mut().rust_mut().doc.apply_photo_filter(r, g, b, density, preserve_luminosity);
+        self.as_mut().doc_mut().apply_photo_filter(r, g, b, density, preserve_luminosity);
         self.sync();
     }
 
@@ -8381,7 +8605,7 @@ impl ffi::Engine {
         shadow_amount: f32,
         highlight_amount: f32,
     ) {
-        self.as_mut().rust_mut().doc.apply_shadows_highlights(shadow_amount, highlight_amount);
+        self.as_mut().doc_mut().apply_shadows_highlights(shadow_amount, highlight_amount);
         self.sync();
     }
 
@@ -8392,7 +8616,7 @@ impl ffi::Engine {
         shadow: f32, highlight: f32,
         vibrance: f32, saturation: f32,
     ) {
-        self.as_mut().rust_mut().doc.apply_hdr_toning(
+        self.as_mut().doc_mut().apply_hdr_toning(
             radius, strength, gamma, exposure, detail,
             shadow, highlight, vibrance, saturation,
         );
@@ -8413,12 +8637,12 @@ impl ffi::Engine {
                 adj[i][j] = val.trim().parse::<f32>().unwrap_or(0.0);
             }
         }
-        self.as_mut().rust_mut().doc.apply_selective_color(&adj, relative);
+        self.as_mut().doc_mut().apply_selective_color(&adj, relative);
         self.sync();
     }
 
     fn apply_equalize_bridge(mut self: core::pin::Pin<&mut Self>) {
-        self.as_mut().rust_mut().doc.apply_equalize();
+        self.as_mut().doc_mut().apply_equalize();
         self.sync();
     }
 
@@ -8435,7 +8659,7 @@ impl ffi::Engine {
         if parsed.is_empty() {
             return;
         }
-        self.as_mut().rust_mut().doc.apply_replace_color(
+        self.as_mut().doc_mut().apply_replace_color(
             &parsed, fuzziness, localized, hue, saturation, lightness,
         );
         self.sync();
@@ -8464,7 +8688,7 @@ impl ffi::Engine {
         let bg = self.as_ref().rust().background;
         if let Some(grad) = crate::gradient::preset(&name_str, fg, bg) {
             let grad = if reverse { grad.reversed() } else { grad };
-            self.as_mut().rust_mut().doc.apply_gradient_map(&grad, dither);
+            self.as_mut().doc_mut().apply_gradient_map(&grad, dither);
             self.sync();
         }
     }
@@ -8477,7 +8701,7 @@ impl ffi::Engine {
     ) {
         if let Some(grad) = parse_gradient_stops(stops_str) {
             let grad = if reverse { grad.reversed() } else { grad };
-            self.as_mut().rust_mut().doc.apply_gradient_map(&grad, dither);
+            self.as_mut().doc_mut().apply_gradient_map(&grad, dither);
             self.sync();
         }
     }
@@ -8509,24 +8733,26 @@ impl ffi::Engine {
     ) {
         let matrix = [rr, rg, rb, gr, gg, gb, br, bg, bb];
         let constants = [cr, cg, cb];
-        self.as_mut().rust_mut().doc.apply_channel_mixer(&matrix, &constants, monochrome);
+        self.as_mut().doc_mut().apply_channel_mixer(&matrix, &constants, monochrome);
         self.sync();
     }
 
     // -- history ------------------------------------------------------------
 
     fn undo(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let ok = self.as_mut().rust_mut().doc.undo();
+        let stroke = self.doc.stroke_dirty();
+        let ok = self.as_mut().doc_mut_within().undo();
         if ok {
-            self.sync();
+            self.sync_restored(stroke);
         }
         ok
     }
 
     fn redo(mut self: core::pin::Pin<&mut Self>) -> bool {
-        let ok = self.as_mut().rust_mut().doc.redo();
+        let stroke = self.doc.stroke_dirty();
+        let ok = self.as_mut().doc_mut_within().redo();
         if ok {
-            self.sync();
+            self.sync_restored(stroke);
         }
         ok
     }
@@ -8570,8 +8796,12 @@ impl ffi::Engine {
         if index < 0 {
             return;
         }
-        self.as_mut().rust_mut().doc.jump_to_history(index as usize);
-        self.sync();
+        let stroke = self.doc.stroke_dirty();
+        if self.as_mut().doc_mut_within().jump_to_history(index as usize) {
+            self.sync_restored(stroke);
+        } else {
+            self.sync();
+        }
     }
 
     // -- static metadata ----------------------------------------------------
@@ -8694,4 +8924,31 @@ mod tests {
             assert!(i < BlendMode::ALL.len(), "separator {} out of range", i);
         }
     }
+}
+
+/// Diagnostics: with `PHOTORUST_TRACE_EDITS` set, every undescribed change
+/// prints the bridge call that made it. Each one costs the canvas a full
+/// redraw — on a large picture, a second with every core busy — so a flag
+/// raised where nothing changed the picture shows up as lag. This is how
+/// a brush setting and a selection-bounds query were found to be doing it.
+/// See `crate::damage`.
+fn trace_edit(how: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PHOTORUST_TRACE_EDITS").is_some()) {
+        return;
+    }
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let caller = trace
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("at ") && l.contains("ffi::Engine"))
+        .filter(|l| !["trace_edit", "doc_mut", "::edit", "cxxbridge"].iter().any(|n| l.contains(n)))
+        .map(|l| {
+            // The last path segment that is not the symbol's hash.
+            let hash = |seg: &str| seg.len() == 17 && seg.starts_with('h') && seg[1..].chars().all(|c| c.is_ascii_hexdigit());
+            l.split("::").filter(|seg| !hash(seg)).last().unwrap_or(l).to_string()
+        })
+        .next()
+        .unwrap_or_else(|| "?".into());
+    eprintln!("photorust: undescribed change via {how} in {caller} — the canvas will redraw everything");
 }

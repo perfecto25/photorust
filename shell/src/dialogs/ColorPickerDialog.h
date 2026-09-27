@@ -256,12 +256,10 @@ private:
     QColor m_original{Qt::black};
     bool m_updating = false;
 
-    /// True while the pointer is off the dialog and the mouse is held, which
-    /// is when sampling happens.
+    /// True while the pointer is over the image, with the mouse held so the
+    /// dialog sees the click that chooses a colour there. Being over the
+    /// image chooses nothing by itself.
     bool m_sampling = false;
-    /// A click on the image holds that colour until the next one: the pointer
-    /// can travel back to the dialog without the colour following it.
-    bool m_latched = false;
     /// Polls where the pointer is. The dialog is modal, so nothing else in the
     /// application sees the pointer to tell it — and without the mouse held
     /// there are no move events to go on either.

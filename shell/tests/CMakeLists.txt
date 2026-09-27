@@ -6,6 +6,7 @@
 # and real widgets with nowhere to put them, which is all these assertions want.
 
 set(SHELL_TESTS
+    tst_canvasdamage
     tst_docktitle
     tst_filterdialog
     tst_glyphspanel
@@ -21,6 +22,7 @@ set(SHELL_TESTS
     tst_typerestyle
     tst_typewarp
     tst_workpath
+    tst_colorpicker
 )
 
 foreach(test_name IN LISTS SHELL_TESTS)
